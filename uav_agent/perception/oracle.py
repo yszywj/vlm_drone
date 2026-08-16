@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 
 from env.moving_target import TargetState
+from perception.runtime import PerceptionCapability
 from skills.types import Observation
 
 if TYPE_CHECKING:
@@ -37,6 +38,10 @@ class OraclePerception:
     """
 
     target_id: str = "target"
+
+    # Runtime policy code uses this declaration to prevent this adapter from
+    # being selected by the default production profile.
+    capability = PerceptionCapability.PRIVILEGED_ORACLE
 
     def __post_init__(self) -> None:
         if not isinstance(self.target_id, str) or not self.target_id.strip():

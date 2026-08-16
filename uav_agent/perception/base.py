@@ -10,6 +10,12 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
+from perception.types import (
+    DetectionCandidate,
+    IdentityConsistencyEvidence,
+    SemanticVerification,
+    ShortTrackEvidence,
+)
 from skills.types import Observation
 
 
@@ -21,4 +27,45 @@ class PerceptionBackend(Protocol):
         """Return the observation represented by ``frame``."""
 
 
-__all__ = ["PerceptionBackend"]
+@runtime_checkable
+class DetectorTrackerBackend(Protocol):
+    """Learned proposal and short-track boundary; no ground truth allowed."""
+
+    def detect(self, observation: Observation) -> DetectionCandidate | None: ...
+
+    def update_track(
+        self,
+        candidate_id: str,
+        observation: Observation,
+    ) -> ShortTrackEvidence: ...
+
+
+@runtime_checkable
+class SemanticVerifierBackend(Protocol):
+    """Verify that one candidate matches the requested semantics."""
+
+    def verify_candidate(
+        self,
+        candidate: DetectionCandidate,
+        target_description: str,
+        camera_rgb: object,
+    ) -> SemanticVerification: ...
+
+
+@runtime_checkable
+class IdentityVerifierBackend(Protocol):
+    """Provide ReID plus temporal identity-consistency evidence."""
+
+    def verify_identity(
+        self,
+        candidate_id: str,
+        observation: Observation,
+    ) -> IdentityConsistencyEvidence: ...
+
+
+__all__ = [
+    "DetectorTrackerBackend",
+    "IdentityVerifierBackend",
+    "PerceptionBackend",
+    "SemanticVerifierBackend",
+]

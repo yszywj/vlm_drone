@@ -180,7 +180,11 @@ class FullOracleSkillPipelineIsaacTest(unittest.TestCase):
     def test_complete_pipeline_with_camera_fov_recovery(self) -> None:
         # Isaac-backed imports are deliberately local and occur after app setup.
         from env.simple_uav_search_env import SimpleUavSearchEnv
-        from perception.oracle import OraclePerception
+        from perception import (
+            GuardedPerceptionBackend,
+            OraclePerception,
+            PerceptionRuntimeProfile,
+        )
         from skills.manager import (
             SkillManager,
             TaskPlan,
@@ -192,7 +196,11 @@ class FullOracleSkillPipelineIsaacTest(unittest.TestCase):
         environment = SimpleUavSearchEnv(config)
         try:
             environment.setup()
-            oracle = OraclePerception(target_id="target")
+            oracle = GuardedPerceptionBackend(
+                OraclePerception(target_id="target"),
+                profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
+                acknowledge_privileged_oracle=True,
+            )
             clock = _WorldClock(environment)
             context = environment.make_skill_context(clock, perception=oracle)
             registry = create_default_skill_registry(

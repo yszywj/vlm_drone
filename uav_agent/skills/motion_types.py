@@ -11,7 +11,7 @@ from typing import Sequence
 
 import numpy as np
 
-from env.kinematic_uav import KinematicUAV
+from skills.types import UAVController
 
 
 class YawMode(Enum):
@@ -89,7 +89,7 @@ def _normalize_motion_policy(policy: MotionPolicy) -> _ValidatedMotionPolicy:
 
 
 def apply_motion_policy(
-    uav: KinematicUAV,
+    uav: UAVController,
     velocity_xyz_mps: Sequence[float],
     policy: MotionPolicy,
     *,
@@ -118,7 +118,7 @@ def apply_motion_policy(
         raise MotionPolicyValidationError("yaw mode has no target implementation")
     if validated.yaw_mode is YawMode.FACE_POINT and validated.look_at_point is None:
         raise MotionPolicyValidationError("FACE_POINT has no normalized look_at_point")
-    # KinematicUAV uses world-frame velocity, so translation never depends on yaw.
+    # UAVController defines world-frame velocity, so translation never depends on yaw.
     uav.set_velocity(velocity)
     if validated.yaw_mode is YawMode.FACE_POINT:
         uav.face_point(
@@ -134,7 +134,7 @@ def apply_motion_policy(
 
 
 def move_toward_with_policy(
-    uav: KinematicUAV,
+    uav: UAVController,
     goal_xyz_m: Sequence[float],
     speed_mps: float,
     tolerance_m: float,

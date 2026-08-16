@@ -1,0 +1,112 @@
+schema_version: 1
+
+simulation:
+  # The demo is finite and headless by default so it is safe to run on a server.
+  headless: true
+  physics_dt_s: 0.016666666666666666
+  # Phase 2 uses one kinematic update per World.step, so physics/render dt match.
+  rendering_dt_s: 0.016666666666666666
+  stage_units_in_meters: 1.0
+  demo_steps: 120
+
+scene:
+  # [x, y, z]; x/y are centered on the world origin and z starts at 0.
+  size_xyz_m: [100.0, 100.0, 30.0]
+
+uav:
+  # Initial orientation is identity: yaw=0, with the UAV nose along world +X.
+  initial_position_xyz_m: [0.0, 0.0, 10.0]
+  max_speed_mps: 5.0
+  max_yaw_rate_deg_s: 60.0
+
+camera:
+  # [width, height]
+  resolution_wh_px: [640, 480]
+  # Must be an integer divisor of the 60 Hz rendering rate.
+  frequency_hz: 10
+  horizontal_fov_deg: 90.0
+  # Optional Isaac Camera focal length in stage units (meter here).
+  # When null, focal length is derived from horizontal_fov_deg.
+  focal_length_m: null
+  # Negative pitch points the camera downward relative to the UAV body.
+  pitch_deg: -45.0
+
+target:
+  # Closed axis-aligned bounds; setup uses their center as the spawn position.
+  initial_region:
+    # This default puts the first target near the onboard camera's optical axis.
+    min_xyz_m: [9.0, -1.0, 0.5]
+    max_xyz_m: [11.0, 1.0, 0.5]
+  max_speed_mps: 1.5
+  motion:
+    mode: RANDOM_WALK  # STATIC | LINEAR | RANDOM_WALK
+    region:
+      min_xyz_m: [-40.0, -40.0, 0.5]
+      max_xyz_m: [40.0, 40.0, 0.5]
+    speed_mps: 1.0
+    initial_heading_deg: 0.0
+    direction_change_interval_s: 4.0
+    seed: 7
+
+search:
+  # SearchSkill constructor accepts this mode; FACE_POINT keeps the camera
+  # aimed toward the region while moving around its perimeter.
+  transit_yaw_mode: FACE_POINT  # FACE_POINT | COURSE_ALIGNED | KEEP_CURRENT
+  radius_m: 25.0
+  timeout_s: 120.0
+
+# Lightweight experiment-output defaults.  Raw sensor artifacts and periodic
+# checkpoints remain deliberately disabled on the shared server.
+experiment:
+  name: oracle_baseline
+  seed: 42
+  output_root: null
+
+logging:
+  terminal: true
+  console_log_interval_updates: 10
+  print_every_episode: false
+  debug_logging: false
+  csv: true
+
+tensorboard:
+  enabled: true
+  scalars_only: true
+  log_interval_updates: 1
+  flush_interval_s: 30.0
+
+checkpoint:
+  save_best: true
+  save_latest: true
+  latest_interval_steps: 50000
+  save_periodic: false
+  save_full_base_model: false
+  save_adapter_only: true
+  save_optimizer_in_latest_only: true
+
+evaluation:
+  enabled: true
+  interval_steps: 20000
+  num_validation_episodes: 50
+  num_test_episodes: 200
+  deterministic: true
+  fixed_validation_seeds: true
+  fixed_test_seeds: true
+
+artifacts:
+  save_images: false
+  save_videos: false
+  save_trajectories: false
+  save_observations: false
+  save_raw_frames: false
+
+figures:
+  enabled: true
+  format: png
+  save_pdf: false
+
+storage:
+  min_free_space_gb_before_start: 20.0
+  min_free_space_gb_during_run: 10.0
+  warning_run_size_gb: 3.0
+  max_run_size_gb: 5.0

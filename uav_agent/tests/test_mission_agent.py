@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import deque
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import unittest
 
@@ -24,6 +24,14 @@ from agents.mission_agent import (
 )
 from env.kinematic_uav import KinematicUAV, UAVState
 from planner.base import MissionPlanner
+from perception.runtime import PerceptionRuntimeProfile
+from perception.confirmation import CandidateConfirmationCoordinator
+from perception.types import (
+    DetectionCandidate,
+    IdentityConsistencyEvidence,
+    SemanticVerification,
+    ShortTrackEvidence,
+)
 from planner.schemas import (
     CompiledMission,
     LandingZoneSpec,
@@ -368,6 +376,12 @@ def make_harness(
     safety: CountingSafetySupervisor | None = None,
     start_error: Exception | None = None,
     logger: object | None = None,
+    # ScriptedSkill outcomes model the Stage-0 ideal Oracle path.  Individual
+    # production-boundary tests override this explicitly.
+    perception_runtime_profile: PerceptionRuntimeProfile = (
+        PerceptionRuntimeProfile.ORACLE_EVALUATION
+    ),
+    acknowledge_privileged_oracle: bool = True,
 ) -> Harness:
     clock = FakeClock()
     context = SkillContext(
@@ -409,6 +423,8 @@ def make_harness(
         target_manager=target,
         clock=clock,
         logger=logger,  # type: ignore[arg-type]
+        perception_runtime_profile=perception_runtime_profile,
+        acknowledge_privileged_oracle=acknowledge_privileged_oracle,
     )
     return Harness(
         agent=agent,
@@ -599,6 +615,63 @@ class MissionAgentTickAndTargetTests(unittest.TestCase):
             ],
         )
 
+    def test_production_search_cannot_directly_oracle_lock(self) -> None:
+        harness = make_harness(
+            perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
+            acknowledge_privileged_oracle=False,
+        )
+        harness.start()
+        harness.tick(1.0)
+        harness.tick(2.0)
+
+        snapshot = harness.tick(3.0)  # SEARCH result tries to enter TRACK
+
+        self.assertEqual(snapshot.active_skill, "LAND")
+        self.assertIn("prior visual", snapshot.last_error or "")
+        self.assertNotEqual(snapshot.target.source, "oracle")
+
+    def test_production_search_accepts_confirmed_candidate_lock(self) -> None:
+        harness = make_harness(
+            perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
+            acknowledge_privileged_oracle=False,
+        )
+        harness.start()
+        harness.tick(1.0)
+        harness.tick(2.0)  # target lifecycle enters SEARCHING
+        coordinator = CandidateConfirmationCoordinator()
+        coordinator.register_candidate(
+            DetectionCandidate("tracklet_0", 2.1, 0.8),
+            harness.target,
+        )
+        result = coordinator.evaluate(
+            target_manager=harness.target,
+            track=ShortTrackEvidence("tracklet_0", 2.7, 4, 0.6, True, 0.9),
+            semantic=SemanticVerification(
+                "tracklet_0",
+                2.8,
+                "moving red target",
+                True,
+                0.9,
+                "qwen-vl",
+            ),
+            identity=IdentityConsistencyEvidence(
+                "tracklet_0",
+                "target_0",
+                2.9,
+                True,
+                True,
+                4,
+                0.9,
+            ),
+        )
+        self.assertEqual(result.decision.value, "CONFIRMED")
+
+        snapshot = harness.tick(3.0)
+
+        self.assertEqual(snapshot.active_skill, "TRACK")
+        self.assertIs(snapshot.target.lifecycle, TargetLifecycle.TRACKING)
+        self.assertEqual(snapshot.target.source, "confirmed_vision")
+
     def test_track_lost_enters_reacquiring_with_real_last_seen_data(self) -> None:
         lost_data = {
             "target_id": "target_0",
@@ -682,6 +755,66 @@ class MissionAgentTickAndTargetTests(unittest.TestCase):
             ],
         )
 
+    def test_production_reacquire_requires_confirmed_candidate(self) -> None:
+        lost_data = {
+            "last_seen_position": (7.0, 8.0, 0.0),
+            "last_seen_velocity": (0.5, 0.0, 0.0),
+            "last_seen_time": 3.5,
+        }
+        harness = make_harness(
+            outcomes={
+                SkillName.TRACK: [
+                    failed(SkillResultCode.TARGET_LOST, lost_data),
+                    succeeded(SkillResultCode.TRACK_COMPLETE),
+                ]
+            },
+            perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
+            acknowledge_privileged_oracle=False,
+        )
+        harness.start()
+        harness.tick(1.0)
+        harness.tick(2.0)
+        coordinator = CandidateConfirmationCoordinator()
+        coordinator.register_candidate(
+            DetectionCandidate("initial_tracklet", 2.1, 0.8),
+            harness.target,
+        )
+        coordinator.evaluate(
+            target_manager=harness.target,
+            track=ShortTrackEvidence("initial_tracklet", 2.7, 4, 0.6, True, 0.9),
+            semantic=SemanticVerification(
+                "initial_tracklet", 2.8, "moving red target", True, 0.9, "qwen-vl"
+            ),
+            identity=IdentityConsistencyEvidence(
+                "initial_tracklet", "target_0", 2.9, True, True, 4, 0.9
+            ),
+        )
+        harness.tick(3.0)  # confirmed SEARCH -> TRACK
+        harness.tick(4.0)  # TRACK lost -> REACQUIRE
+        self.assertIs(harness.target.lifecycle, TargetLifecycle.REACQUIRING)
+
+        coordinator.register_candidate(
+            DetectionCandidate("reacquire_tracklet", 4.1, 0.85),
+            harness.target,
+        )
+        coordinator.evaluate(
+            target_manager=harness.target,
+            track=ShortTrackEvidence("reacquire_tracklet", 4.7, 4, 0.6, True, 0.9),
+            semantic=SemanticVerification(
+                "reacquire_tracklet", 4.8, "moving red target", True, 0.9, "qwen-vl"
+            ),
+            identity=IdentityConsistencyEvidence(
+                "reacquire_tracklet", "target_0", 4.9, True, True, 4, 0.9
+            ),
+        )
+
+        snapshot = harness.tick(5.0)
+
+        self.assertEqual(snapshot.active_skill, "TRACK")
+        self.assertIs(snapshot.target.lifecycle, TargetLifecycle.TRACKING)
+        self.assertEqual(snapshot.target.target_id, "target_0")
+        self.assertEqual(snapshot.target.source, "confirmed_vision")
+
     def test_track_complete_terminates_target_before_return_goto(self) -> None:
         harness = make_harness()
         harness.start()
@@ -714,6 +847,70 @@ class MissionAgentTickAndTargetTests(unittest.TestCase):
 
 
 class MissionAgentSafetyAndLifecycleTests(unittest.TestCase):
+    def test_production_agent_rejects_oracle_before_safety_or_skill(self) -> None:
+        harness = make_harness(
+            perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
+            acknowledge_privileged_oracle=False,
+        )
+        harness.start()
+        privileged = replace(
+            observation(1.0),
+            oracle_target_visible=False,
+        )
+
+        snapshot = harness.agent.tick(privileged)
+
+        self.assertEqual(harness.safety.evaluate_calls, 0)
+        self.assertEqual(harness.manager.tick_calls, 0)
+        self.assertEqual(harness.manager.cancel_task_calls, 1)
+        self.assertEqual(snapshot.active_skill, "LAND")
+        self.assertIn("perception boundary", snapshot.last_error or "")
+
+    def test_repeated_oracle_violation_cannot_starve_fail_safe_land(self) -> None:
+        harness = make_harness(
+            perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
+            acknowledge_privileged_oracle=False,
+        )
+        harness.start()
+
+        first = harness.agent.tick(
+            replace(observation(1.0), oracle_target_visible=False)
+        )
+        self.assertEqual(first.active_skill, "LAND")
+        self.assertEqual(harness.manager.tick_calls, 0)
+
+        final = harness.agent.tick(
+            replace(observation(2.0), oracle_target_visible=False)
+        )
+
+        self.assertEqual(harness.manager.tick_calls, 1)
+        self.assertIs(final.status, AgentStatus.FAILED)
+
+    def test_oracle_evaluation_agent_requires_explicit_acknowledgement(self) -> None:
+        with self.assertRaisesRegex(MissionAgentError, "explicit"):
+            make_harness(
+                perception_runtime_profile=(
+                    PerceptionRuntimeProfile.ORACLE_EVALUATION
+                ),
+                acknowledge_privileged_oracle=False,
+            )
+
+        harness = make_harness(
+            perception_runtime_profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
+            acknowledge_privileged_oracle=True,
+        )
+        harness.start()
+        privileged = replace(
+            observation(1.0),
+            oracle_target_visible=False,
+        )
+        harness.clock.set(1.0)
+
+        harness.agent.tick(privileged)
+
+        self.assertEqual(harness.safety.evaluate_calls, 1)
+        self.assertEqual(harness.manager.tick_calls, 1)
+
     def test_runtime_boundary_violation_cancels_into_land(self) -> None:
         harness = make_harness()
         harness.start()

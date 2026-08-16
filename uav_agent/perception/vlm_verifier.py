@@ -8,6 +8,8 @@ verification result.
 
 from __future__ import annotations
 
+from perception.types import DetectionCandidate, SemanticVerification
+
 
 class VLMVerifier:
     """Placeholder for candidate confirmation and reacquisition disambiguation."""
@@ -29,6 +31,18 @@ class VLMVerifier:
         raise NotImplementedError(
             "VLMVerifier is not implemented; no visual candidate verification "
             "result is available"
+        )
+
+    def verify_candidate(
+        self,
+        candidate: DetectionCandidate,
+        target_description: str,
+        camera_rgb: object,
+    ) -> SemanticVerification:
+        del candidate, target_description, camera_rgb
+        raise NotImplementedError(
+            "VLMVerifier is not implemented; no semantic verification result "
+            "is available"
         )
 
 

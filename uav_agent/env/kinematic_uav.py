@@ -7,23 +7,16 @@ use commands followed by repeated ``step`` calls. Yaw is stored in radians.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from math import atan2, cos, isfinite, pi, sin
 from numbers import Real
 from typing import Callable, Sequence
 
 import numpy as np
 
+from env.uav_controller import UAVState
+
 
 PoseWriter = Callable[[np.ndarray, np.ndarray], None]
-
-
-@dataclass(frozen=True)
-class UAVState:
-    x: float
-    y: float
-    z: float
-    yaw: float
 
 
 class KinematicUAV:

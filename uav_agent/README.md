@@ -4,7 +4,17 @@
 
 ## 快速开始
 
-项目级 `python.sh` 固定使用服务器 Conda 环境 `r_isaac_sim`，不依赖当前 shell 激活环境，也不会修改其他用户的环境。
+仓库提供 `environment.yml` 作为 Isaac 运行环境的可复现基线。新克隆首次安装（Isaac wheels 体积较大）：
+
+```bash
+cd /path/to/vlm_drones/uav_agent
+conda env create -f environment.yml
+conda activate r_isaac_sim
+export UAV_AGENT_CONDA_ENV="${CONDA_PREFIX}"
+./python.sh scripts/run_demo.py --config configs/default.yaml --validate-only
+```
+
+`python.sh` 默认仍使用这台服务器的 `/home/amax/miniconda3/envs/r_isaac_sim`，但不再写死 Conda 可执行文件。其他机器应通过 `UAV_AGENT_CONDA_ENV=/absolute/env/prefix` 指定环境；当 `conda` 不在 `PATH` 中时，脚本会尝试由 `<prefix>/../..` 定位 Conda，也可显式设置 `UAV_AGENT_CONDA_BIN=/absolute/path/to/conda`。脚本始终用 `conda run -p` 运行，并把项目目录及其父目录加入 `PYTHONPATH`，因此历史顶层导入与 `python -m uav_agent...` 两种入口均可使用。
 
 ```bash
 cd /home/amax/ry/vlm_drones/uav_agent
@@ -57,6 +67,25 @@ CUDA_VISIBLE_DEVICES=0 \
 
 除 `SimulationApp` 本身外，所有 `isaacsim.core`、`omni`、`carb`、`pxr` 相关导入都发生在应用创建之后。`scripts/run_demo.py`、`scripts/run_oracle_pipeline.py` 和 `scripts/run_llm_oracle_pipeline.py` 都采用 standalone 启动顺序，并保证环境和 `SimulationApp` 最终关闭。
 
+## 环境版本、GPU 与模型权重
+
+`environment.yml` 固定 Python 3.11、Isaac Sim 5.1.0.0、NumPy 1.26.0、PyYAML 6.0.2 和 Pillow 11.3.0。当前服务器 `r_isaac_sim` 环境实际读取到的版本为 Python 3.11.15 和 Isaac Sim 5.1.0.0，与该基线一致。Isaac Sim 依赖 NVIDIA 的 Python package index，安装及首次启动仍受 NVIDIA 许可条款约束。
+
+Conda 文件不安装或固定主机 NVIDIA driver，也不能替代 [Isaac Sim 5.1 官方系统要求](https://docs.isaacsim.omniverse.nvidia.com/5.1.0/installation/requirements.html)。运行前应在主机上用 `nvidia-smi` 确认 GPU 和 driver 正常，再依官方 5.1 兼容矩阵核对 driver/CUDA 支持；`CUDA_VISIBLE_DEVICES` 只选择运行 GPU，不会安装 driver 或 CUDA。本次受控 shell 无法通过 `nvidia-smi` 读取主机 driver，因此仓库不声称已验证某个具体 driver 版本。
+
+Qwen 服务端必须使用另一个 Conda 环境和独立进程；不要把 vLLM 或 Transformers 安装进 `r_isaac_sim`。Qwen3-VL 上游当前给出的兼容下限是 `transformers>=4.57.0` 与 `vllm>=0.11.0`（离线多模态工具另建议 `qwen-vl-utils==0.0.14`）；这些是服务环境的最低版本，不是本项目已经验收的精确 lock。当前 Isaac 环境中 vLLM/Transformers 均未安装，本地模型 `config.json` 的 `transformers_version=4.57.0.dev0` 也只是模型元数据。首次真实服务验收后，应在独立服务环境中导出实际 lock，而不是把它并入 Isaac 环境。
+
+模型权重不进入 Git。在独立的 Qwen 服务环境中安装 Hugging Face Hub CLI 并下载，再把得到的本地路径交给 `QWEN_MODEL_PATH`：
+
+```bash
+cd /path/to/vlm_drones
+hf download Qwen/Qwen3-VL-4B-Instruct \
+  --local-dir models/initial_model/Qwen3-VL-4B-Instruct
+export QWEN_MODEL_PATH="$PWD/models/initial_model/Qwen3-VL-4B-Instruct"
+```
+
+根目录 `/models/` 按重量级权重处理并由 `.gitignore` 忽略；`uav_agent/models/` 是 OpenAI-compatible 客户端源码，必须跟踪。公共的 `configs/__init__.py`、`configs/schema.py`、`configs/loader.py` 和 `configs/default.yaml` 同样必须跟踪；只有 `configs/local.yaml` 和 `configs/private/` 被忽略。
+
 ## Stage 1A / 1B：MissionAgent + Oracle
 
 两种模式共用相同的可信编译、安全检查、目标生命周期和底层 Skill 调度链：
@@ -99,7 +128,27 @@ QWEN_MODEL=Qwen3-VL-4B-Instruct \
   --headless
 ```
 
-当前能力边界必须明确：Qwen3-VL 在此阶段只接收文本，不接收 Camera 图像；SEARCH / TRACK / REACQUIRE 仍消费带 `oracle_` 前缀的真值字段；LOCK 只是 `TargetManager` 的逻辑生命周期状态。真实图片 detector、视觉 tracker 和 ReID 尚未实现，`perception/detector_tracker.py` 与 `perception/vlm_verifier.py` 仍是占位接口。因此 Stage 1A/1B 都是 Oracle 集成里程碑，不能称为真实视觉搜索闭环。
+当前能力边界必须明确：Qwen3-VL 在此阶段只接收文本，不接收 Camera 图像；SEARCH / TRACK / REACQUIRE 仍消费带 `oracle_` 前缀的真值字段；LOCK 只是 `TargetManager` 的逻辑生命周期状态。真实图片 detector、视觉 tracker、VLM 语义验证和 ReID 尚未实现，`DetectorTrackerPerception`、`VLMVerifier` 与 `ReIDVerifier` 调用时仍明确抛出 `NotImplementedError`，绝不返回占位命中。因此 Stage 1A/1B 都是 Oracle 集成里程碑，不能称为真实视觉搜索闭环。
+
+感知运行时默认使用 `PerceptionRuntimeProfile.PRODUCTION`。`GuardedPerceptionBackend` 会拒绝声明为 `PRIVILEGED_ORACLE` 的 backend，也会二次检查任何伪装成视觉 backend 却输出 `oracle_target_*` 的 Observation；`MissionAgent` 在 Safety 和 Skill 之前还有同样的 production gate。Oracle 只能在明确选择 `ORACLE_EVALUATION` 并设置 `acknowledge_privileged_oracle=True` 后运行，两个 Oracle demo 会在控制台打印醒目标记。该 profile 仅用于上界、回归测试、数据标注和专家轨迹，不是部署配置，也不能与真实视觉配置静默互换。
+
+真实视觉候选确认的纯 Python 边界已定义，但 backend 尚未实现：
+
+```text
+Detector proposal
+    ↓
+TargetManager.SEARCHING → CANDIDATE
+    ↓
+stable short-track evidence
+    ↓
+VLM semantic match
+    ↓
+ReID + temporal identity consistency
+    ↓
+TargetManager.LOCKED → TRACKING
+```
+
+`CandidateConfirmationCoordinator` 只接受带有限 timestamp、confidence、一致 candidate id、合法时间顺序和可实现轨迹时长的类型化 evidence；任一明确否定会清除 SEARCH 候选并回到 `SEARCHING`，REACQUIRE 候选被否定时则恢复原 target id 与 last-seen 状态并回到 `REACQUIRING`。证据不足时保持 `CANDIDATE`，短轨迹、语义、ReID 和时序一致性全部通过才写入非 Oracle 的 `confirmed_vision` lock。裸 `TargetManager.lock()` / `mark_reacquired()` 会拒绝直接调用，避免绕过 coordinator。生产模式下，`MissionAgent` 的 SEARCH/REACQUIRE→TRACK 转换要求这个 lock 已存在且 target id 匹配；它不会再把 Skill 成功结果直接伪造成 `confidence=1.0` 的 Oracle lock。当前 Oracle profile 只保留名称明确的 evaluator shortcut，以便已有 Ideal Skills 回归。
 
 ## 本地 Qwen OpenAI-compatible 服务
 
@@ -162,7 +211,7 @@ Camera prim 本身不是可渲染几何体；overview 中看到的青色物体�
 
 ## Phase 2：Kinematic UAV
 
-`env/kinematic_uav.py` 是不导入 Isaac 的纯运动学模块，状态为 `UAVState(x, y, z, yaw)`。它不模拟电机、thrust、roll/pitch dynamics 或 aerodynamic forces，也暂不处理碰撞与避障，因此可能穿过障碍物。
+`env/uav_controller.py` 定义 simulator-independent 的 `UAVState` 与 `UAVController` Protocol；`env/kinematic_uav.py` 只是其中一个不导入 Isaac 的实现，并兼容 re-export `UAVState`。PX4、Pegasus、MAVSDK、ROS 2 或真实飞控适配器可实现同一 world-frame contract，不需要继承 `KinematicUAV`。当前 ideal 实现不模拟电机、thrust、roll/pitch dynamics 或 aerodynamic forces，也暂不处理碰撞与避障，因此可能穿过障碍物。
 
 `set_pose()` 只用于初始化、reset 和 debug。正常导航必须先下达命令，再逐 step 积分：
 
@@ -260,7 +309,7 @@ status = manager.tick(observation)
 
 `SkillResult.to_dict()` 会把枚举转换为 Qwen 工具层使用的 `"SUCCEEDED"`、`"GOAL_REACHED"` 等字符串；各 Skill 写入的 `data` 仍应保持 JSON-compatible。
 
-普通 `Observation` 的所有 `oracle_target_*` 均为 `None`。只有 evaluator/test 显式调用 `get_skill_observation(include_oracle=True)` 才会注入 Target 真值；其中当前 `oracle_target_visible` 表示几何 frustum 内，不包含遮挡判断。SkillContext 只含 KinematicUAV、CameraSensor、perception 和 simulation clock，不含 scene、target 或全局 Manager。
+普通 `Observation` 的所有 `oracle_target_*` 均为 `None`。只有 evaluator/test 显式调用 `get_skill_observation(include_oracle=True)` 才会注入 Target 真值；其中当前 `oracle_target_visible` 表示几何 frustum 内，不包含遮挡判断。`SkillContext` 只含结构化 `UAVController`、`CameraSensor`、perception 和 simulation clock，不含具体 `KinematicUAV` 类型、scene、target 或全局 Manager。
 
 ## Phase 6A：Ideal Kinematic TAKEOFF
 
@@ -485,10 +534,11 @@ episode reset 必须调用 `environment.reset(target_seed=...)`，它会一起�
 
 ```text
 uav_agent/
-├── configs/       # 统一 YAML 配置和纯 Python 校验器
+├── configs/       # 公共 schema、统一 YAML 配置和纯 Python 校验器
 ├── env/           # scene、kinematic UAV、RGB Camera、moving Target、World wrapper
 ├── models/        # 纯 Python 模型合同与 OpenAI-compatible HTTP 客户端
 ├── agents/        # VLM/LLM Agent
+├── experiments/   # 轻量运行目录、CSV/TensorBoard、checkpoint、评测与图表
 ├── skills/        # 统一 Skill API、MotionPolicy、Manager 与六类 Goal 合同
 ├── perception/    # 视觉感知；Stage-0 含 evaluator-only OraclePerception
 ├── planner/       # 任务分解与层次规划
@@ -497,8 +547,86 @@ uav_agent/
 ├── scripts/       # scene demo 与完整 Oracle standalone 入口
 ├── tests/         # 快速纯测试及一个显式 opt-in Isaac 集成测试
 ├── logs/          # 运行日志（默认忽略产物）
-├── python.sh      # 固定使用 r_isaac_sim
+├── python.sh      # 默认 r_isaac_sim，支持通过环境变量覆盖 prefix
+├── environment.yml # Python 3.11 / Isaac Sim 5.1 环境基线
 └── README.md
+```
+
+仓库根目录的 `outputs/` 是默认实验结果根目录，不属于源码树并由 `.gitignore` 忽略。
+
+## 轻量级训练与评测结果输出
+
+`experiments` 包提供一套与 Isaac、Torch 和模型实现解耦的公共输出层。输出根目录按以下优先级解析：显式 `--output-root` 或 `RunManager.create(output_root=...)`，其次 `VLM_DRONE_OUTPUT_ROOT`，最后是仓库根目录的 `outputs/`。开始运行前会验证目录可写并检查剩余空间；默认至少需要 20 GiB。
+
+每个 run 只创建以下目录，不创建图片帧、视频、轨迹、Observation dump 或周期 checkpoint：
+
+```text
+outputs/runs/<experiment_name>/<run_id>/
+├── manifest.yaml
+├── resolved_config.yaml
+├── command.sh
+├── exit_code.txt
+├── logs/terminal.log
+├── metrics/
+│   ├── train_metrics.csv
+│   ├── eval_metrics.csv
+│   ├── episode_metrics.csv
+│   ├── failure_cases.csv
+│   └── final_metrics.csv
+├── tensorboard/events.out.tfevents.*
+├── checkpoints/
+│   ├── best/
+│   └── latest/
+└── figures/
+    ├── train_success_rate.png
+    ├── eval_success_rate.png
+    ├── final_success_rate.png
+    ├── stage_success_rate.png
+    ├── failure_breakdown.png
+    └── training_curve.png
+```
+
+`MetricLogger` 的 CSV 是固定 schema；不存在的测量值写空单元格，不伪造为零。episode 使用 `(run_id, phase, episode_id)` 防重复，恢复运行会继续追加并要求 train/eval global step 严格递增。`compute_mission_success_strict()` 是训练、验证和测试唯一的完整任务成功定义；错误锁定、碰撞、越界、安全中止、超时或未成功降落都会判失败。验证和测试使用互斥固定种子，最终测试只接受 `best` checkpoint，并报告 Wilson 95% 置信区间。
+
+TensorBoard writer 只公开 `add_scalar()`，没有 image、video、histogram、graph、embedding 或 text API；其 TFEvent writer 不要求运行环境安装 TensorBoard，安装 `environment.yml` 中的 TensorBoard 后即可读取。`CheckpointManager` 只管理 `best` 与 `latest` 两个原子替换槽位。`latest` 可包含恢复所需 optimizer、scheduler、RNG 和 normalizer state；`best` 会移除训练状态。默认 adapter-only 模式拒绝完整 Qwen 基础模型和其 shard，基础模型只在 manifest 中记录名称及路径。
+
+训练入口的推荐接线顺序是：创建 `RunManager`，在 update 粒度调用 `MetricLogger.log_train()`，固定间隔通过 `Evaluator` 验证并调用 `CheckpointManager.maybe_save_best()`，周期覆盖 `latest`，最后加载 `best` 进行测试、写 `final_metrics.csv`，再由 `ExperimentPlotter` 从 CSV 生成 PNG。当前仓库尚无实际 RL/SFT 训练入口，因此没有擅自把该模块接入仿真 tick；现有 Isaac demo 和 MissionAgent 流程保持不变。
+
+外部训练进程可使用统一 tee 启动器，保留实时 terminal、合并 stdout/stderr、真实 Python 退出码以及恢复分隔线：
+
+```bash
+RUN_DIR=/path/to/existing/run \
+  uav_agent/scripts/run_with_output.sh -m your_training_module --config configs/local.yaml
+
+VLM_DRONE_RESUME=1 RUN_DIR=/path/to/existing/run \
+  uav_agent/scripts/run_with_output.sh -m your_training_module --resume
+```
+
+默认输出配置位于 `configs/default.yaml` 的 `experiment`、`logging`、`tensorboard`、`checkpoint`、`evaluation`、`artifacts`、`figures` 和 `storage` 段。运行期可周期调用 storage guard；低于 10 GiB 或 run 达到 5 GiB 时，统一协调层会尝试覆盖保存 `latest`、flush CSV/TensorBoard、更新 manifest 并要求训练循环安全结束。它不会删除其他 run 或其他用户文件。
+
+真实训练入口应显式启用中断保护；构造 `ExperimentRuntime` 本身不会修改进程级 signal handler。下面的 context 会在 Ctrl+C（SIGINT）或 SIGTERM 时按 `latest → flush CSV/TensorBoard → 更新 manifest` 的顺序做 best-effort 持久化，并恢复原 handler：
+
+```python
+from experiments import InterruptState
+
+with runtime.interrupt_handlers(
+    lambda: InterruptState(
+        global_step=global_step,
+        update=update,
+        payload=adapter_and_resume_state,
+    )
+):
+    training_loop()
+```
+
+未捕获的中断分别以 130（SIGINT）或 143（SIGTERM）退出，和 manifest/`exit_code.txt` 中记录的进程段状态保持一致。该机制只允许在主线程显式安装；signal handler 本身不执行 checkpoint 或文件 I/O。
+
+纯 Python 冒烟测试会生成 20 个训练、10 个验证和 20 个测试 episode，并自动核验精确目录、五个 CSV、真实 scalar TFEvent、best/latest、六张图、总体大小和禁用 artifact 不存在：
+
+```bash
+cd /path/to/vlm_drones
+./uav_agent/python.sh -m uav_agent.experiments.smoke_test \
+  --output-root /tmp/vlm_drone_output_smoke
 ```
 
 ## 测试约定

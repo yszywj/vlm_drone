@@ -1,0 +1,24 @@
+name: r_isaac_sim
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # Isaac Sim wheels are published on NVIDIA's Python package index.
+      - --extra-index-url https://pypi.nvidia.com
+      - isaacsim[all,extscache]==5.1.0.0
+      # Direct pure-Python/runtime dependencies used by this repository.
+      - numpy==1.26.0
+      - PyYAML==6.0.2
+      - Pillow==11.3.0
+      - matplotlib==3.10.3
+      # Optional reader/UI for the scalar-only TFEvent files emitted by the
+      # lightweight experiment logger.  The writer itself has no hard runtime
+      # dependency on TensorBoard.
+      - tensorboard==2.20.0
+
+# vLLM, Transformers and model weights intentionally live outside this
+# Isaac Sim environment. Run the Qwen server in a separate environment/process.
+# The upstream Qwen3-VL baseline currently requires transformers>=4.57.0 and
+# vllm>=0.11.0; those are compatibility floors, not packages for this env.

@@ -19,7 +19,7 @@ from isaacsim.core.utils.rotations import euler_angles_to_quat
 from isaacsim.sensors.camera import Camera
 from PIL import Image
 
-from configs.loader import CameraConfig
+from configs.schema import CameraConfig
 
 
 class CameraFrameNotReady(RuntimeError):

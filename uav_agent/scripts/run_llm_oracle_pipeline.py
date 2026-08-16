@@ -7,13 +7,19 @@ import argparse
 from dataclasses import dataclass
 import json
 from math import hypot, isfinite
+import os
 from pathlib import Path
 import random
 import sys
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_ENV = Path("/home/amax/miniconda3/envs/r_isaac_sim")
+EXPECTED_ENV = Path(
+    os.environ.get(
+        "UAV_AGENT_CONDA_ENV",
+        "/home/amax/miniconda3/envs/r_isaac_sim",
+    )
+).expanduser()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -535,7 +541,11 @@ def main() -> int:
     try:
         from agents.mission_agent import MissionAgent
         from env.simple_uav_search_env import SimpleUavSearchEnv
-        from perception.oracle import OraclePerception
+        from perception import (
+            GuardedPerceptionBackend,
+            OraclePerception,
+            PerceptionRuntimeProfile,
+        )
         from skills.manager import SkillManager, create_default_skill_registry
         from target.target_manager import TargetManager
 
@@ -553,7 +563,15 @@ def main() -> int:
         if args.debug_ground_truth:
             print(f"[GroundTruth] target_spawn_m={target_spawn}")
 
-        oracle = OraclePerception(target_id="target")
+        print(
+            "[Perception] PRIVILEGED ORACLE_EVALUATION profile enabled; "
+            "this is an upper-bound/regression path, not production vision"
+        )
+        oracle = GuardedPerceptionBackend(
+            OraclePerception(target_id="target"),
+            profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
+            acknowledge_privileged_oracle=True,
+        )
         clock = IsaacSimulationClock(environment)
         context = environment.make_skill_context(clock, perception=oracle)
         manager = SkillManager(
@@ -570,6 +588,10 @@ def main() -> int:
             manager,
             target_manager,
             clock,
+            perception_runtime_profile=(
+                PerceptionRuntimeProfile.ORACLE_EVALUATION
+            ),
+            acknowledge_privileged_oracle=True,
         )
 
         task_start_s = clock.now()

@@ -9,11 +9,16 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from math import isfinite
 from numbers import Real
 
+from perception.runtime import (
+    PerceptionBoundaryError,
+    PerceptionRuntimeProfile,
+    observation_contains_oracle_data,
+)
 from planner.base import MissionPlanner
 from planner.schemas import CompiledMission, PlannerRequest, PlannerWorldContext
 from runtime.plan_validator import PlanValidator
@@ -122,6 +127,10 @@ class MissionAgent:
         target_manager: TargetManager,
         clock: SkillClock,
         logger: Callable[[str], object] | None = None,
+        perception_runtime_profile: PerceptionRuntimeProfile = (
+            PerceptionRuntimeProfile.PRODUCTION
+        ),
+        acknowledge_privileged_oracle: bool = False,
     ) -> None:
         if not isinstance(planner, MissionPlanner):
             raise TypeError("planner must be a MissionPlanner")
@@ -137,6 +146,28 @@ class MissionAgent:
             raise TypeError("clock must satisfy SkillClock")
         if logger is not None and not callable(logger):
             raise TypeError("logger must be callable or None")
+        if not isinstance(perception_runtime_profile, PerceptionRuntimeProfile):
+            raise TypeError(
+                "perception_runtime_profile must be a PerceptionRuntimeProfile"
+            )
+        if not isinstance(acknowledge_privileged_oracle, bool):
+            raise TypeError("acknowledge_privileged_oracle must be bool")
+        if (
+            perception_runtime_profile
+            is PerceptionRuntimeProfile.ORACLE_EVALUATION
+            and not acknowledge_privileged_oracle
+        ):
+            raise MissionAgentError(
+                "ORACLE_EVALUATION requires explicit "
+                "acknowledge_privileged_oracle=True"
+            )
+        if (
+            perception_runtime_profile is PerceptionRuntimeProfile.PRODUCTION
+            and acknowledge_privileged_oracle
+        ):
+            raise MissionAgentError(
+                "privileged Oracle acknowledgement is invalid in PRODUCTION"
+            )
         if skill_manager.task_status is not TaskStatus.IDLE:
             raise MissionAgentError("skill_manager must be IDLE at construction")
         if target_manager.lifecycle is not TargetLifecycle.UNINITIALIZED:
@@ -149,6 +180,7 @@ class MissionAgent:
         self._target_manager = target_manager
         self._clock = clock
         self._logger = logger
+        self._perception_runtime_profile = perception_runtime_profile
 
         self._status = AgentStatus.IDLE
         self._compiled_mission: CompiledMission | None = None
@@ -252,6 +284,44 @@ class MissionAgent:
         if self._status is not AgentStatus.RUNNING:
             raise MissionAgentError(
                 f"tick requires RUNNING, current status is {self._status.value}"
+            )
+
+        # Enforce the information boundary before timestamp de-duplication,
+        # SafetySupervisor, SkillManager, or transition handling sees the
+        # observation.  Production is the constructor default; the legacy
+        # ideal Oracle pipeline requires a conspicuous two-part opt-in.
+        boundary_violation = (
+            isinstance(observation, Observation)
+            and self._perception_runtime_profile
+            is PerceptionRuntimeProfile.PRODUCTION
+            and observation_contains_oracle_data(observation)
+        )
+        if boundary_violation and self._shutdown_outcome is None:
+            exc = PerceptionBoundaryError(
+                "production MissionAgent rejects oracle_target_* fields"
+            )
+            message = self._error_text("perception boundary rejected observation", exc)
+            self._last_error = message
+            self._begin_shutdown(AgentStatus.FAILED, message)
+            self._consume_transitions()
+            self._sync_status()
+            rejected_timestamp = _valid_observation_timestamp(observation)
+            if rejected_timestamp is not None and (
+                self._last_observation_timestamp is None
+                or rejected_timestamp > self._last_observation_timestamp
+            ):
+                self._last_observation_timestamp = rejected_timestamp
+            return self.snapshot()
+        if boundary_violation:
+            # Never pass privileged values into Safety or LAND.  Once shutdown
+            # is latched, stripping those fields lets fail-safe LAND continue
+            # even if a misconfigured backend keeps emitting Oracle data.
+            observation = replace(
+                observation,
+                oracle_target_id=None,
+                oracle_target_visible=None,
+                oracle_target_pose=None,
+                oracle_target_velocity=None,
             )
 
         timestamp = _valid_observation_timestamp(observation)
@@ -508,12 +578,21 @@ class MissionAgent:
             target_id = self._skill_manager.active_target_id
             if not isinstance(target_id, str) or not target_id.strip():
                 raise MissionAgentError("SEARCH transition has no active target_id")
-            self._target_manager.lock(
-                target_id.strip(),
-                timestamp_s=record.timestamp,
-                confidence=1.0,
-                source="oracle",
-            )
+            target_id = target_id.strip()
+            if (
+                self._perception_runtime_profile
+                is PerceptionRuntimeProfile.ORACLE_EVALUATION
+            ):
+                # Explicit Stage-0 expert/upper-bound bypass.  Production must
+                # arrive here only after the visual confirmation coordinator
+                # has already advanced CANDIDATE -> LOCKED.
+                self._target_manager.lock_oracle_from_search(
+                    target_id,
+                    timestamp_s=record.timestamp,
+                    confidence=1.0,
+                )
+            else:
+                self._require_production_visual_lock(target_id, "SEARCH")
             self._target_manager.start_tracking(record.timestamp)
             return
 
@@ -542,12 +621,18 @@ class MissionAgent:
             target_id = self._skill_manager.active_target_id
             if not isinstance(target_id, str) or not target_id.strip():
                 raise MissionAgentError("REACQUIRE transition has no target_id")
-            self._target_manager.mark_reacquired(
-                target_id.strip(),
-                timestamp_s=record.timestamp,
-                confidence=1.0,
-                source="oracle",
-            )
+            target_id = target_id.strip()
+            if (
+                self._perception_runtime_profile
+                is PerceptionRuntimeProfile.ORACLE_EVALUATION
+            ):
+                self._target_manager.mark_reacquired_oracle(
+                    target_id,
+                    timestamp_s=record.timestamp,
+                    confidence=1.0,
+                )
+            else:
+                self._require_production_visual_lock(target_id, "REACQUIRE")
             self._target_manager.start_tracking(record.timestamp)
             return
 
@@ -587,6 +672,27 @@ class MissionAgent:
         ):
             return {}
         return result.data
+
+    def _require_production_visual_lock(
+        self,
+        target_id: str,
+        skill_name: str,
+    ) -> None:
+        snapshot = self._target_manager.snapshot()
+        if snapshot.lifecycle is not TargetLifecycle.LOCKED:
+            raise MissionAgentError(
+                f"production {skill_name}->TRACK requires prior visual "
+                "CANDIDATE confirmation and LOCKED state"
+            )
+        if snapshot.target_id != target_id:
+            raise MissionAgentError(
+                f"production {skill_name}->TRACK target_id does not match "
+                "the confirmed visual target"
+            )
+        if snapshot.source is None or snapshot.source.casefold() == "oracle":
+            raise MissionAgentError(
+                f"production {skill_name}->TRACK rejects an Oracle target lock"
+            )
 
     def _terminate_target_if_needed(self, timestamp: float, reason: str) -> None:
         if self._target_manager.lifecycle in _TARGET_TERMINATABLE_STATES:

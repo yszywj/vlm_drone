@@ -23,11 +23,10 @@ def searching_manager() -> TargetManager:
 
 def tracking_manager() -> TargetManager:
     manager = searching_manager()
-    manager.lock(
+    manager.lock_oracle_from_search(
         "target_0",
         timestamp_s=2.0,
         confidence=1.0,
-        source="oracle",
         last_seen_position=(4, 5, 0),
         last_seen_velocity=(0.5, 0, 0),
     )
@@ -133,13 +132,17 @@ class TargetTypesTest(unittest.TestCase):
     def test_confidence_range_is_inclusive(self) -> None:
         for confidence in (0, 1):
             manager = searching_manager()
-            manager.lock("target", timestamp_s=2, confidence=confidence)
+            manager.lock_oracle_from_search(
+                "target", timestamp_s=2, confidence=confidence
+            )
             self.assertEqual(manager.snapshot().confidence, float(confidence))
 
         for confidence in (-0.01, 1.01):
             manager = searching_manager()
             with self.subTest(confidence=confidence), self.assertRaises(ValueError):
-                manager.lock("target", timestamp_s=2, confidence=confidence)
+                manager.lock_oracle_from_search(
+                    "target", timestamp_s=2, confidence=confidence
+                )
             self.assertEqual(manager.lifecycle, TargetLifecycle.SEARCHING)
 
 
@@ -147,7 +150,9 @@ class TargetManagerTest(unittest.TestCase):
     def test_oracle_search_lock_tracking_path(self) -> None:
         manager = searching_manager()
 
-        manager.lock("target_0", timestamp_s=2, confidence=1.0, source="oracle")
+        manager.lock_oracle_from_search(
+            "target_0", timestamp_s=2, confidence=1.0
+        )
         manager.start_tracking(timestamp_s=3)
 
         snapshot = manager.snapshot()
@@ -178,14 +183,43 @@ class TargetManagerTest(unittest.TestCase):
 
         self.assertEqual(candidate.lifecycle, TargetLifecycle.CANDIDATE)
         self.assertEqual(candidate.source, "detector")
-        manager.lock(
+        with self.assertRaisesRegex(TargetStateError, "ConfirmationCoordinator"):
+            manager.lock(
+                "candidate_0",
+                timestamp_s=2,
+                confidence=0.9,
+                source="vlm_verifier",
+            )
+        self.assertEqual(manager.lifecycle, TargetLifecycle.CANDIDATE)
+
+    def test_visual_lock_cannot_bypass_candidate_confirmation(self) -> None:
+        manager = searching_manager()
+
+        with self.assertRaisesRegex(TargetStateError, "ConfirmationCoordinator"):
+            manager.lock(
+                "target_0",
+                timestamp_s=2,
+                confidence=0.9,
+                source="detector",
+            )
+
+        self.assertIs(manager.lifecycle, TargetLifecycle.SEARCHING)
+        self.assertEqual(len(manager.events()), 1)
+
+        manager.set_candidate(
             "candidate_0",
-            timestamp_s=2,
-            confidence=0.9,
-            source="vlm_verifier",
+            timestamp_s=2.1,
+            confidence=0.8,
+            source="detector",
         )
-        manager.start_tracking(timestamp_s=2.5)
-        self.assertEqual(manager.lifecycle, TargetLifecycle.TRACKING)
+        with self.assertRaisesRegex(TargetStateError, "ConfirmationCoordinator"):
+            manager.lock(
+                "target_0",
+                timestamp_s=2.2,
+                confidence=0.9,
+                source="confirmed_vision",
+            )
+        self.assertIs(manager.lifecycle, TargetLifecycle.CANDIDATE)
 
     def test_lost_reacquire_lock_track_path(self) -> None:
         manager = tracking_manager()
@@ -197,10 +231,9 @@ class TargetManagerTest(unittest.TestCase):
             last_seen_time_s=4.5,
         )
         manager.start_reacquiring(timestamp_s=5.1)
-        manager.mark_reacquired(
+        manager.mark_reacquired_oracle(
             timestamp_s=6,
             confidence=1.0,
-            source="oracle",
             last_seen_position=(6.75, 5, 0),
         )
         manager.start_tracking(timestamp_s=6.1)
@@ -251,7 +284,7 @@ class TargetManagerTest(unittest.TestCase):
 
     def test_timestamps_are_finite_monotonic_and_equal_is_allowed(self) -> None:
         manager = searching_manager()
-        manager.lock("target", timestamp_s=1)
+        manager.lock_oracle_from_search("target", timestamp_s=1)
         self.assertEqual(manager.lifecycle, TargetLifecycle.LOCKED)
 
         with self.assertRaisesRegex(TargetStateError, "cannot move backward"):
@@ -263,7 +296,7 @@ class TargetManagerTest(unittest.TestCase):
             with self.subTest(timestamp=timestamp), self.assertRaises(
                 (TypeError, ValueError)
             ):
-                fresh.lock("target", timestamp_s=timestamp)
+                fresh.lock_oracle_from_search("target", timestamp_s=timestamp)
             self.assertEqual(fresh.lifecycle, TargetLifecycle.SEARCHING)
 
     def test_invalid_inputs_do_not_partially_mutate_state(self) -> None:
@@ -272,9 +305,9 @@ class TargetManagerTest(unittest.TestCase):
         events_before = manager.events()
 
         with self.assertRaises(ValueError):
-            manager.lock(
+            manager.set_candidate(
                 "target",
-                timestamp_s=2,
+                timestamp_s=1.5,
                 confidence=0.5,
                 source=" ",
             )
@@ -368,7 +401,9 @@ class TargetManagerTest(unittest.TestCase):
         snapshot_a = manager.snapshot()
         events_a = manager.events()
 
-        manager.lock("target_0", timestamp_s=2, confidence=1.0)
+        manager.lock_oracle_from_search(
+            "target_0", timestamp_s=2, confidence=1.0
+        )
 
         self.assertEqual(snapshot_a.lifecycle, TargetLifecycle.SEARCHING)
         self.assertEqual(len(events_a), 1)

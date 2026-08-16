@@ -169,7 +169,7 @@ class LandSkill(Skill):
         if controller_pose.z < ground_altitude - goal.tolerance:
             self._fail(
                 SkillResultCode.INVALID_STATE,
-                "Kinematic UAV state is below the LAND ground altitude",
+                "UAV controller state is below the LAND ground altitude",
                 {
                     "altitude": float(controller_pose.z),
                     "ground_altitude": ground_altitude,

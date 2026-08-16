@@ -41,6 +41,7 @@ from skills.types import (
     SkillResult,
     SkillResultCode,
     SkillStatus,
+    UAVController,
 )
 
 __all__ = [
@@ -80,6 +81,7 @@ __all__ = [
     "TrackGoal",
     "TrackSkill",
     "TransitionRecord",
+    "UAVController",
     "YawMode",
     "apply_motion_policy",
     "create_default_skill_registry",

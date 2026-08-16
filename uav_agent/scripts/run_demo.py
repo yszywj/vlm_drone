@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from math import ceil, isfinite
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_ENV = Path("/home/amax/miniconda3/envs/r_isaac_sim")
+EXPECTED_ENV = Path(
+    os.environ.get(
+        "UAV_AGENT_CONDA_ENV",
+        "/home/amax/miniconda3/envs/r_isaac_sim",
+    )
+).expanduser()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -68,8 +74,9 @@ def main() -> int:
     args = parse_args()
     if Path(sys.prefix).resolve() != EXPECTED_ENV.resolve():
         print(
-            "error: this project must run in the r_isaac_sim environment; "
-            "use ./python.sh scripts/run_demo.py --config configs/default.yaml",
+            "error: this project must run in the environment selected by "
+            "UAV_AGENT_CONDA_ENV; use ./python.sh scripts/run_demo.py "
+            "--config configs/default.yaml",
             file=sys.stderr,
         )
         return 2

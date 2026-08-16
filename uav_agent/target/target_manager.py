@@ -52,6 +52,9 @@ class TargetManager:
         self._last_seen_velocity: tuple[float, float, float] | None = None
         self._last_seen_time_s: float | None = None
         self._source: str | None = None
+        # When REACQUIRE evaluates a new visual candidate, rejection must
+        # restore the previously tracked identity/last-seen snapshot.
+        self._candidate_restore: TargetSnapshot | None = None
         self._last_event_time_s: float | None = None
         self._events: list[TargetEvent] = []
 
@@ -75,6 +78,7 @@ class TargetManager:
         self._last_seen_velocity = None
         self._last_seen_time_s = None
         self._source = None
+        self._candidate_restore = None
         self._commit_transition(
             TargetLifecycle.SEARCHING,
             timestamp,
@@ -93,10 +97,18 @@ class TargetManager:
     ) -> None:
         """Record a perception candidate without claiming that it is locked."""
 
+        candidate_restore = (
+            self.snapshot()
+            if self._lifecycle is TargetLifecycle.REACQUIRING
+            else None
+        )
         timestamp = self._validated_transition(
             TargetLifecycle.CANDIDATE,
             timestamp_s,
-            allowed_from={TargetLifecycle.SEARCHING},
+            allowed_from={
+                TargetLifecycle.SEARCHING,
+                TargetLifecycle.REACQUIRING,
+            },
         )
         values = self._validated_observation_values(
             target_id=target_id,
@@ -105,6 +117,11 @@ class TargetManager:
             last_seen_position=last_seen_position,
             last_seen_velocity=last_seen_velocity,
         )
+        if values[2].casefold() == "oracle":
+            raise ValueError(
+                "set_candidate() does not accept Oracle evidence"
+            )
+        self._candidate_restore = candidate_restore
         self._apply_observation_values(*values, timestamp_s=timestamp)
         self._commit_transition(
             TargetLifecycle.CANDIDATE,
@@ -118,19 +135,45 @@ class TargetManager:
         *,
         timestamp_s: float,
         confidence: float | None = None,
-        source: str = "oracle",
+        source: str = "confirmed_vision",
         last_seen_position: tuple[float, float, float] | None = None,
         last_seen_velocity: tuple[float, float, float] | None = None,
     ) -> None:
-        """Lock a candidate, including the Stage-0 SEARCHING-to-LOCKED path."""
+        """Reject legacy direct locks that bypass confirmation evidence."""
+
+        del (
+            target_id,
+            timestamp_s,
+            confidence,
+            source,
+            last_seen_position,
+            last_seen_velocity,
+        )
+        raise TargetStateError(
+            "direct visual lock is disabled; use "
+            "CandidateConfirmationCoordinator"
+        )
+
+    def _lock_confirmed_candidate(
+        self,
+        target_id: str,
+        *,
+        timestamp_s: float,
+        confidence: float | None,
+        source: str,
+        last_seen_position: tuple[float, float, float] | None = None,
+        last_seen_velocity: tuple[float, float, float] | None = None,
+    ) -> None:
+        """Commit a coordinator-validated visual evidence bundle.
+
+        This is intentionally internal.  The public confirmation entry point
+        is :class:`perception.confirmation.CandidateConfirmationCoordinator`.
+        """
 
         timestamp = self._validated_transition(
             TargetLifecycle.LOCKED,
             timestamp_s,
-            allowed_from={
-                TargetLifecycle.SEARCHING,
-                TargetLifecycle.CANDIDATE,
-            },
+            allowed_from={TargetLifecycle.CANDIDATE},
         )
         values = self._validated_observation_values(
             target_id=target_id,
@@ -139,13 +182,111 @@ class TargetManager:
             last_seen_position=last_seen_position,
             last_seen_velocity=last_seen_velocity,
         )
+        if values[2].casefold() == "oracle":
+            raise ValueError(
+                "confirmed visual lock does not accept Oracle evidence; use "
+                "an explicit Oracle evaluation shortcut"
+            )
+        restore = self._candidate_restore
+        if (
+            restore is not None
+            and restore.target_id is not None
+            and values[0] != restore.target_id
+        ):
+            raise TargetStateError(
+                "reacquired visual identity does not match the previously "
+                "tracked target_id"
+            )
+        reacquired = restore is not None
         self._apply_observation_values(*values, timestamp_s=timestamp)
-        reason = (
-            "target_locked_from_candidate"
-            if self._lifecycle is TargetLifecycle.CANDIDATE
-            else "target_locked"
+        self._candidate_restore = None
+        self._commit_transition(
+            TargetLifecycle.LOCKED,
+            timestamp,
+            (
+                "target_reacquired_from_candidate"
+                if reacquired
+                else "target_locked_from_candidate"
+            ),
         )
-        self._commit_transition(TargetLifecycle.LOCKED, timestamp, reason)
+
+    def lock_oracle_from_search(
+        self,
+        target_id: str,
+        *,
+        timestamp_s: float,
+        confidence: float | None = 1.0,
+        last_seen_position: tuple[float, float, float] | None = None,
+        last_seen_velocity: tuple[float, float, float] | None = None,
+    ) -> None:
+        """Explicit privileged shortcut for Oracle evaluation pipelines only.
+
+        Production visual code must use ``CandidateConfirmationCoordinator``.
+        Keeping the legacy expert shortcut under an Oracle-named method
+        prevents a detector caller from silently bypassing confirmation.
+        """
+
+        timestamp = self._validated_transition(
+            TargetLifecycle.LOCKED,
+            timestamp_s,
+            allowed_from={TargetLifecycle.SEARCHING},
+        )
+        values = self._validated_observation_values(
+            target_id=target_id,
+            confidence=confidence,
+            source="oracle",
+            last_seen_position=last_seen_position,
+            last_seen_velocity=last_seen_velocity,
+        )
+        self._apply_observation_values(*values, timestamp_s=timestamp)
+        self._candidate_restore = None
+        self._commit_transition(
+            TargetLifecycle.LOCKED,
+            timestamp,
+            "target_locked_by_oracle_evaluation",
+        )
+
+    def reject_candidate(self, *, timestamp_s: float, reason: str) -> None:
+        """Reject a candidate and return to SEARCHING or REACQUIRING.
+
+        A SEARCH candidate is cleared so a later proposal cannot inherit its
+        evidence.  A REACQUIRE candidate restores the previously tracked
+        identity and last-seen state.  The mission description is preserved.
+        """
+
+        normalized_reason = _non_empty_string(reason, "reason")
+        restore = self._candidate_restore
+        return_state = (
+            TargetLifecycle.REACQUIRING
+            if restore is not None
+            else TargetLifecycle.SEARCHING
+        )
+        timestamp = self._validated_transition(
+            return_state,
+            timestamp_s,
+            allowed_from={TargetLifecycle.CANDIDATE},
+        )
+        if restore is None:
+            self._target_id = None
+            self._confidence = None
+            self._last_seen_position = None
+            self._last_seen_velocity = None
+            self._last_seen_time_s = None
+            self._source = None
+        else:
+            self._description = restore.description
+            self._target_id = restore.target_id
+            self._confidence = restore.confidence
+            self._last_seen_position = restore.last_seen_position
+            self._last_seen_velocity = restore.last_seen_velocity
+            self._last_seen_time_s = restore.last_seen_time_s
+            self._source = restore.source
+        self._candidate_restore = None
+        self._commit_transition(
+            return_state,
+            timestamp,
+            f"candidate_rejected:{normalized_reason}",
+        )
 
     def start_tracking(self, timestamp_s: float) -> None:
         timestamp = self._validated_transition(
@@ -225,10 +366,36 @@ class TargetManager:
         *,
         timestamp_s: float,
         confidence: float | None = None,
-        source: str = "oracle",
+        source: str = "confirmed_vision",
         last_seen_position: tuple[float, float, float] | None = None,
         last_seen_velocity: tuple[float, float, float] | None = None,
     ) -> None:
+        """Reject legacy direct visual reacquisition without evidence."""
+
+        del (
+            target_id,
+            timestamp_s,
+            confidence,
+            source,
+            last_seen_position,
+            last_seen_velocity,
+        )
+        raise TargetStateError(
+            "direct visual reacquisition is disabled; use "
+            "CandidateConfirmationCoordinator"
+        )
+
+    def mark_reacquired_oracle(
+        self,
+        target_id: str | None = None,
+        *,
+        timestamp_s: float,
+        confidence: float | None = 1.0,
+        last_seen_position: tuple[float, float, float] | None = None,
+        last_seen_velocity: tuple[float, float, float] | None = None,
+    ) -> None:
+        """Explicit privileged REACQUIRE shortcut for Oracle evaluation."""
+
         timestamp = self._validated_transition(
             TargetLifecycle.LOCKED,
             timestamp_s,
@@ -240,11 +407,12 @@ class TargetManager:
         values = self._validated_observation_values(
             target_id=resolved_target_id,
             confidence=confidence,
-            source=source,
+            source="oracle",
             last_seen_position=last_seen_position,
             last_seen_velocity=last_seen_velocity,
         )
         self._apply_observation_values(*values, timestamp_s=timestamp)
+        self._candidate_restore = None
         self._commit_transition(
             TargetLifecycle.LOCKED,
             timestamp,
@@ -258,6 +426,7 @@ class TargetManager:
             timestamp_s,
             allowed_from=_TERMINATABLE_STATES,
         )
+        self._candidate_restore = None
         self._commit_transition(
             TargetLifecycle.TERMINATED,
             timestamp,
@@ -280,6 +449,7 @@ class TargetManager:
         self._last_seen_velocity = None
         self._last_seen_time_s = None
         self._source = None
+        self._candidate_restore = None
         self._last_event_time_s = None
         self._events.clear()
 

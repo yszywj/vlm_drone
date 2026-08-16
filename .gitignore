@@ -7,8 +7,16 @@ __pycache__/
 # 结果文件
 result/
 
-configs/
+# 公共配置、schema 和加载代码需要跟随仓库发布。
+# 只忽略开发者本地覆盖和私密配置。
+uav_agent/configs/local.yaml
+uav_agent/configs/private/
 
+# 仓库根目录的模型权重不入 Git；uav_agent/models/ 是需要跟踪的客户端代码。
 /models/
 
 uav_agent/logs/
+
+# Generated experiment results, checkpoints, CSV metrics and TensorBoard data.
+/outputs/
+*.tfevents.*

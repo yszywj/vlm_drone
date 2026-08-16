@@ -166,7 +166,7 @@ class TakeoffSkill(Skill):
         if controller_pose.z > target_altitude + goal.tolerance:
             self._set_feedback(
                 progress,
-                "Kinematic UAV state is above the TAKEOFF target altitude",
+                "UAV controller state is above the TAKEOFF target altitude",
                 {
                     "altitude": controller_pose.z,
                     "target_altitude": target_altitude,
@@ -175,7 +175,7 @@ class TakeoffSkill(Skill):
             )
             self._fail(
                 SkillResultCode.INVALID_STATE,
-                "Kinematic UAV state is above the TAKEOFF target altitude",
+                "UAV controller state is above the TAKEOFF target altitude",
                 {
                     "altitude": controller_pose.z,
                     "target_altitude": target_altitude,

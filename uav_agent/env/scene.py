@@ -25,7 +25,7 @@ from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.utils.viewports import set_camera_view
 from pxr import Gf, UsdGeom, UsdLux
 
-from configs.loader import AppConfig
+from configs.schema import AppConfig
 from env.camera_sensor import ImageProjection, RGBCameraSensor
 
 

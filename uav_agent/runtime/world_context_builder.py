@@ -10,7 +10,7 @@ from __future__ import annotations
 from math import isfinite
 from numbers import Real
 
-from configs.loader import AppConfig
+from configs.schema import AppConfig
 from planner.schemas import (
     LandingZoneSpec,
     PlannerWorldContext,
@@ -44,7 +44,7 @@ def build_planner_world_context(
     """
 
     if not isinstance(config, AppConfig):
-        raise TypeError("config must be a configs.loader.AppConfig")
+        raise TypeError("config must be a configs.schema.AppConfig")
 
     size = _vector3(config.scene.size_xyz_m, "scene.size_xyz_m")
     if any(component <= 0.0 for component in size):

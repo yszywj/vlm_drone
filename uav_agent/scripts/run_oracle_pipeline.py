@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import sys
 from dataclasses import asdict, is_dataclass
@@ -13,7 +14,12 @@ from typing import Mapping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_ENV = Path("/home/amax/miniconda3/envs/r_isaac_sim")
+EXPECTED_ENV = Path(
+    os.environ.get(
+        "UAV_AGENT_CONDA_ENV",
+        "/home/amax/miniconda3/envs/r_isaac_sim",
+    )
+).expanduser()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -208,7 +214,11 @@ def main() -> int:
     environment = None
     try:
         from env.simple_uav_search_env import SimpleUavSearchEnv
-        from perception.oracle import OraclePerception
+        from perception import (
+            GuardedPerceptionBackend,
+            OraclePerception,
+            PerceptionRuntimeProfile,
+        )
         from skills.manager import (
             SkillManager,
             TaskPlan,
@@ -234,7 +244,15 @@ def main() -> int:
         )
         environment.set_target_pose(target_start)
         print(f"[TaskManager] target_spawn={target_start}")
-        oracle = OraclePerception(target_id="target")
+        print(
+            "[Perception] PRIVILEGED ORACLE_EVALUATION profile enabled; "
+            "not a production visual-perception runtime"
+        )
+        oracle = GuardedPerceptionBackend(
+            OraclePerception(target_id="target"),
+            profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
+            acknowledge_privileged_oracle=True,
+        )
         clock = IsaacSimulationClock(environment)
         context = environment.make_skill_context(clock, perception=oracle)
         registry = create_default_skill_registry(

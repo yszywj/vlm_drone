@@ -13,7 +13,7 @@ from typing import Callable, Sequence
 import numpy as np
 from isaacsim.core.api import World
 
-from configs.loader import AppConfig
+from configs.schema import AppConfig
 from env.camera_sensor import CameraFrameNotReady, ImageProjection
 from env.kinematic_uav import KinematicUAV, UAVState
 from env.moving_target import MovingTarget, TargetState

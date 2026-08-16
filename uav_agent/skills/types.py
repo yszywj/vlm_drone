@@ -11,8 +11,8 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from env.kinematic_uav import KinematicUAV, UAVState
 from env.moving_target import TargetState
+from env.uav_controller import UAVController, UAVState
 
 
 class SkillName(str, Enum):
@@ -155,14 +155,14 @@ class SkillClock(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class SkillContext:
-    uav: KinematicUAV
+    uav: UAVController
     camera: CameraSensor
     perception: object | None
     clock: SkillClock
 
     def validate(self) -> None:
-        if not isinstance(self.uav, KinematicUAV):
-            raise TypeError("SkillContext.uav must be a KinematicUAV")
+        if not isinstance(self.uav, UAVController):
+            raise TypeError("SkillContext.uav must satisfy UAVController")
         if not isinstance(self.camera, CameraSensor):
             raise TypeError("SkillContext.camera must satisfy CameraSensor")
         if not isinstance(self.clock, SkillClock):

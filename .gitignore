@@ -1,0 +1,12 @@
+# 忽略Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 结果文件
+result/
+
+configs/
+
+models/

@@ -9,6 +9,6 @@ result/
 
 configs/
 
-models/
+/models/
 
 uav_agent/logs/

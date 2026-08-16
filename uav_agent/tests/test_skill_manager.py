@@ -15,6 +15,7 @@ from skills.manager import (
     SkillManager,
     SkillManagerError,
     TaskPlan,
+    TaskPlanError,
     TaskStatus,
     create_default_skill_registry,
 )
@@ -132,6 +133,20 @@ def standard_plan(*, track_duration: float = 5.0) -> TaskPlan:
     )
 
 
+def six_step_plan(*, track_duration: float = 5.0) -> TaskPlan:
+    entries = standard_plan(track_duration=track_duration).to_dicts()
+    entries.insert(
+        -1,
+        {
+            "skill": "GOTO",
+            "position": [2.0, -3.0, 10.0],
+            "tolerance": 0.25,
+            "timeout": 45.0,
+        },
+    )
+    return TaskPlan.from_dicts(entries)
+
+
 def default_outcomes() -> dict[SkillName, list[ScriptedOutcome]]:
     return {
         SkillName.TAKEOFF: [succeeded(SkillResultCode.TAKEOFF_COMPLETE)],
@@ -193,6 +208,32 @@ def tick_once(manager: SkillManager, clock: ManualClock) -> TaskStatus:
 
 
 class SkillManagerTaskTest(unittest.TestCase):
+    def test_task_plan_accepts_only_the_five_or_six_step_sequences(self) -> None:
+        self.assertEqual(len(standard_plan().steps), 5)
+        self.assertEqual(len(six_step_plan().steps), 6)
+
+        base = standard_plan().to_dicts()
+        invalid_plans = {
+            "missing takeoff": base[1:],
+            "missing search": [base[0], base[1], base[3], base[4]],
+            "missing track": [base[0], base[1], base[2], base[4]],
+            "land not last": [base[0], base[1], base[2], base[4], base[3]],
+            "arbitrary order": [base[0], base[2], base[1], base[3], base[4]],
+            "duplicate search": [base[0], base[1], base[2], base[2], base[4]],
+            "duplicate track": [base[0], base[1], base[3], base[3], base[4]],
+            "explicit reacquire": [
+                base[0],
+                base[1],
+                base[2],
+                base[3],
+                {"skill": "REACQUIRE"},
+                base[4],
+            ],
+        }
+        for label, entries in invalid_plans.items():
+            with self.subTest(label=label), self.assertRaises(TaskPlanError):
+                TaskPlan.from_dicts(entries)
+
     def test_complete_success_task_and_typed_parameter_passing(self) -> None:
         context, clock = make_context()
         scripted, registry = make_registry()
@@ -267,6 +308,118 @@ class SkillManagerTaskTest(unittest.TestCase):
             manager.tick(observation(clock.now())),
             TaskStatus.SUCCEEDED,
         )
+
+    def test_six_step_task_returns_to_landing_zone_before_land(self) -> None:
+        context, clock = make_context()
+        scripted, registry = make_registry(
+            {
+                SkillName.GOTO: [
+                    succeeded(SkillResultCode.GOAL_REACHED),
+                    succeeded(SkillResultCode.GOAL_REACHED),
+                ]
+            }
+        )
+        manager = SkillManager(context, registry=registry)
+        manager.start_task(six_step_plan())
+
+        for _ in range(4):
+            self.assertIs(tick_once(manager, clock), TaskStatus.RUNNING)
+        self.assertIs(manager.active_name, SkillName.GOTO)
+        self.assertIs(manager.pending_task_result, TaskStatus.SUCCEEDED)
+        self.assertEqual(
+            [goal.position for goal in scripted[SkillName.GOTO].started_goals],
+            [(20.0, 30.0, 10.0), (2.0, -3.0, 10.0)],
+        )
+
+        self.assertIs(tick_once(manager, clock), TaskStatus.RUNNING)
+        self.assertIs(manager.active_name, SkillName.LAND)
+        self.assertIs(tick_once(manager, clock), TaskStatus.SUCCEEDED)
+        self.assertEqual(
+            [record.new_skill for record in manager.transition_log],
+            [
+                SkillName.TAKEOFF,
+                SkillName.GOTO,
+                SkillName.SEARCH,
+                SkillName.TRACK,
+                SkillName.GOTO,
+                SkillName.LAND,
+                None,
+            ],
+        )
+        self.assertEqual(manager.transition_log[4].reason, "track_complete")
+
+    def test_six_step_recovery_still_returns_to_landing_zone(self) -> None:
+        lost_data = {
+            "target_id": "target_0",
+            "last_seen_position": (11.0, 12.0, 0.5),
+            "last_seen_velocity": (0.4, -0.2, 0.0),
+            "last_seen_time": 3.5,
+            "tracking_duration": 1.25,
+        }
+        context, clock = make_context()
+        scripted, registry = make_registry(
+            {
+                SkillName.GOTO: [
+                    succeeded(SkillResultCode.GOAL_REACHED),
+                    succeeded(SkillResultCode.GOAL_REACHED),
+                ],
+                SkillName.TRACK: [
+                    failed(SkillResultCode.TARGET_LOST, lost_data),
+                    succeeded(SkillResultCode.TRACK_COMPLETE),
+                ],
+            }
+        )
+        manager = SkillManager(context, registry=registry)
+        manager.start_task(six_step_plan(track_duration=5.0))
+
+        for _ in range(6):
+            self.assertIs(tick_once(manager, clock), TaskStatus.RUNNING)
+        self.assertIs(manager.active_name, SkillName.GOTO)
+        self.assertEqual(len(scripted[SkillName.TRACK].started_goals), 2)
+        self.assertEqual(len(scripted[SkillName.GOTO].started_goals), 2)
+
+        self.assertIs(tick_once(manager, clock), TaskStatus.RUNNING)
+        self.assertIs(manager.active_name, SkillName.LAND)
+        self.assertIs(tick_once(manager, clock), TaskStatus.SUCCEEDED)
+        self.assertEqual(
+            [record.new_skill for record in manager.transition_log],
+            [
+                SkillName.TAKEOFF,
+                SkillName.GOTO,
+                SkillName.SEARCH,
+                SkillName.TRACK,
+                SkillName.REACQUIRE,
+                SkillName.TRACK,
+                SkillName.GOTO,
+                SkillName.LAND,
+                None,
+            ],
+        )
+
+    def test_second_goto_failure_skips_to_fail_safe_land(self) -> None:
+        context, clock = make_context()
+        scripted, registry = make_registry(
+            {
+                SkillName.GOTO: [
+                    succeeded(SkillResultCode.GOAL_REACHED),
+                    failed(SkillResultCode.TIMEOUT),
+                ]
+            }
+        )
+        manager = SkillManager(context, registry=registry)
+        manager.start_task(six_step_plan())
+
+        for _ in range(5):
+            self.assertIs(tick_once(manager, clock), TaskStatus.RUNNING)
+        self.assertIs(manager.active_name, SkillName.LAND)
+        self.assertIs(manager.pending_task_result, TaskStatus.FAILED)
+        self.assertIs(manager.task_failure_result.code, SkillResultCode.TIMEOUT)
+        self.assertEqual(len(scripted[SkillName.GOTO].started_goals), 2)
+        self.assertEqual(len(scripted[SkillName.LAND].started_goals), 1)
+        self.assertEqual(manager.transition_log[-1].reason, "goto_timeout")
+
+        self.assertIs(tick_once(manager, clock), TaskStatus.FAILED)
+        self.assertEqual(manager.transition_log[-1].reason, "failure_landing_complete")
 
     def test_target_lost_reacquires_and_resumes_saved_track_goal(self) -> None:
         lost_data = {

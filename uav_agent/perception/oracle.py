@@ -10,7 +10,7 @@ calculation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
@@ -43,14 +43,21 @@ class OraclePerception:
             raise OraclePerceptionError("target_id must be a non-empty string")
         object.__setattr__(self, "target_id", self.target_id.strip())
 
-    def observe(self, frame: EvaluatorFrame) -> Observation:
+    def observe(self, frame: object) -> Observation:
         """Return a defensive copy of the synchronized Oracle observation."""
 
+        # Keep the public boundary identical to ``PerceptionBackend``.  The
+        # cast is static-only; the guarded field access below remains the
+        # runtime validation for an evaluator frame.
+        evaluator_frame = cast("EvaluatorFrame", frame)
+
         try:
-            agent = frame.observation
-            projection_visible = np.asarray(frame.target_projection.visible)
-            target_state = frame.target_state
-            target_velocity = np.asarray(frame.target_velocity_mps)
+            agent = evaluator_frame.observation
+            projection_visible = np.asarray(
+                evaluator_frame.target_projection.visible
+            )
+            target_state = evaluator_frame.target_state
+            target_velocity = np.asarray(evaluator_frame.target_velocity_mps)
         except (AttributeError, TypeError) as exc:
             raise OraclePerceptionError(
                 "frame must be a synchronized environment EvaluatorFrame"
@@ -95,7 +102,7 @@ class OraclePerception:
             ) from exc
         return observation
 
-    def get_observation(self, frame: EvaluatorFrame) -> Observation:
+    def get_observation(self, frame: object) -> Observation:
         """Compatibility alias for runtimes that use ``get_*`` naming."""
 
         return self.observe(frame)

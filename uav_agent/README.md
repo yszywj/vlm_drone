@@ -1,13 +1,13 @@
 # UAV Agent
 
-基于 VLM Agent 的层次化无人机目标搜索与跟踪项目。Stage 0 已具备第一版 Isaac Sim 场景、运动学 UAV、固定 RGB Camera、有界移动 Target，以及 TAKEOFF / GOTO / SEARCH / TRACK / REACQUIRE / LAND 的完整 Oracle 任务流水线；Qwen3-VL/LLM 规划仍是后续阶段。
+基于 VLM Agent 的层次化无人机目标搜索与跟踪项目。Stage 0 已具备第一版 Isaac Sim 场景、运动学 UAV、固定 RGB Camera、有界移动 Target，以及 TAKEOFF / GOTO / SEARCH / TRACK / REACQUIRE / LAND 的完整 Oracle 任务流水线。Stage 1 已把 `MissionAgent` 接入该流水线，支持确定性 Scripted Planner 与文本 Qwen Planner 两种高层规划入口；当前视觉搜索、跟踪和重捕获仍由 Oracle 真值驱动，并不代表已经实现真实图片识别。
 
 ## 快速开始
 
 项目级 `python.sh` 固定使用服务器 Conda 环境 `r_isaac_sim`，不依赖当前 shell 激活环境，也不会修改其他用户的环境。
 
 ```bash
-cd /home/amax/ry/Qwen_drones/uav_agent
+cd /home/amax/ry/vlm_drones/uav_agent
 ./python.sh scripts/run_demo.py --config configs/default.yaml
 ```
 
@@ -16,6 +16,21 @@ cd /home/amax/ry/Qwen_drones/uav_agent
 ```bash
 ./python.sh scripts/run_oracle_pipeline.py --config configs/default.yaml \
   --start-altitude 0 --takeoff-altitude 10 --track-duration 30
+```
+
+运行经 `MissionAgent` 调度的 Stage 1A Scripted Planner + Oracle 任务：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+./python.sh scripts/run_llm_oracle_pipeline.py \
+  --config configs/default.yaml \
+  --planner scripted \
+  --instruction "前往 search_area 搜寻移动目标，找到后跟踪十秒，然后返回 home 降落" \
+  --takeoff-altitude 10 \
+  --track-duration 10 \
+  --start-altitude 0 \
+  --max-sim-time 300 \
+  --headless
 ```
 
 常用命令：
@@ -40,7 +55,74 @@ cd /home/amax/ry/Qwen_drones/uav_agent
   --steps 300 --debug-ground-truth --save-rgb logs/debug_rgb.png
 ```
 
-除 `SimulationApp` 本身外，所有 `isaacsim.core`、`omni`、`carb`、`pxr` 相关导入都发生在应用创建之后。`scripts/run_demo.py` 和 `scripts/run_oracle_pipeline.py` 都采用 standalone 启动顺序，并保证环境和 `SimulationApp` 最终关闭。
+除 `SimulationApp` 本身外，所有 `isaacsim.core`、`omni`、`carb`、`pxr` 相关导入都发生在应用创建之后。`scripts/run_demo.py`、`scripts/run_oracle_pipeline.py` 和 `scripts/run_llm_oracle_pipeline.py` 都采用 standalone 启动顺序，并保证环境和 `SimulationApp` 最终关闭。
+
+## Stage 1A / 1B：MissionAgent + Oracle
+
+两种模式共用相同的可信编译、安全检查、目标生命周期和底层 Skill 调度链：
+
+```text
+Instruction
+    ↓
+MissionPlanner                 # ScriptedPlanner 或文本 LLMPlanner
+    ↓
+MissionIntent                  # 只含语义任务意图
+    ↓
+PlanValidator                  # 可信 WorldContext → 六步 TaskPlan
+    ↓
+MissionAgent                   # 每个新 Camera sample 最多 tick 一次
+    ↓
+SkillManager
+    ↓
+Oracle-backed Ideal Skills     # SEARCH / TRACK / REACQUIRE 使用 evaluator truth
+```
+
+Stage 1A 使用 `ScriptedPlanner`，不依赖模型服务，适合作为 Isaac 集成基线。Stage 1B 使用 `LLMPlanner` 调用 OpenAI-compatible Qwen 服务；Qwen 只在 `MissionAgent.start()` 的规划阶段读取文本指令和去真值的具名区域描述，输出严格 `MissionIntent`。坐标、速度、航点和六步 `TAKEOFF → GOTO → SEARCH → TRACK → GOTO → LAND` 计划均由可信的 `PlanValidator` 生成，仿真 tick 不调用模型。
+
+WorldContext 的 `search_area` 只从配置中的 `target.initial_region`、`search.radius_m` 和任务起飞高度构造，`home` 只取配置的 UAV 初始 XY 与地面高度。它不包含本次随机 Target spawn 坐标、Target 速度、`EvaluatorFrame` 或 Oracle Observation。`--debug-ground-truth` 仅允许把真值打印给人工调试/evaluator，不会把它加入 instruction、Planner prompt 或 GOTO 目标。
+
+脚本保持 Isaac standalone 导入顺序：先解析参数、加载纯 Python 配置并创建 Planner 配置，随后创建 `SimulationApp`，最后才导入 Isaac-backed 环境模块。默认 `--headless` 适合服务器验收；需要 GUI 时使用 `--no-headless`。只有 `environment.step()` 产生新 Camera sample 后才构造 Oracle Observation 并推进 Agent。
+
+`--max-sim-time` 是外部任务时限。到期后脚本调用 `MissionAgent.cancel()`，继续推进仿真以完成 fail-safe LAND，而不是立刻把进程结束在空中；降落另有有限 shutdown guard，超时会明确返回失败。`KeyboardInterrupt` 也会尽力触发相同的取消和安全降落流程。成功验收同时检查 Agent/Task 状态、最终 `LAND_COMPLETE`、home XY 误差和地面高度误差。
+
+Stage 1B 必须让 Qwen 服务和 Isaac Sim 在独立进程运行，推荐双 GPU 分工：GPU 0 运行 Isaac Sim，GPU 1 运行 Qwen3-VL。先按下一节启动并检查 Qwen 服务，再运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+QWEN_API_BASE=http://127.0.0.1:8000/v1 \
+QWEN_API_KEY=EMPTY \
+QWEN_MODEL=Qwen3-VL-4B-Instruct \
+./python.sh scripts/run_llm_oracle_pipeline.py \
+  --config configs/default.yaml \
+  --planner llm \
+  --instruction "起飞到十米，前往 search_area 搜寻移动目标，找到以后持续跟踪三十秒，最后返回 home 降落" \
+  --headless
+```
+
+当前能力边界必须明确：Qwen3-VL 在此阶段只接收文本，不接收 Camera 图像；SEARCH / TRACK / REACQUIRE 仍消费带 `oracle_` 前缀的真值字段；LOCK 只是 `TargetManager` 的逻辑生命周期状态。真实图片 detector、视觉 tracker 和 ReID 尚未实现，`perception/detector_tracker.py` 与 `perception/vlm_verifier.py` 仍是占位接口。因此 Stage 1A/1B 都是 Oracle 集成里程碑，不能称为真实视觉搜索闭环。
+
+## 本地 Qwen OpenAI-compatible 服务
+
+`uav_agent/models/` 是纯 Python 客户端包，与仓库根目录存放权重的 `models/` 不同。客户端只使用标准库 `urllib`，默认访问 `http://127.0.0.1:8000/v1` 的 `GET /models` 与 `POST /chat/completions`；Stage 1B 仅通过 `LLMPlanner` 发送文本消息，不发送 Camera、Oracle 或完整环境对象。可通过 `QWEN_API_BASE / QWEN_API_KEY / QWEN_MODEL / QWEN_REQUEST_TIMEOUT_S` 设置默认值，显式构造参数优先。
+
+服务脚本不会安装 vLLM，也不会修改 `r_isaac_sim`。请先进入服务器上已有的兼容 vLLM 环境，或把 `VLLM_BIN` 指向该环境中的可执行文件，再运行：
+
+```bash
+cd /home/amax/ry/vlm_drones/uav_agent
+QWEN_CUDA_VISIBLE_DEVICES=1 \
+QWEN_MODEL_PATH=/home/amax/ry/vlm_drones/models/initial_model/Qwen3-VL-4B-Instruct \
+./scripts/serve_qwen3_vl.sh
+```
+
+默认只绑定 `127.0.0.1:8000`。模型路径、served name、host、port、最大上下文、GPU memory utilization、CUDA device 和 vLLM binary 都可用清单中对应的 `QWEN_*` / `VLLM_BIN` 环境变量覆盖。另一个终端执行：
+
+```bash
+./python.sh scripts/check_qwen_server.py \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen3-VL-4B-Instruct
+```
+
+检查器先调用 models endpoint，再发送一个最小文本 completion；普通失败只显示连接、HTTP 或协议错误类型，`--debug` 才附带已脱敏 traceback。
 
 ## 场景与稳定 prim 路径
 
@@ -137,7 +219,7 @@ observation = agent_view.observe()
 # 仅含 rgb、uav_state、uav_velocity_mps、camera pose、camera_timestamp_s
 ```
 
-Planner 只注入 `AgentView`；Skill 只注入下面定义的 `SkillContext`。两者都不得接收完整 environment。`read_poses()`、`target_position`、`target_orientation`、`get_evaluator_frame()` 和 `world_to_image()` 属于 simulator/evaluator 的 privileged API；CLI 也只有显式传入 `--debug-ground-truth` 才输出 Target 真值。
+早期低层控制接口可通过 `AgentView` 读取非真值观测；当前高层 `MissionPlanner` 只接收纯 Python 的 `PlannerRequest + PlannerWorldContext`，Skill 则只接收下面定义的 `SkillContext`。这些接口都不得接收完整 environment。`read_poses()`、`target_position`、`target_orientation`、`get_evaluator_frame()` 和 `world_to_image()` 属于 simulator/evaluator 的 privileged API；CLI 也只有显式传入 `--debug-ground-truth` 才输出 Target 真值。
 
 ## Phase 5：统一 Skill API 与 Motion Policy
 
@@ -329,7 +411,7 @@ manager.start(
 
 ## Phase 10：SkillManager 与完整 Oracle Pipeline
 
-任务模式在统一 Manager 上显式开启。`TaskPlan.from_dicts()` 接受手写编排映射，但启动每个 Skill 前都会把参数转换为对应 Goal dataclass；Skill 本身仍不接收通用 dict。标准 Stage-0 顺序固定为 TAKEOFF → GOTO → SEARCH → TRACK → LAND，REACQUIRE 只由恢复规则动态插入：
+任务模式在统一 Manager 上显式开启。`TaskPlan.from_dicts()` 接受手写编排映射，但启动每个 Skill 前都会把参数转换为对应 Goal dataclass；Skill 本身仍不接收通用 dict。TaskPlan 只接受旧五步 TAKEOFF → GOTO → SEARCH → TRACK → LAND，或带返航点的新六步 TAKEOFF → GOTO → SEARCH → TRACK → GOTO → LAND；REACQUIRE 只由恢复规则动态插入：
 
 ```python
 from skills.manager import (
@@ -353,6 +435,7 @@ plan = TaskPlan.from_dicts([
         "target_id": "$SEARCH.result.target_id",
         "track_duration": 30.0,
     },
+    {"skill": "GOTO", "position": [0.0, 0.0, 10.0]},
     {"skill": "LAND"},
 ])
 
@@ -369,7 +452,13 @@ while manager.task_status.name == "RUNNING":
         manager.tick(observation)
 ```
 
-`TaskStatus` 独立于 `SkillStatus`。正常路径用 SEARCH Result 的 `target_id` 构造 TrackGoal；TRACK 返回 `TARGET_LOST` 时，Manager 校验并传递 `last_seen_position / velocity / time` 给 ReacquireGoal；REACQUIRE 找回后复用先前 TrackGoal 参数重新进入 TRACK，并从 `track_duration` 中扣除恢复前已经执行的跟踪时间，因此完成条件按多段 TRACK 累计。Skill 之间不会直接互相调用。
+`TaskStatus` 独立于 `SkillStatus`。正常路径用 SEARCH Result 的 `target_id` 构造 TrackGoal；TRACK 返回 `TARGET_LOST` 时，Manager 校验并传递 `last_seen_position / velocity / time` 给 ReacquireGoal；REACQUIRE 找回后复用先前 TrackGoal 参数重新进入 TRACK，并从 `track_duration` 中扣除恢复前已经执行的跟踪时间，因此完成条件按多段 TRACK 累计。恢复后的 TRACK 完成时，六步计划仍会继续第二个 GOTO；该 GOTO 失败或任务取消时则跳过返航点，直接执行 fail-safe LAND。Skill 之间不会直接互相调用。
+
+### MissionIntent 与确定性编译
+
+`planner.schemas` 定义不可变的 `MissionIntent`、具名 `SearchRegionSpec` / `LandingZoneSpec` 和只读 `PlannerWorldContext`。高层意图只包含目标描述、区域名、跟踪时长、降落区名和可选起飞高度，不允许携带 Target/Oracle 坐标，也不包含低层 timeout 或控制参数。`MissionIntent.from_dict()` 对未知字段、缺失字段、bool、NaN 和 Inf 严格报错。
+
+`ScriptedPlanner` 是不读取环境、Camera 或 Oracle 的确定性基线，只返回构造时保存的高层意图副本。`LLMPlanner` 让本地 Qwen 文本模型只生成相同的严格 `MissionIntent`，首次输出无效时最多请求一次修复。`runtime.PlanValidator` 在可信世界上下文中解析区域名，检查场景边界、正飞行高度、1～600 s 跟踪时长和描述长度，再确定性生成六步 TaskPlan。当前上下文没有单独的 TAKEOFF timeout，因此编译器明确复用 `goto_timeout_s`。`source` 只允许 `scripted` 或 `llm`；两类 Planner 均由 `MissionAgent.start()` 仅调用一次。
 
 主流程失败不会立即让程序把 UAV 留在空中。TAKEOFF、GOTO、SEARCH、TRACK 或 REACQUIRE 失败时，Manager 先把 `pending_task_result` 设为 `FAILED`，随后执行 LAND；LAND_COMPLETE 后才提交最终 Task `FAILED`。TRACK_COMPLETE 同样先设置待定 `SUCCEEDED`，完成 LAND 后才提交 Task `SUCCEEDED`；LAND 自身失败则直接 Task `FAILED`。`transition_log` 为每次切换保存 simulation timestamp、旧 Skill/status、ResultCode、新 Skill 和 reason。
 
@@ -398,10 +487,12 @@ episode reset 必须调用 `environment.reset(target_seed=...)`，它会一起�
 uav_agent/
 ├── configs/       # 统一 YAML 配置和纯 Python 校验器
 ├── env/           # scene、kinematic UAV、RGB Camera、moving Target、World wrapper
+├── models/        # 纯 Python 模型合同与 OpenAI-compatible HTTP 客户端
 ├── agents/        # VLM/LLM Agent
 ├── skills/        # 统一 Skill API、MotionPolicy、Manager 与六类 Goal 合同
 ├── perception/    # 视觉感知；Stage-0 含 evaluator-only OraclePerception
 ├── planner/       # 任务分解与层次规划
+├── runtime/       # MissionIntent 校验与确定性 TaskPlan 编译边界
 ├── prompts/       # Prompt 模板
 ├── scripts/       # scene demo 与完整 Oracle standalone 入口
 ├── tests/         # 快速纯测试及一个显式 opt-in Isaac 集成测试

@@ -71,12 +71,26 @@ class TaskStep:
         return {"skill": self.skill.value, **deepcopy(dict(self.params))}
 
 
-_STANDARD_TASK_SEQUENCE = (
+_FIVE_STEP_TASK_SEQUENCE = (
     SkillName.TAKEOFF,
     SkillName.GOTO,
     SkillName.SEARCH,
     SkillName.TRACK,
     SkillName.LAND,
+)
+
+_SIX_STEP_TASK_SEQUENCE = (
+    SkillName.TAKEOFF,
+    SkillName.GOTO,
+    SkillName.SEARCH,
+    SkillName.TRACK,
+    SkillName.GOTO,
+    SkillName.LAND,
+)
+
+_STANDARD_TASK_SEQUENCES = (
+    _FIVE_STEP_TASK_SEQUENCE,
+    _SIX_STEP_TASK_SEQUENCE,
 )
 
 
@@ -92,8 +106,11 @@ class TaskPlan:
         ):
             raise TaskPlanError("TaskPlan.steps must be a tuple of TaskStep values")
         names = tuple(step.skill for step in self.steps)
-        if names != _STANDARD_TASK_SEQUENCE:
-            expected = " -> ".join(name.value for name in _STANDARD_TASK_SEQUENCE)
+        if names not in _STANDARD_TASK_SEQUENCES:
+            expected = " or ".join(
+                " -> ".join(name.value for name in sequence)
+                for sequence in _STANDARD_TASK_SEQUENCES
+            )
             actual = " -> ".join(name.value for name in names) or "<empty>"
             raise TaskPlanError(
                 f"Stage-0 TaskPlan must be {expected}; received {actual}"
@@ -326,7 +343,12 @@ class SkillManager:
             raise SkillManagerError("reset_task() is required before starting another task")
         if self._active_name is not None:
             raise SkillManagerError("reset the manually active Skill before starting a task")
-        missing = [name.value for name in set(_STANDARD_TASK_SEQUENCE) | {SkillName.REACQUIRE} if name not in self._skills]
+        required_skills = set(_FIVE_STEP_TASK_SEQUENCE) | {SkillName.REACQUIRE}
+        missing = [
+            name.value
+            for name in required_skills
+            if name not in self._skills
+        ]
         if missing:
             raise SkillNotRegisteredError(
                 "task registry is missing: " + ", ".join(sorted(missing))
@@ -612,6 +634,20 @@ class SkillManager:
 
         if old_name is SkillName.TRACK:
             self._pending_task_result = TaskStatus.SUCCEEDED
+            next_skill = self._next_planned_skill()
+            if next_skill is SkillName.GOTO:
+                self._start_next_planned(old_name, old_status, result)
+                return
+            if next_skill is not SkillName.LAND:
+                self._task_failure_result = result
+                self._pending_task_result = TaskStatus.FAILED
+                self._begin_landing(
+                    old_name,
+                    old_status,
+                    result,
+                    "track_complete_without_terminal_step",
+                )
+                return
             self._begin_landing(
                 old_name,
                 old_status,
@@ -621,6 +657,14 @@ class SkillManager:
             return
 
         self._start_next_planned(old_name, old_status, result)
+
+    def _next_planned_skill(self) -> SkillName | None:
+        if self._task_plan is None or self._plan_index is None:
+            return None
+        next_index = self._plan_index + 1
+        if next_index >= len(self._task_plan.steps):
+            return None
+        return self._task_plan.steps[next_index].skill
 
     def _start_next_planned(
         self,
@@ -1122,6 +1166,7 @@ def _normal_transition_reason(name: SkillName) -> str:
         SkillName.TAKEOFF: "takeoff_complete",
         SkillName.GOTO: "goal_reached",
         SkillName.SEARCH: "target_found",
+        SkillName.TRACK: "track_complete",
     }.get(name, "step_complete")
 
 

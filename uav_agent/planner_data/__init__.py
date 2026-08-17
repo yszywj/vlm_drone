@@ -1,6 +1,7 @@
 """Pure-Python Gold-first Planner dataset generation and evaluation."""
 
 from .evaluator import (
+    DEFAULT_DYNAMIC_SYSTEM_PROMPT_PATH,
     PlannerDatasetEvaluator,
     PlannerEvaluationError,
     PlannerEvaluationErrorCode,
@@ -8,6 +9,11 @@ from .evaluator import (
     aggregate_planner_predictions,
     load_planner_dataset_split,
     load_planner_world_cases,
+)
+from .dynamic_judge import (
+    DynamicPlanJudge,
+    DynamicPlanJudgeResult,
+    build_gold_dynamic_draft,
 )
 from .generator import (
     DEFAULT_DATASET_CONFIG_PATH,
@@ -78,12 +84,15 @@ from .validator import (
 
 __all__ = [
     "DEFAULT_DATASET_CONFIG_PATH",
+    "DEFAULT_DYNAMIC_SYSTEM_PROMPT_PATH",
     "DatasetGenerationError",
     "DatasetLeakageError",
     "DatasetManifest",
     "DatasetProfile",
     "DatasetValidationError",
     "DatasetValidationReport",
+    "DynamicPlanJudge",
+    "DynamicPlanJudgeResult",
     "GeneratedPlannerDataset",
     "GenerationConfig",
     "InstructionParaphraser",
@@ -116,6 +125,7 @@ __all__ = [
     "assign_groups",
     "assign_splits",
     "build_statistics",
+    "build_gold_dynamic_draft",
     "check_dataset_leakage",
     "compute_semantic_spec_family",
     "generate_and_write_dataset",

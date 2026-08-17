@@ -1,10 +1,9 @@
 """Offline, instruction-grounded evaluation for Planner dataset examples.
 
-This module is deliberately independent of Isaac Sim and ``PlanValidator``.
-Predictions are compared directly with immutable Gold planner specifications
-through :class:`tasks.intent_judge.IntentJudge`.  The LLM path delegates all
-JSON parsing and its single repair attempt to the production
-:class:`planner.llm_planner.LLMPlanner`.
+This module is deliberately independent of Isaac Sim.  Legacy predictions are
+compared directly through :class:`tasks.intent_judge.IntentJudge`; dynamic
+predictions additionally pass the production Catalog, shared symbolic checker
+and trusted compiler before their semantics are scored.
 """
 
 from __future__ import annotations
@@ -24,11 +23,16 @@ import time
 
 from models.base import ChatMessage, GenerationOptions, ModelClient, ModelResponse
 from planner.llm_planner import LLMPlanner
+from planner.dynamic_llm_planner import DynamicLLMPlanner
+from planner.policy import PlannerLimits, PlannerPolicy
 from planner.schemas import (
     MissionIntent,
     PlannerRequest,
     PlannerWorldContext,
+    SkillPlanDraft,
 )
+from planner.skill_catalog import SkillCatalog, build_default_skill_catalog
+from runtime.plan_validator import PlanValidator
 from tasks.intent_judge import IntentErrorCode, IntentJudge, IntentJudgeResult
 from tasks.schemas import PlannerWorldCase
 from tasks.target_ontology import TargetOntology
@@ -39,12 +43,22 @@ from .renderers import (
     world_case_to_runtime_context as _renderer_world_case_to_runtime_context,
 )
 from .schemas import PLANNER_DATASET_SPLITS, PlannerDatasetSample
+from .dynamic_judge import (
+    DynamicPlanJudge,
+    DynamicPlanJudgeResult,
+    build_gold_dynamic_draft,
+)
 
 
 DEFAULT_SYSTEM_PROMPT_PATH = (
     Path(__file__).resolve().parents[1]
     / "prompts"
     / "mission_planner_system.txt"
+)
+DEFAULT_DYNAMIC_SYSTEM_PROMPT_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "prompts"
+    / "dynamic_skill_planner_system.txt"
 )
 DEFAULT_WORLD_CONTEXTS_PATH = (
     Path(__file__).resolve().parents[1]
@@ -187,11 +201,18 @@ class PlannerDatasetEvaluator:
         world_cases: Mapping[str, PlannerWorldCase],
         ontology: TargetOntology | None = None,
         model_client: ModelClient | None = None,
-        system_prompt_path: str | os.PathLike[str] = DEFAULT_SYSTEM_PROMPT_PATH,
+        system_prompt_path: str | os.PathLike[str] | None = None,
+        skill_catalog: SkillCatalog | None = None,
+        planner_limits: PlannerLimits | None = None,
+        planner_policy: PlannerPolicy | None = None,
+        validator: PlanValidator | None = None,
         logger: object | None = None,
     ) -> None:
-        if planner not in {"scripted", "llm"}:
-            raise ValueError("planner must be 'scripted' or 'llm'")
+        planner_modes = {"scripted", "llm", "dynamic_scripted", "dynamic_llm"}
+        if planner not in planner_modes:
+            raise ValueError(
+                "planner must be scripted, llm, dynamic_scripted, or dynamic_llm"
+            )
         if not isinstance(world_cases, Mapping) or not world_cases:
             raise ValueError("world_cases must be a non-empty mapping")
         checked_worlds: dict[str, PlannerWorldCase] = {}
@@ -211,17 +232,68 @@ class PlannerDatasetEvaluator:
         self.logger = logger
         self._recording_client: _RecordingModelClient | None = None
         self._llm_planner: LLMPlanner | None = None
-        if planner == "llm":
-            if model_client is None:
-                raise ValueError("model_client is required for llm evaluation")
-            self._recording_client = _RecordingModelClient(model_client)
-            self._llm_planner = LLMPlanner(
-                self._recording_client,
-                system_prompt_path,
-                logger=logger,
+        self._dynamic_llm_planner: DynamicLLMPlanner | None = None
+        self._dynamic_judge: DynamicPlanJudge | None = None
+        self._skill_catalog = skill_catalog or build_default_skill_catalog()
+        self._planner_limits = planner_limits or PlannerLimits()
+        self._planner_policy = planner_policy or PlannerPolicy()
+        self._planner_policy.validate_against(self._planner_limits)
+        if validator is None:
+            validator = PlanValidator(
+                limits=self._planner_limits,
+                policy=self._planner_policy,
             )
+        self._validator = validator
+
+        if system_prompt_path is None:
+            system_prompt_path = (
+                DEFAULT_DYNAMIC_SYSTEM_PROMPT_PATH
+                if planner.startswith("dynamic_")
+                else DEFAULT_SYSTEM_PROMPT_PATH
+            )
+
+        if planner in {"llm", "dynamic_llm"}:
+            if model_client is None:
+                raise ValueError("model_client is required for LLM evaluation")
+            self._recording_client = _RecordingModelClient(model_client)
+            if planner == "llm":
+                self._llm_planner = LLMPlanner(
+                    self._recording_client,
+                    system_prompt_path,
+                    logger=logger,
+                )
+            else:
+                self._dynamic_llm_planner = self._build_dynamic_llm_planner(
+                    self._recording_client,
+                    system_prompt_path,
+                )
         elif model_client is not None:
             raise ValueError("scripted evaluation must not receive a model_client")
+
+        if planner.startswith("dynamic_"):
+            self._dynamic_judge = DynamicPlanJudge(
+                self.ontology,
+                skill_catalog=self._skill_catalog,
+                limits=self._planner_limits,
+                policy=self._planner_policy,
+                validator=self._validator,
+            )
+
+    def _build_dynamic_llm_planner(
+        self,
+        client: ModelClient,
+        system_prompt_path: str | os.PathLike[str],
+    ) -> DynamicLLMPlanner:
+        """Construct the production dynamic Planner with trusted policy."""
+
+        return DynamicLLMPlanner(
+            client,
+            system_prompt_path,
+            skill_catalog=self._skill_catalog,
+            planner_limits=self._planner_limits,
+            planner_policy=self._planner_policy,
+            logger=self.logger,
+        )
 
     def evaluate(
         self,
@@ -350,6 +422,14 @@ class PlannerDatasetEvaluator:
         expected = sample.gold.to_expected_intent()
         started_ns = time.perf_counter_ns()
 
+        if self.planner_mode.startswith("dynamic_"):
+            return self._evaluate_dynamic_one(
+                sample,
+                world=world,
+                expected=expected,
+                started_ns=started_ns,
+            )
+
         if self.planner_mode == "scripted":
             raw = _json_dumps(expected.to_dict())
             result = self.judge.judge(
@@ -440,6 +520,265 @@ class PlannerDatasetEvaluator:
             latency_ms=latency_ms,
             request_failed=request_failed,
         )
+
+    def _evaluate_dynamic_one(
+        self,
+        sample: PlannerDatasetSample,
+        *,
+        world: PlannerWorldCase,
+        expected: MissionIntent,
+        started_ns: int,
+    ) -> Mapping[str, object]:
+        assert self._dynamic_judge is not None
+        context = planner_world_case_to_runtime_context(world)
+        gold_draft = build_gold_dynamic_draft(sample.gold)
+
+        if self.planner_mode == "dynamic_scripted":
+            raw = _json_dumps(gold_draft.to_dict())
+            result = self._dynamic_judge.judge(
+                gold=sample.gold,
+                world=world,
+                world_context=context,
+                raw_output=raw,
+                draft=gold_draft,
+                source="dynamic_scripted",
+            )
+            latency_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+            return self._dynamic_record(
+                planner=self.planner_mode,
+                sample=sample,
+                expected=expected,
+                gold_draft=gold_draft,
+                initial_raw=raw,
+                final_raw=raw,
+                initial_draft=gold_draft,
+                final_draft=gold_draft,
+                initial_result=result,
+                final_result=result,
+                model_calls=0,
+                latency_ms=latency_ms,
+                request_failed=False,
+                repair_requested=False,
+                repair_succeeded=False,
+                diagnostics=None,
+            )
+
+        assert self._recording_client is not None
+        assert self._dynamic_llm_planner is not None
+        recorder = self._recording_client
+        recorder.reset()
+        predicted: SkillPlanDraft | None = None
+        diagnostics: object | None = None
+        request_failed = False
+        request = PlannerRequest(
+            instruction=sample.metadata.instruction,
+            world_context=context,
+        )
+        try:
+            plan_with_diagnostics = getattr(
+                self._dynamic_llm_planner,
+                "plan_with_diagnostics",
+                None,
+            )
+            if callable(plan_with_diagnostics):
+                execution = plan_with_diagnostics(request)
+                predicted = execution.output
+                diagnostics = execution.diagnostics
+            else:  # Compatibility during rollout; production exposes diagnostics.
+                predicted = self._dynamic_llm_planner.plan(request)
+        except Exception:
+            request_failed = len(recorder.responses) < recorder.calls
+            diagnostics = getattr(
+                self._dynamic_llm_planner,
+                "last_diagnostics",
+                None,
+            )
+
+        initial_raw = recorder.responses[0] if recorder.responses else ""
+        final_raw = (
+            initial_raw
+            if recorder.calls <= 1
+            else (recorder.responses[1] if len(recorder.responses) > 1 else "")
+        )
+        initial_result = self._dynamic_judge.judge(
+            gold=sample.gold,
+            world=world,
+            world_context=context,
+            raw_output=initial_raw,
+            source="dynamic_llm",
+        )
+        final_result = self._dynamic_judge.judge(
+            gold=sample.gold,
+            world=world,
+            world_context=context,
+            raw_output=final_raw,
+            draft=predicted,
+            source="dynamic_llm",
+        )
+        initial_draft = self._strict_parse_dynamic_or_none(initial_raw)
+
+        if recorder.calls > 2:
+            raise PlannerEvaluationError(
+                "DynamicLLMPlanner exceeded the two-call contract"
+            )
+        if any(
+            options is None or options.temperature != 0.0
+            for options in recorder.options
+        ):
+            raise PlannerEvaluationError(
+                "DynamicLLMPlanner did not use temperature 0.0"
+            )
+        if any(
+            getattr(options, "response_format", None) is None
+            for options in recorder.options
+        ):
+            raise PlannerEvaluationError(
+                "DynamicLLMPlanner did not enable structured output"
+            )
+
+        if diagnostics is not None:
+            model_calls = getattr(diagnostics, "model_calls", None)
+            if model_calls != recorder.calls:
+                raise PlannerEvaluationError(
+                    "DynamicLLMPlanner diagnostics model_calls is inconsistent"
+                )
+            repair_requested = bool(getattr(diagnostics, "repair_used", False))
+            repair_succeeded = bool(
+                getattr(diagnostics, "repair_succeeded", False)
+            )
+            if not bool(
+                getattr(diagnostics, "structured_output_enabled", False)
+            ):
+                raise PlannerEvaluationError(
+                    "DynamicLLMPlanner diagnostics disabled structured output"
+                )
+        else:
+            repair_requested = recorder.calls == 2
+            repair_succeeded = repair_requested and final_result.output_valid
+
+        latency_ms = (time.perf_counter_ns() - started_ns) / 1_000_000.0
+        return self._dynamic_record(
+            planner=self.planner_mode,
+            sample=sample,
+            expected=expected,
+            gold_draft=gold_draft,
+            initial_raw=initial_raw,
+            final_raw=final_raw,
+            initial_draft=initial_draft,
+            final_draft=predicted,
+            initial_result=initial_result,
+            final_result=final_result,
+            model_calls=recorder.calls,
+            latency_ms=latency_ms,
+            request_failed=request_failed,
+            repair_requested=repair_requested,
+            repair_succeeded=repair_succeeded,
+            diagnostics=diagnostics,
+        )
+
+    @staticmethod
+    def _strict_parse_dynamic_or_none(raw: str) -> SkillPlanDraft | None:
+        try:
+            return DynamicLLMPlanner._parse_plan_draft(raw)
+        except (
+            json.JSONDecodeError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+    @staticmethod
+    def _dynamic_record(
+        *,
+        planner: str,
+        sample: PlannerDatasetSample,
+        expected: MissionIntent,
+        gold_draft: SkillPlanDraft,
+        initial_raw: str,
+        final_raw: str,
+        initial_draft: SkillPlanDraft | None,
+        final_draft: SkillPlanDraft | None,
+        initial_result: DynamicPlanJudgeResult,
+        final_result: DynamicPlanJudgeResult,
+        model_calls: int,
+        latency_ms: float,
+        request_failed: bool,
+        repair_requested: bool,
+        repair_succeeded: bool,
+        diagnostics: object | None,
+    ) -> Mapping[str, object]:
+        error_codes = (
+            (PlannerEvaluationErrorCode.PLANNER_REQUEST_FAILED.value,)
+            if request_failed
+            else final_result.error_codes
+        )
+        diagnostics_dict = (
+            diagnostics.to_dict()
+            if diagnostics is not None
+            and callable(getattr(diagnostics, "to_dict", None))
+            else None
+        )
+        initial_mapping = initial_result.to_dict()
+        final_mapping = final_result.to_dict()
+        return {
+            "planner": planner,
+            "sample_id": sample.sample_id,
+            "split": sample.split,
+            "instruction": sample.metadata.instruction,
+            "gold_intent": expected.to_dict(),
+            "gold_dynamic_plan": gold_draft.to_dict(),
+            "initial_model_output": initial_raw,
+            "final_model_output": final_raw,
+            "raw_model_output": final_raw,
+            "initial_parsed_prediction": (
+                initial_draft.to_dict() if initial_draft is not None else None
+            ),
+            "parsed_prediction": (
+                final_draft.to_dict() if final_draft is not None else None
+            ),
+            "initial_judge_result": initial_mapping,
+            "judge_result": final_mapping,
+            "initial_schema_valid": initial_result.schema_valid,
+            "initial_catalog_valid": initial_result.catalog_valid,
+            "initial_symbolic_valid": initial_result.symbolic_valid,
+            "initial_compile_success": initial_result.compile_success,
+            "initial_semantic_match": initial_result.semantic_match,
+            "initial_minimal_plan_match": initial_result.minimal_plan_match,
+            "final_schema_valid": final_result.schema_valid,
+            "final_catalog_valid": final_result.catalog_valid,
+            "final_symbolic_valid": final_result.symbolic_valid,
+            "final_compile_success": final_result.compile_success,
+            "final_semantic_match": final_result.semantic_match,
+            "final_minimal_plan_match": final_result.minimal_plan_match,
+            "semantic_match": final_result.semantic_match,
+            "minimal_plan_match": final_result.minimal_plan_match,
+            "initial_error_code": (
+                diagnostics_dict.get("initial_error_code")
+                if diagnostics_dict is not None
+                and diagnostics_dict.get("initial_error_code") is not None
+                else initial_result.primary_error_code
+            ),
+            "final_error_code": final_result.primary_error_code,
+            "model_calls": model_calls,
+            "repair_requested": repair_requested,
+            "repair_succeeded": repair_succeeded,
+            "request_failed": request_failed,
+            "structured_output_enabled": bool(
+                diagnostics_dict.get("structured_output_enabled")
+                if diagnostics_dict is not None
+                else model_calls > 0
+            )
+            if model_calls else False,
+            "planner_diagnostics": diagnostics_dict,
+            "default_recovery_injected": (
+                final_result.default_recovery_injected
+            ),
+            "explicit_fail": final_result.explicit_fail,
+            "latency_ms": round(float(latency_ms), 6),
+            "error_codes": list(error_codes),
+        }
 
     @staticmethod
     def _strict_parse_or_none(raw: str) -> MissionIntent | None:
@@ -619,6 +958,16 @@ class PlannerDatasetEvaluator:
             ("landing_zone", "landing_zone_match"),
             ("takeoff_altitude", "takeoff_altitude_match"),
         )
+        dynamic = bool(
+            records
+            and isinstance(records[0].get("planner"), str)
+            and str(records[0]["planner"]).startswith("dynamic_")
+        )
+        if dynamic:
+            fields += (
+                ("skill_sequence", "skill_sequence_match"),
+                ("lost_target_policy", "lost_target_policy_match"),
+            )
         output = io.StringIO(newline="")
         writer = csv.writer(output, lineterminator="\n")
         writer.writerow(("stage", "field", "correct", "total", "accuracy"))
@@ -666,9 +1015,13 @@ def aggregate_planner_predictions(
     total = len(records)
     planners = {record.get("planner") for record in records}
     splits = {record.get("split") for record in records}
+    planner_modes = {"scripted", "llm", "dynamic_scripted", "dynamic_llm"}
     if records and (
         len(planners) != 1
-        or not all(isinstance(value, str) and value in {"scripted", "llm"} for value in planners)
+        or not all(
+            isinstance(value, str) and value in planner_modes
+            for value in planners
+        )
     ):
         raise PlannerEvaluationError("predictions mix or omit planner modes")
     if records and (
@@ -687,6 +1040,7 @@ def aggregate_planner_predictions(
     repairs = sum(bool(record.get("repair_requested")) for record in records)
     repair_successes = sum(bool(record.get("repair_succeeded")) for record in records)
     latency_values: list[float] = []
+    model_call_values: list[int] = []
     for record in records:
         value = record.get("latency_ms")
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -696,9 +1050,43 @@ def aggregate_planner_predictions(
             raise PlannerEvaluationError("prediction latency_ms must be finite")
         latency_values.append(value)
 
+        model_calls = record.get("model_calls")
+        if (
+            isinstance(model_calls, bool)
+            or not isinstance(model_calls, int)
+            or not 0 <= model_calls <= 2
+        ):
+            raise PlannerEvaluationError(
+                "prediction model_calls must be an integer between 0 and 2"
+            )
+        model_call_values.append(model_calls)
+
+    planner_mode = next(iter(planners)) if planners else None
+    dynamic = isinstance(planner_mode, str) and planner_mode.startswith("dynamic_")
+
+    def dynamic_count(key: str) -> int:
+        if not dynamic:
+            return 0
+        count_value = 0
+        for record in records:
+            value = record.get(key)
+            if not isinstance(value, bool):
+                raise PlannerEvaluationError(
+                    f"dynamic prediction {key} must be boolean"
+                )
+            count_value += int(value)
+        return count_value
+
+    sorted_latency = sorted(latency_values)
+    p95_latency = 0.0
+    if sorted_latency:
+        # Nearest-rank percentile: deterministic and defined for one sample.
+        rank = max(1, (95 * len(sorted_latency) + 99) // 100)
+        p95_latency = sorted_latency[rank - 1]
+
     return {
         "schema_version": "planner_eval_v1",
-        "planner": next(iter(planners)) if planners else None,
+        "planner": planner_mode,
         "split": next(iter(splits)) if splits else None,
         "num_samples": total,
         "output_valid_rate": _rate(count(final_judges, "output_valid"), total),
@@ -728,9 +1116,44 @@ def aggregate_planner_predictions(
         ),
         "repair_request_rate": _rate(repairs, total),
         "repair_success_rate": _rate(repair_successes, repairs),
+        "mean_model_calls": (
+            round(sum(model_call_values) / total, 6) if total else 0.0
+        ),
         "mean_latency_ms": (
             round(sum(latency_values) / total, 6) if total else 0.0
         ),
+        "p95_latency_ms": round(p95_latency, 6),
+        "initial_schema_valid_rate": _rate(
+            dynamic_count("initial_schema_valid"), total
+        ),
+        "initial_catalog_valid_rate": _rate(
+            dynamic_count("initial_catalog_valid"), total
+        ),
+        "initial_symbolic_valid_rate": _rate(
+            dynamic_count("initial_symbolic_valid"), total
+        ),
+        "initial_compile_success_rate": _rate(
+            dynamic_count("initial_compile_success"), total
+        ),
+        "final_schema_valid_rate": _rate(
+            dynamic_count("final_schema_valid"), total
+        ),
+        "final_catalog_valid_rate": _rate(
+            dynamic_count("final_catalog_valid"), total
+        ),
+        "final_symbolic_valid_rate": _rate(
+            dynamic_count("final_symbolic_valid"), total
+        ),
+        "final_compile_success_rate": _rate(
+            dynamic_count("final_compile_success"), total
+        ),
+        "minimal_plan_match_rate": _rate(
+            dynamic_count("minimal_plan_match"), total
+        ),
+        "default_recovery_injected_rate": _rate(
+            dynamic_count("default_recovery_injected"), total
+        ),
+        "explicit_fail_rate": _rate(dynamic_count("explicit_fail"), total),
     }
 
 
@@ -882,6 +1305,7 @@ def _safe_slug(value: str) -> str:
 
 
 __all__ = [
+    "DEFAULT_DYNAMIC_SYSTEM_PROMPT_PATH",
     "DEFAULT_SYSTEM_PROMPT_PATH",
     "DEFAULT_WORLD_CONTEXTS_PATH",
     "PlannerDatasetEvaluator",

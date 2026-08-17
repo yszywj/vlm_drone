@@ -183,6 +183,11 @@ class OpenAICompatibleClient:
             "max_tokens": selected_options.max_tokens,
             "top_p": selected_options.top_p,
         }
+        if selected_options.response_format is not None:
+            request_payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": selected_options.response_format.to_dict(),
+            }
         response_payload = self._request_json(
             "POST",
             "/chat/completions",

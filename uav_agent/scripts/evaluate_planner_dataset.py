@@ -16,6 +16,7 @@ if str(_PACKAGE_ROOT) not in sys.path:
 
 from models.openai_compatible_client import OpenAICompatibleClient  # noqa: E402
 from planner_data.evaluator import (  # noqa: E402
+    DEFAULT_DYNAMIC_SYSTEM_PROMPT_PATH,
     DEFAULT_SYSTEM_PROMPT_PATH,
     DEFAULT_WORLD_CONTEXTS_PATH,
     PlannerDatasetEvaluator,
@@ -70,9 +71,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--planner",
-        choices=("scripted", "llm"),
+        choices=("scripted", "llm", "dynamic_scripted", "dynamic_llm"),
         default="scripted",
-        help="scripted validates the evaluator; llm calls the configured service",
+        help=(
+            "scripted/dynamic_scripted validate the evaluator; "
+            "llm/dynamic_llm call the configured text-model service"
+        ),
     )
     parser.add_argument(
         "--output-root",
@@ -100,7 +104,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--system-prompt",
         type=Path,
-        default=DEFAULT_SYSTEM_PROMPT_PATH,
+        default=None,
+        help=(
+            "override the mode-specific system prompt (legacy defaults to "
+            f"{DEFAULT_SYSTEM_PROMPT_PATH}; dynamic defaults to "
+            f"{DEFAULT_DYNAMIC_SYSTEM_PROMPT_PATH})"
+        ),
     )
     parser.add_argument(
         "--base-url",
@@ -145,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         worlds = load_planner_world_cases(args.world_contexts)
         ontology = TargetOntology.from_file(args.ontology)
         model_client = None
-        if args.planner == "llm":
+        if args.planner in {"llm", "dynamic_llm"}:
             model_client = OpenAICompatibleClient(
                 base_url=args.base_url,
                 model=args.model,

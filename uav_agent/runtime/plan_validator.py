@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -17,6 +16,8 @@ from planner.schemas import (
     SearchRegionSpec,
     SkillPlanDraft,
 )
+from planner.policy import PlannerLimits, PlannerPolicy, TargetLostAction
+from planner.symbolic_checker import SymbolicPlanChecker
 from skills.motion_types import MotionPolicy, YawMode
 from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskPlanError, TaskStep
 from skills.types import SkillName
@@ -24,83 +25,6 @@ from skills.types import SkillName
 
 class PlanValidationError(ValueError):
     """Raised when planner output cannot be compiled without unsafe inference."""
-
-
-@dataclass(frozen=True, slots=True)
-class PlannerLimits:
-    """Immutable policy limits enforced after untrusted model parsing."""
-
-    max_plan_steps: int = 10
-    max_goto_calls: int = 5
-    max_search_calls: int = 1
-    max_track_calls: int = 2
-    max_reacquire_attempts_per_track: int = 2
-    max_total_reacquire_attempts: int = 4
-    min_track_duration_s: float = 1.0
-    max_track_duration_s: float = 600.0
-
-    def __post_init__(self) -> None:
-        integer_fields = (
-            "max_plan_steps",
-            "max_goto_calls",
-            "max_search_calls",
-            "max_track_calls",
-            "max_reacquire_attempts_per_track",
-            "max_total_reacquire_attempts",
-        )
-        for name in integer_fields:
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if self.max_plan_steps < 2:
-            raise ValueError("max_plan_steps must be at least 2")
-        hard_caps = {
-            "max_plan_steps": 10,
-            "max_goto_calls": 5,
-            "max_track_calls": 2,
-            "max_reacquire_attempts_per_track": 2,
-            "max_total_reacquire_attempts": 4,
-        }
-        for name, hard_cap in hard_caps.items():
-            if getattr(self, name) > hard_cap:
-                raise ValueError(f"{name} must not exceed {hard_cap} in planner v1")
-        if self.max_search_calls != 1:
-            raise ValueError("max_search_calls must be 1 in dynamic planner v1")
-        if (
-            self.max_reacquire_attempts_per_track
-            > self.max_total_reacquire_attempts
-        ):
-            raise ValueError(
-                "max_reacquire_attempts_per_track must not exceed "
-                "max_total_reacquire_attempts"
-            )
-        minimum = _positive_finite_number(
-            self.min_track_duration_s,
-            "min_track_duration_s",
-            error_type=ValueError,
-        )
-        maximum = _positive_finite_number(
-            self.max_track_duration_s,
-            "max_track_duration_s",
-            error_type=ValueError,
-        )
-        if minimum > maximum:
-            raise ValueError(
-                "min_track_duration_s must not exceed max_track_duration_s"
-            )
-        object.__setattr__(self, "min_track_duration_s", minimum)
-        object.__setattr__(self, "max_track_duration_s", maximum)
-
-    @classmethod
-    def from_config(cls, config: object) -> "PlannerLimits":
-        """Construct limits from the public ``PlannerConfig`` contract."""
-
-        names = tuple(cls.__dataclass_fields__)
-        try:
-            values = {name: getattr(config, name) for name in names}
-        except AttributeError as exc:
-            raise TypeError("config must expose every PlannerLimits field") from exc
-        return cls(**values)
 
 
 class _MissionState(Enum):
@@ -140,6 +64,7 @@ _DYNAMIC_ARGUMENTS: Mapping[SkillName, frozenset[str]] = {
             "duration_s",
             "desired_altitude_m",
             "desired_distance_m",
+            "on_target_lost",
         }
     ),
     SkillName.LAND: frozenset({"zone", "yaw_mode", "yaw_deg"}),
@@ -161,15 +86,23 @@ class PlanValidator:
     TRUSTED_TARGET_LOST_TIME_S = 2.0
     TRUSTED_TRACK_TIMEOUT_GRACE_S = 5.0
     DEFAULT_DESIRED_DISTANCE_M = 6.0
-    DEFAULT_RECOVERY_RADIUS_M = 10.0
-    DEFAULT_RECOVERY_TIMEOUT_S = 30.0
-
-    def __init__(self, limits: PlannerLimits | None = None) -> None:
+    def __init__(
+        self,
+        limits: PlannerLimits | None = None,
+        policy: PlannerPolicy | None = None,
+    ) -> None:
         if limits is None:
             limits = PlannerLimits()
         if not isinstance(limits, PlannerLimits):
             raise TypeError("limits must be a PlannerLimits")
+        if policy is None:
+            policy = PlannerPolicy()
+        if not isinstance(policy, PlannerPolicy):
+            raise TypeError("policy must be a PlannerPolicy")
+        policy.validate_against(limits)
         self._limits = limits
+        self._policy = policy
+        self._symbolic_checker = SymbolicPlanChecker()
 
     @property
     def limits(self) -> PlannerLimits:
@@ -178,6 +111,14 @@ class PlanValidator:
         # without ``super()`` on the trusted default limits.
         limits = getattr(self, "_limits", None)
         return PlannerLimits() if limits is None else limits
+
+    @property
+    def policy(self) -> PlannerPolicy:
+        policy = getattr(self, "_policy", None)
+        if policy is None:
+            policy = PlannerPolicy()
+        policy.validate_against(self.limits)
+        return policy
 
     def validate_and_compile(
         self,
@@ -205,6 +146,23 @@ class PlanValidator:
                 raise PlanValidationError(
                     "SkillPlanDraft requires source 'dynamic_scripted' or "
                     "'dynamic_llm'"
+                )
+            result = getattr(
+                self,
+                "_symbolic_checker",
+                SymbolicPlanChecker(),
+            ).check(
+                planner_output,
+                world_context=context,
+                limits=self.limits,
+                policy=self.policy,
+            )
+            if not result.valid:
+                issue = result.issues[0]
+                location = "" if issue.step_id is None else f" at {issue.step_id}"
+                raise PlanValidationError(
+                    f"symbolic plan invalid [{issue.code.value}]{location}: "
+                    f"{issue.message}"
                 )
             return self._compile_dynamic(planner_output, context, source)
         raise TypeError("planner_output must be MissionIntent or SkillPlanDraft")
@@ -239,7 +197,7 @@ class PlanValidator:
             world,
             require_disk_in_bounds=False,
         )
-        landing_xy, ground_altitude = self._trusted_landing_geometry(
+        landing_xy, ground_altitude, landing_tolerance = self._trusted_landing_geometry(
             landing_zone,
             world,
         )
@@ -248,8 +206,8 @@ class PlanValidator:
                 "landing ground altitude must not exceed the flight altitude"
             )
 
-        # Do not change this shape: planner_v1 and legacy Agent tests rely on
-        # this exact deterministic template and its legacy target placeholder.
+        # Keep the deterministic six-step shape and legacy target placeholder;
+        # trusted LAND geometry is appended without exposing it to the model.
         raw_plan: list[dict[str, object]] = [
             {
                 "skill": "TAKEOFF",
@@ -283,6 +241,8 @@ class PlanValidator:
             {
                 "skill": "LAND",
                 "ground_altitude": ground_altitude,
+                "expected_position_xy": list(landing_xy),
+                "zone_tolerance_m": landing_tolerance,
                 "timeout": world.land_timeout,
             },
         ]
@@ -291,6 +251,10 @@ class PlanValidator:
             planner_output=intent,
             task_plan=task_plan,
             source=source,
+            compiler_notes=(
+                "step_06: trusted landing geometry attached for zone "
+                f"{intent.landing_zone!r}",
+            ),
         )
 
     def _compile_dynamic(
@@ -303,29 +267,10 @@ class PlanValidator:
         self._require_unambiguous_named_locations(context)
         steps = tuple(draft.steps)
         limits = self.limits
-        if not 2 <= len(steps) <= limits.max_plan_steps:
-            raise PlanValidationError(
-                f"dynamic plan must contain 2-{limits.max_plan_steps} steps"
-            )
-
+        # Cross-step ordering/count/reference rules were already accepted by
+        # SymbolicPlanChecker in validate_and_compile().  Compilation below
+        # owns only trusted geometry, numeric policy and Goal construction.
         skill_names = tuple(_skill_name(step.skill) for step in steps)
-        if skill_names[0] is not SkillName.TAKEOFF:
-            raise PlanValidationError("dynamic plan first step must be TAKEOFF")
-        if skill_names[-1] is not SkillName.LAND:
-            raise PlanValidationError("dynamic plan final step must be LAND")
-        counts = Counter(skill_names)
-        if counts[SkillName.TAKEOFF] != 1:
-            raise PlanValidationError("TAKEOFF must appear exactly once")
-        if counts[SkillName.LAND] != 1:
-            raise PlanValidationError("LAND must appear exactly once")
-        if counts[SkillName.GOTO] > limits.max_goto_calls:
-            raise PlanValidationError("GOTO call count exceeds planner limit")
-        if counts[SkillName.SEARCH] > limits.max_search_calls:
-            raise PlanValidationError("SEARCH call count exceeds planner limit")
-        if counts[SkillName.TRACK] > limits.max_track_calls:
-            raise PlanValidationError("TRACK call count exceeds planner limit")
-        if counts[SkillName.REACQUIRE]:
-            raise PlanValidationError("REACQUIRE is recovery-only, not a top-level step")
 
         state = _MissionState.ON_GROUND
         current_altitude = world.initial_uav[2]
@@ -341,8 +286,7 @@ class PlanValidator:
                 raise PlanValidationError(f"step {step_id} args must be a mapping")
             self._reject_unknown_args(step_id, skill, args)
             recovery = getattr(draft_step, "recovery", None)
-            if recovery is not None and skill is not SkillName.TRACK:
-                raise PlanValidationError("recovery is only allowed on TRACK steps")
+            assert recovery is None or skill is SkillName.TRACK
 
             params: dict[str, object]
             compiled_recovery: RecoveryPolicy | None = None
@@ -504,8 +448,13 @@ class PlanValidator:
                     "timeout": duration + self.TRUSTED_TRACK_TIMEOUT_GRACE_S,
                 }
                 current_altitude = desired_altitude
-                if recovery is not None:
-                    compiled_recovery = self._compile_recovery(recovery, step_id)
+                compiled_recovery, recovery_note = self._compile_track_recovery(
+                    args=args,
+                    recovery=recovery,
+                    step_id=step_id,
+                )
+                compiler_notes.append(f"{step_id}: {recovery_note}")
+                if compiled_recovery is not None:
                     total_recovery_attempts += compiled_recovery.max_attempts
                     if (
                         total_recovery_attempts
@@ -523,9 +472,11 @@ class PlanValidator:
                     f"step {step_id} LAND",
                 )
                 zone = _landing_zone(context, zone_name)
-                _landing_xy, ground_altitude = self._trusted_landing_geometry(
+                landing_xy, ground_altitude, landing_tolerance = (
+                    self._trusted_landing_geometry(
                     zone,
                     world,
+                    )
                 )
                 if ground_altitude > current_altitude:
                     raise PlanValidationError(
@@ -545,13 +496,16 @@ class PlanValidator:
                 )
                 params = {
                     "ground_altitude": ground_altitude,
+                    "expected_position_xy": landing_xy,
+                    "zone_tolerance_m": landing_tolerance,
                     "yaw_mode": yaw_mode,
                     "yaw_value": yaw_value,
                     "timeout": world.land_timeout,
                 }
                 state = _MissionState.LANDED
                 compiler_notes.append(
-                    f"{step_id}: landing altitude resolved from zone {zone_name!r}"
+                    f"{step_id}: trusted landing geometry attached for zone "
+                    f"{zone_name!r}"
                 )
 
             else:  # pragma: no cover - guarded by _skill_name and catalog set
@@ -652,7 +606,7 @@ class PlanValidator:
         self,
         zone: LandingZoneSpec,
         world: _TrustedWorld,
-    ) -> tuple[tuple[float, float], float]:
+    ) -> tuple[tuple[float, float], float, float]:
         landing_xy = _finite_vector2(zone.position_xy_m, "landing position_xy_m")
         if not (
             world.scene_min[0] <= landing_xy[0] <= world.scene_max[0]
@@ -667,7 +621,11 @@ class PlanValidator:
             raise PlanValidationError(
                 "landing ground altitude is outside the scene Z bounds"
             )
-        return landing_xy, ground_altitude
+        horizontal_tolerance = _positive_finite_number(
+            zone.horizontal_tolerance_m,
+            "landing horizontal_tolerance_m",
+        )
+        return landing_xy, ground_altitude, horizontal_tolerance
 
     def _dynamic_altitude(
         self,
@@ -750,7 +708,7 @@ class PlanValidator:
             point = (approach[0], approach[1], altitude)
             face_point = center
         elif destination in context.landing_zones:
-            landing_xy, ground = self._trusted_landing_geometry(
+            landing_xy, ground, _tolerance = self._trusted_landing_geometry(
                 _landing_zone(context, destination),
                 world,
             )
@@ -804,6 +762,77 @@ class PlanValidator:
                 + ", ".join(ambiguous)
             )
 
+    def _compile_track_recovery(
+        self,
+        *,
+        args: Mapping[str, object],
+        recovery: object | None,
+        step_id: str,
+    ) -> tuple[RecoveryPolicy | None, str]:
+        """Resolve model intent to one explicit trusted recovery policy."""
+
+        raw_action = args.get("on_target_lost")
+        if raw_action is None:
+            # A pre-policy hand-written plan containing only ``recovery`` is
+            # interpreted exactly as it was before this protocol field existed.
+            action = (
+                TargetLostAction.REACQUIRE
+                if recovery is not None
+                else self.policy.default_on_target_lost
+            )
+        else:
+            try:
+                action = TargetLostAction(str(raw_action))
+            except ValueError:
+                raise PlanValidationError(
+                    f"step {step_id} on_target_lost must be REACQUIRE or FAIL"
+                ) from None
+
+        if action is TargetLostAction.FAIL:
+            if recovery is not None:
+                # SymbolicPlanChecker is the public authority for this error;
+                # this branch protects direct/internal compiler reuse.
+                raise PlanValidationError(
+                    f"step {step_id} recovery conflicts with on_target_lost=FAIL"
+                )
+            note = (
+                "recovery explicitly disabled by on_target_lost=FAIL"
+                if raw_action is not None
+                else "recovery disabled by trusted default policy"
+            )
+            return None, note
+
+        if recovery is None:
+            return self._default_recovery_policy(), (
+                "recovery injected from trusted default policy"
+            )
+
+        attempts = _nonnegative_integer(
+            getattr(recovery, "max_attempts", None),
+            f"step {step_id} recovery.max_attempts",
+        )
+        if attempts == 0:
+            return None, (
+                "recovery disabled by deprecated max_attempts=0 compatibility"
+            )
+        return self._compile_recovery(recovery, step_id), (
+            "recovery explicitly enabled with bounded overrides"
+        )
+
+    def _default_recovery_policy(self) -> RecoveryPolicy:
+        policy = self.policy
+        try:
+            return RecoveryPolicy(
+                skill=SkillName.REACQUIRE,
+                max_attempts=policy.default_reacquire_max_attempts,
+                search_radius_m=policy.default_reacquire_search_radius_m,
+                timeout_s=policy.default_reacquire_timeout_s,
+            )
+        except (TypeError, ValueError, TaskPlanError) as exc:
+            raise PlanValidationError(
+                f"trusted default recovery policy is invalid: {exc}"
+            ) from exc
+
     def _compile_recovery(
         self,
         recovery: object,
@@ -822,20 +851,12 @@ class PlanValidator:
             raise PlanValidationError(
                 f"step {step_id} recovery attempts exceed planner limit"
             )
-        radius_value = getattr(
-            recovery,
-            "search_radius_m",
-            self.DEFAULT_RECOVERY_RADIUS_M,
-        )
-        timeout_value = getattr(
-            recovery,
-            "timeout_s",
-            self.DEFAULT_RECOVERY_TIMEOUT_S,
-        )
+        radius_value = getattr(recovery, "search_radius_m", None)
+        timeout_value = getattr(recovery, "timeout_s", None)
         if radius_value is None:
-            radius_value = self.DEFAULT_RECOVERY_RADIUS_M
+            radius_value = self.policy.default_reacquire_search_radius_m
         if timeout_value is None:
-            timeout_value = self.DEFAULT_RECOVERY_TIMEOUT_S
+            timeout_value = self.policy.default_reacquire_timeout_s
         radius = _finite_number(radius_value, "recovery.search_radius_m")
         timeout = _finite_number(timeout_value, "recovery.timeout_s")
         if not 3.0 <= radius <= 20.0:
@@ -863,8 +884,11 @@ class PlanValidator:
         # LandSkill locks the current XY; it does not navigate to the zone.
         if index == 1:
             zone = _landing_zone(context, zone_name)
-            landing_xy, _ground = self._trusted_landing_geometry(zone, world)
-            if _same_xy(world.initial_uav, landing_xy):
+            landing_xy, _ground, tolerance = self._trusted_landing_geometry(
+                zone,
+                world,
+            )
+            if _same_xy(world.initial_uav, landing_xy, tolerance):
                 return
             raise PlanValidationError(
                 "TAKEOFF -> LAND is only valid when initial XY is in that zone"

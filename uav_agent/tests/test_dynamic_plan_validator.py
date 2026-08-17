@@ -7,6 +7,7 @@ from math import pi
 import unittest
 
 from configs.schema import PlannerConfig
+from planner.policy import PlannerPolicy
 from planner.schemas import (
     LandingZoneSpec,
     NavigationPointSpec,
@@ -175,6 +176,54 @@ class DynamicPlanValidatorTests(unittest.TestCase):
         self.assertEqual(recovery.search_radius_m, 10.0)
         self.assertEqual(recovery.timeout_s, 30.0)
 
+    def test_lost_target_action_and_trusted_defaults_are_compiled(self) -> None:
+        base = [_takeoff(), _search()]
+        tail = [_goto("goto_home", "home"), _land()]
+
+        inherited = self.compile([*base, _track(), *tail])
+        inherited_recovery = inherited.task_plan.steps[2].recovery
+        self.assertIsNotNone(inherited_recovery)
+        self.assertEqual(inherited_recovery.max_attempts, 2)
+        self.assertTrue(
+            any(
+                "recovery injected from trusted default policy" in note
+                for note in inherited.compiler_notes
+            )
+        )
+
+        explicit_fail = _track()
+        explicit_fail["args"]["on_target_lost"] = "FAIL"
+        failed = self.compile([*base, explicit_fail, *tail])
+        self.assertIsNone(failed.task_plan.steps[2].recovery)
+        self.assertTrue(
+            any(
+                "recovery explicitly disabled by on_target_lost=FAIL" in note
+                for note in failed.compiler_notes
+            )
+        )
+
+        explicit_reacquire = _track()
+        explicit_reacquire["args"]["on_target_lost"] = "REACQUIRE"
+        enabled = self.compile([*base, explicit_reacquire, *tail])
+        self.assertEqual(enabled.task_plan.steps[2].recovery.max_attempts, 2)
+
+        legacy_zero = _track(recovery=_recovery(0))
+        deprecated = self.compile([*base, legacy_zero, *tail])
+        self.assertIsNone(deprecated.task_plan.steps[2].recovery)
+        self.assertTrue(
+            any("deprecated max_attempts=0" in note for note in deprecated.compiler_notes)
+        )
+
+    def test_compiled_land_uses_only_trusted_zone_geometry(self) -> None:
+        compiled = self.compile([_takeoff(), _goto("goto_home", "home"), _land()])
+        land = compiled.task_plan.steps[-1]
+        self.assertEqual(land.params["expected_position_xy"], (0.0, 0.0))
+        self.assertEqual(land.params["zone_tolerance_m"], 0.75)
+        self.assertNotIn("expected_position_xy", compiled.skill_plan_draft.steps[-1].args)
+        self.assertTrue(
+            any("trusted landing geometry attached" in note for note in compiled.compiler_notes)
+        )
+
     def test_navigation_only_plan_is_not_forced_to_search(self) -> None:
         compiled = self.compile(
             [
@@ -225,7 +274,7 @@ class DynamicPlanValidatorTests(unittest.TestCase):
                 "home": LandingZoneSpec("home", (1.0, 0.0), 0.0)
             },
         )
-        with self.assertRaisesRegex(PlanValidationError, "initial XY"):
+        with self.assertRaisesRegex(PlanValidationError, "LAND_GOTO_MISSING"):
             self.validator.validate_and_compile(
                 _draft([_takeoff(), _land()]),
                 moved_home,
@@ -294,10 +343,10 @@ class DynamicPlanValidatorTests(unittest.TestCase):
             _goto(f"goto_{index}", "checkpoint") for index in range(6)
         )
         too_many_gotos.extend([_goto("goto_home", "home"), _land()])
-        with self.assertRaisesRegex(PlanValidationError, "GOTO call count"):
+        with self.assertRaisesRegex(PlanValidationError, "GOTO_LIMIT_EXCEEDED"):
             self.compile(too_many_gotos)
 
-        with self.assertRaisesRegex(PlanValidationError, "SEARCH call count"):
+        with self.assertRaisesRegex(PlanValidationError, "SEARCH_LIMIT_EXCEEDED"):
             self.compile(
                 [
                     _takeoff(),
@@ -308,7 +357,7 @@ class DynamicPlanValidatorTests(unittest.TestCase):
                 ]
             )
 
-        with self.assertRaisesRegex(PlanValidationError, "TRACK call count"):
+        with self.assertRaisesRegex(PlanValidationError, "TRACK_LIMIT_EXCEEDED"):
             self.compile(
                 [
                     _takeoff(),
@@ -322,7 +371,8 @@ class DynamicPlanValidatorTests(unittest.TestCase):
             )
 
         budget_validator = PlanValidator(
-            PlannerLimits(max_total_reacquire_attempts=3)
+            PlannerLimits(max_total_reacquire_attempts=3),
+            PlannerPolicy(default_reacquire_max_attempts=1),
         )
         plan = _draft(
             [
@@ -334,7 +384,7 @@ class DynamicPlanValidatorTests(unittest.TestCase):
                 _land(),
             ]
         )
-        with self.assertRaisesRegex(PlanValidationError, "total REACQUIRE"):
+        with self.assertRaisesRegex(PlanValidationError, "RECOVERY_BUDGET_EXCEEDED"):
             budget_validator.validate_and_compile(
                 plan, self.context, source="dynamic_scripted"
             )
@@ -415,9 +465,9 @@ class DynamicPlanValidatorTests(unittest.TestCase):
         )
 
     def test_land_must_follow_goto_to_the_same_zone(self) -> None:
-        with self.assertRaisesRegex(PlanValidationError, "immediately preceded"):
+        with self.assertRaisesRegex(PlanValidationError, "LAND_ZONE_MISMATCH"):
             self.compile([_takeoff(), _goto("goto_search", "search_area"), _land()])
-        with self.assertRaisesRegex(PlanValidationError, "immediately preceded"):
+        with self.assertRaisesRegex(PlanValidationError, "LAND_ZONE_MISMATCH"):
             self.compile(
                 [
                     _takeoff(),

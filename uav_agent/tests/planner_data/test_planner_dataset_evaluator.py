@@ -21,6 +21,7 @@ from planner_data.evaluator import (
     load_planner_world_cases,
     planner_world_case_to_runtime_context,
 )
+from planner_data.dynamic_judge import build_gold_dynamic_draft
 from planner_data.renderers import world_case_to_runtime_context
 from planner_data.schemas import (
     PLANNER_DATASET_SCHEMA_VERSION,
@@ -150,6 +151,35 @@ def sample(index: int) -> PlannerDatasetSample:
     )
 
 
+def dynamic_plan_dict(index: int = 1) -> dict[str, object]:
+    """Return Gold semantics with deliberately non-Gold step identifiers."""
+
+    value = build_gold_dynamic_draft(sample(index).gold).to_dict()
+    replacements = {
+        "gold_takeoff": "lift",
+        "gold_goto_search": "approach",
+        "gold_search": "find_person",
+        "gold_track": "follow_person",
+        "gold_goto_land": "return_pad",
+        "gold_land": "touch_down",
+    }
+    for step in value["steps"]:
+        old_id = step["id"]
+        step["id"] = replacements[old_id]
+        if step["skill"] == "TRACK":
+            step["args"]["target_ref"] = "$find_person.target_id"
+    return value
+
+
+def dynamic_output(value: dict[str, object] | None = None) -> str:
+    return json.dumps(
+        value if value is not None else dynamic_plan_dict(),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+
+
 class PlannerDatasetEvaluatorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.ontology = TargetOntology.load_default()
@@ -168,6 +198,159 @@ class PlannerDatasetEvaluatorTest(unittest.TestCase):
             model_client=client,
             system_prompt_path=self.prompt,
         )
+
+    def dynamic_llm_evaluator(
+        self,
+        client: FakeModelClient,
+    ) -> PlannerDatasetEvaluator:
+        return PlannerDatasetEvaluator(
+            planner="dynamic_llm",
+            world_cases=self.worlds,
+            ontology=self.ontology,
+            model_client=client,
+        )
+
+    def test_dynamic_scripted_gold_has_perfect_layered_metrics(self) -> None:
+        evaluator = PlannerDatasetEvaluator(
+            planner="dynamic_scripted",
+            world_cases=self.worlds,
+            ontology=self.ontology,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            run = evaluator.evaluate((sample(1), sample(2)), output_root=temporary)
+            with (run.run_dir / "field_metrics.csv").open(
+                "r", encoding="utf-8", newline=""
+            ) as stream:
+                field_names = {row["field"] for row in csv.DictReader(stream)}
+
+        self.assertEqual(run.summary["num_samples"], 2)
+        self.assertEqual(run.summary["final_schema_valid_rate"], 1.0)
+        self.assertEqual(run.summary["final_catalog_valid_rate"], 1.0)
+        self.assertEqual(run.summary["final_symbolic_valid_rate"], 1.0)
+        self.assertEqual(run.summary["final_compile_success_rate"], 1.0)
+        self.assertEqual(run.summary["semantic_match_rate"], 1.0)
+        self.assertEqual(run.summary["minimal_plan_match_rate"], 1.0)
+        self.assertTrue(all(row["model_calls"] == 0 for row in run.predictions))
+        self.assertIn("skill_sequence", field_names)
+        self.assertIn("lost_target_policy", field_names)
+
+    def test_dynamic_step_ids_are_canonicalized_by_semantics(self) -> None:
+        client = FakeModelClient([dynamic_output()])
+        evaluator = self.dynamic_llm_evaluator(client)
+        with tempfile.TemporaryDirectory() as temporary:
+            run = evaluator.evaluate((sample(1),), output_root=temporary)
+
+        self.assertEqual(run.summary["semantic_match_rate"], 1.0)
+        self.assertEqual(run.summary["minimal_plan_match_rate"], 1.0)
+        self.assertEqual(run.summary["final_compile_success_rate"], 1.0)
+        self.assertIsNotNone(client.options[0].response_format)
+
+    def test_dynamic_llm_records_initial_symbolic_error_and_repair(self) -> None:
+        broken = dynamic_plan_dict()
+        del broken["steps"][-2]
+        client = FakeModelClient([dynamic_output(broken), dynamic_output()])
+        evaluator = self.dynamic_llm_evaluator(client)
+        with tempfile.TemporaryDirectory() as temporary:
+            run = evaluator.evaluate((sample(1),), output_root=temporary)
+
+        record = run.predictions[0]
+        self.assertTrue(record["initial_schema_valid"])
+        self.assertFalse(record["initial_symbolic_valid"])
+        self.assertFalse(record["initial_compile_success"])
+        self.assertEqual(record["initial_error_code"], "LAND_GOTO_MISSING")
+        self.assertTrue(record["final_symbolic_valid"])
+        self.assertTrue(record["final_compile_success"])
+        self.assertEqual(record["model_calls"], 2)
+        self.assertTrue(record["repair_requested"])
+        self.assertTrue(record["repair_succeeded"])
+        self.assertEqual(run.summary["repair_request_rate"], 1.0)
+        self.assertEqual(run.summary["repair_success_rate"], 1.0)
+
+    def test_dynamic_missing_return_goto_is_symbolically_invalid(self) -> None:
+        broken = dynamic_plan_dict()
+        del broken["steps"][-2]
+        raw = dynamic_output(broken)
+        client = FakeModelClient([raw, raw])
+        evaluator = self.dynamic_llm_evaluator(client)
+        with tempfile.TemporaryDirectory() as temporary:
+            run = evaluator.evaluate((sample(1),), output_root=temporary)
+            with (run.run_dir / "errors.csv").open(
+                "r", encoding="utf-8", newline=""
+            ) as stream:
+                errors = {row["error_code"] for row in csv.DictReader(stream)}
+
+        record = run.predictions[0]
+        self.assertFalse(record["final_symbolic_valid"])
+        self.assertFalse(record["final_compile_success"])
+        self.assertEqual(record["final_error_code"], "LAND_GOTO_MISSING")
+        self.assertEqual(run.summary["final_symbolic_valid_rate"], 0.0)
+        self.assertIn("LAND_GOTO_MISSING", errors)
+
+    def test_dynamic_extra_track_reduces_only_minimal_plan_metric(self) -> None:
+        value = dynamic_plan_dict()
+        extra = {
+            "id": "follow_again",
+            "skill": "TRACK",
+            "args": {
+                "target_ref": "$find_person.target_id",
+                "duration_s": 30.0,
+            },
+        }
+        value["steps"].insert(-2, extra)
+        client = FakeModelClient([dynamic_output(value)])
+        evaluator = self.dynamic_llm_evaluator(client)
+        with tempfile.TemporaryDirectory() as temporary:
+            run = evaluator.evaluate((sample(1),), output_root=temporary)
+
+        self.assertEqual(run.summary["semantic_match_rate"], 1.0)
+        self.assertEqual(run.summary["minimal_plan_match_rate"], 0.0)
+        self.assertTrue(run.predictions[0]["final_compile_success"])
+
+    def test_dynamic_default_recovery_is_semantically_neutral(self) -> None:
+        evaluator = PlannerDatasetEvaluator(
+            planner="dynamic_scripted",
+            world_cases=self.worlds,
+            ontology=self.ontology,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            run = evaluator.evaluate((sample(1),), output_root=temporary)
+
+        self.assertEqual(run.summary["semantic_match_rate"], 1.0)
+        self.assertEqual(run.summary["default_recovery_injected_rate"], 1.0)
+
+    def test_dynamic_explicit_fail_is_reported_separately(self) -> None:
+        value = dynamic_plan_dict()
+        value["steps"][3]["args"]["on_target_lost"] = "FAIL"
+        client = FakeModelClient([dynamic_output(value)])
+        evaluator = self.dynamic_llm_evaluator(client)
+        with tempfile.TemporaryDirectory() as temporary:
+            run = evaluator.evaluate((sample(1),), output_root=temporary)
+
+        self.assertEqual(run.summary["semantic_match_rate"], 1.0)
+        self.assertEqual(run.summary["explicit_fail_rate"], 1.0)
+        self.assertEqual(run.summary["default_recovery_injected_rate"], 0.0)
+        self.assertTrue(run.predictions[0]["explicit_fail"])
+
+    def test_dynamic_resume_skips_completed_ids(self) -> None:
+        evaluator = PlannerDatasetEvaluator(
+            planner="dynamic_scripted",
+            world_cases=self.worlds,
+            ontology=self.ontology,
+        )
+        samples = (sample(1), sample(2))
+        with tempfile.TemporaryDirectory() as temporary:
+            first = evaluator.evaluate(
+                samples,
+                run_dir=Path(temporary) / "dynamic-resume",
+                limit=1,
+            )
+            resumed = evaluator.evaluate(
+                samples,
+                run_dir=first.run_dir,
+                resume=True,
+            )
+        self.assertEqual(resumed.summary["num_samples"], 2)
+        self.assertEqual(resumed.summary["final_compile_success_rate"], 1.0)
 
     def test_scripted_gold_is_exact_and_semantic_100_percent(self) -> None:
         evaluator = PlannerDatasetEvaluator(

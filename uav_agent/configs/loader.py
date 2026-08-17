@@ -347,7 +347,7 @@ def load_config(path: str | Path) -> AppConfig:
         planner_raw = _mapping(planner_raw_value, "planner")
         if any(not isinstance(key, str) for key in planner_raw):
             raise ConfigError("planner keys must be strings")
-        expected_planner_keys = {
+        required_planner_keys = {
             "max_plan_steps",
             "max_goto_calls",
             "max_search_calls",
@@ -357,13 +357,23 @@ def load_config(path: str | Path) -> AppConfig:
             "min_track_duration_s",
             "max_track_duration_s",
         }
+        policy_planner_keys = {
+            "default_on_target_lost",
+            "default_reacquire_max_attempts",
+            "default_reacquire_search_radius_m",
+            "default_reacquire_timeout_s",
+        }
+        expected_planner_keys = required_planner_keys | policy_planner_keys
         unknown_planner_keys = sorted(set(planner_raw) - expected_planner_keys)
         if unknown_planner_keys:
             raise ConfigError(
                 "planner contains unknown keys: "
                 + ", ".join(str(key) for key in unknown_planner_keys)
             )
-        missing_planner_keys = sorted(expected_planner_keys - set(planner_raw))
+        # Policy fields were added after the original dynamic planner limits.
+        # Old public configs that contain the limit block therefore inherit
+        # the new trusted policy defaults rather than becoming unreadable.
+        missing_planner_keys = sorted(required_planner_keys - set(planner_raw))
         if missing_planner_keys:
             raise ConfigError(
                 "planner is missing required keys: "
@@ -398,6 +408,31 @@ def load_config(path: str | Path) -> AppConfig:
                 max_track_duration_s=_positive_number(
                     planner_raw["max_track_duration_s"],
                     "planner.max_track_duration_s",
+                ),
+                default_on_target_lost=planner_raw.get(
+                    "default_on_target_lost",
+                    _DEFAULT_PLANNER_CONFIG.default_on_target_lost,
+                ),
+                default_reacquire_max_attempts=_positive_integer(
+                    planner_raw.get(
+                        "default_reacquire_max_attempts",
+                        _DEFAULT_PLANNER_CONFIG.default_reacquire_max_attempts,
+                    ),
+                    "planner.default_reacquire_max_attempts",
+                ),
+                default_reacquire_search_radius_m=_positive_number(
+                    planner_raw.get(
+                        "default_reacquire_search_radius_m",
+                        _DEFAULT_PLANNER_CONFIG.default_reacquire_search_radius_m,
+                    ),
+                    "planner.default_reacquire_search_radius_m",
+                ),
+                default_reacquire_timeout_s=_positive_number(
+                    planner_raw.get(
+                        "default_reacquire_timeout_s",
+                        _DEFAULT_PLANNER_CONFIG.default_reacquire_timeout_s,
+                    ),
+                    "planner.default_reacquire_timeout_s",
                 ),
             )
         except (TypeError, ValueError) as exc:

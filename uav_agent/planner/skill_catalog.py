@@ -26,6 +26,7 @@ _MODEL_VISIBLE_ARGUMENTS: dict[str, frozenset[str]] = {
             "duration_s",
             "desired_altitude_m",
             "desired_distance_m",
+            "on_target_lost",
         }
     ),
     "REACQUIRE": frozenset(
@@ -400,7 +401,11 @@ def build_default_skill_catalog() -> SkillCatalog:
             ),
             SkillContract(
                 name="TRACK",
-                description="跟踪由先前 SEARCH 输出引用的目标。",
+                description=(
+                    "跟踪先前 SEARCH 输出的目标。目标丢失时，省略 "
+                    "on_target_lost 将继承 trusted_planner_policy 的默认动作；"
+                    "用户明确要求不重新搜索、丢失即失败时使用 FAIL。"
+                ),
                 top_level_allowed=True,
                 recovery_only=False,
                 arguments=(
@@ -422,6 +427,13 @@ def build_default_skill_catalog() -> SkillCatalog:
                         "number",
                         required=False,
                     ),
+                    _argument(
+                        "on_target_lost",
+                        "目标丢失动作；省略时继承可信 Planner Policy。",
+                        "string",
+                        required=False,
+                        allowed_values=("REACQUIRE", "FAIL"),
+                    ),
                 ),
                 preconditions=("a prior SEARCH target reference is available",),
                 outputs=("track_complete", "last_seen_state_on_loss"),
@@ -436,7 +448,7 @@ def build_default_skill_catalog() -> SkillCatalog:
                         "max_attempts",
                         "该 TRACK 的最大恢复尝试次数。",
                         "integer",
-                        minimum=0,
+                        minimum=1,
                         maximum=2,
                     ),
                     _argument(

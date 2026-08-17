@@ -54,7 +54,16 @@ _ALLOWED_COMPILED_PARAMS: Mapping[SkillName, frozenset[str]] = {
         }
     ),
     SkillName.LAND: frozenset(
-        {"ground_altitude", "tolerance", "descent_speed", "yaw_mode", "yaw_value", "timeout"}
+        {
+            "ground_altitude",
+            "tolerance",
+            "descent_speed",
+            "yaw_mode",
+            "yaw_value",
+            "timeout",
+            "expected_position_xy",
+            "zone_tolerance_m",
+        }
     ),
 }
 
@@ -538,8 +547,21 @@ class SafetySupervisor:
             _validate_optional_positive_fields(
                 params,
                 prefix,
-                ("tolerance", "descent_speed"),
+                ("tolerance", "descent_speed", "zone_tolerance_m"),
             )
+            expected_xy = params.get("expected_position_xy")
+            if expected_xy is not None:
+                expected_x, expected_y = _finite_vector2(
+                    expected_xy,
+                    f"{prefix} expected_position_xy",
+                )
+                if not (
+                    self._scene_min[0] <= expected_x <= self._scene_max[0]
+                    and self._scene_min[1] <= expected_y <= self._scene_max[1]
+                ):
+                    raise ValueError(
+                        f"{prefix} expected_position_xy is outside scene XY bounds"
+                    )
             _validate_vertical_yaw(params, prefix)
 
     def _require_flight_altitude(self, altitude: float, name: str) -> None:
@@ -742,6 +764,19 @@ def _validate_finite_tree(
             ancestors.remove(identity)
         return
     raise TypeError(f"{name} contains unsupported value type {type(value).__name__}")
+
+
+def _finite_vector2(value: object, name: str) -> tuple[float, float]:
+    if (
+        isinstance(value, (str, bytes, bytearray, Mapping))
+        or not isinstance(value, Sequence)
+        or len(value) != 2
+    ):
+        raise ValueError(f"{name} must contain exactly two finite numbers")
+    return (
+        _finite_number(value[0], f"{name}[0]"),
+        _finite_number(value[1], f"{name}[1]"),
+    )
 
 
 def _finite_vector3(value: object, name: str) -> tuple[float, float, float]:

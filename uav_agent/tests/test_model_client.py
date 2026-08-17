@@ -5,12 +5,14 @@ import math
 import os
 import socket
 import unittest
+from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 from urllib import error as urllib_error
 
 from models.base import (
     ChatMessage,
     GenerationOptions,
+    JsonSchemaResponseFormat,
     ModelConnectionError,
     ModelHTTPError,
     ModelProtocolError,
@@ -118,6 +120,60 @@ class ModelSchemaTest(unittest.TestCase):
             ):
                 GenerationOptions(**values)
 
+    def test_json_schema_response_format_is_validated_and_defensive(self) -> None:
+        source = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+        }
+        response_format = JsonSchemaResponseFormat("safe-name_1", source)
+        source["properties"]["answer"]["type"] = "number"
+        source["required"].append("later")
+
+        first = response_format.to_dict()
+        self.assertEqual(first["schema"]["properties"]["answer"]["type"], "string")
+        self.assertEqual(first["schema"]["required"], ["answer"])
+
+        first["schema"]["properties"]["answer"]["type"] = "boolean"
+        self.assertEqual(
+            response_format.to_dict()["schema"]["properties"]["answer"]["type"],
+            "string",
+        )
+        with self.assertRaises(TypeError):
+            response_format.schema["type"] = "array"  # type: ignore[index]
+        with self.assertRaises(FrozenInstanceError):
+            response_format.name = "changed"  # type: ignore[misc]
+
+    def test_json_schema_response_format_rejects_invalid_inputs(self) -> None:
+        for name in ("", "with space", "unsafe/slash", "中文"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                JsonSchemaResponseFormat(name, {})
+        with self.assertRaises(TypeError):
+            JsonSchemaResponseFormat(1, {})  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            JsonSchemaResponseFormat("schema", [])  # type: ignore[arg-type]
+
+        invalid_schemas = (
+            {1: "not a string key"},
+            {"nested": {2: "not a string key"}},
+            {"value": math.nan},
+            {"value": math.inf},
+            {"value": object()},
+        )
+        for schema in invalid_schemas:
+            with self.subTest(schema=schema), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                JsonSchemaResponseFormat("schema", schema)
+
+        circular: dict[str, object] = {}
+        circular["self"] = circular
+        with self.assertRaisesRegex(ValueError, "circular"):
+            JsonSchemaResponseFormat("schema", circular)
+
+        with self.assertRaises(TypeError):
+            GenerationOptions(response_format={})  # type: ignore[arg-type]
+
 
 class OpenAICompatibleClientTest(unittest.TestCase):
     def make_client(
@@ -181,6 +237,64 @@ class OpenAICompatibleClientTest(unittest.TestCase):
         self.assertEqual(body["temperature"], 0.2)
         self.assertEqual(body["max_tokens"], 16)
         self.assertEqual(body["top_p"], 0.8)
+        self.assertNotIn("response_format", body)
+
+    def test_chat_completion_sends_json_schema_response_format(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        }
+        response_format = JsonSchemaResponseFormat("answer_schema", schema)
+        transport = QueueTransport(FakeResponse(chat_payload()))
+
+        self.make_client(transport).chat(
+            [ChatMessage("user", "answer")],
+            options=GenerationOptions(response_format=response_format),
+        )
+
+        request, _ = transport.calls[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(
+            body["response_format"],
+            {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer_schema",
+                    "schema": schema,
+                },
+            },
+        )
+        self.assertNotIn("guided_json", body)
+        self.assertNotIn("guided_decoding", body)
+
+    def test_structured_output_http_400_has_no_unconstrained_fallback(self) -> None:
+        api_key = "structured-secret-key"
+        transport = QueueTransport(
+            http_error(400),
+            FakeResponse(chat_payload("unexpected fallback")),
+        )
+        options = GenerationOptions(
+            response_format=JsonSchemaResponseFormat(
+                "answer",
+                {"type": "object", "additionalProperties": False},
+            )
+        )
+
+        with self.assertRaises(ModelHTTPError) as raised:
+            self.make_client(
+                transport,
+                api_key=api_key,
+                max_retries=3,
+            ).chat([ChatMessage("user", "answer")], options=options)
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.attempts, 1)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertNotIn(api_key, str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
 
     def test_chat_request_escapes_lone_surrogate_code_points(self) -> None:
         transport = QueueTransport(FakeResponse(chat_payload()))

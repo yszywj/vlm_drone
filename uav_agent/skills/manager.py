@@ -51,6 +51,7 @@ class ExecutionKind(str, Enum):
 
     PLANNED = "PLANNED"
     RECOVERY = "RECOVERY"
+    EMERGENCY = "EMERGENCY"
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,14 +496,26 @@ class SkillManager:
                 )
             else:
                 self._task_failure_result = self._task_failure_result or result
-                self._finish_task(
-                    TaskStatus.FAILED,
-                    old_name,
-                    old_status,
-                    result.code,
-                    "landing_failed",
-                    old_step_id=old_step_id,
-                )
+                if old_kind is ExecutionKind.PLANNED:
+                    self._pending_task_result = TaskStatus.FAILED
+                    self._start_emergency_landing(
+                        old_name,
+                        old_status,
+                        result,
+                        "planned_landing_failed",
+                        old_step_id=old_step_id,
+                    )
+                else:
+                    # An emergency LAND is the single terminal fallback.  It
+                    # must never recurse into another landing attempt.
+                    self._finish_task(
+                        TaskStatus.FAILED,
+                        old_name,
+                        old_status,
+                        result.code,
+                        "emergency_landing_failed",
+                        old_step_id=old_step_id,
+                    )
             return
 
         if old_status is SkillStatus.CANCELED:
@@ -902,9 +915,28 @@ class SkillManager:
             )
             return
 
+        self._start_emergency_landing(
+            old_name,
+            old_status,
+            result,
+            reason,
+            old_step_id=old_step_id,
+            recovery_attempt=recovery_attempt,
+        )
+
+    def _start_emergency_landing(
+        self,
+        old_name: SkillName | None,
+        old_status: SkillStatus | None,
+        result: SkillResult | None,
+        reason: str,
+        *,
+        old_step_id: str | None,
+        recovery_attempt: int | None = None,
+    ) -> None:
         land_step = self._planned_land_step()
         new_step_id = None if land_step is None else land_step.step_id
-        land_goal = self._planned_land_goal(land_step)
+        land_goal = self._emergency_land_goal(land_step)
         if self._task_plan is not None and land_step is not None:
             self._plan_index = self._task_plan.steps.index(land_step)
         self._start_transition(
@@ -916,7 +948,7 @@ class SkillManager:
             reason,
             old_step_id=old_step_id,
             new_step_id=new_step_id,
-            execution_kind=ExecutionKind.PLANNED,
+            execution_kind=ExecutionKind.EMERGENCY,
             recovery_attempt=recovery_attempt,
         )
 
@@ -1038,6 +1070,12 @@ class SkillManager:
                 pass
         return LandGoal()
 
+    def _emergency_land_goal(self, step: TaskStep | None) -> LandGoal:
+        """Copy trusted LAND dynamics but remove named-zone enforcement."""
+
+        planned = self._planned_land_goal(step)
+        return replace(planned, expected_position_xy=None)
+
     def _land_completion_status(self, step_id: str | None) -> TaskStatus:
         if self._task_plan is None or self._plan_index is None or step_id is None:
             return TaskStatus.FAILED
@@ -1077,6 +1115,7 @@ class SkillManager:
             "look_at_point",
             "last_seen_position",
             "last_seen_velocity",
+            "expected_position_xy",
         } & params.keys():
             if isinstance(params[key], list):
                 params[key] = tuple(params[key])

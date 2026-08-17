@@ -108,7 +108,7 @@ Oracle-backed Ideal Skills     # SEARCH / TRACK / REACQUIRE 使用 evaluator tru
 
 旧的 `scripted` / `llm` 模式保持不变：Planner 输出严格五字段 `MissionIntent`，可信编译器生成固定六步 baseline。新增的 `dynamic_scripted` / `dynamic_llm` 显式启用受约束动态规划：Planner 输出 2～10 步的 `SkillPlanDraft`，可以按指令省略 SEARCH/TRACK、有限重复 GOTO/TRACK，并为 TRACK 选择是否启用有界 REACQUIRE。两条路径都只在 `MissionAgent.start()` 规划一次；仿真 tick 不调用模型，也没有运行时 LLM replanning。
 
-动态模式不会把飞控交给 Qwen。模型只看到 Skill Catalog、调用上限、具名区域/降落区/导航点及文字描述，并只能填写高层参数；它看不到这些名称背后的坐标、搜索中心/半径、目标 spawn/真值、图像、速度向量、实际 max speed 或普通 Skill timeout。`PlanValidator` 才负责把名称解析为可信世界坐标、补充 motion policy/timeout/速度上限、检查引用与计划状态，并拒绝缺失 TAKEOFF/LAND、越界高度或非法顺序，而不是静默补步骤。
+动态模式不会把飞控交给 Qwen。模型只看到场景总边界、默认高度/时长、Skill Catalog、调用上限、具名区域/降落区/导航点及文字描述，并只能填写高层参数；它看不到这些名称背后的具体坐标、搜索中心/半径、目标 spawn/真值、图像、速度向量、实际 max speed 或普通 Skill timeout。`PlanValidator` 才负责把名称解析为可信世界坐标、补充 motion policy/timeout/速度上限、检查引用与计划状态，并拒绝缺失 TAKEOFF/LAND、越界高度或非法顺序，而不是静默补步骤。
 
 WorldContext 的 `search_area` 只从配置中的 `target.initial_region`、`search.radius_m` 和任务起飞高度构造，`home` 只取配置的 UAV 初始 XY 与地面高度。它不包含本次随机 Target spawn 坐标、Target 速度、`EvaluatorFrame` 或 Oracle Observation。`--debug-ground-truth` 仅允许把真值打印给人工调试/evaluator，不会把它加入 instruction、Planner prompt 或 GOTO 目标。
 
@@ -522,13 +522,13 @@ while manager.task_status.name == "RUNNING":
         manager.tick(observation)
 ```
 
-`TaskStatus` 独立于 `SkillStatus`。Manager 按 step id 保存 SEARCH 输出，并在启动 TRACK 时解析结构化 `StepOutputRef`；旧 `$SEARCH.result.target_id` 仍只作为 baseline 兼容形式。TRACK 返回 `TARGET_LOST` 时，仅在该步显式启用且尚未耗尽 `RecoveryPolicy.max_attempts` 时启动内部 REACQUIRE；成功后回到同一 TRACK，失败或次数耗尽则 fail-safe LAND。恢复不是顶层计划步骤，也不会形成无限循环。任何 Skill 失败、引用解析失败、取消或意外提前结束都保持安全降落语义；每个外部 observation 最多 tick 一个 Skill。
+`TaskStatus` 独立于 `SkillStatus`。Manager 按 step id 保存 SEARCH 输出，并在启动 TRACK 时解析结构化 `StepOutputRef`；旧 `$SEARCH.result.target_id` 仍只作为 baseline 兼容形式。动态计划的 TRACK 返回 `TARGET_LOST` 时，Manager 只执行 Compiler 已经附着的 `RecoveryPolicy`：非空且预算未耗尽才启动内部 REACQUIRE，成功后回到同一 TRACK；为 `None` 时直接进入任务失败和 emergency LAND。恢复不是顶层计划步骤，也不会形成无限循环。任何 Skill 失败、引用解析失败、取消或意外提前结束都保持安全降落语义；每个外部 observation 最多 tick 一个 Skill。
 
 ### Legacy MissionIntent 与动态 SkillPlanDraft
 
 `planner.schemas` 定义不可变的 `MissionIntent`、具名 `SearchRegionSpec` / `LandingZoneSpec` 和只读 `PlannerWorldContext`。高层意图只包含目标描述、区域名、跟踪时长、降落区名和可选起飞高度，不允许携带 Target/Oracle 坐标，也不包含低层 timeout 或控制参数。`MissionIntent.from_dict()` 对未知字段、缺失字段、bool、NaN 和 Inf 严格报错。
 
-`ScriptedPlanner` / `LLMPlanner` 继续返回 `MissionIntent` 并走固定模板。`ScriptedDynamicPlanner` / `DynamicLLMPlanner` 返回严格 `SkillPlanDraft`：对象拒绝未知字段、重复 step id、bool 数字、NaN/Inf、未知 Skill/参数、前向或非 SEARCH 引用；LLM 首次格式错误时最多修复一次，temperature 固定为 0。动态 `source` 为 `dynamic_scripted` 或 `dynamic_llm`。
+`ScriptedPlanner` / `LLMPlanner` 继续返回 `MissionIntent` 并走固定模板。`ScriptedDynamicPlanner` / `DynamicLLMPlanner` 返回严格 `SkillPlanDraft`：对象拒绝未知字段、重复 step id、bool 数字、NaN/Inf、未知 Skill/参数、前向或非 SEARCH 引用；LLM 首次输出不合法时最多修复一次，temperature 固定为 0。动态 `source` 为 `dynamic_scripted` 或 `dynamic_llm`。
 
 `SkillPlanDraft` 是模型唯一允许输出的动态协议；其中只保留具名地点、高层语义参数和前序 SEARCH 输出引用，不含解析后的坐标、速度或普通 Skill timeout。例如导航任务可以省略 SEARCH/TRACK：
 
@@ -544,11 +544,23 @@ while manager.task_status.name == "RUNNING":
 }
 ```
 
-需要跟踪时，`TRACK.args.target_ref` 只能写成 `$<先前SEARCH步骤id>.target_id`。`REACQUIRE` 不占顶层步骤，只能附着在 TRACK 的 `recovery` 中，并由 `max_attempts` 和全局恢复预算共同限制。
+需要跟踪时，`TRACK.args.target_ref` 只能写成 `$<先前SEARCH步骤id>.target_id`。`REACQUIRE` 不占顶层步骤，只能附着在 TRACK 的 `recovery` 中，并由 `max_attempts` 和全局恢复预算共同限制。TRACK 还可用 `on_target_lost` 表达 `REACQUIRE` 或 `FAIL`；未写该字段时继承可信 `PlannerPolicy`，默认是 `REACQUIRE`。显式 `FAIL` 禁止同时携带 `recovery`，编译结果不含恢复策略；它表示目标丢失后任务失败并原地紧急降落，不表示条件式返航。当前协议没有实现 `RETURN_HOME`、无目标继续执行或运行时询问 LLM。
 
-Skill Catalog 是模型可见的功能标签白名单，当前只注册已实现的 TAKEOFF/GOTO/SEARCH/TRACK/REACQUIRE/LAND。REACQUIRE 标记为 recovery-only。默认可信限制为最多 10 个顶层步骤、5 次 GOTO、1 次 SEARCH、2 次 TRACK、每个 TRACK 最多 2 次恢复、总计最多 4 次恢复，TRACK duration 为 1～600 s；可在 `configs/default.yaml` 的 `planner` 段收紧。v1 仍是单目标、有限线性计划，不支持分支图、多目标或运行时 LLM 重规划。
+Skill Catalog 是模型可见的功能标签白名单，当前只注册已实现的 TAKEOFF/GOTO/SEARCH/TRACK/REACQUIRE/LAND。REACQUIRE 标记为 recovery-only。默认可信限制为最多 10 个顶层步骤、5 次 GOTO、1 次 SEARCH、2 次 TRACK、每个 TRACK 最多 2 次恢复、总计最多 4 次恢复，TRACK duration 为 1～600 s；可在 `configs/default.yaml` 的 `planner` 段收紧。`PlannerPolicy` 另行保存默认目标丢失动作及可信的恢复次数、半径和 timeout。模型可以选择允许的动作或给出有界覆盖，但不能修改这些边界。v1 仍是单目标、有限线性计划，不支持分支图、多目标或运行时 LLM 重规划。
 
-主流程失败不会立即让程序把 UAV 留在空中。TAKEOFF、GOTO、SEARCH、TRACK 或 REACQUIRE 失败时，Manager 先把 `pending_task_result` 设为 `FAILED`，随后执行 LAND；LAND_COMPLETE 后才提交最终 Task `FAILED`。TRACK_COMPLETE 同样先设置待定 `SUCCEEDED`，完成 LAND 后才提交 Task `SUCCEEDED`；LAND 自身失败则直接 Task `FAILED`。`transition_log` 为每次切换保存 simulation timestamp、旧 Skill/status、ResultCode、新 Skill 和 reason。
+### Structured output、符号检查与可信编译
+
+`DynamicLLMPlanner` 的首次生成和唯一一次 repair 都使用同一份 `SkillPlanDraft` JSON Schema structured output。请求通过 OpenAI-compatible `response_format.type=json_schema` 发送；若服务端不支持并返回错误，客户端会明确失败，不会静默降级为自由文本。Schema 用 `oneOf` 区分五种顶层 Skill，只暴露 world context 中的具名区域、降落区和导航点枚举，不包含这些名称背后的坐标，也不包含 Oracle 数据、速度或底层控制参数。受约束生成之后仍执行严格 JSON、duplicate key、有限数值、dataclass 和 Catalog 校验，不能把 JSON Schema 当作唯一信任边界。
+
+跨步骤规则集中由共享 `SymbolicPlanChecker` 检查，包括 TAKEOFF/LAND 位置与次数、LAND 前匹配的 GOTO、调用预算、TRACK 引用、顶层 REACQUIRE 禁止项，以及 `FAIL` 与 recovery 的冲突。`DynamicLLMPlanner` 用稳定的 `PlanIssueCode` 生成结构化 repair 请求，`PlanValidator` 在可信编译前复用同一个 Checker；后者仍独占具名地点到坐标、速度/timeout、安全参数、默认 recovery 和正常 LAND 几何的编译权。`SafetySupervisor` 随后独立检查编译后的 `TaskPlan`，属于不同的运行时安全边界。
+
+恢复策略在 dynamic 与 legacy 路径上的边界不同：dynamic Compiler 按 `on_target_lost`、显式 recovery、`PlannerPolicy` 的优先级生成最终 `TaskStep.recovery`，Manager 不再猜测默认策略；旧 `MissionIntent` 模板和历史 placeholder 继续保留原有恢复 fallback，以免破坏兼容入口。显式 `REACQUIRE` 可以使用可信默认值或有界覆盖，省略动作则继承 policy；旧手写 draft 仅提供 recovery 时按 REACQUIRE 兼容，`max_attempts=0` 仅作为弃用的禁用写法接受。Compiler notes 会说明恢复来自可信默认、显式有界启用或显式关闭。
+
+正常计划 LAND 与 emergency LAND 具有不同语义。Compiler 从可信 `LandingZoneSpec` 为正常 LAND 附加 `expected_position_xy` 和 `zone_tolerance_m`；这些字段不由 Qwen 输出。`LandSkill` 启动和下降期间都检查实际 XY 是否仍在容差内，通过后锁定当前 XY 垂直下降，而不会把 LAND 当作第二个 GOTO。前置 Skill 失败或取消时，Manager 创建 `expected_position_xy=None` 的 emergency LAND，在当前位置下降，不受 home XY 检查约束；其成功只完成 fail-safe termination，最终任务状态仍为原先的 `FAILED` 或 `CANCELED`。若正常计划 LAND 的区域检查失败，只允许再尝试一次 emergency LAND；紧急降落自身失败后直接结束，禁止递归 LAND 重试。
+
+Planner 可通过 `plan_with_diagnostics()` 返回输出及不含原始模型文本的诊断。`run_planner_demo.py` 的文本和 `--json-output` 模式均报告 `model_calls`、`repair_used`、`repair_succeeded`、`initial_output_valid`、`final_output_valid`、`initial_error_code`、`initial_error_message` 与 `structured_output_enabled`。首轮成功的 LLM 调用数为 1，repair 路径为 2；scripted 模式为 0 且不启用 structured output。错误码区分 `INVALID_JSON`、`SCHEMA_INVALID`、`CATALOG_CONTRACT_VIOLATION` 和稳定的符号问题码，失败输出也只保留脱敏诊断，不默认保存或打印完整首轮响应。
+
+主流程失败不会立即让程序把 UAV 留在空中。TAKEOFF、GOTO、SEARCH、TRACK 或 REACQUIRE 失败时，Manager 先把 `pending_task_result` 设为 `FAILED`，随后执行 emergency LAND；LAND_COMPLETE 后才提交最终 Task `FAILED`。TRACK_COMPLETE 同样先设置待定 `SUCCEEDED`，正常计划 LAND 完成后才提交 Task `SUCCEEDED`。正常 LAND 失败可降级为一次 emergency LAND，emergency LAND 再失败则直接 Task `FAILED`。`transition_log` 为每次切换保存 simulation timestamp、旧 Skill/status、ResultCode、新 Skill 和 reason。
 
 `cancel_task()` 采用相同安全策略：非 LAND Skill 会被取消并切换到 LAND；若已经在下降，则不会中断 LAND。此时已有 `FAILED` 保持最高优先级，否则把待提交结果改为 `CANCELED`。
 
@@ -630,7 +642,7 @@ datasets/planner_v1/
 └── _candidates/                 # 可选、未审核且被忽略
 ```
 
-先用 scripted evaluator 自检 evaluator 和 Gold judge；它不调用模型，所有有效 split 的 exact/semantic match 都应为 100%：
+Evaluator 提供四种模式：`scripted`、`llm` 保留 MissionIntent baseline；`dynamic_scripted`、`dynamic_llm` 评测受约束 SkillPlanDraft。先用 scripted evaluator 自检 evaluator 和 Gold judge；它不调用模型，所有有效 split 的 exact/semantic match 都应为 100%：
 
 ```bash
 ./python.sh scripts/evaluate_planner_dataset.py \
@@ -647,6 +659,30 @@ for split in train validation test_iid test_compositional test_language test_rob
     --output-root ../outputs/planner_eval
 done
 ```
+
+`dynamic_scripted` 从同一份 Planner v1 Gold 确定性构造标准 dynamic draft，用来验证动态 evaluator 自身，不需要另建或改写数据集；`dynamic_llm` 则调用生产 `DynamicLLMPlanner`。动态判定会 canonicalize step id，并把 draft 投影成 instruction-grounded 语义，因此语义相同但 step id 不同不会误判，可信默认 REACQUIRE 是否由模型显式写出也不影响旧 Gold 的 semantic match。额外的无任务依据 SEARCH、TRACK 或绕行 GOTO 会单独降低 `minimal_plan_match`。
+
+```bash
+# 纯 Python 的确定性动态 evaluator
+./python.sh scripts/evaluate_planner_dataset.py \
+  --dataset-root ../datasets/planner_v1 \
+  --split test_iid \
+  --planner dynamic_scripted \
+  --output-root ../outputs/planner_eval
+
+# 已在独立进程启动 Qwen 服务后再运行；本命令不会启动 Isaac Sim
+./python.sh scripts/evaluate_planner_dataset.py \
+  --dataset-root ../datasets/planner_v1 \
+  --split test_iid \
+  --planner dynamic_llm \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen3-VL-4B-Instruct \
+  --api-key EMPTY \
+  --output-root ../outputs/planner_eval \
+  --limit 20
+```
+
+动态 evaluator 对首轮和最终输出分别记录 `schema_valid`、`catalog_valid`、`symbolic_valid`、`compile_success`，并报告 `semantic_match` 与 `minimal_plan_match`。汇总还包含初次/最终 schema、symbolic 和 compile 成功率、repair request/success、平均模型调用数与延迟、默认 recovery 注入率和显式 FAIL 比例；`errors.csv` 使用稳定错误码，`field_metrics.csv` 增加 Skill sequence 与 lost-target policy 统计。动态 LLM 模式同时验证最多两次 chat、所有调用 `temperature=0` 且 structured output 已启用；旧 evaluator 的字段准确率继续保留。
 
 连接现有 OpenAI-compatible Qwen 文本服务时，evaluator 复用生产 `LLMPlanner` 的严格 JSON parser、固定 `temperature=0` 和最多一次 repair；它不发送图像或 Gold，也不用 `PlanValidator` 代替 Gold judge：
 
@@ -685,7 +721,7 @@ field_metrics.csv
 terminal.log
 ```
 
-`summary.json` 同时聚合 output validity、exact/semantic match、五字段 accuracy、repair request/success 和 latency；单条模型或解析失败会记录后继续下一条，不会中止整个 split。API key、隐藏世界真值、完整环境对象和图像均不会写入这些文件。
+`summary.json` 按所选模式聚合上述 legacy 或 dynamic 指标；单条模型、解析、符号检查或编译失败会记录后继续下一条，不会中止整个 split。`predictions.jsonl` 的 dynamic 记录包含初次/最终合法性、`initial_error_code`、模型调用数和 repair 结果，但不保存 API key、隐藏世界真值、完整环境对象、图像或默认的完整首轮模型输出。
 
 ## 统一配置
 

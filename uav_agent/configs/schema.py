@@ -8,8 +8,7 @@ depend on the configuration contract without importing the loader itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
-from numbers import Real
+from planner.policy import PlannerLimits, PlannerPolicy
 
 
 @dataclass(frozen=True)
@@ -84,57 +83,39 @@ class PlannerConfig:
     max_total_reacquire_attempts: int = 4
     min_track_duration_s: float = 1.0
     max_track_duration_s: float = 600.0
+    default_on_target_lost: str = "REACQUIRE"
+    default_reacquire_max_attempts: int = 2
+    default_reacquire_search_radius_m: float = 10.0
+    default_reacquire_timeout_s: float = 30.0
 
     def __post_init__(self) -> None:
-        for name in (
-            "max_plan_steps",
-            "max_goto_calls",
-            "max_search_calls",
-            "max_track_calls",
-            "max_reacquire_attempts_per_track",
-            "max_total_reacquire_attempts",
-        ):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        if self.max_plan_steps < 2:
-            raise ValueError("max_plan_steps must be at least 2")
-        hard_caps = {
-            "max_plan_steps": 10,
-            "max_goto_calls": 5,
-            "max_track_calls": 2,
-            "max_reacquire_attempts_per_track": 2,
-            "max_total_reacquire_attempts": 4,
-        }
-        for name, hard_cap in hard_caps.items():
-            if getattr(self, name) > hard_cap:
-                raise ValueError(f"{name} must not exceed {hard_cap} in planner v1")
-        if self.max_search_calls != 1:
-            raise ValueError("max_search_calls must be 1 in planner v1")
-        if (
-            self.max_reacquire_attempts_per_track
-            > self.max_total_reacquire_attempts
-        ):
-            raise ValueError(
-                "max_reacquire_attempts_per_track must not exceed "
-                "max_total_reacquire_attempts"
-            )
-        durations: list[float] = []
-        for name in ("min_track_duration_s", "max_track_duration_s"):
-            value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, Real)
-                or not isfinite(value)
-                or value <= 0.0
-            ):
-                raise ValueError(f"{name} must be a positive finite number")
-            durations.append(float(value))
-            object.__setattr__(self, name, float(value))
-        if durations[0] > durations[1]:
-            raise ValueError(
-                "min_track_duration_s must not exceed max_track_duration_s"
-            )
+        limits = PlannerLimits.from_config(self)
+        policy = PlannerPolicy.from_config(self, limits)
+        object.__setattr__(
+            self,
+            "min_track_duration_s",
+            limits.min_track_duration_s,
+        )
+        object.__setattr__(
+            self,
+            "max_track_duration_s",
+            limits.max_track_duration_s,
+        )
+        object.__setattr__(
+            self,
+            "default_on_target_lost",
+            policy.default_on_target_lost.value,
+        )
+        object.__setattr__(
+            self,
+            "default_reacquire_search_radius_m",
+            policy.default_reacquire_search_radius_m,
+        )
+        object.__setattr__(
+            self,
+            "default_reacquire_timeout_s",
+            policy.default_reacquire_timeout_s,
+        )
 
 
 @dataclass(frozen=True)

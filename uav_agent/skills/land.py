@@ -27,6 +27,36 @@ class LandGoal(SkillGoal):
     yaw_mode: YawMode = YawMode.KEEP_CURRENT
     yaw_value: float | None = None
     timeout: float = 30.0
+    expected_position_xy: tuple[float, float] | None = None
+    zone_tolerance_m: float = 0.75
+
+    def __post_init__(self) -> None:
+        if self.expected_position_xy is not None:
+            value = self.expected_position_xy
+            if (
+                isinstance(value, (str, bytes))
+                or not isinstance(value, tuple)
+                or len(value) != 2
+            ):
+                raise ValueError(
+                    "expected_position_xy must be a two-number tuple or None"
+                )
+            normalized: list[float] = []
+            for index, component in enumerate(value):
+                if (
+                    isinstance(component, bool)
+                    or not isinstance(component, Real)
+                    or not isfinite(component)
+                ):
+                    raise ValueError(
+                        "expected_position_xy must contain two finite numbers"
+                    )
+                normalized.append(float(component))
+            object.__setattr__(
+                self,
+                "expected_position_xy",
+                (normalized[0], normalized[1]),
+            )
 
     @property
     def motion_policy(self) -> MotionPolicy:
@@ -60,6 +90,7 @@ class LandSkill(Skill):
         require_positive(typed_goal.tolerance, "tolerance")
         require_positive(typed_goal.descent_speed, "descent_speed")
         require_positive(typed_goal.timeout, "timeout")
+        require_positive(typed_goal.zone_tolerance_m, "zone_tolerance_m")
         if typed_goal.yaw_mode not in {YawMode.KEEP_CURRENT, YawMode.FIXED}:
             raise SkillGoalValidationError(
                 "LAND yaw_mode must be KEEP_CURRENT or FIXED"
@@ -73,6 +104,32 @@ class LandSkill(Skill):
         if pose.z < ground_altitude - typed_goal.tolerance:
             raise SkillExecutionStateError(
                 "LAND ground_altitude is above the current UAV altitude"
+            )
+        zone_error = self._zone_error(
+            float(pose.x),
+            float(pose.y),
+            typed_goal.expected_position_xy,
+        )
+        if (
+            zone_error is not None
+            and zone_error > typed_goal.zone_tolerance_m
+        ):
+            self._set_feedback(
+                0.0,
+                "UAV is outside the trusted landing zone",
+                {
+                    "altitude": float(pose.z),
+                    "ground_altitude": ground_altitude,
+                    "landing_position_xy": (float(pose.x), float(pose.y)),
+                    "horizontal_error": 0.0,
+                    "expected_position_xy": typed_goal.expected_position_xy,
+                    "zone_error_m": zone_error,
+                    "zone_tolerance_m": float(typed_goal.zone_tolerance_m),
+                },
+            )
+            raise SkillExecutionStateError(
+                "normal LAND requires the UAV to already be inside the "
+                "trusted landing zone"
             )
 
         context.uav.stop()
@@ -89,6 +146,9 @@ class LandSkill(Skill):
                 "ground_altitude": ground_altitude,
                 "landing_position_xy": (self._landing_x, self._landing_y),
                 "horizontal_error": 0.0,
+                "expected_position_xy": typed_goal.expected_position_xy,
+                "zone_error_m": zone_error,
+                "zone_tolerance_m": float(typed_goal.zone_tolerance_m),
             },
         )
 
@@ -116,6 +176,11 @@ class LandSkill(Skill):
             float(pose.x) - self._landing_x,
             float(pose.y) - self._landing_y,
         )
+        zone_error = self._zone_error(
+            float(pose.x),
+            float(pose.y),
+            goal.expected_position_xy,
+        )
         progress = self._progress(altitude, ground_altitude)
         feedback_data: dict[str, object] = {
             "altitude": altitude,
@@ -124,7 +189,23 @@ class LandSkill(Skill):
             "horizontal_error": horizontal_error,
             "landing_position_xy": (self._landing_x, self._landing_y),
             "elapsed_time": elapsed,
+            "expected_position_xy": goal.expected_position_xy,
+            "zone_error_m": zone_error,
+            "zone_tolerance_m": float(goal.zone_tolerance_m),
         }
+
+        if zone_error is not None and zone_error > goal.zone_tolerance_m:
+            self._set_feedback(
+                progress,
+                "UAV left the trusted landing zone",
+                feedback_data,
+            )
+            self._fail(
+                SkillResultCode.INVALID_STATE,
+                "UAV moved outside the trusted landing zone during LAND",
+                feedback_data,
+            )
+            return
 
         if abs(vertical_error) <= goal.tolerance:
             final_position = (float(pose.x), float(pose.y), altitude)
@@ -137,6 +218,9 @@ class LandSkill(Skill):
                     "final_altitude": altitude,
                     "ground_altitude": ground_altitude,
                     "landing_position_xy": (self._landing_x, self._landing_y),
+                    "expected_position_xy": goal.expected_position_xy,
+                    "zone_error_m": zone_error,
+                    "zone_tolerance_m": float(goal.zone_tolerance_m),
                     "is_airborne": altitude > ground_altitude + goal.tolerance,
                     "elapsed_time": elapsed,
                 },
@@ -198,6 +282,19 @@ class LandSkill(Skill):
             return 1.0 if abs(altitude - ground_altitude) <= 1e-12 else 0.0
         descended = self._start_altitude - altitude
         return min(1.0, max(0.0, descended / descent_distance))
+
+    @staticmethod
+    def _zone_error(
+        x: float,
+        y: float,
+        expected_position_xy: tuple[float, float] | None,
+    ) -> float | None:
+        if expected_position_xy is None:
+            return None
+        return hypot(
+            x - expected_position_xy[0],
+            y - expected_position_xy[1],
+        )
 
     def _on_reset(self) -> None:
         self._landing_x = None

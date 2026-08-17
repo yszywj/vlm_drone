@@ -577,6 +577,7 @@ def main() -> int:
         DynamicLLMPlanner,
         LLMPlanner,
         MissionIntent,
+        PlannerPolicy,
         ScriptedDynamicPlanner,
         ScriptedPlanner,
         SkillPlanDraft,
@@ -603,6 +604,7 @@ def main() -> int:
         return 2
 
     planner_limits = PlannerLimits.from_config(config.planner)
+    planner_policy = PlannerPolicy.from_config(config.planner, planner_limits)
     counting_client: _CountingModelClient | None = None
     selected_model: str | None = None
     if args.planner == "scripted":
@@ -637,9 +639,10 @@ def main() -> int:
                 counting_client,
                 PROJECT_ROOT / "prompts" / "dynamic_skill_planner_system.txt",
                 planner_limits=planner_limits,
+                planner_policy=planner_policy,
             )
 
-    validator = PlanValidator(planner_limits)
+    validator = PlanValidator(planner_limits, planner_policy)
     shutdown_guard_s = _shutdown_guard_s(
         # An LLM may validly select another altitude within the trusted scene.
         # Size the emergency guard for the highest validator-accepted Z.

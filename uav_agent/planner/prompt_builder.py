@@ -17,6 +17,7 @@ import unicodedata
 
 from models.base import ChatMessage
 from planner.schemas import PlannerWorldContext
+from planner.policy import PlannerLimits, PlannerPolicy
 from planner.skill_catalog import SkillCatalog
 from planner.text_safety import reject_forbidden_planner_text
 
@@ -169,6 +170,7 @@ def build_dynamic_skill_planner_messages(
     skill_catalog: SkillCatalog,
     planner_limits: object,
     system_prompt: str,
+    planner_policy: object = None,
 ) -> tuple[ChatMessage, ...]:
     """Build the deterministic, text-only prompt for ``SkillPlanDraft``.
 
@@ -221,11 +223,17 @@ def build_dynamic_skill_planner_messages(
         "default_takeoff_altitude_m": world_context.default_takeoff_altitude_m,
         "default_track_duration_s": world_context.default_track_duration_s,
     }
+    projected_limits = _project_dynamic_limits(planner_limits)
+    trusted_limits = PlannerLimits(**projected_limits)
     payload = {
         "task": "Create one constrained SkillPlanDraft JSON object.",
         "trusted_world_context": safe_context,
         "skill_catalog": skill_catalog.to_prompt_dict(),
-        "planner_limits": _project_dynamic_limits(planner_limits),
+        "planner_limits": projected_limits,
+        "trusted_planner_policy": _project_dynamic_policy(
+            planner_policy,
+            limits=trusted_limits,
+        ),
         "user_instruction": normalized_instruction,
     }
     user_prompt = json.dumps(
@@ -312,6 +320,39 @@ def _project_dynamic_limits(value: object) -> dict[str, int | float]:
             "planner_limits.min_track_duration_s must not exceed the maximum"
         )
     return result
+
+
+def _project_dynamic_policy(
+    value: object,
+    *,
+    limits: PlannerLimits,
+) -> dict[str, object]:
+    """Validate trusted defaults while exposing only model-relevant actions."""
+
+    if value is None:
+        policy = PlannerPolicy()
+    elif isinstance(value, PlannerPolicy):
+        policy = value
+    elif isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("planner_policy keys must be strings")
+        allowed = set(PlannerPolicy.__dataclass_fields__)
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(
+                "planner_policy contains unknown fields: "
+                + ", ".join(sorted(unknown))
+            )
+        policy = PlannerPolicy(**dict(value))
+    else:
+        try:
+            policy = PlannerPolicy.from_config(value)
+        except (AttributeError, TypeError) as exc:
+            raise TypeError(
+                "planner_policy object must expose every trusted policy field"
+            ) from exc
+    policy.validate_against(limits)
+    return policy.to_prompt_dict()
 
 
 def _non_empty_text(value: object, field_name: str) -> str:

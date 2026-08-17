@@ -26,6 +26,7 @@ from planner.schemas import (  # noqa: E402
     SearchRegionSpec,
     SkillPlanDraft,
 )
+from planner.diagnostics import PlannerDiagnostics  # noqa: E402
 from planner.scripted_planner import ScriptedPlanner  # noqa: E402
 from runtime.plan_validator import PlanValidator  # noqa: E402
 
@@ -127,6 +128,7 @@ def _build_world_context(
         name="home",
         position_xy_m=(0.0, 0.0),
         ground_altitude_m=0.0,
+        horizontal_tolerance_m=0.75,
         description="the UAV launch and recovery zone",
     )
     return PlannerWorldContext(
@@ -182,12 +184,6 @@ def _standard_dynamic_draft(args: argparse.Namespace) -> SkillPlanDraft:
                         "desired_altitude_m": args.takeoff_altitude,
                         "desired_distance_m": 6.0,
                     },
-                    "recovery": {
-                        "skill": "REACQUIRE",
-                        "max_attempts": 2,
-                        "search_radius_m": 10.0,
-                        "timeout_s": 30.0,
-                    },
                 },
                 {
                     "id": "goto_home",
@@ -208,7 +204,33 @@ def _standard_dynamic_draft(args: argparse.Namespace) -> SkillPlanDraft:
     )
 
 
-def _plan(args: argparse.Namespace) -> tuple[PlannerOutput, CompiledMission]:
+class _PlannerDemoFailure(RuntimeError):
+    def __init__(
+        self,
+        cause: Exception,
+        diagnostics: PlannerDiagnostics | None,
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause_type = type(cause).__name__
+        self.diagnostics = diagnostics
+
+
+def _scripted_diagnostics() -> PlannerDiagnostics:
+    return PlannerDiagnostics(
+        model_calls=0,
+        repair_used=False,
+        repair_succeeded=False,
+        initial_output_valid=True,
+        final_output_valid=True,
+        initial_error_code=None,
+        initial_error_message=None,
+        structured_output_enabled=False,
+    )
+
+
+def _plan(
+    args: argparse.Namespace,
+) -> tuple[PlannerOutput, CompiledMission, PlannerDiagnostics]:
     context = _build_world_context(
         takeoff_altitude_m=args.takeoff_altitude,
         track_duration_s=args.track_duration,
@@ -251,18 +273,33 @@ def _plan(args: argparse.Namespace) -> tuple[PlannerOutput, CompiledMission]:
                 system_prompt_path=_DYNAMIC_SYSTEM_PROMPT_PATH,
             )
 
-    planner_output = planner.plan(request)
-    compiled = PlanValidator().validate_and_compile(
-        planner_output,
-        context,
-        source=args.planner,
-    )
-    return planner_output, compiled
+    diagnostics: PlannerDiagnostics | None = None
+    try:
+        plan_with_diagnostics = getattr(planner, "plan_with_diagnostics", None)
+        if callable(plan_with_diagnostics):
+            execution = plan_with_diagnostics(request)
+            planner_output = execution.output
+            diagnostics = execution.diagnostics
+        else:
+            planner_output = planner.plan(request)
+            diagnostics = _scripted_diagnostics()
+        compiled = PlanValidator().validate_and_compile(
+            planner_output,
+            context,
+            source=args.planner,
+        )
+    except Exception as exc:
+        observed = getattr(planner, "last_diagnostics", None)
+        if isinstance(observed, PlannerDiagnostics):
+            diagnostics = observed
+        raise _PlannerDemoFailure(exc, diagnostics) from None
+    return planner_output, compiled, diagnostics
 
 
 def _render(
     planner_output: PlannerOutput,
     compiled: CompiledMission,
+    diagnostics: PlannerDiagnostics,
     *,
     json_output: bool,
 ) -> None:
@@ -271,6 +308,7 @@ def _render(
     payload = {
         output_key: planner_output.to_dict(),
         "compiled_task_plan": compiled.task_plan.to_dicts(),
+        "planner_diagnostics": diagnostics.to_dict(),
     }
     if dynamic:
         payload["planner_output_type"] = type(planner_output).__name__
@@ -286,21 +324,50 @@ def _render(
     if dynamic:
         print("\nCompiler Notes")
         print(json.dumps(payload["compiler_notes"], ensure_ascii=False, indent=2))
+    print("\nPlanner Diagnostics")
+    print(json.dumps(payload["planner_diagnostics"], ensure_ascii=False, indent=2))
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        planner_output, compiled = _plan(args)
-        _render(planner_output, compiled, json_output=args.json_output)
+        planner_output, compiled, diagnostics = _plan(args)
+        _render(
+            planner_output,
+            compiled,
+            diagnostics,
+            json_output=args.json_output,
+        )
         return 0
     except Exception as exc:
         # Model client errors intentionally do not contain credentials.  Keep
         # normal CLI failures concise and leave stdout clean for JSON callers.
-        print(
-            f"[Planner demo] FAILED ({type(exc).__name__}): {exc}",
-            file=sys.stderr,
-        )
+        if isinstance(exc, _PlannerDemoFailure):
+            error_type = exc.cause_type
+            diagnostics = exc.diagnostics
+        else:
+            error_type = type(exc).__name__
+            diagnostics = None
+        failure = {
+            "status": "FAILED",
+            "error": {"type": error_type, "message": str(exc)},
+            "planner_diagnostics": (
+                None if diagnostics is None else diagnostics.to_dict()
+            ),
+        }
+        if args.json_output:
+            print(json.dumps(failure, ensure_ascii=False, separators=(",", ":")))
+        else:
+            print(
+                f"[Planner demo] FAILED ({error_type}): {exc}",
+                file=sys.stderr,
+            )
+            if diagnostics is not None:
+                print(
+                    "Planner Diagnostics: "
+                    + json.dumps(diagnostics.to_dict(), ensure_ascii=False),
+                    file=sys.stderr,
+                )
         return 1
 
 

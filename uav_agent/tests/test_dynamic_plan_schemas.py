@@ -140,8 +140,11 @@ class DynamicPlanSchemasTest(unittest.TestCase):
 
         duplicate = _valid_plan()
         duplicate["steps"][1]["id"] = "takeoff_1"  # type: ignore[index]
-        with self.assertRaisesRegex(ValueError, "unique"):
-            SkillPlanDraft.from_dict(duplicate)
+        # Cross-step uniqueness is diagnosed by SymbolicPlanChecker.
+        self.assertEqual(
+            SkillPlanDraft.from_dict(duplicate).steps[1].id,
+            "takeoff_1",
+        )
 
         for invalid_id in ("1_takeoff", "Takeoff", "a-b", "a" * 33):
             raw = _valid_plan()
@@ -200,6 +203,14 @@ class DynamicPlanSchemasTest(unittest.TestCase):
         self.assertEqual(
             defaults.to_dict(),
             {"skill": "REACQUIRE", "max_attempts": 1},
+        )
+        # Compatibility only: the trusted compiler normalizes the legacy
+        # max_attempts=0 convention to disabled recovery and emits a note.
+        self.assertEqual(
+            RecoveryDraft.from_dict(
+                {"skill": "REACQUIRE", "max_attempts": 0}
+            ).max_attempts,
+            0,
         )
 
         for field, value in (
@@ -310,13 +321,34 @@ class DynamicPlanSchemasTest(unittest.TestCase):
     def test_target_reference_must_point_backward_to_search(self) -> None:
         future = _valid_plan()
         future["steps"][3]["args"]["target_ref"] = "$future_search.target_id"  # type: ignore[index]
-        with self.assertRaisesRegex(ValueError, "prior step"):
-            SkillPlanDraft.from_dict(future)
+        self.assertEqual(
+            SkillPlanDraft.from_dict(future).steps[3].args["target_ref"],
+            "$future_search.target_id",
+        )
 
         wrong_skill = _valid_plan()
         wrong_skill["steps"][3]["args"]["target_ref"] = "$goto_search.target_id"  # type: ignore[index]
-        with self.assertRaisesRegex(ValueError, "SEARCH"):
-            SkillPlanDraft.from_dict(wrong_skill)
+        self.assertEqual(
+            SkillPlanDraft.from_dict(wrong_skill).steps[3].args["target_ref"],
+            "$goto_search.target_id",
+        )
+
+    def test_track_lost_action_is_strict_and_optional(self) -> None:
+        for action in ("REACQUIRE", "FAIL"):
+            raw = _valid_plan()
+            raw["steps"][3]["args"]["on_target_lost"] = action  # type: ignore[index]
+            draft = SkillPlanDraft.from_dict(raw)
+            self.assertEqual(draft.steps[3].args["on_target_lost"], action)
+
+        omitted = SkillPlanDraft.from_dict(_valid_plan())
+        self.assertNotIn("on_target_lost", omitted.steps[3].args)
+        for invalid in ("RETURN_HOME", "reacquire", True, 1):
+            raw = _valid_plan()
+            raw["steps"][3]["args"]["on_target_lost"] = invalid  # type: ignore[index]
+            with self.subTest(invalid=invalid), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                SkillPlanDraft.from_dict(raw)
 
 if __name__ == "__main__":
     unittest.main()

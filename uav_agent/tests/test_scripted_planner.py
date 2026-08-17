@@ -47,6 +47,10 @@ class ScriptedPlannerTest(unittest.TestCase):
         self.assertEqual(first, expected)
         self.assertEqual(second, expected)
         self.assertIsNot(first, second)
+        execution = planner.plan_with_diagnostics(request())
+        self.assertEqual(execution.output, expected)
+        self.assertEqual(execution.diagnostics.model_calls, 0)
+        self.assertFalse(execution.diagnostics.structured_output_enabled)
 
     def test_caller_cannot_mutate_or_pollute_planner_state(self) -> None:
         planner = ScriptedPlanner(

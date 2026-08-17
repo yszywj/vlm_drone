@@ -112,8 +112,16 @@ def _plan_dicts() -> list[dict[str, object]]:
             "track_duration": 0.6,
         },
         {
+            "skill": "GOTO",
+            "position": [0.0, 0.0, 4.0],
+            "tolerance": 0.2,
+            "timeout": 5.0,
+        },
+        {
             "skill": "LAND",
             "ground_altitude": 0.0,
+            "expected_position_xy": [0.0, 0.0],
+            "zone_tolerance_m": 0.75,
             "tolerance": 0.1,
             "descent_speed": 2.0,
             "timeout": 5.0,
@@ -287,6 +295,7 @@ class FullOracleSkillPipelineIsaacTest(unittest.TestCase):
                         "TRACK",
                         "REACQUIRE",
                         "TRACK",
+                        "GOTO",
                         "LAND",
                     ],
                     new_skills,
@@ -301,6 +310,7 @@ class FullOracleSkillPipelineIsaacTest(unittest.TestCase):
 
             final_uav = environment.uav_controller.get_pose()
             self.assertLessEqual(abs(final_uav.z), 0.1 + 1e-6)
+            self.assertLessEqual((final_uav.x**2 + final_uav.y**2) ** 0.5, 0.75)
             final_target = environment.get_evaluator_frame().target_state
             bounds = config.target.motion.region
             self.assertTrue(

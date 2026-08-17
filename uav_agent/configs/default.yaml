@@ -66,6 +66,10 @@ planner:
   max_total_reacquire_attempts: 4
   min_track_duration_s: 1.0
   max_track_duration_s: 600.0
+  default_on_target_lost: REACQUIRE  # REACQUIRE | FAIL
+  default_reacquire_max_attempts: 2
+  default_reacquire_search_radius_m: 10.0
+  default_reacquire_timeout_s: 30.0
 
 # Lightweight experiment-output defaults.  Raw sensor artifacts and periodic
 # checkpoints remain deliberately disabled on the shared server.

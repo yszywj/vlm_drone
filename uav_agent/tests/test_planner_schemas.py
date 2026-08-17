@@ -92,6 +92,7 @@ class RegionAndWorldSchemaTest(unittest.TestCase):
         self.assertEqual(region.radius_m, 15.0)
         self.assertEqual(zone.position_xy_m, (0.0, 0.0))
         self.assertEqual(zone.ground_altitude_m, 0.0)
+        self.assertEqual(zone.horizontal_tolerance_m, 0.75)
 
     def test_region_rejects_invalid_name_vectors_and_radius(self) -> None:
         with self.assertRaises(ValueError):
@@ -111,6 +112,15 @@ class RegionAndWorldSchemaTest(unittest.TestCase):
         for altitude in (True, math.nan, math.inf):
             with self.subTest(altitude=altitude), self.assertRaises((TypeError, ValueError)):
                 LandingZoneSpec("home", (0, 0), altitude)
+        for tolerance in (0, -1, True, math.nan, math.inf):
+            with self.subTest(tolerance=tolerance), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                LandingZoneSpec(
+                    "home",
+                    (0, 0),
+                    horizontal_tolerance_m=tolerance,
+                )
 
     def test_world_context_takes_readonly_mapping_snapshots(self) -> None:
         regions = {"search_area": search_region()}

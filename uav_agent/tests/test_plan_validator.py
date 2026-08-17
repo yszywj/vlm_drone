@@ -103,6 +103,8 @@ class PlanValidatorTests(unittest.TestCase):
                     "id": "step_06",
                     "skill": "LAND",
                     "ground_altitude": 0.0,
+                    "expected_position_xy": [1.0, -2.0],
+                    "zone_tolerance_m": 0.75,
                     "timeout": 60.0,
                 },
             ],

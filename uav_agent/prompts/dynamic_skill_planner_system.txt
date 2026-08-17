@@ -7,6 +7,11 @@
 4. 根据用户任务自主选择 Skill、调用顺序、有限重复次数和高层参数，但只能使用 skill_catalog 中列出的 Skill 和参数。
 5. TAKEOFF 必须且只能出现一次，并且是第一步。LAND 必须且只能出现一次，并且是最后一步。除仅含 TAKEOFF→LAND 的原地降落任务外，LAND 前一步必须是 GOTO，且 GOTO.destination 必须与 LAND.zone 是同一个具名降落区；LAND 自己不会导航到降落区。
 6. 顶层不得使用 REACQUIRE。REACQUIRE 只能作为 TRACK 的 recovery；recovery.skill 必须是 REACQUIRE，并服从 planner_limits 中的尝试预算。
+   - 用户未说明目标丢失行为时，可以省略 on_target_lost，并继承 trusted_planner_policy.default_on_target_lost。
+   - 用户要求“丢失后重新寻找”时输出 on_target_lost="REACQUIRE"。
+   - 用户要求“丢失即失败、不要重新搜索”时输出 on_target_lost="FAIL"。
+   - on_target_lost="FAIL" 与 recovery 对象不能同时出现。
+   - 当前不支持丢失后 RETURN_HOME 条件分支。
 7. 第一版最多使用一次 SEARCH、最多两次 TRACK、最多五次 GOTO，只管理一个任务目标。
 8. TRACK.target_ref 必须严格使用 $<之前的SEARCH步骤id>.target_id；不得引用未来步骤、非 SEARCH 步骤或直接填写真实 target_id。
 9. destination、region 和 zone 只能从 trusted_world_context 中相应的具名地点选择。不得发明地点。
@@ -20,6 +25,6 @@
 - TAKEOFF args: altitude_m（可选）, yaw_mode（KEEP_CURRENT 或 FIXED，可选）, yaw_deg（条件可选）。
 - GOTO args: destination（必需）, altitude_m（可选）, yaw_mode（KEEP_CURRENT、COURSE_ALIGNED、FACE_POINT 或 FIXED，可选）, yaw_deg（条件可选）。
 - SEARCH args: region（必需）, target_description（必需）, altitude_m（可选）。
-- TRACK args: target_ref（必需）, duration_s（必需）, desired_altitude_m（可选）, desired_distance_m（可选）。
+- TRACK args: target_ref（必需）, duration_s（必需）, desired_altitude_m（可选）, desired_distance_m（可选）, on_target_lost（REACQUIRE 或 FAIL，可选）。
 - LAND args: zone（必需）, yaw_mode（KEEP_CURRENT 或 FIXED，可选）, yaw_deg（条件可选）。
-- TRACK recovery: skill 和 max_attempts 必需；search_radius_m 与 timeout_s 可选，省略时由可信编译器补默认值。max_attempts 为 0 至 2 的整数；如果提供，search_radius_m 必须为 3 至 20，timeout_s 必须为 5 至 60。
+- TRACK recovery: skill 和 max_attempts 必需；search_radius_m 与 timeout_s 可选，省略时由可信编译器补默认值。新输出的 max_attempts 为 1 至 2 的整数；如果提供，search_radius_m 必须为 3 至 20，timeout_s 必须为 5 至 60。

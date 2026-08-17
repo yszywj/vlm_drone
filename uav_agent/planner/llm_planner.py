@@ -10,6 +10,7 @@ import re
 
 from models.base import ChatMessage, GenerationOptions, ModelClient, ModelResponse
 from planner.base import MissionPlanner, PlannerError, PlannerOutputError
+from planner.diagnostics import PlannerDiagnostics, PlannerExecution
 from planner.prompt_builder import build_mission_planner_messages
 from planner.schemas import MissionIntent, PlannerRequest
 
@@ -63,12 +64,24 @@ class LLMPlanner(MissionPlanner):
         # Sampling must remain deterministic for both the initial and repair
         # calls.  The immutable object is safe to reuse between plan() calls.
         self._generation_options = GenerationOptions(temperature=0.0)
+        self._last_diagnostics: PlannerDiagnostics | None = None
+
+    @property
+    def last_diagnostics(self) -> PlannerDiagnostics | None:
+        return self._last_diagnostics
 
     def plan(self, request: PlannerRequest) -> MissionIntent:
         """Return a model-produced intent, never an executable ``TaskPlan``."""
 
+        return self.plan_with_diagnostics(request).output
+
+    def plan_with_diagnostics(self, request: PlannerRequest) -> PlannerExecution:
+        """Return the intent plus sanitized, bounded-call diagnostics."""
+
         if not isinstance(request, PlannerRequest):
             raise TypeError("request must be a PlannerRequest")
+
+        self._last_diagnostics = None
 
         initial_messages = build_mission_planner_messages(
             request.instruction,
@@ -77,50 +90,130 @@ class LLMPlanner(MissionPlanner):
         )
 
         self._safe_log("debug", "mission intent model call started")
-        first_output = self._chat_content(initial_messages)
         try:
-            intent = self._parse_intent(first_output)
-        except (
-            json.JSONDecodeError,
-            OverflowError,
-            RecursionError,
-            TypeError,
-            ValueError,
-        ) as first_error:
-            validation_error = self._describe_validation_error(first_error)
+            first_output = self._chat_content(initial_messages)
+        except Exception:
+            self._last_diagnostics = self._failure_diagnostics(
+                model_calls=1,
+                repair_used=False,
+                initial_error_code="MODEL_CLIENT_ERROR",
+                initial_error_message="model client call failed",
+            )
+            raise
+        first_failure: tuple[str, str] | None = None
+        try:
+            intent = self._validate_model_output(first_output)
+        except PlannerOutputError as exc:
+            code, _, message = str(exc).partition(": ")
+            first_failure = (code, message or code)
             self._safe_log(
                 "warning",
                 "mission intent model output was invalid; requesting one repair",
             )
         else:
             self._safe_log("debug", "mission intent model call succeeded")
-            return intent
+            diagnostics = PlannerDiagnostics(
+                model_calls=1,
+                repair_used=False,
+                repair_succeeded=False,
+                initial_output_valid=True,
+                final_output_valid=True,
+                initial_error_code=None,
+                initial_error_message=None,
+                structured_output_enabled=False,
+            )
+            self._last_diagnostics = diagnostics
+            return PlannerExecution(output=intent, diagnostics=diagnostics)
 
-        repair_prompt = self._build_repair_prompt(first_output, validation_error)
+        assert first_failure is not None
+        repair_prompt = self._build_repair_prompt(
+            first_output,
+            f"{first_failure[0]}: {first_failure[1]}",
+        )
         repair_messages = (
             *initial_messages,
             ChatMessage(role="assistant", content=first_output),
             ChatMessage(role="user", content=repair_prompt),
         )
-        repaired_output = self._chat_content(repair_messages)
         try:
-            intent = self._parse_intent(repaired_output)
+            repaired_output = self._chat_content(repair_messages)
+        except Exception:
+            self._last_diagnostics = self._failure_diagnostics(
+                model_calls=2,
+                repair_used=True,
+                initial_error_code=first_failure[0],
+                initial_error_message=first_failure[1],
+            )
+            raise
+        try:
+            intent = self._validate_model_output(repaired_output)
+        except PlannerOutputError as second_error:
+            self._safe_log("error", "mission intent repair output was invalid")
+            self._last_diagnostics = self._failure_diagnostics(
+                model_calls=2,
+                repair_used=True,
+                initial_error_code=first_failure[0],
+                initial_error_message=first_failure[1],
+            )
+            raise PlannerOutputError(
+                "model failed to produce a valid MissionIntent after one repair: "
+                f"{second_error}"
+            ) from None
+
+        self._safe_log("debug", "mission intent repair succeeded")
+        diagnostics = PlannerDiagnostics(
+            model_calls=2,
+            repair_used=True,
+            repair_succeeded=True,
+            initial_output_valid=False,
+            final_output_valid=True,
+            initial_error_code=first_failure[0],
+            initial_error_message=first_failure[1],
+            structured_output_enabled=False,
+        )
+        self._last_diagnostics = diagnostics
+        return PlannerExecution(output=intent, diagnostics=diagnostics)
+
+    @staticmethod
+    def _failure_diagnostics(
+        *,
+        model_calls: int,
+        repair_used: bool,
+        initial_error_code: str,
+        initial_error_message: str,
+    ) -> PlannerDiagnostics:
+        return PlannerDiagnostics(
+            model_calls=model_calls,
+            repair_used=repair_used,
+            repair_succeeded=False,
+            initial_output_valid=False,
+            final_output_valid=False,
+            initial_error_code=initial_error_code,
+            initial_error_message=initial_error_message,
+            structured_output_enabled=False,
+        )
+
+    @classmethod
+    def _validate_model_output(cls, raw_output: str) -> MissionIntent:
+        try:
+            parsed = cls._parse_json_object(raw_output)
         except (
             json.JSONDecodeError,
+            _DuplicateJSONKeyError,
             OverflowError,
             RecursionError,
             TypeError,
             ValueError,
-        ) as second_error:
-            detail = self._describe_validation_error(second_error)
-            self._safe_log("error", "mission intent repair output was invalid")
+        ) as exc:
             raise PlannerOutputError(
-                "model failed to produce a valid MissionIntent after one repair: "
-                f"{detail}"
+                f"INVALID_JSON: {cls._describe_validation_error(exc)}"
             ) from None
-
-        self._safe_log("debug", "mission intent repair succeeded")
-        return intent
+        try:
+            return MissionIntent.from_dict(parsed)
+        except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+            raise PlannerOutputError(
+                f"SCHEMA_INVALID: {cls._describe_validation_error(exc)}"
+            ) from None
 
     def _chat_content(self, messages: tuple[ChatMessage, ...]) -> str:
         response = self._model_client.chat(
@@ -167,6 +260,10 @@ class LLMPlanner(MissionPlanner):
 
     @classmethod
     def _parse_intent(cls, raw_output: str) -> MissionIntent:
+        return MissionIntent.from_dict(cls._parse_json_object(raw_output))
+
+    @classmethod
+    def _parse_json_object(cls, raw_output: str) -> Mapping[str, object]:
         if not isinstance(raw_output, str):
             raise TypeError("model output must be a string")
         text = raw_output.strip()
@@ -188,7 +285,7 @@ class LLMPlanner(MissionPlanner):
         )
         if not isinstance(parsed, Mapping):
             raise TypeError("model output must be one JSON object")
-        return MissionIntent.from_dict(parsed)
+        return parsed
 
     @staticmethod
     def _reject_nonfinite_constant(value: str) -> object:

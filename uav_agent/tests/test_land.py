@@ -75,12 +75,20 @@ class LandSkillTest(unittest.TestCase):
         self.assertIs(defaults.yaw_mode, YawMode.KEEP_CURRENT)
         self.assertIsNone(defaults.yaw_value)
         self.assertEqual(defaults.timeout, 30.0)
+        self.assertIsNone(defaults.expected_position_xy)
+        self.assertEqual(defaults.zone_tolerance_m, 0.75)
+
+        with self.assertRaises(ValueError):
+            LandGoal(expected_position_xy=(0.0, float("nan")))
+        with self.assertRaises(ValueError):
+            LandGoal(expected_position_xy=[0.0, 0.0])  # type: ignore[arg-type]
 
         invalid_goals = (
             LandGoal(ground_altitude=float("nan")),
             LandGoal(tolerance=0.0),
             LandGoal(descent_speed=0.0),
             LandGoal(timeout=0.0),
+            LandGoal(zone_tolerance_m=0.0),
             LandGoal(yaw_mode=YawMode.COURSE_ALIGNED),
             LandGoal(yaw_mode=YawMode.FIXED),
         )
@@ -91,6 +99,76 @@ class LandSkillTest(unittest.TestCase):
                 skill.start(invalid_goal, make_context(uav, ManualClock()))
                 self.assertIs(skill.status, SkillStatus.FAILED)
                 self.assertIs(skill.get_result().code, SkillResultCode.INVALID_GOAL)
+
+    def test_normal_land_requires_trusted_zone_at_start(self) -> None:
+        inside_uav = make_uav((3.2, -4.1, 2.0))
+        inside = LandSkill()
+        inside.start(
+            LandGoal(
+                expected_position_xy=(3.0, -4.0),
+                zone_tolerance_m=0.75,
+            ),
+            make_context(inside_uav, ManualClock()),
+        )
+        self.assertIs(inside.status, SkillStatus.RUNNING)
+        feedback = inside.get_feedback().data
+        self.assertEqual(feedback["expected_position_xy"], (3.0, -4.0))
+        self.assertAlmostEqual(feedback["zone_error_m"], math.hypot(0.2, -0.1))
+        self.assertEqual(feedback["zone_tolerance_m"], 0.75)
+
+        outside_uav = make_uav((4.0, -4.0, 2.0))
+        outside = LandSkill()
+        outside.start(
+            LandGoal(
+                expected_position_xy=(3.0, -4.0),
+                zone_tolerance_m=0.75,
+            ),
+            make_context(outside_uav, ManualClock()),
+        )
+        self.assertIs(outside.status, SkillStatus.FAILED)
+        self.assertIs(
+            outside.get_result().code,
+            SkillResultCode.INVALID_STATE,
+        )
+        outside_feedback = outside.get_feedback()
+        self.assertEqual(
+            outside_feedback.message,
+            "UAV is outside the trusted landing zone",
+        )
+        self.assertEqual(
+            outside_feedback.data["expected_position_xy"],
+            (3.0, -4.0),
+        )
+        self.assertEqual(outside_feedback.data["zone_error_m"], 1.0)
+        self.assertEqual(outside_feedback.data["zone_tolerance_m"], 0.75)
+
+    def test_normal_land_fails_if_observation_leaves_trusted_zone(self) -> None:
+        uav = make_uav((0.0, 0.0, 2.0))
+        clock = ManualClock()
+        skill = LandSkill()
+        skill.start(
+            LandGoal(expected_position_xy=(0.0, 0.0), zone_tolerance_m=0.75),
+            make_context(uav, clock),
+        )
+        drifted = Observation(
+            timestamp=0.0,
+            uav_pose=UAVState(0.8, 0.0, 2.0, 0.0),
+            uav_velocity=np.zeros(3),
+            camera_rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+        )
+
+        self.assertIs(skill.tick(drifted), SkillStatus.FAILED)
+        self.assertIs(skill.get_result().code, SkillResultCode.INVALID_STATE)
+
+    def test_emergency_land_without_expected_zone_starts_in_place(self) -> None:
+        uav = make_uav((40.0, -40.0, 2.0))
+        skill = LandSkill()
+
+        skill.start(LandGoal(expected_position_xy=None), make_context(uav, ManualClock()))
+
+        self.assertIs(skill.status, SkillStatus.RUNNING)
+        self.assertIsNone(skill.get_feedback().data["expected_position_xy"])
+        self.assertIsNone(skill.get_feedback().data["zone_error_m"])
 
     def test_normal_land_is_continuous_locks_xy_and_keeps_default_yaw(self) -> None:
         uav = make_uav(

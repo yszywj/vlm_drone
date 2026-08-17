@@ -140,6 +140,32 @@ class LLMPlannerTest(unittest.TestCase):
         self.assertEqual(result, MissionIntent.from_dict(_intent_dict()))
         self.assertEqual(len(client.calls), 1)
 
+    def test_plan_with_diagnostics_reports_legacy_llm_calls(self) -> None:
+        planner, _client = self._planner([_intent_json()])
+
+        execution = planner.plan_with_diagnostics(_request())
+
+        self.assertIsInstance(execution.output, MissionIntent)
+        self.assertEqual(execution.diagnostics.model_calls, 1)
+        self.assertTrue(execution.diagnostics.initial_output_valid)
+        self.assertFalse(execution.diagnostics.repair_used)
+        self.assertFalse(execution.diagnostics.structured_output_enabled)
+
+    def test_repaired_intent_reports_stable_schema_diagnostics(self) -> None:
+        planner, _client = self._planner([
+            json.dumps({"target_description": "moving target"}),
+            _intent_json(),
+        ])
+
+        execution = planner.plan_with_diagnostics(_request())
+
+        self.assertEqual(execution.diagnostics.model_calls, 2)
+        self.assertTrue(execution.diagnostics.repair_succeeded)
+        self.assertEqual(
+            execution.diagnostics.initial_error_code,
+            "SCHEMA_INVALID",
+        )
+
     def test_single_json_code_fence_is_accepted_without_repair(self) -> None:
         fenced = f"```json\n{_intent_json()}\n```"
         planner, client = self._planner([fenced])

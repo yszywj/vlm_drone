@@ -21,6 +21,7 @@ from .schema import (
     TensorboardConfig,
     UavConfig,
 )
+from planner.policy import PlannerLimits, PlannerPolicy, TargetLostAction
 
 __all__ = [
     "AppConfig",
@@ -33,12 +34,15 @@ __all__ = [
     "FiguresConfig",
     "LoggingConfig",
     "PlannerConfig",
+    "PlannerLimits",
+    "PlannerPolicy",
     "SceneConfig",
     "SearchConfig",
     "StorageConfig",
     "SimulationConfig",
     "TargetConfig",
     "TargetMotionConfig",
+    "TargetLostAction",
     "TargetRegionConfig",
     "TensorboardConfig",
     "UavConfig",

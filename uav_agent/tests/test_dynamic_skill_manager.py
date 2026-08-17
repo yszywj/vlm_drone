@@ -9,6 +9,7 @@ import numpy as np
 
 from env.kinematic_uav import KinematicUAV, UAVState
 from skills.base import Skill
+from skills.land import LandGoal
 from skills.manager import ExecutionKind, SkillManager, TaskStatus
 from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskStep
 from skills.reacquire import ReacquireGoal
@@ -127,6 +128,7 @@ def registry(
     goto_count: int = 1,
     track: list[Outcome] | None = None,
     reacquire: list[Outcome] | None = None,
+    land: list[Outcome] | None = None,
 ) -> tuple[dict[SkillName, CountingScriptedSkill], dict[SkillName, Skill]]:
     outcomes = {
         SkillName.TAKEOFF: [ok(SkillResultCode.TAKEOFF_COMPLETE)],
@@ -137,7 +139,7 @@ def registry(
         SkillName.TRACK: track or [ok(SkillResultCode.TRACK_COMPLETE)],
         SkillName.REACQUIRE: reacquire
         or [ok(SkillResultCode.TARGET_FOUND, target_id="target_7")],
-        SkillName.LAND: [ok(SkillResultCode.LAND_COMPLETE)],
+        SkillName.LAND: land or [ok(SkillResultCode.LAND_COMPLETE)],
     }
     scripted = {
         name: CountingScriptedSkill(*values) for name, values in outcomes.items()
@@ -151,7 +153,14 @@ def navigation_plan() -> TaskPlan:
             TaskStep("takeoff", SkillName.TAKEOFF, {"target_altitude": 8.0}),
             TaskStep("goto_a", SkillName.GOTO, {"position": (2.0, 0.0, 8.0)}),
             TaskStep("goto_b", SkillName.GOTO, {"position": (3.0, 1.0, 8.0)}),
-            TaskStep("land", SkillName.LAND, {}),
+            TaskStep(
+                "land",
+                SkillName.LAND,
+                {
+                    "expected_position_xy": (3.0, 1.0),
+                    "zone_tolerance_m": 0.75,
+                },
+            ),
         )
     )
 
@@ -256,9 +265,40 @@ class DynamicSkillManagerTests(unittest.TestCase):
         for _ in range(4):
             self.assertIs(tick(manager, clock), TaskStatus.RUNNING)
         self.assertIs(manager.active_name, SkillName.LAND)
+        self.assertIs(manager.active_execution_kind, ExecutionKind.EMERGENCY)
+        emergency_goal = skills[SkillName.LAND].started_goals[-1]
+        self.assertIsInstance(emergency_goal, LandGoal)
+        self.assertIsNone(emergency_goal.expected_position_xy)
         self.assertEqual(manager.recovery_attempts, {})
         self.assertEqual(manager.transition_log[-1].reason, "target_lost_recovery_unavailable")
         self.assertIs(tick(manager, clock), TaskStatus.FAILED)
+
+    def test_normal_land_keeps_zone_but_failure_retries_once_in_place(self) -> None:
+        ctx, clock = context()
+        scripted, skills = registry(
+            goto_count=2,
+            land=[
+                fail(SkillResultCode.INVALID_STATE),
+                ok(SkillResultCode.LAND_COMPLETE),
+            ],
+        )
+        manager = SkillManager(ctx, registry=skills)
+        manager.start_task(navigation_plan())
+        for _ in range(3):
+            self.assertIs(tick(manager, clock), TaskStatus.RUNNING)
+
+        planned = scripted[SkillName.LAND].started_goals[0]
+        self.assertIsInstance(planned, LandGoal)
+        self.assertEqual(planned.expected_position_xy, (3.0, 1.0))
+        self.assertIs(manager.active_execution_kind, ExecutionKind.PLANNED)
+
+        self.assertIs(tick(manager, clock), TaskStatus.RUNNING)
+        self.assertIs(manager.active_execution_kind, ExecutionKind.EMERGENCY)
+        emergency = scripted[SkillName.LAND].started_goals[1]
+        self.assertIsInstance(emergency, LandGoal)
+        self.assertIsNone(emergency.expected_position_xy)
+        self.assertIs(tick(manager, clock), TaskStatus.FAILED)
+        self.assertEqual(len(scripted[SkillName.LAND].started_goals), 2)
 
     def test_bounded_recovery_resumes_same_track_and_records_attempt(self) -> None:
         policy = RecoveryPolicy(SkillName.REACQUIRE, 2, 7.0, 11.0)

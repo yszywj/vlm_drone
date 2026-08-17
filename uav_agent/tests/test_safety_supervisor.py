@@ -75,6 +75,26 @@ class SafetySupervisorTests(unittest.TestCase):
         decision = self.supervisor.preflight(self.compiled.task_plan)
         self.assertIs(decision.action, SafetyAction.CONTINUE)
 
+    def test_landing_zone_geometry_is_validated_when_present(self) -> None:
+        land = self.compiled.task_plan.steps[-1]
+        land.params["expected_position_xy"] = (0.0, 0.0)
+        land.params["zone_tolerance_m"] = 0.75
+        self.assertIs(
+            self.supervisor.preflight(self.compiled).action,
+            SafetyAction.CONTINUE,
+        )
+
+        land.params["expected_position_xy"] = (51.0, 0.0)
+        decision = self.supervisor.preflight(self.compiled)
+        self.assertIs(decision.action, SafetyAction.ABORT)
+        self.assertIn("expected_position_xy", decision.reason)
+
+        land.params["expected_position_xy"] = None
+        land.params["zone_tolerance_m"] = 0.0
+        decision = self.supervisor.preflight(self.compiled)
+        self.assertIs(decision.action, SafetyAction.ABORT)
+        self.assertIn("zone_tolerance_m", decision.reason)
+
     def test_dynamic_plan_receives_independent_preflight_validation(self) -> None:
         draft = SkillPlanDraft.from_dict(
             {

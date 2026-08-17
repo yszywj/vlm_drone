@@ -204,6 +204,50 @@ class DynamicLLMPlannerTest(unittest.TestCase):
         self.assertNotIsInstance(result, TaskPlan)
         self.assertEqual(len(client.calls), 1)
 
+    def test_plan_with_diagnostics_reports_structured_direct_success(self) -> None:
+        planner, client = self._planner([_draft_json()])
+
+        execution = planner.plan_with_diagnostics(_request())
+
+        self.assertIsInstance(execution.output, SkillPlanDraft)
+        self.assertEqual(execution.diagnostics.model_calls, 1)
+        self.assertFalse(execution.diagnostics.repair_used)
+        self.assertTrue(execution.diagnostics.initial_output_valid)
+        self.assertTrue(execution.diagnostics.final_output_valid)
+        self.assertTrue(execution.diagnostics.structured_output_enabled)
+        self.assertIsNotNone(client.calls[0][1].response_format)
+        self.assertNotIn("original_output", execution.diagnostics.to_dict())
+
+    def test_repair_diagnostics_use_stable_symbolic_code_and_same_schema(self) -> None:
+        invalid = _draft_dict()
+        invalid["steps"].pop(4)  # type: ignore[union-attr]
+        planner, client = self._planner(
+            [json.dumps(invalid, ensure_ascii=False), _draft_json()]
+        )
+
+        execution = planner.plan_with_diagnostics(_request())
+
+        diagnostics = execution.diagnostics
+        self.assertEqual(diagnostics.model_calls, 2)
+        self.assertTrue(diagnostics.repair_used)
+        self.assertTrue(diagnostics.repair_succeeded)
+        self.assertEqual(diagnostics.initial_error_code, "LAND_GOTO_MISSING")
+        self.assertEqual(
+            client.calls[0][1].response_format,
+            client.calls[1][1].response_format,
+        )
+
+    def test_failed_repair_keeps_sanitized_last_diagnostics(self) -> None:
+        planner, _client = self._planner(["not json", "[]"])
+        with self.assertRaises(PlannerOutputError):
+            planner.plan_with_diagnostics(_request())
+        diagnostics = planner.last_diagnostics
+        self.assertIsNotNone(diagnostics)
+        self.assertEqual(diagnostics.model_calls, 2)
+        self.assertEqual(diagnostics.initial_error_code, "INVALID_JSON")
+        self.assertFalse(diagnostics.final_output_valid)
+        self.assertNotIn("not json", json.dumps(diagnostics.to_dict()))
+
     def test_single_json_fence_is_accepted(self) -> None:
         planner, client = self._planner([f"```json\n{_draft_json()}\n```"])
         self.assertEqual(len(planner.plan(_request()).steps), 6)
@@ -219,7 +263,14 @@ class DynamicLLMPlannerTest(unittest.TestCase):
         self.assertEqual(len(client.calls), 2)
         repair_payload = json.loads(str(client.calls[1][0][-1].content))
         self.assertEqual(repair_payload["original_output"], invalid)
-        self.assertIn("between 2 and 10", repair_payload["validation_error"])
+        self.assertEqual(
+            repair_payload["validation_issues"][0]["code"],
+            "SCHEMA_INVALID",
+        )
+        self.assertIn(
+            "between 2 and 10",
+            repair_payload["validation_issues"][0]["message"],
+        )
 
     def test_landing_precondition_error_uses_the_single_repair_call(self) -> None:
         invalid = _draft_dict()
@@ -232,9 +283,13 @@ class DynamicLLMPlannerTest(unittest.TestCase):
         self.assertEqual(len(result.steps), 6)
         self.assertEqual(len(client.calls), 2)
         repair_payload = json.loads(str(client.calls[1][0][-1].content))
+        self.assertEqual(
+            repair_payload["validation_issues"][0]["code"],
+            "LAND_GOTO_MISSING",
+        )
         self.assertIn(
-            "LAND must be immediately preceded by GOTO to the same zone",
-            repair_payload["validation_error"],
+            "LAND must be preceded by matching GOTO",
+            repair_payload["validation_issues"][0]["message"],
         )
 
     def test_two_invalid_outputs_fail_and_never_make_third_call(self) -> None:
@@ -413,7 +468,15 @@ class DynamicLLMPlannerTest(unittest.TestCase):
                 "trusted_world_context",
                 "skill_catalog",
                 "planner_limits",
+                "trusted_planner_policy",
                 "user_instruction",
+            },
+        )
+        self.assertEqual(
+            payload["trusted_planner_policy"],
+            {
+                "default_on_target_lost": "REACQUIRE",
+                "allowed_on_target_lost": ["REACQUIRE", "FAIL"],
             },
         )
         trusted = payload["trusted_world_context"]
@@ -532,6 +595,10 @@ class DynamicLLMPlannerTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertIsNot(first, second)
         self.assertEqual(planner.source, "dynamic_scripted")
+        execution = planner.plan_with_diagnostics(_request())
+        self.assertEqual(execution.output, source)
+        self.assertEqual(execution.diagnostics.model_calls, 0)
+        self.assertFalse(execution.diagnostics.structured_output_enabled)
 
 
 if __name__ == "__main__":

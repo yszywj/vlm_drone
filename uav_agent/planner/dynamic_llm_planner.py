@@ -10,8 +10,17 @@ import os
 from pathlib import Path
 import re
 
-from models.base import ChatMessage, GenerationOptions, ModelClient, ModelResponse
+from models.base import (
+    ChatMessage,
+    GenerationOptions,
+    JsonSchemaResponseFormat,
+    ModelClient,
+    ModelResponse,
+)
 from planner.base import MissionPlanner, PlannerError, PlannerOutputError
+from planner.diagnostics import PlannerDiagnostics, PlannerExecution
+from planner.json_schema import build_skill_plan_draft_json_schema
+from planner.policy import PlannerLimits, PlannerPolicy
 from planner.prompt_builder import build_dynamic_skill_planner_messages
 from planner.schemas import PlannerRequest, SkillPlanDraft
 from planner.skill_catalog import (
@@ -19,6 +28,7 @@ from planner.skill_catalog import (
     SkillCatalog,
     build_default_skill_catalog,
 )
+from planner.symbolic_checker import PlanIssue, SymbolicPlanChecker
 
 
 _JSON_FENCE = re.compile(
@@ -30,6 +40,22 @@ _FIXED_YAW_CONDITION = "only allowed and required when yaw_mode is FIXED"
 
 class _DuplicateJSONKeyError(ValueError):
     """Internal marker for ambiguous JSON objects."""
+
+
+class _DraftValidationFailure(ValueError):
+    """Sanitized validation failure used to drive the one repair call."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        issues: tuple[PlanIssue, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.issues = issues
 
 
 class DynamicLLMPlanner(MissionPlanner):
@@ -49,6 +75,7 @@ class DynamicLLMPlanner(MissionPlanner):
         skill_catalog: SkillCatalog | None = None,
         planner_limits: object = None,
         logger: object | None = None,
+        planner_policy: PlannerPolicy | Mapping[str, object] | None = None,
     ) -> None:
         if not callable(getattr(model_client, "chat", None)):
             raise TypeError("model_client must provide a callable chat() method")
@@ -71,55 +98,118 @@ class DynamicLLMPlanner(MissionPlanner):
             raise TypeError("skill_catalog must be a SkillCatalog")
         self._validate_catalog_conditions(skill_catalog)
 
-        # Mappings are snapshotted so caller mutation cannot change a planner
-        # after construction.  Immutable PlannerLimits dataclasses can be kept
-        # directly and are projected through a fixed allow-list by the builder.
-        if isinstance(planner_limits, Mapping):
-            planner_limits = dict(planner_limits)
+        if planner_limits is None:
+            limits = PlannerLimits()
+        elif isinstance(planner_limits, PlannerLimits):
+            limits = planner_limits
+        elif isinstance(planner_limits, Mapping):
+            limits = PlannerLimits(**dict(planner_limits))
+        else:
+            try:
+                limits = PlannerLimits.from_config(planner_limits)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise TypeError(
+                    "planner_limits must be PlannerLimits, a mapping, or a "
+                    "compatible config object"
+                ) from exc
+
+        if planner_policy is None:
+            policy = PlannerPolicy()
+        elif isinstance(planner_policy, PlannerPolicy):
+            policy = planner_policy
+        elif isinstance(planner_policy, Mapping):
+            policy = PlannerPolicy(**dict(planner_policy))
+        else:
+            try:
+                policy = PlannerPolicy.from_config(planner_policy)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise TypeError(
+                    "planner_policy must be PlannerPolicy, a mapping, or a "
+                    "compatible config object"
+                ) from exc
+        policy.validate_against(limits)
 
         self._model_client = model_client
         self._system_prompt = prompt.strip()
         self._skill_catalog = skill_catalog
-        self._planner_limits = planner_limits
+        self._planner_limits = limits
+        self._planner_policy = policy
+        self._symbolic_checker = SymbolicPlanChecker()
         self._logger = logger
-        self._generation_options = GenerationOptions(temperature=0.0)
+        self._last_diagnostics: PlannerDiagnostics | None = None
 
     @property
     def skill_catalog(self) -> SkillCatalog:
         return self._skill_catalog
 
+    @property
+    def last_diagnostics(self) -> PlannerDiagnostics | None:
+        return self._last_diagnostics
+
     def plan(self, request: PlannerRequest) -> SkillPlanDraft:
+        return self.plan_with_diagnostics(request).output
+
+    def plan_with_diagnostics(self, request: PlannerRequest) -> PlannerExecution:
         if not isinstance(request, PlannerRequest):
             raise TypeError("request must be a PlannerRequest")
 
+        self._last_diagnostics = None
         initial_messages = build_dynamic_skill_planner_messages(
             request.instruction,
             request.world_context,
             self._skill_catalog,
             self._planner_limits,
             self._system_prompt,
+            self._planner_policy,
+        )
+        response_format = JsonSchemaResponseFormat(
+            name="skill_plan_draft",
+            schema=build_skill_plan_draft_json_schema(
+                world_context=request.world_context,
+                skill_catalog=self._skill_catalog,
+                limits=self._planner_limits,
+            ),
+        )
+        generation_options = GenerationOptions(
+            temperature=0.0,
+            response_format=response_format,
         )
         self._safe_log("debug", "dynamic Skill plan model call started")
-        first_output = self._chat_content(initial_messages)
         try:
-            draft = self._parse_plan_draft(first_output)
-            self._validate_against_catalog(draft)
-            self._validate_repairable_structure(draft)
-        except (
-            json.JSONDecodeError,
-            OverflowError,
-            RecursionError,
-            TypeError,
-            ValueError,
-        ) as first_error:
-            validation_error = self._describe_validation_error(first_error)
+            first_output = self._chat_content(initial_messages, generation_options)
+        except Exception:
+            self._last_diagnostics = self._failure_diagnostics(
+                model_calls=1,
+                repair_used=False,
+                initial_error_code="MODEL_CLIENT_ERROR",
+                initial_error_message="model client call failed",
+            )
+            raise
+        first_failure: _DraftValidationFailure | None = None
+        try:
+            draft = self._validate_model_output(first_output, request)
+        except _DraftValidationFailure as exc:
+            first_failure = exc
             self._safe_log(
                 "warning",
                 "dynamic Skill plan output was invalid; requesting one repair",
             )
         else:
             self._safe_log("debug", "dynamic Skill plan model call succeeded")
-            return draft
+            diagnostics = PlannerDiagnostics(
+                model_calls=1,
+                repair_used=False,
+                repair_succeeded=False,
+                initial_output_valid=True,
+                final_output_valid=True,
+                initial_error_code=None,
+                initial_error_message=None,
+                structured_output_enabled=True,
+            )
+            self._last_diagnostics = diagnostics
+            return PlannerExecution(output=draft, diagnostics=diagnostics)
+
+        assert first_failure is not None
 
         repair_messages = (
             *initial_messages,
@@ -128,42 +218,130 @@ class DynamicLLMPlanner(MissionPlanner):
                 role="user",
                 content=self._build_repair_prompt(
                     first_output,
-                    validation_error,
+                    first_failure,
                 ),
             ),
         )
-        repaired_output = self._chat_content(repair_messages)
         try:
-            draft = self._parse_plan_draft(repaired_output)
-            self._validate_against_catalog(draft)
-            self._validate_repairable_structure(draft)
-        except (
-            json.JSONDecodeError,
-            OverflowError,
-            RecursionError,
-            TypeError,
-            ValueError,
-        ) as second_error:
-            detail = self._describe_validation_error(second_error)
+            repaired_output = self._chat_content(repair_messages, generation_options)
+        except Exception:
+            self._last_diagnostics = self._failure_diagnostics(
+                model_calls=2,
+                repair_used=True,
+                initial_error_code=first_failure.code,
+                initial_error_message=first_failure.message,
+            )
+            raise
+        try:
+            draft = self._validate_model_output(repaired_output, request)
+        except _DraftValidationFailure as second_error:
             self._safe_log("error", "dynamic Skill plan repair output was invalid")
+            self._last_diagnostics = self._failure_diagnostics(
+                model_calls=2,
+                repair_used=True,
+                initial_error_code=first_failure.code,
+                initial_error_message=first_failure.message,
+            )
             raise PlannerOutputError(
                 "model failed to produce a valid SkillPlanDraft after one repair: "
-                f"{detail}"
+                f"{second_error.code}: {second_error.message}"
             ) from None
 
         self._safe_log("debug", "dynamic Skill plan repair succeeded")
-        return draft
+        diagnostics = PlannerDiagnostics(
+            model_calls=2,
+            repair_used=True,
+            repair_succeeded=True,
+            initial_output_valid=False,
+            final_output_valid=True,
+            initial_error_code=first_failure.code,
+            initial_error_message=first_failure.message,
+            structured_output_enabled=True,
+        )
+        self._last_diagnostics = diagnostics
+        return PlannerExecution(output=draft, diagnostics=diagnostics)
 
-    def _chat_content(self, messages: tuple[ChatMessage, ...]) -> str:
+    def _chat_content(
+        self,
+        messages: tuple[ChatMessage, ...],
+        options: GenerationOptions,
+    ) -> str:
         response = self._model_client.chat(
             messages,
-            options=self._generation_options,
+            options=options,
         )
         if not isinstance(response, ModelResponse):
             raise PlannerOutputError(
                 "model client returned an invalid response object"
             )
         return response.content
+
+    def _validate_model_output(
+        self,
+        raw_output: str,
+        request: PlannerRequest,
+    ) -> SkillPlanDraft:
+        try:
+            parsed = self._parse_json_object(raw_output)
+        except (
+            json.JSONDecodeError,
+            _DuplicateJSONKeyError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise _DraftValidationFailure(
+                "INVALID_JSON",
+                self._describe_validation_error(exc),
+            ) from None
+        try:
+            draft = SkillPlanDraft.from_dict(parsed)
+        except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+            raise _DraftValidationFailure(
+                "SCHEMA_INVALID",
+                self._describe_validation_error(exc),
+            ) from None
+        try:
+            self._validate_against_catalog(draft)
+        except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+            raise _DraftValidationFailure(
+                "CATALOG_CONTRACT_VIOLATION",
+                self._describe_validation_error(exc),
+            ) from None
+        result = self._symbolic_checker.check(
+            draft,
+            world_context=request.world_context,
+            limits=self._planner_limits,
+            policy=self._planner_policy,
+        )
+        if not result.valid:
+            first_issue = result.issues[0]
+            raise _DraftValidationFailure(
+                first_issue.code.value,
+                first_issue.message,
+                issues=result.issues,
+            )
+        return draft
+
+    @staticmethod
+    def _failure_diagnostics(
+        *,
+        model_calls: int,
+        repair_used: bool,
+        initial_error_code: str,
+        initial_error_message: str,
+    ) -> PlannerDiagnostics:
+        return PlannerDiagnostics(
+            model_calls=model_calls,
+            repair_used=repair_used,
+            repair_succeeded=False,
+            initial_output_valid=False,
+            final_output_valid=False,
+            initial_error_code=initial_error_code,
+            initial_error_message=initial_error_message,
+            structured_output_enabled=True,
+        )
 
     def _validate_against_catalog(self, draft: SkillPlanDraft) -> None:
         """Enforce the exact catalog shown in this planner invocation."""
@@ -203,36 +381,6 @@ class DynamicLLMPlanner(MissionPlanner):
                 recovery_contract.arguments,
                 prefix=f"step {step.id} recovery",
             )
-
-    @staticmethod
-    def _validate_repairable_structure(draft: SkillPlanDraft) -> None:
-        """Catch cross-step mistakes that should consume the one repair call.
-
-        World geometry and final authority remain in PlanValidator.  This
-        narrow check exists because LandSkill descends in place: a model that
-        omits the matching return GOTO can be corrected before the draft is
-        handed to the trusted compiler.  The compact TAKEOFF -> LAND form is
-        left to PlanValidator, which alone knows the initial landing geometry.
-        """
-
-        steps = draft.steps
-        for index, step in enumerate(steps):
-            if step.skill != "LAND":
-                continue
-            if index == 1 and steps[0].skill == "TAKEOFF":
-                continue
-            if index == 0:
-                raise ValueError(
-                    "LAND must be immediately preceded by GOTO to the same zone"
-                )
-            previous = steps[index - 1]
-            if (
-                previous.skill != "GOTO"
-                or previous.args.get("destination") != step.args.get("zone")
-            ):
-                raise ValueError(
-                    "LAND must be immediately preceded by GOTO to the same zone"
-                )
 
     @staticmethod
     def _validate_catalog_conditions(catalog: SkillCatalog) -> None:
@@ -349,15 +497,32 @@ class DynamicLLMPlanner(MissionPlanner):
     @staticmethod
     def _build_repair_prompt(
         original_output: str,
-        validation_error: str,
+        validation_failure: _DraftValidationFailure,
     ) -> str:
+        issues = validation_failure.issues or ()
+        validation_issues = [
+            {
+                "code": issue.code.value,
+                "step_id": issue.step_id,
+                "message": issue.message,
+            }
+            for issue in issues
+        ]
+        if not validation_issues:
+            validation_issues = [
+                {
+                    "code": validation_failure.code,
+                    "step_id": None,
+                    "message": validation_failure.message,
+                }
+            ]
         payload = {
             "task": (
                 "Repair the previous output into one valid SkillPlanDraft "
                 "JSON object."
             ),
             "original_output": original_output,
-            "validation_error": validation_error,
+            "validation_issues": validation_issues,
             "requirements": (
                 "Follow the system rules, trusted world context, Skill Catalog, "
                 "and planner limits. Return only corrected JSON with no Markdown "
@@ -374,6 +539,10 @@ class DynamicLLMPlanner(MissionPlanner):
 
     @classmethod
     def _parse_plan_draft(cls, raw_output: str) -> SkillPlanDraft:
+        return SkillPlanDraft.from_dict(cls._parse_json_object(raw_output))
+
+    @classmethod
+    def _parse_json_object(cls, raw_output: str) -> Mapping[str, object]:
         if not isinstance(raw_output, str):
             raise TypeError("model output must be a string")
         text = raw_output.strip()
@@ -395,7 +564,7 @@ class DynamicLLMPlanner(MissionPlanner):
         )
         if not isinstance(parsed, Mapping):
             raise TypeError("model output must be one JSON object")
-        return SkillPlanDraft.from_dict(parsed)
+        return parsed
 
     @staticmethod
     def _reject_nonfinite_constant(value: str) -> object:

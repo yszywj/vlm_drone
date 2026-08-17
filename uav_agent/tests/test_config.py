@@ -51,6 +51,10 @@ class DefaultConfigTest(unittest.TestCase):
         self.assertGreater(config.search.radius_m, 0.0)
         self.assertGreater(config.search.timeout_s, 0.0)
         self.assertEqual(config.planner, PlannerConfig())
+        self.assertEqual(config.planner.default_on_target_lost, "REACQUIRE")
+        self.assertEqual(config.planner.default_reacquire_max_attempts, 2)
+        self.assertEqual(config.planner.default_reacquire_search_radius_m, 10.0)
+        self.assertEqual(config.planner.default_reacquire_timeout_s, 30.0)
         self.assertEqual(config.experiment.name, "oracle_baseline")
         self.assertEqual(config.experiment.seed, 42)
         self.assertIsNone(config.experiment.output_root)
@@ -150,6 +154,64 @@ class DefaultConfigTest(unittest.TestCase):
         with self.assertRaises(ConfigError):
             self._load_mutated(lambda raw: raw.__setitem__("planner", None))
 
+    def test_previous_planner_block_inherits_new_policy_defaults(self) -> None:
+        policy_keys = (
+            "default_on_target_lost",
+            "default_reacquire_max_attempts",
+            "default_reacquire_search_radius_m",
+            "default_reacquire_timeout_s",
+        )
+        raw = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "default.yaml").read_text(
+                encoding="utf-8"
+            )
+        )
+        for key in policy_keys:
+            raw["planner"].pop(key)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "previous.yaml"
+            path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+            config = load_config(path)
+        self.assertEqual(config.planner, PlannerConfig())
+
+    def test_planner_recovery_policy_is_strictly_validated(self) -> None:
+        mutations = (
+            ("default_on_target_lost", "RETURN_HOME"),
+            ("default_on_target_lost", "reacquire"),
+            ("default_on_target_lost", True),
+            ("default_reacquire_max_attempts", 0),
+            ("default_reacquire_max_attempts", 3),
+            ("default_reacquire_max_attempts", True),
+            ("default_reacquire_search_radius_m", 2.9),
+            ("default_reacquire_search_radius_m", 20.1),
+            ("default_reacquire_search_radius_m", True),
+            ("default_reacquire_timeout_s", 4.9),
+            ("default_reacquire_timeout_s", 60.1),
+            ("default_reacquire_timeout_s", float("inf")),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key, value=value), self.assertRaises(ConfigError):
+                self._load_mutated(
+                    lambda raw, key=key, value=value: raw["planner"].__setitem__(
+                        key, value
+                    )
+                )
+
+        with self.assertRaises(ConfigError):
+            self._load_mutated(
+                lambda raw: raw["planner"].update(
+                    max_reacquire_attempts_per_track=1,
+                    default_reacquire_max_attempts=2,
+                )
+            )
+        with self.assertRaises(ConfigError):
+            self._load_mutated(
+                lambda raw: raw["planner"].update(
+                    max_total_reacquire_attempts=3,
+                    default_reacquire_max_attempts=2,
+                )
+            )
+
     def test_planner_config_direct_construction_is_strict(self) -> None:
         for kwargs in (
             {"max_plan_steps": True},
@@ -158,6 +220,10 @@ class DefaultConfigTest(unittest.TestCase):
             {"max_search_calls": 2},
             {"min_track_duration_s": float("nan")},
             {"min_track_duration_s": 20.0, "max_track_duration_s": 10.0},
+            {"default_on_target_lost": "RETURN_HOME"},
+            {"default_reacquire_max_attempts": True},
+            {"default_reacquire_search_radius_m": 2.0},
+            {"default_reacquire_timeout_s": 61.0},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):

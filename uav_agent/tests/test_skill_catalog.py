@@ -55,6 +55,7 @@ class SkillCatalogTest(unittest.TestCase):
                 "duration_s",
                 "desired_altitude_m",
                 "desired_distance_m",
+                "on_target_lost",
             },
             "REACQUIRE": {"max_attempts", "search_radius_m", "timeout_s"},
             "LAND": {"zone", "yaw_mode", "yaw_deg"},
@@ -73,6 +74,19 @@ class SkillCatalogTest(unittest.TestCase):
             goto_yaw.allowed_values,
             ("KEEP_CURRENT", "COURSE_ALIGNED", "FACE_POINT", "FIXED"),
         )
+        lost_action = next(
+            arg
+            for arg in catalog.get("TRACK").arguments
+            if arg.name == "on_target_lost"
+        )
+        self.assertFalse(lost_action.required)
+        self.assertEqual(lost_action.allowed_values, ("REACQUIRE", "FAIL"))
+        attempts = next(
+            arg
+            for arg in catalog.get("REACQUIRE").arguments
+            if arg.name == "max_attempts"
+        )
+        self.assertEqual((attempts.minimum, attempts.maximum), (1.0, 2.0))
 
     def test_catalog_does_not_expose_runtime_goal_fields_or_world_data(self) -> None:
         serialized = json.dumps(

@@ -113,6 +113,7 @@ class LandingZoneSpec:
     position_xy_m: tuple[float, float]
     ground_altitude_m: float = 0.0
     description: str = ""
+    horizontal_tolerance_m: float = 0.75
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", _non_empty_string(self.name, "name"))
@@ -125,6 +126,14 @@ class LandingZoneSpec:
             self,
             "ground_altitude_m",
             _finite_number(self.ground_altitude_m, "ground_altitude_m"),
+        )
+        object.__setattr__(
+            self,
+            "horizontal_tolerance_m",
+            _positive_number(
+                self.horizontal_tolerance_m,
+                "horizontal_tolerance_m",
+            ),
         )
         object.__setattr__(
             self,
@@ -499,7 +508,13 @@ _STEP_ARGUMENT_FIELDS: dict[
     ),
     "TRACK": (
         frozenset({"target_ref", "duration_s"}),
-        frozenset({"desired_altitude_m", "desired_distance_m"}),
+        frozenset(
+            {
+                "desired_altitude_m",
+                "desired_distance_m",
+                "on_target_lost",
+            }
+        ),
     ),
     "LAND": (
         frozenset({"zone"}),
@@ -523,6 +538,7 @@ def _validated_step_args(skill: str, value: object) -> Mapping[str, object]:
         "region",
         "target_description",
         "target_ref",
+        "on_target_lost",
         "zone",
     }
     finite_number_fields = {
@@ -543,6 +559,13 @@ def _validated_step_args(skill: str, value: object) -> Mapping[str, object]:
                 reject_forbidden_planner_text(
                     text,
                     "SEARCH.args.target_description",
+                )
+            if key == "on_target_lost" and text not in {
+                "REACQUIRE",
+                "FAIL",
+            }:
+                raise ValueError(
+                    "TRACK.args.on_target_lost must be REACQUIRE or FAIL"
                 )
             normalized[key] = text
         elif key in finite_number_fields:
@@ -572,12 +595,6 @@ def _validated_step_args(skill: str, value: object) -> Mapping[str, object]:
         raise ValueError(f"{skill}.args.yaw_deg is only allowed for FIXED yaw")
     if normalized.get("yaw_mode") == "FIXED" and "yaw_deg" not in normalized:
         raise ValueError(f"{skill}.args.yaw_deg is required for FIXED yaw")
-    if skill == "TRACK":
-        reference = str(normalized["target_ref"])
-        if _TARGET_REF_PATTERN.fullmatch(reference) is None:
-            raise ValueError(
-                "TRACK.args.target_ref must use $<step_id>.target_id"
-            )
     return MappingProxyType(normalized)
 
 
@@ -671,27 +688,9 @@ class SkillPlanDraft:
             raise ValueError("steps must contain between 2 and 10 entries")
         if any(not isinstance(step, PlanStepDraft) for step in steps):
             raise TypeError("steps must contain only PlanStepDraft values")
-        step_ids = tuple(step.id for step in steps)
-        if len(step_ids) != len(set(step_ids)):
-            raise ValueError("step ids must be unique")
-
-        # References are plan structure rather than WorldContext semantics, so
-        # reject forward and non-SEARCH references at this boundary as well as
-        # in the trusted compiler's defense-in-depth checks.
-        previous: dict[str, str] = {}
-        for step in steps:
-            if step.skill == "TRACK":
-                match = _TARGET_REF_PATTERN.fullmatch(
-                    str(step.args["target_ref"])
-                )
-                assert match is not None  # validated by PlanStepDraft
-                source_id = match.group("step_id")
-                if source_id not in previous:
-                    raise ValueError("TRACK target_ref must point to a prior step")
-                if previous[source_id] != "SEARCH":
-                    raise ValueError("TRACK target_ref must point to a SEARCH step")
-            previous[step.id] = step.skill
-
+        # Cross-step identity and reference semantics are intentionally owned
+        # by SymbolicPlanChecker so planning, compilation and evaluation use a
+        # single set of stable issue codes.
         object.__setattr__(self, "steps", steps)
 
     @classmethod

@@ -3,6 +3,7 @@
 from models.base import (
     ChatMessage,
     GenerationOptions,
+    JsonSchemaResponseFormat,
     ModelClient,
     ModelClientError,
     ModelConnectionError,
@@ -15,6 +16,7 @@ from models.openai_compatible_client import OpenAICompatibleClient
 __all__ = [
     "ChatMessage",
     "GenerationOptions",
+    "JsonSchemaResponseFormat",
     "ModelClient",
     "ModelClientError",
     "ModelConnectionError",

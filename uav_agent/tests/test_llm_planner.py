@@ -15,6 +15,7 @@ from models.base import (
 )
 from planner.base import MissionPlanner, PlannerOutputError
 from planner.llm_planner import LLMPlanner
+from planner.prompt_builder import build_mission_planner_messages
 from planner.schemas import (
     LandingZoneSpec,
     MissionIntent,
@@ -288,6 +289,66 @@ class LLMPlannerTest(unittest.TestCase):
         self.assertNotIn("evaluatorframe", prompt)
         self.assertNotIn("camera_rgb", prompt)
 
+    def test_runtime_uses_shared_prompt_builder_byte_for_byte(self) -> None:
+        planner, client = self._planner([_intent_json()])
+        request = _request()
+        system_prompt = PROMPT_PATH.read_text(encoding="utf-8")
+
+        planner.plan(request)
+        expected = build_mission_planner_messages(
+            request.instruction,
+            request.world_context,
+            system_prompt,
+        )
+
+        actual = client.calls[0][0]
+        self.assertEqual(actual, expected)
+        self.assertEqual(
+            tuple(str(message.content).encode("utf-8") for message in actual),
+            tuple(str(message.content).encode("utf-8") for message in expected),
+        )
+
+    def test_shared_prompt_builder_exposes_only_runtime_public_context(self) -> None:
+        context = _world_context()
+        messages = build_mission_planner_messages(
+            _request(context).instruction,
+            context,
+            PROMPT_PATH.read_text(encoding="utf-8"),
+        )
+
+        payload = json.loads(str(messages[1].content))
+        self.assertEqual(
+            set(payload),
+            {"task", "trusted_world_context", "user_instruction"},
+        )
+        trusted = payload["trusted_world_context"]
+        self.assertEqual(
+            set(trusted),
+            {
+                "scene_bounds_m",
+                "search_regions",
+                "landing_zones",
+                "default_takeoff_altitude_m",
+                "default_track_duration_s",
+            },
+        )
+        serialized = str(messages[1].content).casefold()
+        for forbidden in (
+            "gold",
+            "oracle",
+            "spawn",
+            "evaluator",
+            "frame",
+            "image",
+            "initial_uav",
+            "approach_xyz",
+            "center_xyz",
+            "position_xy",
+            "timeout",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, serialized)
+
     def test_prompt_omits_geometry_and_random_spawn_coordinates(self) -> None:
         context = PlannerWorldContext(
             scene_min_xyz_m=(-100, -100, 0),
@@ -339,6 +400,119 @@ class LLMPlannerTest(unittest.TestCase):
                 self.assertNotIn(str(value), prompt)
         self.assertIn('"name":"search_area"', prompt)
         self.assertIn('"name":"home"', prompt)
+
+    def test_prompt_builder_rejects_forbidden_world_metadata_markers(self) -> None:
+        markers = (
+            "oracle_target",
+            "ORACLE",
+            "target-spawn",
+            "targetSpawn",
+            "出生点",
+            "真实位置",
+            "target_pose",
+            "target position",
+            "targetVelocity",
+            "目标坐标",
+            "目标 的 坐标",
+            "目标速度",
+            "EvaluatorFrame",
+            "evaluator",
+            "image_rgb",
+            "video-stream",
+            "frame",
+            "camera",
+            "cameraFrame",
+        )
+        locations = (
+            "search_key",
+            "search_name",
+            "search_description",
+            "landing_key",
+            "landing_name",
+            "landing_description",
+        )
+
+        for marker in markers:
+            for location in locations:
+                with self.subTest(marker=marker, location=location):
+                    search_key = marker if location == "search_key" else "search_area"
+                    search_name = marker if location == "search_name" else "search_area"
+                    search_description = (
+                        marker
+                        if location == "search_description"
+                        else "north sector with open ground"
+                    )
+                    landing_key = marker if location == "landing_key" else "home"
+                    landing_name = marker if location == "landing_name" else "home"
+                    landing_description = (
+                        marker
+                        if location == "landing_description"
+                        else "launch pad"
+                    )
+                    context = PlannerWorldContext(
+                        scene_min_xyz_m=(-50, -50, 0),
+                        scene_max_xyz_m=(50, 50, 30),
+                        initial_uav_xyz_m=(0, 0, 0),
+                        search_regions={
+                            search_key: SearchRegionSpec(
+                                search_name,
+                                center_xyz_m=(20, 30, 0),
+                                radius_m=15,
+                                approach_xyz_m=(20, 12, 10),
+                                description=search_description,
+                            )
+                        },
+                        landing_zones={
+                            landing_key: LandingZoneSpec(
+                                landing_name,
+                                position_xy_m=(0, 0),
+                                description=landing_description,
+                            )
+                        },
+                        default_takeoff_altitude_m=10,
+                        default_track_duration_s=30,
+                        search_timeout_s=60,
+                    )
+
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "forbidden hidden-state or media marker",
+                    ):
+                        build_mission_planner_messages(
+                            _request(context).instruction,
+                            context,
+                            PROMPT_PATH.read_text(encoding="utf-8"),
+                        )
+
+    def test_llm_planner_rejects_tainted_context_before_model_call(self) -> None:
+        context = _world_context()
+        tainted = PlannerWorldContext(
+            scene_min_xyz_m=context.scene_min_xyz_m,
+            scene_max_xyz_m=context.scene_max_xyz_m,
+            initial_uav_xyz_m=context.initial_uav_xyz_m,
+            search_regions={
+                "search_area": SearchRegionSpec(
+                    "search_area",
+                    center_xyz_m=(20, 30, 0),
+                    radius_m=15,
+                    approach_xyz_m=(20, 12, 10),
+                    description="contains oracle_target_pose",
+                )
+            },
+            landing_zones=context.landing_zones,
+            default_takeoff_altitude_m=context.default_takeoff_altitude_m,
+            default_track_duration_s=context.default_track_duration_s,
+            search_timeout_s=context.search_timeout_s,
+        )
+        planner, client = self._planner([_intent_json()])
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "forbidden hidden-state or media marker",
+        ):
+            planner.plan(_request(tainted))
+
+        self.assertEqual(client.calls, [])
 
     def test_llm_planner_returns_intent_and_validator_builds_six_steps(self) -> None:
         planner, _ = self._planner([_intent_json()])

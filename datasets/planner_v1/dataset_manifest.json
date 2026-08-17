@@ -1,0 +1,32 @@
+{
+  "dataset_name": "planner_v1",
+  "generated_at_utc": "2026-08-16T17:34:13+00:00",
+  "profile": "pilot",
+  "resource_sha256": {
+    "dataset_config.yaml": "1b8d8bd2391d9362a7fd5d4441aa3926b09ae2e09dc3fe2e73020cd5adcdb26b",
+    "language_lexicon_zh.yaml": "4726eb3ef09ffe15c679cb5ccdd2a5d0e2d23a3cfca9b36fb9b194ddef2dd793",
+    "mission_planner_system.txt": "b0d36874c753201699b9d863803d0bf1432e8f11175fb67abaa5d407a247b4b7",
+    "target_ontology.yaml": "6c214c4241b458940994e8e6bf970b1c9abb48640a4155e210ba33c15b7cd8cf",
+    "templates_zh.yaml": "b1e31c39169621063e6d804ba38210f5a0de47ebd760d176748191f51474e982",
+    "world_contexts.yaml": "e1b35604b344f935f302c6ded52c775898603e19881e92e579ed38a22618f109"
+  },
+  "schema_version": "planner_v1",
+  "seed": 42,
+  "split_counts": {
+    "test_compositional": 200,
+    "test_iid": 200,
+    "test_language": 200,
+    "test_robustness": 100,
+    "train": 1000,
+    "validation": 200
+  },
+  "split_sha256": {
+    "test_compositional.jsonl": "bc139024087355fae012cca06ed26b7c75c77565356e66e47e5b9762f0f5d068",
+    "test_iid.jsonl": "abf8c7e0ec6986f4c9b32938d3d8b91def7c1907af1564cbcbd6a0c5da857d54",
+    "test_language.jsonl": "bb5647e9762c17a7a4ff0bde9a47db14d70c2023bf877ea16809522584769358",
+    "test_robustness.jsonl": "6f0cfbee7fc424e7f7c4d3b2cc1e32d0fdc44adc02caf3db011fd54e2c015fca",
+    "train.jsonl": "ae534cf2d01f9fa2173112eedb219cee4afb073141a68ecac264f5180ea356d1",
+    "validation.jsonl": "3a197eb52d7e3cf35da8a4ca57c999d6678cc2df6b9f9b3c3d64bcacb772ded1"
+  },
+  "statistics_sha256": "63171877359e346393fe25cb7a6e689593a26b21bc344dff1a25a465ff71ca3e"
+}

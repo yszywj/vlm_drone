@@ -20,3 +20,7 @@ uav_agent/logs/
 # Generated experiment results, checkpoints, CSV metrics and TensorBoard data.
 /outputs/
 *.tfevents.*
+
+# Unreviewed optional Planner paraphrases are local candidates.  The official
+# datasets/planner_v1 JSONL, manifest, statistics and checksums are not ignored.
+/datasets/planner_v1/_candidates/

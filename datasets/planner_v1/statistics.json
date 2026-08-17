@@ -1,0 +1,162 @@
+{
+  "automatic_paraphrase_fraction": 0.0,
+  "external_candidate_fraction": 0.0,
+  "external_candidate_policy_met": true,
+  "full_review_requirements_met": false,
+  "generation_source_counts": {
+    "template": 1900
+  },
+  "landing_zone_counts": {
+    "home": 646,
+    "north_pad": 647,
+    "south_pad": 607
+  },
+  "non_train_external_candidate_count": 0,
+  "review_status_counts": {
+    "unreviewed": 1900
+  },
+  "robustness_category_counts": {
+    "extra_field": 13,
+    "forbidden_control": 15,
+    "format_interference": 12,
+    "irrelevant_text": 15,
+    "long_instruction": 14,
+    "prompt_injection": 19,
+    "repeated_requirement": 12
+  },
+  "schema_version": "planner_v1",
+  "search_region_counts": {
+    "east_area": 439,
+    "north_area": 452,
+    "south_area": 499,
+    "west_area": 510
+  },
+  "split_counts": {
+    "test_compositional": 200,
+    "test_iid": 200,
+    "test_language": 200,
+    "test_robustness": 100,
+    "train": 1000,
+    "validation": 200
+  },
+  "split_provenance": {
+    "test_compositional": {
+      "generation_source_counts": {
+        "template": 200
+      },
+      "review_status_counts": {
+        "unreviewed": 200
+      }
+    },
+    "test_iid": {
+      "generation_source_counts": {
+        "template": 200
+      },
+      "review_status_counts": {
+        "unreviewed": 200
+      }
+    },
+    "test_language": {
+      "generation_source_counts": {
+        "template": 200
+      },
+      "review_status_counts": {
+        "unreviewed": 200
+      }
+    },
+    "test_robustness": {
+      "generation_source_counts": {
+        "template": 100
+      },
+      "review_status_counts": {
+        "unreviewed": 100
+      }
+    },
+    "train": {
+      "generation_source_counts": {
+        "template": 1000
+      },
+      "review_status_counts": {
+        "unreviewed": 1000
+      }
+    },
+    "validation": {
+      "generation_source_counts": {
+        "template": 200
+      },
+      "review_status_counts": {
+        "unreviewed": 200
+      }
+    }
+  },
+  "takeoff_altitude_counts": {
+    "10": 276,
+    "12": 334,
+    "15": 321,
+    "5": 341,
+    "8": 322,
+    "null": 306
+  },
+  "target_concept_counts": {
+    "person_upper_black_backpack_blue": 108,
+    "person_upper_black_lower_blue_backpack_black": 103,
+    "person_upper_black_lower_gray_backpack_none": 104,
+    "person_upper_blue_backpack_black": 105,
+    "person_upper_blue_backpack_red": 59,
+    "person_upper_blue_lower_black_backpack_none": 113,
+    "person_upper_blue_lower_gray_backpack_blue": 87,
+    "person_upper_blue_lower_white_backpack_red": 101,
+    "person_upper_red_backpack_black": 73,
+    "person_upper_red_backpack_blue": 92,
+    "person_upper_red_backpack_none": 99,
+    "person_upper_red_lower_black_backpack_blue": 112,
+    "person_upper_red_lower_gray_backpack_black": 88,
+    "person_upper_red_lower_white_backpack_none": 107,
+    "person_upper_white_backpack_black": 93,
+    "person_upper_white_lower_black_backpack_blue": 95,
+    "person_upper_white_lower_blue_backpack_none": 94,
+    "person_upper_yellow_backpack_red": 105,
+    "person_upper_yellow_lower_black_backpack_black": 94,
+    "person_upper_yellow_lower_gray_backpack_blue": 68
+  },
+  "template_family_counts": {
+    "compositional_altitude_duration_region_return": 143,
+    "compositional_duration_region_target_return": 26,
+    "compositional_landing_target_region_default": 4,
+    "compositional_region_altitude_target_default": 27,
+    "heldout_altitude_landing_region": 151,
+    "heldout_duration_altitude_target_region": 27,
+    "heldout_return_target_region": 1,
+    "heldout_target_landing_region": 21,
+    "iid_altitude_landing_region_duration": 151,
+    "iid_duration_altitude_target_return": 25,
+    "iid_region_landing_target_default": 4,
+    "iid_target_region_duration_landing": 20,
+    "robustness_injection": 11,
+    "robustness_injection_altitude": 66,
+    "robustness_injection_default": 2,
+    "robustness_injection_default_altitude": 21,
+    "train_altitude_region_target_return": 714,
+    "train_landing_altitude_target_default": 102,
+    "train_region_target_duration_return": 149,
+    "train_target_region_default_return": 35,
+    "validation_duration_target_region_return": 3,
+    "validation_landing_region_duration": 30,
+    "validation_region_altitude_default_return": 23,
+    "validation_target_altitude_region_return": 144
+  },
+  "template_fraction": 1.0,
+  "test_language_human_authored_or_reviewed_fraction": 0.0,
+  "test_robustness_human_reviewed_fraction": 0.0,
+  "total_samples": 1900,
+  "track_duration_counts": {
+    "10": 263,
+    "15": 270,
+    "20": 288,
+    "30": 558,
+    "45": 252,
+    "60": 269
+  },
+  "train_external_candidate_fraction": 0.0,
+  "unreviewed_external_candidate_count": 0
+}

@@ -1,0 +1,213 @@
+schema_version: planner_templates_zh_v1
+language: zh-CN
+
+# duration_mode and altitude_mode are semantic guards.  A template is eligible
+# only when the corresponding Gold field is explicitly present/absent.
+templates:
+  # Train skeletons.  Exact IDs, families and wording are train-only.
+  - template_id: train_region_target_explicit_default_01
+    template_family: train_region_target_duration_return
+    paraphrase_family: train_direct_explicit
+    splits: [train]
+    duration_mode: explicit
+    altitude_mode: default
+    difficulty: easy
+    text: "{prefix}在{region}搜索{target}，找到后{duration}，然后返回{landing}降落。{suffix}"
+  - template_id: train_target_region_default_default_01
+    template_family: train_target_region_default_return
+    paraphrase_family: train_reordered_default
+    splits: [train]
+    duration_mode: default
+    altitude_mode: default
+    difficulty: medium
+    text: "{prefix}目标是{target}，去{region}搜寻，发现后{duration}，最后在{landing}着陆。{suffix}"
+  - template_id: train_altitude_region_explicit_explicit_01
+    template_family: train_altitude_region_target_return
+    paraphrase_family: train_altitude_first
+    splits: [train]
+    duration_mode: explicit
+    altitude_mode: explicit
+    difficulty: medium
+    text: "{prefix}起飞到{altitude}，前往{region}寻找{target}，{duration}后到{landing}降落。{suffix}"
+  - template_id: train_landing_altitude_default_explicit_01
+    template_family: train_landing_altitude_target_default
+    paraphrase_family: train_landing_fronted_default
+    splits: [train]
+    duration_mode: default
+    altitude_mode: explicit
+    difficulty: hard
+    text: "{prefix}最后到{landing}降落；现在升至{altitude}，在{region}找{target}，找到后{duration}。{suffix}"
+
+  # Validation skeletons are semantically equivalent but structurally held out.
+  - template_id: validation_landing_region_explicit_default_01
+    template_family: validation_landing_region_duration
+    paraphrase_family: validation_landing_first
+    splits: [validation]
+    duration_mode: explicit
+    altitude_mode: default
+    difficulty: medium
+    text: "{prefix}收尾时在{landing}降落。在此之前，请到{region}找出{target}并{duration}。{suffix}"
+  - template_id: validation_duration_target_default_default_01
+    template_family: validation_duration_target_region_return
+    paraphrase_family: validation_duration_first_default
+    splits: [validation]
+    duration_mode: default
+    altitude_mode: default
+    difficulty: hard
+    text: "{prefix}发现后{duration}；先在{region}确认{target}，完成后返回{landing}。{suffix}"
+  - template_id: validation_target_altitude_explicit_explicit_01
+    template_family: validation_target_altitude_region_return
+    paraphrase_family: validation_target_first_altitude
+    splits: [validation]
+    duration_mode: explicit
+    altitude_mode: explicit
+    difficulty: hard
+    text: "{prefix}要找的是{target}；先升到{altitude}，再去{region}，确认后{duration}，后续在{landing}降落。{suffix}"
+  - template_id: validation_region_altitude_default_explicit_01
+    template_family: validation_region_altitude_default_return
+    paraphrase_family: validation_region_first_default
+    splits: [validation]
+    duration_mode: default
+    altitude_mode: explicit
+    difficulty: medium
+    text: "{prefix}搜索范围是{region}，起飞高度设为{altitude}，目标为{target}，看到后{duration}，然后去{landing}。{suffix}"
+
+  # IID test uses familiar vocabulary with unseen exact skeletons.
+  - template_id: iid_target_region_explicit_default_01
+    template_family: iid_target_region_duration_landing
+    paraphrase_family: iid_target_first
+    splits: [test_iid]
+    duration_mode: explicit
+    altitude_mode: default
+    difficulty: medium
+    text: "{prefix}请把{target}作为对象，到{region}去找，找到后{duration}，任务结束于{landing}。{suffix}"
+  - template_id: iid_region_landing_default_default_01
+    template_family: iid_region_landing_target_default
+    paraphrase_family: iid_region_landing_default
+    splits: [test_iid]
+    duration_mode: default
+    altitude_mode: default
+    difficulty: medium
+    text: "{prefix}请先去{region}，在那里搜寻{target}；锁定后{duration}，再前往{landing}降落。{suffix}"
+  - template_id: iid_altitude_landing_explicit_explicit_01
+    template_family: iid_altitude_landing_region_duration
+    paraphrase_family: iid_altitude_landing_fronted
+    splits: [test_iid]
+    duration_mode: explicit
+    altitude_mode: explicit
+    difficulty: hard
+    text: "{prefix}以{altitude}高度起飞，并预定在{landing}降落；中间到{region}搜索{target}并{duration}。{suffix}"
+  - template_id: iid_duration_altitude_default_explicit_01
+    template_family: iid_duration_altitude_target_return
+    paraphrase_family: iid_duration_first_altitude
+    splits: [test_iid]
+    duration_mode: default
+    altitude_mode: explicit
+    difficulty: hard
+    text: "{prefix}{duration}即可；升至{altitude}后在{region}识别{target}，随后到{landing}着陆。{suffix}"
+
+  # Compositional test skeletons are also isolated from all ordinary splits.
+  - template_id: compositional_duration_region_explicit_default_01
+    template_family: compositional_duration_region_target_return
+    paraphrase_family: compositional_duration_fronted
+    splits: [test_compositional]
+    duration_mode: explicit
+    altitude_mode: default
+    difficulty: hard
+    text: "{prefix}持续时间要求如下：{duration}。请在{region}搜索{target}，之后到{landing}降落。{suffix}"
+  - template_id: compositional_landing_target_default_default_01
+    template_family: compositional_landing_target_region_default
+    paraphrase_family: compositional_landing_fronted_default
+    splits: [test_compositional]
+    duration_mode: default
+    altitude_mode: default
+    difficulty: hard
+    text: "{prefix}降落点定为{landing}；先确认{target}，搜索位置是{region}，找到后{duration}。{suffix}"
+  - template_id: compositional_altitude_duration_explicit_explicit_01
+    template_family: compositional_altitude_duration_region_return
+    paraphrase_family: compositional_altitude_duration_fronted
+    splits: [test_compositional]
+    duration_mode: explicit
+    altitude_mode: explicit
+    difficulty: hard
+    text: "{prefix}起飞到{altitude}，且对{target}{duration}；搜索在{region}进行，最后返回{landing}。{suffix}"
+  - template_id: compositional_region_altitude_default_explicit_01
+    template_family: compositional_region_altitude_target_default
+    paraphrase_family: compositional_region_altitude_default
+    splits: [test_compositional]
+    duration_mode: default
+    altitude_mode: explicit
+    difficulty: hard
+    text: "{prefix}到{region}寻找{target}，但先把起飞高度设为{altitude}；发现后{duration}，然后在{landing}结束。{suffix}"
+
+  # Held-out aliases, orderings and polite forms are exclusive to language test.
+  - template_id: language_target_landing_region_explicit_no_alt_01
+    template_family: heldout_target_landing_region
+    paraphrase_family: heldout_language_order
+    splits: [test_language]
+    duration_mode: explicit
+    altitude_mode: default
+    difficulty: hard
+    text: "{prefix}请识别{target}，收尾位置定在{landing}；请先去{region}，确认后{duration}。{suffix}"
+  - template_id: language_return_target_region_default_no_alt_01
+    template_family: heldout_return_target_region
+    paraphrase_family: heldout_language_default
+    splits: [test_language]
+    duration_mode: default
+    altitude_mode: default
+    difficulty: hard
+    text: "{prefix}返程在{landing}结束；此前将{target}作为目标，前往{region}搜寻，发现后{duration}。{suffix}"
+  - template_id: language_alt_landing_region_explicit_01
+    template_family: heldout_altitude_landing_region
+    paraphrase_family: heldout_language_altitude
+    splits: [test_language]
+    duration_mode: explicit
+    altitude_mode: explicit
+    difficulty: hard
+    text: "{prefix}请以{altitude}的起飞高度执行，结束后在{landing}着陆；中间去{region}识别{target}并{duration}。{suffix}"
+  - template_id: language_duration_alt_target_region_default_01
+    template_family: heldout_duration_altitude_target_region
+    paraphrase_family: heldout_language_default_altitude
+    splits: [test_language]
+    duration_mode: default
+    altitude_mode: explicit
+    difficulty: hard
+    text: "{prefix}{duration}即可。升至{altitude}后，以{target}为搜寻对象前往{region}，完成后在{landing}落地。{suffix}"
+
+  # Prompt-injection and format interference never appear outside robustness.
+  - template_id: robustness_explicit_no_alt_01
+    template_family: robustness_injection
+    paraphrase_family: injection_suffix
+    splits: [test_robustness]
+    duration_mode: explicit
+    altitude_mode: default
+    difficulty: adversarial
+    robustness: true
+    text: "{prefix}去{region}寻找{target}，{duration}后在{landing}降落。{injection}"
+  - template_id: robustness_default_no_alt_01
+    template_family: robustness_injection_default
+    paraphrase_family: injection_suffix_default
+    splits: [test_robustness]
+    duration_mode: default
+    altitude_mode: default
+    difficulty: adversarial
+    robustness: true
+    text: "{prefix}到{region}搜索{target}，看到后{duration}，然后去{landing}降落。{injection}"
+  - template_id: robustness_explicit_alt_01
+    template_family: robustness_injection_altitude
+    paraphrase_family: injection_suffix_altitude
+    splits: [test_robustness]
+    duration_mode: explicit
+    altitude_mode: explicit
+    difficulty: adversarial
+    robustness: true
+    text: "{prefix}起飞至{altitude}，在{region}找{target}，{duration}后到{landing}降落。{injection}"
+  - template_id: robustness_default_alt_01
+    template_family: robustness_injection_default_altitude
+    paraphrase_family: injection_suffix_default_altitude
+    splits: [test_robustness]
+    duration_mode: default
+    altitude_mode: explicit
+    difficulty: adversarial
+    robustness: true
+    text: "{prefix}先升到{altitude}，再去{region}寻找{target}，后续{duration}，任务完成于{landing}。{injection}"

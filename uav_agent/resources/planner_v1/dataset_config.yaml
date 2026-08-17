@@ -1,0 +1,49 @@
+schema_version: planner_dataset_config_v1
+language: zh-CN
+resources:
+  target_ontology: target_ontology.yaml
+  language_lexicon: language_lexicon_zh.yaml
+  world_contexts: world_contexts.yaml
+  templates: templates_zh.yaml
+
+profiles:
+  pilot:
+    split_counts:
+      train: 1000
+      validation: 200
+      test_iid: 200
+      test_compositional: 200
+      test_language: 200
+      test_robustness: 100
+  full:
+    split_counts:
+      train: 8000
+      validation: 1000
+      test_iid: 1000
+      test_compositional: 1000
+      test_language: 1000
+      test_robustness: 500
+
+generation:
+  track_durations_s: [10.0, 15.0, 20.0, 30.0, 45.0, 60.0]
+  takeoff_altitudes_m: [5.0, 8.0, 10.0, 12.0, 15.0]
+  explicit_duration_ratio: 0.8
+  explicit_altitude_ratio: 0.5
+  generation_source: template
+  default_paraphraser: none
+  split_seed_offsets:
+    train: 100000
+    validation: 200000
+    test_iid: 300000
+    test_compositional: 400000
+    test_language: 500000
+    test_robustness: 600000
+  compositional_holdout_concepts:
+    - person_upper_red_backpack_black
+    - person_upper_blue_backpack_red
+    - person_upper_yellow_lower_gray_backpack_blue
+  minimum_coverage:
+    target_concept: 1
+    search_region: 1
+    landing_zone: 1
+    track_duration: 1

@@ -15,7 +15,10 @@ import json
 import math
 from pathlib import Path
 from statistics import fmean
-from typing import Any, Callable, ContextManager, Mapping, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, ContextManager, Mapping, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from tasks.intent_judge import IntentJudgeResult
 
 try:
     from .schemas import MetricPhase
@@ -128,6 +131,29 @@ def compute_mission_success_strict(
 
     return all(_is_true(_metric_value(metrics, name)) for name in STRICT_SUCCESS_FIELDS) and all(
         _is_false(_metric_value(metrics, name)) for name in STRICT_FAILURE_FIELDS
+    )
+
+
+def compute_instruction_grounded_success(
+    execution_metrics: Mapping[str, object],
+    intent_result: "IntentJudgeResult",
+) -> bool:
+    """Require both Gold-intent agreement and strict execution success.
+
+    This versioned, independent metric intentionally leaves
+    :func:`compute_mission_success_strict` and its existing producers unchanged.
+    It must only be used when an episode has an independently authored Gold
+    specification and a corresponding :class:`tasks.IntentJudgeResult`.
+    """
+
+    from tasks.intent_judge import IntentJudgeResult
+
+    if not isinstance(execution_metrics, Mapping):
+        raise TypeError("execution_metrics must be a mapping")
+    if not isinstance(intent_result, IntentJudgeResult):
+        raise TypeError("intent_result must be an IntentJudgeResult")
+    return intent_result.semantic_match and compute_mission_success_strict(
+        execution_metrics
     )
 
 
@@ -534,6 +560,7 @@ __all__ = [
     "STRICT_FAILURE_FIELDS",
     "STRICT_SUCCESS_FIELDS",
     "aggregate_episode_metrics",
+    "compute_instruction_grounded_success",
     "compute_mission_success_strict",
     "parse_metric_bool",
     "wilson_interval_95",

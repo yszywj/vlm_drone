@@ -524,6 +524,130 @@ Oracle demo 使用 `target.motion.seed` 在 `target.initial_region` 内可重复
   --start-altitude 0 --takeoff-altitude 10 --track-duration 30
 ```
 
+## Planner 数据集 v1：Gold 任务链与离线评测
+
+Planner v1 是一个纯文本、Planner-only 的中文数据集。它只训练和评测下面这一段映射：
+
+```text
+自然语言任务指令
+    ↓
+MissionIntent（五个严格字段）
+```
+
+数据中不包含 Camera 图片、视频、Observation dump、目标出生坐标或速度、Oracle/evaluator 真值、Skill sequence、航点、姿态、电机动作和控制轨迹。生成、验证和离线评测均为纯 Python，不启动 Isaac Sim；本仓库也没有因此新增 Qwen SFT、LoRA、RL 或其他实际训练入口。开放 VLN 数据集的任务定义、坐标系、动作空间和标签 schema 与当前 `MissionIntent` 不同，因此不能直接把开放 VLN 样本当作 Planner v1 的监督标签；使用前必须经过独立的语义映射、人工审核和本项目 validator，而不能简单拼接进 JSONL。
+
+标签采用 Gold-first 流程：先从封闭 target ontology、公开的 world context 和可信默认值构造不可变 `GoldPlannerSpec`，再由 Gold 确定性生成 assistant JSON，最后渲染自然语言 instruction 和与运行时逐字节一致的 prompt。Gold 在调用任何模型前就已经确定，绝不从 Planner prediction 反推或回填。`IntentJudge` 分开报告严格输出 `exact_match` 和解析默认值后的五字段 `semantic_match`；执行自己的错误计划不能获得 instruction-grounded success。
+
+在 `uav_agent/` 目录生成 pilot：
+
+```bash
+cd /path/to/vlm_drones/uav_agent
+./python.sh scripts/generate_planner_dataset.py \
+  --config resources/planner_v1/dataset_config.yaml \
+  --output-root ../datasets/planner_v1 \
+  --seed 42 \
+  --profile pilot
+```
+
+已存在输出时生成器默认拒绝覆盖；只有确认替换整个正式数据集时才加入 `--overwrite`。若目录内存在尚未审核的 `_candidates/`，覆盖也会被拒绝，须先移动或完成审核，避免丢失候选。相同资源、配置和 seed 会产生相同的 JSONL 内容与 checksums。pilot 的精确数量为 train 1,000、validation 200、test_iid 200、test_compositional 200、test_language 200、test_robustness 100，共 1,900 条；它们全部标记为 `generation_source=template`、`review_status=unreviewed`，不会把自动模板伪装成人工数据。
+
+`full` profile 定义了 8,000 / 1,000 / 1,000 / 1,000 / 1,000 / 500，共 12,500 条的候选规模，但它不是“自动生成即正式发布”的捷径。正式 full 数据必须先在人工审核流程中达到 test_language 至少 50% 人工编写或逐条审核、test_robustness 100% 人工审核，并保留真实 provenance；当前仓库不冒充或自动执行这项人工工作。因此未审核的 `--profile full` 正式写盘会按预期失败，validator 也拒绝把未达比例的数据当作 full。当前可直接复现并通过完整验收的是下述 1,900 条 pilot。
+
+默认 `--paraphraser none`，不会加载 Qwen、调用网络或付费 API。可选外部 paraphraser 只能改写 instruction，不能生成或修改 Gold/assistant label。调用方先在仓库外得到只含 `sample_id` 与 `candidate_instruction` 的 JSONL，再用下列显式 candidate-only 命令做封闭词表检查和暂存；CLI 本身绝不会调用外部服务：
+
+```bash
+./python.sh scripts/generate_planner_dataset.py \
+  --config resources/planner_v1/dataset_config.yaml \
+  --output-root ../datasets/planner_v1 \
+  --seed 42 \
+  --profile pilot \
+  --paraphraser external \
+  --candidate-only \
+  --candidate-input /path/to/external-candidates.jsonl
+```
+
+原始改写只允许先进入 `datasets/planner_v1/_candidates/`，通过语义和泄漏检查及人工审核后才可进入正式数据。`_candidates/` 被 Git 忽略，正式 split、manifest、统计和 checksums 不被忽略。缺少 `--candidate-only` 或 candidate input 时 external 模式会明确拒绝，且绝不会改变正式 split。
+
+完整验证只需一条命令，任何 JSON/schema、Gold、prompt、ontology、跨 split 泄漏或 checksum 错误都会返回非零退出码：
+
+```bash
+./python.sh scripts/validate_planner_dataset.py \
+  --dataset-root ../datasets/planner_v1
+```
+
+生成后的仓库根目录结构为：
+
+```text
+datasets/planner_v1/
+├── dataset_manifest.json
+├── train.jsonl
+├── validation.jsonl
+├── test_iid.jsonl
+├── test_compositional.jsonl
+├── test_language.jsonl
+├── test_robustness.jsonl
+├── statistics.json
+├── checksums.sha256
+└── _candidates/                 # 可选、未审核且被忽略
+```
+
+先用 scripted evaluator 自检 evaluator 和 Gold judge；它不调用模型，所有有效 split 的 exact/semantic match 都应为 100%：
+
+```bash
+./python.sh scripts/evaluate_planner_dataset.py \
+  --dataset-root ../datasets/planner_v1 \
+  --split test_iid \
+  --planner scripted \
+  --output-root ../outputs/planner_eval
+
+for split in train validation test_iid test_compositional test_language test_robustness; do
+  ./python.sh scripts/evaluate_planner_dataset.py \
+    --dataset-root ../datasets/planner_v1 \
+    --split "$split" \
+    --planner scripted \
+    --output-root ../outputs/planner_eval
+done
+```
+
+连接现有 OpenAI-compatible Qwen 文本服务时，evaluator 复用生产 `LLMPlanner` 的严格 JSON parser、固定 `temperature=0` 和最多一次 repair；它不发送图像或 Gold，也不用 `PlanValidator` 代替 Gold judge：
+
+```bash
+QWEN_API_BASE=http://127.0.0.1:8000/v1 \
+QWEN_API_KEY=EMPTY \
+QWEN_MODEL=Qwen3-VL-4B-Instruct \
+./python.sh scripts/evaluate_planner_dataset.py \
+  --dataset-root ../datasets/planner_v1 \
+  --split test_iid \
+  --planner llm \
+  --output-root ../outputs/planner_eval \
+  --limit 200
+```
+
+可用 `--start-index N --limit M` 评测一个窗口。中断后把首次输出的 run 目录传给 `--resume`，已完成 sample ID 不会重复请求模型：
+
+```bash
+QWEN_API_BASE=http://127.0.0.1:8000/v1 \
+QWEN_API_KEY=EMPTY \
+QWEN_MODEL=Qwen3-VL-4B-Instruct \
+./python.sh scripts/evaluate_planner_dataset.py \
+  --dataset-root ../datasets/planner_v1 \
+  --split test_iid \
+  --planner llm \
+  --resume /path/to/existing/planner-eval-run
+```
+
+每次运行输出到 `outputs/planner_eval/<run_id>/`，只保存 Planner 文本结果：
+
+```text
+summary.json
+predictions.jsonl
+errors.csv
+field_metrics.csv
+terminal.log
+```
+
+`summary.json` 同时聚合 output validity、exact/semantic match、五字段 accuracy、repair request/success 和 latency；单条模型或解析失败会记录后继续下一条，不会中止整个 split。API key、隐藏世界真值、完整环境对象和图像均不会写入这些文件。
+
 ## 统一配置
 
 `configs/default.yaml` 管理：scene 大小、UAV 初始位置/最大速度/最大 yaw rate、Camera resolution/frequency/FOV/focal length/pitch、Target 初始区域/最大速度/运动模式与边界，以及 Search radius、timeout 和 transit yaw mode。加载器在启动昂贵的 Isaac Sim 之前完成类型、有限值、单位、空间边界、统一 physics/render tick 和 Camera frequency 校验；当前运动学环境要求 physics/render dt 相等。
@@ -542,9 +666,12 @@ uav_agent/
 ├── skills/        # 统一 Skill API、MotionPolicy、Manager 与六类 Goal 合同
 ├── perception/    # 视觉感知；Stage-0 含 evaluator-only OraclePerception
 ├── planner/       # 任务分解与层次规划
+├── tasks/         # 独立 Gold Spec、封闭目标 ontology 与 Intent Judge
+├── planner_data/  # Planner v1 渲染、生成、分割、验证、泄漏检查与离线评测
+├── resources/     # Planner v1 ontology、公开 world、中文词表和模板配置
 ├── runtime/       # MissionIntent 校验与确定性 TaskPlan 编译边界
 ├── prompts/       # Prompt 模板
-├── scripts/       # scene demo 与完整 Oracle standalone 入口
+├── scripts/       # scene demo、Oracle 入口与纯 Python Planner 数据 CLI
 ├── tests/         # 快速纯测试及一个显式 opt-in Isaac 集成测试
 ├── logs/          # 运行日志（默认忽略产物）
 ├── python.sh      # 默认 r_isaac_sim，支持通过环境变量覆盖 prefix

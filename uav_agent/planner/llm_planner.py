@@ -10,6 +10,7 @@ import re
 
 from models.base import ChatMessage, GenerationOptions, ModelClient, ModelResponse
 from planner.base import MissionPlanner, PlannerError, PlannerOutputError
+from planner.prompt_builder import build_mission_planner_messages
 from planner.schemas import MissionIntent, PlannerRequest
 
 
@@ -67,10 +68,10 @@ class LLMPlanner(MissionPlanner):
         if not isinstance(request, PlannerRequest):
             raise TypeError("request must be a PlannerRequest")
 
-        user_prompt = self._build_user_prompt(request)
-        initial_messages = (
-            ChatMessage(role="system", content=self._system_prompt),
-            ChatMessage(role="user", content=user_prompt),
+        initial_messages = build_mission_planner_messages(
+            request.instruction,
+            request.world_context,
+            self._system_prompt,
         )
 
         self._safe_log("debug", "mission intent model call started")
@@ -132,35 +133,14 @@ class LLMPlanner(MissionPlanner):
 
     @staticmethod
     def _build_user_prompt(request: PlannerRequest) -> str:
-        context = request.world_context
-        safe_context = {
-            "scene_bounds_m": {
-                "minimum": list(context.scene_min_xyz_m),
-                "maximum": list(context.scene_max_xyz_m),
-            },
-            "search_regions": [
-                {"name": name, "description": spec.description}
-                for name, spec in sorted(context.search_regions.items())
-            ],
-            "landing_zones": [
-                {"name": name, "description": spec.description}
-                for name, spec in sorted(context.landing_zones.items())
-            ],
-            "default_takeoff_altitude_m": context.default_takeoff_altitude_m,
-            "default_track_duration_s": context.default_track_duration_s,
-        }
-        payload = {
-            "task": "Parse the user instruction into one MissionIntent JSON object.",
-            "trusted_world_context": safe_context,
-            "user_instruction": request.instruction,
-        }
-        return json.dumps(
-            payload,
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
+        """Compatibility wrapper around the shared canonical builder."""
+
+        messages = build_mission_planner_messages(
+            request.instruction,
+            request.world_context,
+            "placeholder",
         )
+        return str(messages[1].content)
 
     @staticmethod
     def _build_repair_prompt(original_output: str, validation_error: str) -> str:

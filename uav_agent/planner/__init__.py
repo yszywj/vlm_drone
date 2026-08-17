@@ -2,6 +2,7 @@
 
 from planner.base import MissionPlanner, PlannerError, PlannerOutputError
 from planner.llm_planner import LLMPlanner
+from planner.prompt_builder import build_mission_planner_messages
 from planner.schemas import (
     CompiledMission,
     LandingZoneSpec,
@@ -24,4 +25,5 @@ __all__ = [
     "PlannerWorldContext",
     "ScriptedPlanner",
     "SearchRegionSpec",
+    "build_mission_planner_messages",
 ]

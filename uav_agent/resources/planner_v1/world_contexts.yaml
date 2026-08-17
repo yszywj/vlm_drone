@@ -1,0 +1,34 @@
+schema_version: planner_world_contexts_v1
+
+# This resource stores only planner-visible semantic descriptions and scene
+# safety boundaries.
+worlds:
+  - context_id: world_01
+    search_regions:
+      east_area: 场地东侧的开阔搜索区
+      west_area: 场地西侧的仓储周边区
+      north_area: 场地北侧的绿化带周边
+      south_area: 场地南侧的通道周边
+    landing_zones:
+      home: 无人机出发的基地降落点
+      north_pad: 场地北侧的安全停机坪
+      south_pad: 场地南侧的安全停机坪
+    default_takeoff_altitude_m: 10.0
+    default_track_duration_s: 30.0
+    scene_min_xyz_m: [-50.0, -50.0, 0.0]
+    scene_max_xyz_m: [50.0, 50.0, 30.0]
+
+  - context_id: world_02
+    search_regions:
+      east_area: 园区东部的集结广场
+      west_area: 园区西部的装卸区
+      north_area: 园区北部的步行通道
+      south_area: 园区南部的空旷区
+    landing_zones:
+      home: 任务出发基地
+      north_pad: 北部备用降落坪
+      south_pad: 南部备用降落坪
+    default_takeoff_altitude_m: 12.0
+    default_track_duration_s: 30.0
+    scene_min_xyz_m: [-60.0, -45.0, 0.0]
+    scene_max_xyz_m: [60.0, 45.0, 35.0]

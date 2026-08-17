@@ -1,6 +1,6 @@
 """Pure-Python runtime validation, compilation, and safety supervision."""
 
-from runtime.plan_validator import PlanValidationError, PlanValidator
+from runtime.plan_validator import PlanValidationError, PlannerLimits, PlanValidator
 from runtime.safety_supervisor import SafetyAction, SafetyDecision, SafetySupervisor
 from runtime.world_context_builder import (
     LANDING_ZONE_NAME,
@@ -11,6 +11,7 @@ from runtime.world_context_builder import (
 
 __all__ = [
     "PlanValidationError",
+    "PlannerLimits",
     "PlanValidator",
     "SafetyAction",
     "SafetyDecision",

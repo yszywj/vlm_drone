@@ -28,6 +28,7 @@ from runtime.safety_supervisor import (
     SafetySupervisor,
 )
 from skills.manager import SkillManager, TaskStatus, TransitionRecord
+from skills.plan import TaskPlan, TaskStep
 from skills.types import (
     Observation,
     SkillClock,
@@ -216,7 +217,7 @@ class MissionAgent:
                 instruction=instruction,
                 world_context=world_context,
             )
-            intent = self._planner.plan(request)
+            planner_output = self._planner.plan(request)
         except Exception as exc:
             self._safe_log("[MissionAgent] planner_finished status=FAILED")
             self._raise_start_failure("planner failed", exc)
@@ -224,15 +225,16 @@ class MissionAgent:
 
         try:
             compiled = self._validator.validate_and_compile(
-                intent,
+                planner_output,
                 world_context,
                 source=self._planner_source(),
             )
+            owned_compiled = _copy_compiled_mission(compiled)
         except Exception as exc:
             self._raise_start_failure("plan validation failed", exc)
 
         try:
-            decision = self._safety.preflight(compiled)
+            decision = self._safety.preflight(owned_compiled)
         except Exception as exc:
             self._raise_start_failure("safety preflight failed", exc)
         if not isinstance(decision, SafetyDecision):
@@ -251,7 +253,7 @@ class MissionAgent:
 
         try:
             mission_start_time = self._read_clock()
-            task_status = self._skill_manager.start_task(compiled.task_plan)
+            task_status = self._skill_manager.start_task(owned_compiled.task_plan)
         except Exception as exc:
             self._raise_start_failure("SkillManager start failed", exc)
         if task_status is not TaskStatus.RUNNING:
@@ -262,7 +264,10 @@ class MissionAgent:
                 ),
             )
 
-        self._compiled_mission = compiled
+        # Keep a private plan snapshot.  The returned CompiledMission is a
+        # separate copy so callers cannot mutate future target metadata or
+        # control-flow queries after Safety preflight.
+        self._compiled_mission = owned_compiled
         self._mission_start_time_s = mission_start_time
         self._last_observation_timestamp = None
         self._transition_cursor = 0
@@ -276,7 +281,7 @@ class MissionAgent:
             self._last_error = self._error_text("transition processing failed", exc)
             self._begin_shutdown(AgentStatus.FAILED, self._last_error)
             raise MissionAgentError(self._last_error) from exc
-        return compiled
+        return _copy_compiled_mission(owned_compiled)
 
     def tick(self, observation: Observation) -> MissionAgentSnapshot:
         """Advance safety and at most one Skill tick for a new frame."""
@@ -462,9 +467,15 @@ class MissionAgent:
     def _planner_source(self) -> str:
         explicit = getattr(self._planner, "source", None)
         if explicit is not None:
-            if explicit not in {"scripted", "llm"}:
+            if explicit not in {
+                "scripted",
+                "llm",
+                "dynamic_scripted",
+                "dynamic_llm",
+            }:
                 raise MissionAgentError(
-                    "planner.source must be either 'scripted' or 'llm'"
+                    "planner.source must be scripted, llm, dynamic_scripted, "
+                    "or dynamic_llm"
                 )
             return explicit
 
@@ -476,6 +487,18 @@ class MissionAgent:
             for cls in type(self._planner).__mro__
         ):
             return "llm"
+        if any(
+            cls.__name__ == "DynamicLLMPlanner"
+            and cls.__module__ == "planner.dynamic_llm_planner"
+            for cls in type(self._planner).__mro__
+        ):
+            return "dynamic_llm"
+        if any(
+            cls.__name__ == "ScriptedDynamicPlanner"
+            and cls.__module__ == "planner.scripted_dynamic_planner"
+            for cls in type(self._planner).__mro__
+        ):
+            return "dynamic_scripted"
         return "scripted"
 
     def _runtime_safety_decision(
@@ -563,9 +586,11 @@ class MissionAgent:
         if record.new_skill is SkillName.SEARCH:
             if self._target_manager.lifecycle is not TargetLifecycle.UNINITIALIZED:
                 raise MissionAgentError("SEARCH entered with an active target")
+            target_description = self._search_target_description(
+                getattr(record, "new_step_id", None)
+            )
             self._target_manager.start_search(
-                TargetSpec(compiled.intent.target_description),
-                record.timestamp,
+                TargetSpec(target_description), record.timestamp
             )
             return
 
@@ -573,7 +598,6 @@ class MissionAgent:
             record.old_skill is SkillName.SEARCH
             and record.old_status is SkillStatus.SUCCEEDED
             and record.result_code is SkillResultCode.TARGET_FOUND
-            and record.new_skill is SkillName.TRACK
         ):
             target_id = self._skill_manager.active_target_id
             if not isinstance(target_id, str) or not target_id.strip():
@@ -593,7 +617,11 @@ class MissionAgent:
                 )
             else:
                 self._require_production_visual_lock(target_id, "SEARCH")
-            self._target_manager.start_tracking(record.timestamp)
+            # SEARCH may be followed by navigation or may be the last target
+            # operation.  Lock immediately, but enter TRACKING only when the
+            # planned successor is actually TRACK.
+            if record.new_skill is SkillName.TRACK:
+                self._target_manager.start_tracking(record.timestamp)
             return
 
         if (
@@ -636,22 +664,49 @@ class MissionAgent:
             self._target_manager.start_tracking(record.timestamp)
             return
 
+        if record.new_skill is SkillName.TRACK:
+            # Dynamic plans may insert one or more GOTO steps between SEARCH
+            # and TRACK.  The target remains LOCKED during that navigation.
+            lifecycle = self._target_manager.lifecycle
+            if lifecycle is TargetLifecycle.LOCKED:
+                self._target_manager.start_tracking(record.timestamp)
+            elif lifecycle is not TargetLifecycle.TRACKING:
+                raise MissionAgentError(
+                    "TRACK entered without a locked or already-tracked target"
+                )
+            return
+
         if (
             record.old_skill is SkillName.TRACK
             and record.old_status is SkillStatus.SUCCEEDED
             and record.result_code is SkillResultCode.TRACK_COMPLETE
             and record.new_skill in {SkillName.GOTO, SkillName.LAND}
         ):
-            self._terminate_target_if_needed(
-                record.timestamp,
-                "tracking_complete",
-            )
+            # A dynamic plan may contain a second bounded TRACK call.  Keep the
+            # identity locked, but do not claim active tracking while an
+            # intervening navigation step is running.
+            if self._has_future_track(getattr(record, "old_step_id", None)):
+                self._target_manager.finish_tracking_segment(record.timestamp)
+            else:
+                self._terminate_target_if_needed(
+                    record.timestamp,
+                    "tracking_complete",
+                )
             return
 
         # Failure/cancel transitions start fail-safe LAND.  A mission canceled
         # before SEARCH terminates directly without fabricating SEARCH or an ID.
         if record.new_skill is SkillName.LAND:
-            self._terminate_target_if_needed(record.timestamp, record.reason)
+            # A navigation-only mission has no target lifecycle to end yet;
+            # keep it UNINITIALIZED until a normal planned LAND completes.  A
+            # failure/cancel landing still records task termination at the
+            # fail-safe boundary, preserving the MissionAgent contract.
+            if (
+                self._target_manager.lifecycle is not TargetLifecycle.UNINITIALIZED
+                or self._skill_manager.pending_task_result
+                in {TaskStatus.FAILED, TaskStatus.CANCELED}
+            ):
+                self._terminate_target_if_needed(record.timestamp, record.reason)
             return
 
         # The final LAND transition records the actual task outcome.  This is a
@@ -672,6 +727,46 @@ class MissionAgent:
         ):
             return {}
         return result.data
+
+    def _search_target_description(self, step_id: str | None) -> str:
+        compiled = self._compiled_mission
+        if compiled is None:
+            raise MissionAgentError("compiled mission is missing")
+        search_steps = [
+            step
+            for step in compiled.task_plan.steps
+            if step.skill is SkillName.SEARCH
+        ]
+        step = None
+        if isinstance(step_id, str):
+            step = next(
+                (item for item in search_steps if item.step_id == step_id),
+                None,
+            )
+        elif len(search_steps) == 1:
+            # Compatibility for transition records produced before planned
+            # step IDs were added.
+            step = search_steps[0]
+        if step is None:
+            raise MissionAgentError("SEARCH transition step_id is not in TaskPlan")
+        description = step.params.get("target_description")
+        if not isinstance(description, str) or not description.strip():
+            raise MissionAgentError(
+                "compiled SEARCH step has no target_description"
+            )
+        return description.strip()
+
+    def _has_future_track(self, step_id: str | None) -> bool:
+        if not isinstance(step_id, str) or self._compiled_mission is None:
+            return False
+        steps = self._compiled_mission.task_plan.steps
+        for index, step in enumerate(steps):
+            if step.step_id == step_id:
+                return any(
+                    later.skill is SkillName.TRACK
+                    for later in steps[index + 1 :]
+                )
+        raise MissionAgentError("TRACK transition step_id is not in TaskPlan")
 
     def _require_production_visual_lock(
         self,
@@ -751,9 +846,12 @@ class MissionAgent:
         self._safe_log(
             "[MissionAgent] skill_transition "
             f"old={_optional_enum_text(record.old_skill)} "
+            f"old_step_id={getattr(record, 'old_step_id', None)} "
             f"status={_optional_enum_text(record.old_status)} "
             f"code={_optional_enum_text(record.result_code)} "
             f"new={_optional_enum_text(record.new_skill)} "
+            f"new_step_id={getattr(record, 'new_step_id', None)} "
+            f"recovery_attempt={getattr(record, 'recovery_attempt', None)} "
             f"reason={record.reason}"
         )
 
@@ -778,6 +876,28 @@ class MissionAgent:
     def _error_text(prefix: str, exc: BaseException) -> str:
         detail = str(exc).strip() or type(exc).__name__
         return f"{prefix}: {detail}"
+
+
+def _copy_compiled_mission(compiled: CompiledMission) -> CompiledMission:
+    """Return a CompiledMission with an independently owned executable plan."""
+
+    plan = TaskPlan(
+        tuple(
+            TaskStep(
+                step.step_id,
+                step.skill,
+                step.params,
+                step.recovery,
+            )
+            for step in compiled.task_plan.steps
+        )
+    )
+    return CompiledMission(
+        planner_output=compiled.planner_output,
+        task_plan=plan,
+        source=compiled.source,
+        compiler_notes=compiled.compiler_notes,
+    )
 
 
 def _valid_observation_timestamp(observation: object) -> float | None:

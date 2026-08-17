@@ -9,6 +9,8 @@ from planner.schemas import MissionIntent, PlannerRequest
 class ScriptedPlanner(MissionPlanner):
     """Return a fresh copy of one constructor-supplied MissionIntent."""
 
+    source = "scripted"
+
     def __init__(self, intent: MissionIntent) -> None:
         if not isinstance(intent, MissionIntent):
             raise TypeError("intent must be a MissionIntent")

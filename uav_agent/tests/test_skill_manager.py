@@ -208,27 +208,27 @@ def tick_once(manager: SkillManager, clock: ManualClock) -> TaskStatus:
 
 
 class SkillManagerTaskTest(unittest.TestCase):
-    def test_task_plan_accepts_only_the_five_or_six_step_sequences(self) -> None:
+    def test_task_plan_is_generic_but_enforces_runtime_structure(self) -> None:
         self.assertEqual(len(standard_plan().steps), 5)
         self.assertEqual(len(six_step_plan().steps), 6)
 
         base = standard_plan().to_dicts()
+        # Mission order and required endpoints now belong to PlanValidator and
+        # SafetySupervisor, not this transport/runtime representation.
+        self.assertEqual(len(TaskPlan.from_dicts(base[1:]).steps), 4)
+        self.assertEqual(
+            len(TaskPlan.from_dicts([base[0], base[1], base[3], base[4]]).steps),
+            4,
+        )
+        self.assertEqual(
+            len(TaskPlan.from_dicts([base[0], base[2], base[1], base[3], base[4]]).steps),
+            5,
+        )
+
         invalid_plans = {
-            "missing takeoff": base[1:],
-            "missing search": [base[0], base[1], base[3], base[4]],
-            "missing track": [base[0], base[1], base[2], base[4]],
-            "land not last": [base[0], base[1], base[2], base[4], base[3]],
-            "arbitrary order": [base[0], base[2], base[1], base[3], base[4]],
-            "duplicate search": [base[0], base[1], base[2], base[2], base[4]],
-            "duplicate track": [base[0], base[1], base[3], base[3], base[4]],
-            "explicit reacquire": [
-                base[0],
-                base[1],
-                base[2],
-                base[3],
-                {"skill": "REACQUIRE"},
-                base[4],
-            ],
+            "empty": [],
+            "duplicate id": [base[0], base[0]],
+            "explicit reacquire": [{"id": "recovery", "skill": "REACQUIRE"}],
         }
         for label, entries in invalid_plans.items():
             with self.subTest(label=label), self.assertRaises(TaskPlanError):

@@ -19,6 +19,7 @@ from configs.schema import (
     ExperimentConfig,
     FiguresConfig,
     LoggingConfig,
+    PlannerConfig,
     SceneConfig,
     SearchConfig,
     StorageConfig,
@@ -36,6 +37,8 @@ class ConfigError(ValueError):
 
 
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+_DEFAULT_PLANNER_CONFIG = PlannerConfig()
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -334,6 +337,72 @@ def load_config(path: str | Path) -> AppConfig:
         transit_yaw_mode=transit_yaw_mode.upper(),
     )
 
+    # ``planner`` was introduced after the original unified configuration.
+    # Its absence is intentionally backward compatible, while any supplied
+    # value is parsed strictly and in full.
+    if "planner" not in root:
+        planner = _DEFAULT_PLANNER_CONFIG
+    else:
+        planner_raw_value = root["planner"]
+        planner_raw = _mapping(planner_raw_value, "planner")
+        if any(not isinstance(key, str) for key in planner_raw):
+            raise ConfigError("planner keys must be strings")
+        expected_planner_keys = {
+            "max_plan_steps",
+            "max_goto_calls",
+            "max_search_calls",
+            "max_track_calls",
+            "max_reacquire_attempts_per_track",
+            "max_total_reacquire_attempts",
+            "min_track_duration_s",
+            "max_track_duration_s",
+        }
+        unknown_planner_keys = sorted(set(planner_raw) - expected_planner_keys)
+        if unknown_planner_keys:
+            raise ConfigError(
+                "planner contains unknown keys: "
+                + ", ".join(str(key) for key in unknown_planner_keys)
+            )
+        missing_planner_keys = sorted(expected_planner_keys - set(planner_raw))
+        if missing_planner_keys:
+            raise ConfigError(
+                "planner is missing required keys: "
+                + ", ".join(missing_planner_keys)
+            )
+        try:
+            planner = PlannerConfig(
+                max_plan_steps=_positive_integer(
+                    planner_raw["max_plan_steps"], "planner.max_plan_steps"
+                ),
+                max_goto_calls=_positive_integer(
+                    planner_raw["max_goto_calls"], "planner.max_goto_calls"
+                ),
+                max_search_calls=_positive_integer(
+                    planner_raw["max_search_calls"], "planner.max_search_calls"
+                ),
+                max_track_calls=_positive_integer(
+                    planner_raw["max_track_calls"], "planner.max_track_calls"
+                ),
+                max_reacquire_attempts_per_track=_positive_integer(
+                    planner_raw["max_reacquire_attempts_per_track"],
+                    "planner.max_reacquire_attempts_per_track",
+                ),
+                max_total_reacquire_attempts=_positive_integer(
+                    planner_raw["max_total_reacquire_attempts"],
+                    "planner.max_total_reacquire_attempts",
+                ),
+                min_track_duration_s=_positive_number(
+                    planner_raw["min_track_duration_s"],
+                    "planner.min_track_duration_s",
+                ),
+                max_track_duration_s=_positive_number(
+                    planner_raw["max_track_duration_s"],
+                    "planner.max_track_duration_s",
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"invalid planner configuration: {exc}") from exc
+
     experiment_raw = _mapping(_required(root, "experiment", "config"), "experiment")
     experiment_name = _required(experiment_raw, "name", "experiment")
     if not isinstance(experiment_name, str) or not _EXPERIMENT_NAME_RE.fullmatch(experiment_name):
@@ -517,6 +586,7 @@ def load_config(path: str | Path) -> AppConfig:
         camera=camera,
         target=target,
         search=search,
+        planner=planner,
         experiment=experiment,
         logging=logging,
         tensorboard=tensorboard,

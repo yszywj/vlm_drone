@@ -1007,6 +1007,7 @@ class MissionAgentSafetyAndLifecycleTests(unittest.TestCase):
             self.assertIsInstance(canceled, MissionAgentSnapshot)
         final = harness.tick(1.0)
         self.assertIs(final.status, AgentStatus.CANCELED)
+        self.assertIs(final.target.lifecycle, TargetLifecycle.TERMINATED)
 
     def test_cancel_terminates_an_active_target(self) -> None:
         harness = make_harness()

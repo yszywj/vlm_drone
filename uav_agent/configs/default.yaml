@@ -55,6 +55,18 @@ search:
   radius_m: 25.0
   timeout_s: 120.0
 
+# Trusted limits for high-level dynamic Skill plans.  These values are never
+# delegated to the language model and are enforced again during preflight.
+planner:
+  max_plan_steps: 10
+  max_goto_calls: 5
+  max_search_calls: 1
+  max_track_calls: 2
+  max_reacquire_attempts_per_track: 2
+  max_total_reacquire_attempts: 4
+  min_track_duration_s: 1.0
+  max_track_duration_s: 600.0
+
 # Lightweight experiment-output defaults.  Raw sensor artifacts and periodic
 # checkpoints remain deliberately disabled on the shared server.
 experiment:

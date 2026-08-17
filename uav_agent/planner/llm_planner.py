@@ -33,6 +33,8 @@ class LLMPlanner(MissionPlanner):
     here.  A malformed first response gets exactly one repair attempt.
     """
 
+    source = "llm"
+
     def __init__(
         self,
         model_client: ModelClient,

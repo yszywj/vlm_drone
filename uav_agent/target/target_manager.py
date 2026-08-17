@@ -302,6 +302,29 @@ class TargetManager:
             "tracking_started",
         )
 
+    def finish_tracking_segment(self, timestamp_s: float) -> None:
+        """Keep the identity locked after one bounded TRACK segment ends.
+
+        Dynamic plans may navigate between two TRACK calls for the same
+        mission target.  During that navigation the target is still known,
+        but it is not actively being tracked.
+        """
+
+        timestamp = self._validated_transition(
+            TargetLifecycle.LOCKED,
+            timestamp_s,
+            allowed_from={TargetLifecycle.TRACKING},
+        )
+        if self._target_id is None:
+            raise TargetStateError(
+                "cannot finish a tracking segment without a target_id"
+            )
+        self._commit_transition(
+            TargetLifecycle.LOCKED,
+            timestamp,
+            "tracking_segment_complete",
+        )
+
     def mark_lost(
         self,
         *,

@@ -64,6 +64,7 @@ class PlanValidatorTests(unittest.TestCase):
             compiled.task_plan.to_dicts(),
             [
                 {
+                    "id": "step_01",
                     "skill": "TAKEOFF",
                     "target_altitude": 10.0,
                     # No separate takeoff timeout exists in the world schema;
@@ -71,11 +72,13 @@ class PlanValidatorTests(unittest.TestCase):
                     "timeout": 120.0,
                 },
                 {
+                    "id": "step_02",
                     "skill": "GOTO",
                     "position": [20.0, 12.0, 10.0],
                     "timeout": 120.0,
                 },
                 {
+                    "id": "step_03",
                     "skill": "SEARCH",
                     "center": [20.0, 30.0, 0.0],
                     "radius": 15.0,
@@ -84,17 +87,20 @@ class PlanValidatorTests(unittest.TestCase):
                     "timeout": 75.0,
                 },
                 {
+                    "id": "step_04",
                     "skill": "TRACK",
                     "target_id": "$SEARCH.result.target_id",
                     "desired_altitude": 10.0,
                     "track_duration": 30.0,
                 },
                 {
+                    "id": "step_05",
                     "skill": "GOTO",
                     "position": [1.0, -2.0, 10.0],
                     "timeout": 120.0,
                 },
                 {
+                    "id": "step_06",
                     "skill": "LAND",
                     "ground_altitude": 0.0,
                     "timeout": 60.0,

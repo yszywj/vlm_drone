@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from planner.schemas import MissionIntent, PlannerRequest
+from planner.schemas import PlannerOutput, PlannerRequest
 
 
 class PlannerError(RuntimeError):
@@ -12,13 +12,19 @@ class PlannerError(RuntimeError):
 
 
 class PlannerOutputError(PlannerError):
-    """Raised when a planner produces an invalid high-level intent."""
+    """Raised when a planner produces invalid high-level JSON output."""
 
 
 class MissionPlanner(ABC):
-    """Convert a natural-language request into a high-level mission intent."""
+    """Convert natural language into a high-level semantic plan.
+
+    A planner may return the legacy ``MissionIntent`` or a dynamic
+    ``SkillPlanDraft``.  It must never return world-coordinate-resolved
+    ``SkillGoal`` or ``TaskPlan`` values; those belong to trusted runtime code.
+    """
+
+    source: str
 
     @abstractmethod
-    def plan(self, request: PlannerRequest) -> MissionIntent:
-        """Return an intent only; Skill execution belongs to the runtime."""
-
+    def plan(self, request: PlannerRequest) -> PlannerOutput:
+        """Return a high-level planner output; execution belongs to runtime."""

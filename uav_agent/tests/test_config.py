@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from configs.loader import AppConfig as LoaderAppConfig  # noqa: E402
 from configs.loader import ConfigError, load_config  # noqa: E402
 from configs.schema import AppConfig  # noqa: E402
+from configs.schema import PlannerConfig  # noqa: E402
 
 
 class DefaultConfigTest(unittest.TestCase):
@@ -49,6 +50,7 @@ class DefaultConfigTest(unittest.TestCase):
         self.assertEqual(config.search.transit_yaw_mode, "FACE_POINT")
         self.assertGreater(config.search.radius_m, 0.0)
         self.assertGreater(config.search.timeout_s, 0.0)
+        self.assertEqual(config.planner, PlannerConfig())
         self.assertEqual(config.experiment.name, "oracle_baseline")
         self.assertEqual(config.experiment.seed, 42)
         self.assertIsNone(config.experiment.output_root)
@@ -91,6 +93,75 @@ class DefaultConfigTest(unittest.TestCase):
                     min_free_space_gb_during_run=10,
                 )
             )
+
+    def test_legacy_config_without_planner_uses_trusted_defaults(self) -> None:
+        config: AppConfig | None = None
+
+        def remove_planner(raw: dict[str, object]) -> None:
+            raw.pop("planner")
+
+        raw = yaml.safe_load(
+            (PROJECT_ROOT / "configs" / "default.yaml").read_text(encoding="utf-8")
+        )
+        remove_planner(raw)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "legacy.yaml"
+            path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+            config = load_config(path)
+
+        self.assertEqual(config.planner, PlannerConfig())
+
+    def test_planner_limits_are_strictly_validated(self) -> None:
+        mutations = (
+            ("max_plan_steps", 1),
+            ("max_plan_steps", 11),
+            ("max_plan_steps", True),
+            ("max_goto_calls", 0),
+            ("max_goto_calls", 6),
+            ("max_search_calls", 2),
+            ("max_track_calls", 0),
+            ("max_track_calls", 3),
+            ("max_reacquire_attempts_per_track", 5),
+            ("max_total_reacquire_attempts", 0),
+            ("max_total_reacquire_attempts", 5),
+            ("min_track_duration_s", 0.0),
+            ("max_track_duration_s", float("inf")),
+        )
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ConfigError):
+                    self._load_mutated(
+                        lambda raw, key=key, value=value: raw["planner"].__setitem__(
+                            key, value
+                        )
+                    )
+
+        with self.assertRaises(ConfigError):
+            self._load_mutated(
+                lambda raw: raw["planner"].update(
+                    min_track_duration_s=30.0,
+                    max_track_duration_s=10.0,
+                )
+            )
+        with self.assertRaises(ConfigError):
+            self._load_mutated(
+                lambda raw: raw["planner"].__setitem__("unknown", 1)
+            )
+        with self.assertRaises(ConfigError):
+            self._load_mutated(lambda raw: raw.__setitem__("planner", None))
+
+    def test_planner_config_direct_construction_is_strict(self) -> None:
+        for kwargs in (
+            {"max_plan_steps": True},
+            {"max_plan_steps": 1},
+            {"max_plan_steps": 11},
+            {"max_search_calls": 2},
+            {"min_track_duration_s": float("nan")},
+            {"min_track_duration_s": 20.0, "max_track_duration_s": 10.0},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    PlannerConfig(**kwargs)
 
 
 if __name__ == "__main__":

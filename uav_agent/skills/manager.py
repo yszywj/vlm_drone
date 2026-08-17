@@ -1,4 +1,4 @@
-"""Single-Skill dispatch and the Stage-0 Oracle task state machine."""
+"""Single-Skill dispatch and generic bounded linear task execution."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from skills.base import Skill, SkillLifecycleError
 from skills.goto import GotoGoal, GotoSkill
 from skills.land import LandGoal, LandSkill
 from skills.motion_types import MotionPolicy, YawMode
+from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskPlanError, TaskStep
 from skills.reacquire import ReacquireGoal, ReacquireSkill
 from skills.search import SearchGoal, SearchSkill
 from skills.takeoff import TakeoffGoal, TakeoffSkill
@@ -34,16 +35,10 @@ class SkillManagerError(RuntimeError):
 
 
 class SkillNotRegisteredError(SkillManagerError):
-    """Raised when a requested Qwen tool name has no registered Skill."""
-
-
-class TaskPlanError(SkillManagerError):
-    """Raised when a Stage-0 task plan is structurally invalid."""
+    """Raised when a requested tool name has no registered Skill."""
 
 
 class TaskStatus(Enum):
-    """Lifecycle of the complete multi-Skill task, independent of SkillStatus."""
-
     IDLE = auto()
     RUNNING = auto()
     SUCCEEDED = auto()
@@ -51,100 +46,16 @@ class TaskStatus(Enum):
     CANCELED = auto()
 
 
-@dataclass(frozen=True, slots=True)
-class TaskStep:
-    """One orchestration-layer step before conversion to a typed SkillGoal."""
+class ExecutionKind(str, Enum):
+    """Whether the active Skill is planned work or internal recovery."""
 
-    skill: SkillName
-    params: Mapping[str, object]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "skill", _skill_name(self.skill))
-        if not isinstance(self.params, Mapping):
-            raise TaskPlanError("TaskStep.params must be a mapping")
-        normalized = deepcopy(dict(self.params))
-        if "skill" in normalized:
-            raise TaskPlanError("TaskStep.params must not contain a skill key")
-        object.__setattr__(self, "params", normalized)
-
-    def to_dict(self) -> dict[str, object]:
-        return {"skill": self.skill.value, **deepcopy(dict(self.params))}
-
-
-_FIVE_STEP_TASK_SEQUENCE = (
-    SkillName.TAKEOFF,
-    SkillName.GOTO,
-    SkillName.SEARCH,
-    SkillName.TRACK,
-    SkillName.LAND,
-)
-
-_SIX_STEP_TASK_SEQUENCE = (
-    SkillName.TAKEOFF,
-    SkillName.GOTO,
-    SkillName.SEARCH,
-    SkillName.TRACK,
-    SkillName.GOTO,
-    SkillName.LAND,
-)
-
-_STANDARD_TASK_SEQUENCES = (
-    _FIVE_STEP_TASK_SEQUENCE,
-    _SIX_STEP_TASK_SEQUENCE,
-)
-
-
-@dataclass(frozen=True, slots=True)
-class TaskPlan:
-    """Hand-written Stage-0 plan; recovery steps are injected by the Manager."""
-
-    steps: tuple[TaskStep, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.steps, tuple) or not all(
-            isinstance(step, TaskStep) for step in self.steps
-        ):
-            raise TaskPlanError("TaskPlan.steps must be a tuple of TaskStep values")
-        names = tuple(step.skill for step in self.steps)
-        if names not in _STANDARD_TASK_SEQUENCES:
-            expected = " or ".join(
-                " -> ".join(name.value for name in sequence)
-                for sequence in _STANDARD_TASK_SEQUENCES
-            )
-            actual = " -> ".join(name.value for name in names) or "<empty>"
-            raise TaskPlanError(
-                f"Stage-0 TaskPlan must be {expected}; received {actual}"
-            )
-
-    @classmethod
-    def from_dicts(cls, entries: Sequence[Mapping[str, object]]) -> TaskPlan:
-        """Parse the user-facing list format without passing dict Goals to Skills."""
-
-        if isinstance(entries, (str, bytes)) or not isinstance(entries, Sequence):
-            raise TaskPlanError("task plan must be a sequence of mappings")
-        parsed: list[TaskStep] = []
-        for index, entry in enumerate(entries):
-            if not isinstance(entry, Mapping):
-                raise TaskPlanError(f"task plan entry {index} must be a mapping")
-            if "skill" not in entry:
-                raise TaskPlanError(f"task plan entry {index} is missing skill")
-            if any(not isinstance(key, str) for key in entry):
-                raise TaskPlanError(
-                    f"task plan entry {index} keys must be strings"
-                )
-            name = _skill_name(entry["skill"])
-            params = {key: deepcopy(value) for key, value in entry.items() if key != "skill"}
-            _reject_unknown_goal_fields(name, params)
-            parsed.append(TaskStep(name, params))
-        return cls(tuple(parsed))
-
-    def to_dicts(self) -> list[dict[str, object]]:
-        return [step.to_dict() for step in self.steps]
+    PLANNED = "PLANNED"
+    RECOVERY = "RECOVERY"
 
 
 @dataclass(frozen=True, slots=True)
 class TransitionRecord:
-    """One externally inspectable task transition."""
+    """One task transition, including its planned-step identity."""
 
     timestamp: float
     old_skill: SkillName | None
@@ -152,6 +63,9 @@ class TransitionRecord:
     result_code: SkillResultCode | None
     new_skill: SkillName | None
     reason: str
+    old_step_id: str | None = None
+    new_step_id: str | None = None
+    recovery_attempt: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -161,15 +75,15 @@ class TransitionRecord:
             "result_code": None if self.result_code is None else self.result_code.name,
             "new_skill": None if self.new_skill is None else self.new_skill.value,
             "reason": self.reason,
+            "old_step_id": self.old_step_id,
+            "new_step_id": self.new_step_id,
+            "recovery_attempt": self.recovery_attempt,
         }
 
 
 def create_default_skill_registry(
-    *,
-    transit_yaw_mode: YawMode | str = YawMode.FACE_POINT,
+    *, transit_yaw_mode: YawMode | str = YawMode.FACE_POINT
 ) -> dict[SkillName, Skill]:
-    """Create exactly one fresh instance of every Stage-0 callable Skill."""
-
     return {
         SkillName.TAKEOFF: TakeoffSkill(),
         SkillName.GOTO: GotoSkill(),
@@ -181,11 +95,11 @@ def create_default_skill_registry(
 
 
 class SkillManager:
-    """Dispatch one Skill at a time and optionally run the complete task plan.
+    """Dispatch a Skill manually or execute an arbitrary validated linear plan.
 
-    The original manual ``start/tick/reset_active`` API remains available.  A
-    caller enters task mode explicitly with :meth:`start_task`; in that mode a
-    tick returns :class:`TaskStatus` and performs at most one Skill tick.
+    In task mode every external :meth:`tick` invokes at most one active
+    ``Skill.tick``.  It may start a successor, but never ticks that successor
+    until the next external sample.
     """
 
     def __init__(
@@ -200,32 +114,34 @@ class SkillManager:
         if not isinstance(context, SkillContext):
             raise TypeError("context must be a SkillContext")
         context.validate()
+        if logger is not None and not callable(logger):
+            raise TypeError("logger must be callable or None")
         self._context = context
+        self._logger = logger
+        self._reacquire_search_radius = _positive_number(
+            reacquire_search_radius, "reacquire_search_radius"
+        )
+        self._reacquire_timeout = _positive_number(
+            reacquire_timeout, "reacquire_timeout"
+        )
         self._skills: dict[SkillName, Skill] = {}
         self._active_name: SkillName | None = None
         self._last_result: SkillResult | None = None
-
-        self._reacquire_search_radius = _positive_number(
-            reacquire_search_radius,
-            "reacquire_search_radius",
-        )
-        self._reacquire_timeout = _positive_number(
-            reacquire_timeout,
-            "reacquire_timeout",
-        )
-        if logger is not None and not callable(logger):
-            raise TypeError("logger must be callable or None")
-        self._logger = logger
 
         self._task_status = TaskStatus.IDLE
         self._task_plan: TaskPlan | None = None
         self._plan_index: int | None = None
         self._pending_task_result: TaskStatus | None = None
         self._active_target_id: str | None = None
-        self._saved_track_goal: TrackGoal | None = None
         self._task_failure_result: SkillResult | None = None
         self._transition_log: list[TransitionRecord] = []
         self._last_transition_time = 0.0
+
+        self._step_outputs: dict[str, dict[str, object]] = {}
+        self._recovery_attempts: dict[str, int] = {}
+        self._active_planned_step_id: str | None = None
+        self._active_execution_kind: ExecutionKind | None = None
+        self._saved_track_goal_by_step: dict[str, TrackGoal] = {}
 
         if registry is not None:
             if not isinstance(registry, Mapping):
@@ -251,12 +167,32 @@ class SkillManager:
         return self._task_status
 
     @property
+    def task_plan(self) -> TaskPlan | None:
+        return None if self._task_plan is None else _copy_task_plan(self._task_plan)
+
+    @property
     def pending_task_result(self) -> TaskStatus | None:
         return self._pending_task_result
 
     @property
     def active_target_id(self) -> str | None:
         return self._active_target_id
+
+    @property
+    def active_planned_step_id(self) -> str | None:
+        return self._active_planned_step_id
+
+    @property
+    def active_execution_kind(self) -> ExecutionKind | None:
+        return self._active_execution_kind
+
+    @property
+    def step_outputs(self) -> dict[str, dict[str, object]]:
+        return deepcopy(self._step_outputs)
+
+    @property
+    def recovery_attempts(self) -> dict[str, int]:
+        return dict(self._recovery_attempts)
 
     @property
     def task_failure_result(self) -> SkillResult | None:
@@ -268,12 +204,10 @@ class SkillManager:
 
     @property
     def skill_registry(self) -> dict[SkillName, Skill]:
-        """Return a shallow registry snapshot; Skill instances remain Manager-owned."""
-
         return dict(self._skills)
 
     def register(self, name: SkillName | str, skill: Skill) -> None:
-        normalized = _skill_name(name)
+        normalized = _manager_skill_name(name)
         if not isinstance(skill, Skill):
             raise TypeError("skill must be a Skill instance")
         if skill.status is not SkillStatus.IDLE:
@@ -285,21 +219,18 @@ class SkillManager:
         self._skills[normalized] = skill
 
     def available_skills(self) -> tuple[SkillName, ...]:
-        return tuple(self._skills.keys())
+        return tuple(self._skills)
 
+    # Manual single-Skill compatibility API.
     def start(self, name: SkillName | str, goal: SkillGoal) -> SkillStatus:
-        """Start one Skill manually; unavailable while a task plan is active."""
-
         if self._task_status is not TaskStatus.IDLE:
             raise SkillManagerError("reset the task before using manual Skill dispatch")
-        return self._start_registered(_skill_name(name), goal)
+        return self._start_registered(_manager_skill_name(name), goal)
 
     def tick(self, observation: Observation) -> SkillStatus | TaskStatus:
         if self._task_status is TaskStatus.RUNNING:
             return self._tick_task(observation)
         if self._task_status is not TaskStatus.IDLE:
-            # Task terminal states are stable and safe to poll from a runtime
-            # loop while it is shutting down.
             return self._task_status
         return self._active_skill().tick(observation)
 
@@ -329,71 +260,84 @@ class SkillManager:
         try:
             skill.reset()
         finally:
-            # Base reset is exception-safe and reaches IDLE even if a subclass
-            # cleanup hook fails. Never leave Manager pointing at an IDLE Skill.
             self._last_result = result
             self._active_name = None
 
     def start_task(self, plan: TaskPlan) -> TaskStatus:
-        """Atomically validate and start the standard Stage-0 task."""
-
         if not isinstance(plan, TaskPlan):
             raise TypeError("plan must be a TaskPlan")
         if self._task_status is not TaskStatus.IDLE:
             raise SkillManagerError("reset_task() is required before starting another task")
         if self._active_name is not None:
             raise SkillManagerError("reset the manually active Skill before starting a task")
-        required_skills = set(_FIVE_STEP_TASK_SEQUENCE) | {SkillName.REACQUIRE}
-        missing = [
-            name.value
-            for name in required_skills
-            if name not in self._skills
-        ]
+        # TaskStep is frozen, but its parameter Mapping intentionally remains
+        # mutable for legacy compatibility and safety corruption tests.  Take
+        # one owned snapshot here so caller mutations after preflight/start
+        # cannot alter a future Goal or output reference (TOCTOU boundary).
+        owned_plan = _copy_task_plan(plan)
+        required = {step.skill for step in owned_plan.steps} | {SkillName.LAND}
+        if any(
+            self._effective_recovery_policy(step) is not None
+            for step in owned_plan.steps
+        ):
+            required.add(SkillName.REACQUIRE)
+        missing = sorted(name.value for name in required if name not in self._skills)
         if missing:
             raise SkillNotRegisteredError(
-                "task registry is missing: " + ", ".join(sorted(missing))
+                "task registry is missing: " + ", ".join(missing)
             )
 
-        # Compile every planned Goal before mutating task state. TRACK uses a
-        # harmless validation id until SEARCH supplies the real result.
-        for step in plan.steps:
-            self._goal_from_step(step, plan=plan, validation_only=True)
+        # Validate every Goal shape before mutating task state. Runtime output
+        # references are checked structurally but resolved only when reached.
+        for step in owned_plan.steps:
+            _reject_unknown_goal_fields(step.skill, step.params)
+            self._goal_from_step(step, plan=owned_plan, validation_only=True)
 
-        self._task_plan = plan
+        self._task_plan = owned_plan
+        self._last_result = None
         self._plan_index = 0
         self._pending_task_result = None
         self._active_target_id = None
-        self._saved_track_goal = None
         self._task_failure_result = None
         self._transition_log = []
         self._last_transition_time = 0.0
+        self._step_outputs = {}
+        self._recovery_attempts = {
+            step.step_id: 0
+            for step in owned_plan.steps
+            if self._effective_recovery_policy(step) is not None
+        }
+        self._saved_track_goal_by_step = {}
+        self._active_planned_step_id = owned_plan.steps[0].step_id
+        self._active_execution_kind = ExecutionKind.PLANNED
         self._task_status = TaskStatus.RUNNING
-        first = plan.steps[0]
+
+        first = owned_plan.steps[0]
         goal = self._goal_from_step(first)
         try:
             self._start_registered(first.skill, goal)
         except Exception:
             self._clear_task_to_idle()
             raise
+        if first.skill is SkillName.TRACK and isinstance(goal, TrackGoal):
+            self._saved_track_goal_by_step[first.step_id] = goal
         self._record_transition(
             old_skill=None,
             old_status=None,
             result_code=None,
             new_skill=first.skill,
             reason="task_started",
+            old_step_id=None,
+            new_step_id=first.step_id,
         )
         return self._task_status
 
     def cancel_task(self) -> TaskStatus:
-        """Cancel the active work, then LAND before committing CANCELED."""
-
         if self._task_status is not TaskStatus.RUNNING:
             raise SkillManagerError("there is no RUNNING task to cancel")
         old_name = self._active_name
+        old_step_id = self._active_planned_step_id
         if old_name is SkillName.LAND:
-            # LAND is already the fail-safe action. Do not cancel it in mid-air;
-            # only change the Task result committed after LAND_COMPLETE. An
-            # existing failure always has precedence over a later cancel.
             if self._pending_task_result is not TaskStatus.FAILED:
                 self._pending_task_result = TaskStatus.CANCELED
             return self._task_status
@@ -408,20 +352,19 @@ class SkillManager:
             try:
                 self._reset_active_internal()
             except Exception as exc:
-                reset_failure = SkillResult(
-                    status=SkillStatus.FAILED,
-                    code=SkillResultCode.INTERNAL_ERROR,
-                    message=f"could not reset canceled {old_name.value}: {exc}",
-                    data={"reset_error": str(exc)},
+                failure = _internal_result(
+                    f"could not reset canceled {old_name.value}: {exc}",
+                    {"reset_error": str(exc)},
                 )
-                self._last_result = reset_failure
-                self._task_failure_result = reset_failure
+                self._last_result = failure
+                self._task_failure_result = failure
                 self._pending_task_result = TaskStatus.FAILED
                 self._begin_landing(
                     old_name,
                     old_status,
-                    reset_failure,
+                    failure,
                     "canceled_skill_reset_failed",
+                    old_step_id=old_step_id,
                 )
                 return self._task_status
         self._pending_task_result = TaskStatus.CANCELED
@@ -430,6 +373,7 @@ class SkillManager:
             old_status,
             result,
             "task_canceled",
+            old_step_id=old_step_id,
         )
         return self._task_status
 
@@ -466,8 +410,8 @@ class SkillManager:
         if self._active_name is None:
             self._fail_without_landing("task has no active Skill")
             return self._task_status
-
         skill = self._active_skill()
+        # No successor is ticked after the active Skill terminates below.
         if skill.status is SkillStatus.RUNNING:
             skill.tick(observation)
         if skill.status is SkillStatus.RUNNING:
@@ -475,6 +419,8 @@ class SkillManager:
 
         old_name = self._active_name
         old_status = skill.status
+        old_step_id = self._active_planned_step_id
+        old_kind = self._active_execution_kind
         result = skill.get_result()
         if result is None:
             self._fail_without_landing("terminal Skill has no result")
@@ -482,17 +428,12 @@ class SkillManager:
         try:
             self._reset_active_internal()
         except Exception as exc:
-            reset_failure = SkillResult(
-                status=SkillStatus.FAILED,
-                code=SkillResultCode.INTERNAL_ERROR,
-                message=f"could not reset {old_name.value}: {exc}",
-                data={
-                    "reset_error": str(exc),
-                    "previous_result": result.to_dict(),
-                },
+            failure = _internal_result(
+                f"could not reset {old_name.value}: {exc}",
+                {"reset_error": str(exc), "previous_result": result.to_dict()},
             )
-            self._last_result = reset_failure
-            self._task_failure_result = reset_failure
+            self._last_result = failure
+            self._task_failure_result = failure
             self._pending_task_result = TaskStatus.FAILED
             if old_name is SkillName.LAND:
                 self._finish_task(
@@ -501,17 +442,21 @@ class SkillManager:
                     old_status,
                     SkillResultCode.INTERNAL_ERROR,
                     "landing_reset_failed",
+                    old_step_id=old_step_id,
                 )
             else:
                 self._begin_landing(
                     old_name,
                     old_status,
-                    reset_failure,
+                    failure,
                     "skill_reset_failed",
+                    old_step_id=old_step_id,
                 )
             return self._task_status
 
-        self._transition_from_result(old_name, old_status, result)
+        self._transition_from_result(
+            old_name, old_status, result, old_step_id, old_kind
+        )
         return self._task_status
 
     def _transition_from_result(
@@ -519,19 +464,35 @@ class SkillManager:
         old_name: SkillName,
         old_status: SkillStatus,
         result: SkillResult,
+        old_step_id: str | None,
+        old_kind: ExecutionKind | None,
     ) -> None:
         if old_name is SkillName.LAND:
             if (
                 old_status is SkillStatus.SUCCEEDED
                 and result.code is SkillResultCode.LAND_COMPLETE
             ):
-                final = self._pending_task_result or TaskStatus.SUCCEEDED
+                if old_step_id is not None:
+                    self._step_outputs[old_step_id] = deepcopy(result.data)
+                final = (
+                    self._pending_task_result
+                    if self._pending_task_result
+                    in {TaskStatus.FAILED, TaskStatus.CANCELED}
+                    else self._land_completion_status(old_step_id)
+                )
                 reason = {
                     TaskStatus.SUCCEEDED: "task_completed",
                     TaskStatus.FAILED: "failure_landing_complete",
                     TaskStatus.CANCELED: "cancel_landing_complete",
                 }[final]
-                self._finish_task(final, old_name, old_status, result.code, reason)
+                self._finish_task(
+                    final,
+                    old_name,
+                    old_status,
+                    result.code,
+                    reason,
+                    old_step_id=old_step_id,
+                )
             else:
                 self._task_failure_result = self._task_failure_result or result
                 self._finish_task(
@@ -540,59 +501,83 @@ class SkillManager:
                     old_status,
                     result.code,
                     "landing_failed",
+                    old_step_id=old_step_id,
                 )
             return
 
         if old_status is SkillStatus.CANCELED:
             self._pending_task_result = TaskStatus.CANCELED
-            self._begin_landing(old_name, old_status, result, "skill_canceled")
+            self._begin_landing(
+                old_name,
+                old_status,
+                result,
+                "skill_canceled",
+                old_step_id=old_step_id,
+            )
             return
 
         if old_status is SkillStatus.FAILED:
-            if old_name is SkillName.TRACK and result.code is SkillResultCode.TARGET_LOST:
-                recovery_goal = self._reacquire_goal_from_result(result)
-                if recovery_goal is not None:
-                    self._start_transition(
-                        old_name,
-                        old_status,
-                        result.code,
-                        SkillName.REACQUIRE,
-                        recovery_goal,
-                        "target_lost",
-                    )
-                    return
+            if (
+                old_kind is ExecutionKind.PLANNED
+                and old_name is SkillName.TRACK
+                and result.code is SkillResultCode.TARGET_LOST
+                and self._try_start_recovery(result, old_status, old_step_id)
+            ):
+                return
             self._task_failure_result = result
             self._pending_task_result = TaskStatus.FAILED
+            recovery_attempt = (
+                self._recovery_attempts.get(old_step_id)
+                if old_name in {SkillName.TRACK, SkillName.REACQUIRE}
+                and old_step_id is not None
+                else None
+            )
             self._begin_landing(
                 old_name,
                 old_status,
                 result,
                 _failure_reason(old_name, result.code),
+                old_step_id=old_step_id,
+                recovery_attempt=recovery_attempt or None,
             )
             return
 
         if old_status is not SkillStatus.SUCCEEDED:
             self._task_failure_result = result
             self._pending_task_result = TaskStatus.FAILED
-            self._begin_landing(old_name, old_status, result, "invalid_skill_status")
+            self._begin_landing(
+                old_name,
+                old_status,
+                result,
+                "invalid_skill_status",
+                old_step_id=old_step_id,
+            )
             return
 
-        expected_codes = {
-            SkillName.TAKEOFF: SkillResultCode.TAKEOFF_COMPLETE,
-            SkillName.GOTO: SkillResultCode.GOAL_REACHED,
-            SkillName.SEARCH: SkillResultCode.TARGET_FOUND,
-            SkillName.REACQUIRE: SkillResultCode.TARGET_FOUND,
-            SkillName.TRACK: SkillResultCode.TRACK_COMPLETE,
-        }
-        if result.code is not expected_codes.get(old_name):
+        if result.code is not _EXPECTED_SUCCESS_CODES.get(old_name):
             self._task_failure_result = result
             self._pending_task_result = TaskStatus.FAILED
-            self._begin_landing(old_name, old_status, result, "unexpected_result_code")
+            self._begin_landing(
+                old_name,
+                old_status,
+                result,
+                "unexpected_result_code",
+                old_step_id=old_step_id,
+            )
             return
 
+        if old_kind is ExecutionKind.RECOVERY:
+            self._resume_track_after_recovery(result, old_status, old_step_id)
+            return
+
+        if old_step_id is None:
+            self._fail_without_landing("planned Skill is missing its step id")
+            return
+        self._step_outputs[old_step_id] = deepcopy(result.data)
         if old_name is SkillName.SEARCH:
             target_id = result.data.get("target_id")
             if not isinstance(target_id, str) or not target_id.strip():
+                self._step_outputs.pop(old_step_id, None)
                 self._task_failure_result = result
                 self._pending_task_result = TaskStatus.FAILED
                 self._begin_landing(
@@ -600,106 +585,217 @@ class SkillManager:
                     old_status,
                     result,
                     "search_result_missing_target_id",
+                    old_step_id=old_step_id,
                 )
                 return
             self._active_target_id = target_id.strip()
-
-        if old_name is SkillName.REACQUIRE:
-            target_id = result.data.get("target_id", self._active_target_id)
-            if isinstance(target_id, str) and target_id.strip():
-                self._active_target_id = target_id.strip()
-            if self._saved_track_goal is None or self._active_target_id is None:
-                self._task_failure_result = result
-                self._pending_task_result = TaskStatus.FAILED
-                self._begin_landing(
-                    old_name,
-                    old_status,
-                    result,
-                    "recovery_state_missing",
-                )
-                return
-            track_goal = replace(
-                self._saved_track_goal,
-                target_id=self._active_target_id,
-            )
-            self._start_transition(
-                old_name,
-                old_status,
-                result.code,
-                SkillName.TRACK,
-                track_goal,
-                "target_reacquired",
-            )
-            return
-
         if old_name is SkillName.TRACK:
+            # Compatibility-visible provisional result.  A later step failure
+            # or cancel replaces it before LAND commits the terminal status.
             self._pending_task_result = TaskStatus.SUCCEEDED
-            next_skill = self._next_planned_skill()
-            if next_skill is SkillName.GOTO:
-                self._start_next_planned(old_name, old_status, result)
-                return
-            if next_skill is not SkillName.LAND:
-                self._task_failure_result = result
-                self._pending_task_result = TaskStatus.FAILED
-                self._begin_landing(
-                    old_name,
-                    old_status,
-                    result,
-                    "track_complete_without_terminal_step",
-                )
-                return
+        self._start_next_planned(old_name, old_status, result, old_step_id)
+
+    def _try_start_recovery(
+        self,
+        result: SkillResult,
+        old_status: SkillStatus,
+        step_id: str | None,
+    ) -> bool:
+        step = self._step_by_id(step_id)
+        if step is None or step.skill is not SkillName.TRACK:
+            return False
+        policy = self._effective_recovery_policy(step)
+        attempts = self._recovery_attempts.get(step.step_id, 0)
+        if policy is None or attempts >= policy.max_attempts:
+            return False
+        target_id, identity_error = self._validated_lost_target_id(
+            result, step.step_id
+        )
+        if identity_error is not None:
+            failure = _internal_result(
+                identity_error,
+                {
+                    "step_id": step.step_id,
+                    "active_target_id": self._active_target_id,
+                    "reported_target_id": result.data.get("target_id"),
+                },
+            )
+            self._last_result = failure
+            self._task_failure_result = failure
+            self._pending_task_result = TaskStatus.FAILED
             self._begin_landing(
-                old_name,
+                SkillName.TRACK,
                 old_status,
-                result,
-                "track_complete",
+                failure,
+                "track_lost_target_mismatch",
+                old_step_id=step.step_id,
+                recovery_attempt=attempts or None,
+            )
+            return True
+        goal = self._reacquire_goal_from_result(
+            result, step.step_id, policy, target_id
+        )
+        if goal is None:
+            return False
+        attempt = attempts + 1
+        self._recovery_attempts[step.step_id] = attempt
+        self._start_transition(
+            SkillName.TRACK,
+            old_status,
+            result.code,
+            SkillName.REACQUIRE,
+            goal,
+            "target_lost",
+            old_step_id=step.step_id,
+            new_step_id=step.step_id,
+            recovery_attempt=attempt,
+            execution_kind=ExecutionKind.RECOVERY,
+        )
+        # _start_transition also owns a start failure and its fail-safe LAND.
+        return True
+
+    def _resume_track_after_recovery(
+        self,
+        result: SkillResult,
+        old_status: SkillStatus,
+        step_id: str | None,
+    ) -> None:
+        if step_id is None:
+            self._fail_without_landing("recovery is missing its TRACK step id")
+            return
+        saved = self._saved_track_goal_by_step.get(step_id)
+        returned_target_id = result.data.get("target_id")
+        if (
+            not isinstance(returned_target_id, str)
+            or not returned_target_id.strip()
+        ):
+            self._fail_recovery_resume(
+                old_status,
+                step_id,
+                "REACQUIRE success result must explicitly contain a non-empty target_id",
+                "reacquire_target_invalid",
             )
             return
+        if (
+            saved is None
+            or self._active_target_id is None
+            or not self._active_target_id.strip()
+            or not saved.target_id.strip()
+        ):
+            self._fail_recovery_resume(
+                old_status,
+                step_id,
+                "REACQUIRE cannot resume because trusted TRACK identity state is missing",
+                "recovery_state_missing",
+            )
+            return
+        normalized_target_id = returned_target_id.strip()
+        active_target_id = self._active_target_id.strip()
+        saved_target_id = saved.target_id.strip()
+        if not (
+            normalized_target_id == active_target_id == saved_target_id
+        ):
+            self._fail_recovery_resume(
+                old_status,
+                step_id,
+                "REACQUIRE returned a target_id inconsistent with trusted TRACK identity",
+                "reacquire_target_mismatch",
+                {
+                    "active_target_id": active_target_id,
+                    "saved_track_target_id": saved_target_id,
+                    "returned_target_id": normalized_target_id,
+                },
+            )
+            return
+        goal = replace(saved, target_id=normalized_target_id)
+        self._saved_track_goal_by_step[step_id] = goal
+        self._start_transition(
+            SkillName.REACQUIRE,
+            old_status,
+            result.code,
+            SkillName.TRACK,
+            goal,
+            "target_reacquired",
+            old_step_id=step_id,
+            new_step_id=step_id,
+            recovery_attempt=self._recovery_attempts.get(step_id),
+            execution_kind=ExecutionKind.PLANNED,
+        )
 
-        self._start_next_planned(old_name, old_status, result)
-
-    def _next_planned_skill(self) -> SkillName | None:
-        if self._task_plan is None or self._plan_index is None:
-            return None
-        next_index = self._plan_index + 1
-        if next_index >= len(self._task_plan.steps):
-            return None
-        return self._task_plan.steps[next_index].skill
+    def _fail_recovery_resume(
+        self,
+        old_status: SkillStatus,
+        step_id: str,
+        message: str,
+        reason: str,
+        data: dict[str, object] | None = None,
+    ) -> None:
+        failure = _internal_result(message, data)
+        self._last_result = failure
+        self._task_failure_result = failure
+        self._pending_task_result = TaskStatus.FAILED
+        self._begin_landing(
+            SkillName.REACQUIRE,
+            old_status,
+            failure,
+            reason,
+            old_step_id=step_id,
+            recovery_attempt=self._recovery_attempts.get(step_id),
+        )
 
     def _start_next_planned(
         self,
         old_name: SkillName,
         old_status: SkillStatus,
         result: SkillResult,
+        old_step_id: str,
     ) -> None:
         if self._task_plan is None or self._plan_index is None:
             self._fail_without_landing("task plan state is missing")
             return
         next_index = self._plan_index + 1
         if next_index >= len(self._task_plan.steps):
-            self._task_failure_result = result
+            failure = _internal_result(
+                "validated plan ended without a terminal LAND",
+                {"last_step_id": old_step_id},
+            )
+            self._last_result = failure
+            self._task_failure_result = failure
             self._pending_task_result = TaskStatus.FAILED
-            self._begin_landing(old_name, old_status, result, "plan_ended_early")
+            self._begin_landing(
+                old_name,
+                old_status,
+                failure,
+                "plan_ended_without_land",
+                old_step_id=old_step_id,
+            )
             return
         step = self._task_plan.steps[next_index]
         try:
             goal = self._goal_from_step(step)
         except Exception as exc:
-            self._task_failure_result = result
+            failure = _internal_result(
+                f"could not resolve step {step.step_id}: {exc}",
+                {"step_id": step.step_id, "error": str(exc)},
+            )
+            self._last_result = failure
+            self._task_failure_result = failure
             self._pending_task_result = TaskStatus.FAILED
             self._begin_landing(
                 old_name,
                 old_status,
-                result,
+                failure,
                 f"next_goal_invalid:{exc}",
+                old_step_id=old_step_id,
             )
             return
+
         self._plan_index = next_index
         if step.skill is SkillName.TRACK:
             if not isinstance(goal, TrackGoal):
                 self._fail_without_landing("TRACK plan did not compile to TrackGoal")
                 return
-            self._saved_track_goal = goal
+            self._saved_track_goal_by_step[step.step_id] = goal
         self._start_transition(
             old_name,
             old_status,
@@ -707,6 +803,9 @@ class SkillManager:
             step.skill,
             goal,
             _normal_transition_reason(old_name),
+            old_step_id=old_step_id,
+            new_step_id=step.step_id,
+            execution_kind=ExecutionKind.PLANNED,
         )
 
     def _start_transition(
@@ -717,11 +816,24 @@ class SkillManager:
         new_name: SkillName,
         goal: SkillGoal,
         reason: str,
+        *,
+        old_step_id: str | None,
+        new_step_id: str | None,
+        recovery_attempt: int | None = None,
+        execution_kind: ExecutionKind = ExecutionKind.PLANNED,
     ) -> None:
+        self._active_planned_step_id = new_step_id
+        self._active_execution_kind = execution_kind
         try:
             self._start_registered(new_name, goal)
         except Exception as exc:
             self._context.uav.stop()
+            failure = _internal_result(
+                f"could not start {new_name.value}: {exc}",
+                {"step_id": new_step_id, "error": str(exc)},
+            )
+            self._last_result = failure
+            self._task_failure_result = failure
             if new_name is SkillName.LAND:
                 self._finish_task(
                     TaskStatus.FAILED,
@@ -729,14 +841,21 @@ class SkillManager:
                     old_status,
                     result_code,
                     f"landing_start_failed:{exc}",
+                    old_step_id=old_step_id,
                 )
                 return
             self._pending_task_result = TaskStatus.FAILED
             self._begin_landing(
                 old_name,
                 old_status,
-                self._last_result,
+                failure,
                 f"skill_start_failed:{new_name.value}:{exc}",
+                old_step_id=old_step_id,
+                recovery_attempt=(
+                    recovery_attempt
+                    if execution_kind is ExecutionKind.RECOVERY
+                    else None
+                ),
             )
             return
         self._record_transition(
@@ -745,6 +864,9 @@ class SkillManager:
             result_code=result_code,
             new_skill=new_name,
             reason=reason,
+            old_step_id=old_step_id,
+            new_step_id=new_step_id,
+            recovery_attempt=recovery_attempt,
         )
 
     def _begin_landing(
@@ -753,6 +875,9 @@ class SkillManager:
         old_status: SkillStatus | None,
         result: SkillResult | None,
         reason: str,
+        *,
+        old_step_id: str | None,
+        recovery_attempt: int | None = None,
     ) -> None:
         if old_name is SkillName.LAND:
             self._finish_task(
@@ -761,6 +886,7 @@ class SkillManager:
                 old_status,
                 None if result is None else result.code,
                 "landing_failed",
+                old_step_id=old_step_id,
             )
             return
         if self._pending_task_result is None:
@@ -772,11 +898,15 @@ class SkillManager:
                 old_status,
                 None if result is None else result.code,
                 "landing_not_registered",
+                old_step_id=old_step_id,
             )
             return
-        land_goal = self._planned_land_goal()
-        if self._task_plan is not None:
-            self._plan_index = len(self._task_plan.steps) - 1
+
+        land_step = self._planned_land_step()
+        new_step_id = None if land_step is None else land_step.step_id
+        land_goal = self._planned_land_goal(land_step)
+        if self._task_plan is not None and land_step is not None:
+            self._plan_index = self._task_plan.steps.index(land_step)
         self._start_transition(
             old_name,
             old_status,
@@ -784,13 +914,19 @@ class SkillManager:
             SkillName.LAND,
             land_goal,
             reason,
+            old_step_id=old_step_id,
+            new_step_id=new_step_id,
+            execution_kind=ExecutionKind.PLANNED,
+            recovery_attempt=recovery_attempt,
         )
 
     def _reacquire_goal_from_result(
         self,
         result: SkillResult,
+        step_id: str,
+        policy: RecoveryPolicy,
+        target_id: str | None,
     ) -> ReacquireGoal | None:
-        target_id = result.data.get("target_id", self._active_target_id)
         position = _finite_vector3_or_none(result.data.get("last_seen_position"))
         velocity = _finite_vector3_or_none(result.data.get("last_seen_velocity"))
         last_seen_time = _nonnegative_number_or_none(result.data.get("last_seen_time"))
@@ -803,31 +939,97 @@ class SkillManager:
         ):
             return None
         self._active_target_id = target_id.strip()
-        self._reduce_remaining_track_duration(result)
+        self._reduce_remaining_track_duration(step_id, result)
         return ReacquireGoal(
             target_id=self._active_target_id,
             last_seen_position=position,
             last_seen_velocity=velocity,
             last_seen_time=last_seen_time,
-            search_radius=self._reacquire_search_radius,
-            timeout=self._reacquire_timeout,
+            search_radius=policy.search_radius_m,
+            timeout=policy.timeout_s,
         )
 
-    def _reduce_remaining_track_duration(self, result: SkillResult) -> None:
-        """Carry cumulative TRACK time across a successful recovery."""
+    def _validated_lost_target_id(
+        self,
+        result: SkillResult,
+        step_id: str,
+    ) -> tuple[str | None, str | None]:
+        """Validate TRACK loss identity before changing any recovery state."""
 
-        goal = self._saved_track_goal
+        saved = self._saved_track_goal_by_step.get(step_id)
+        saved_target_id = None if saved is None else saved.target_id.strip()
+        active_target_id = (
+            None
+            if self._active_target_id is None
+            else self._active_target_id.strip()
+        )
+        if (
+            active_target_id is not None
+            and saved_target_id is not None
+            and active_target_id != saved_target_id
+        ):
+            return None, "TRACK recovery identity state is inconsistent"
+
+        reported = result.data.get("target_id")
+        if reported is None:
+            resolved = active_target_id or saved_target_id
+            if resolved is None:
+                return None, "TRACK TARGET_LOST has no trusted target identity"
+            return resolved, None
+        if not isinstance(reported, str) or not reported.strip():
+            return None, "TRACK TARGET_LOST returned an invalid target_id"
+        normalized = reported.strip()
+        expected = active_target_id or saved_target_id
+        if expected is not None and normalized != expected:
+            return None, "TRACK TARGET_LOST returned a different target_id"
+        return normalized, None
+
+    def _reduce_remaining_track_duration(
+        self, step_id: str, result: SkillResult
+    ) -> None:
+        goal = self._saved_track_goal_by_step.get(step_id)
         if goal is None or goal.track_duration is None:
             return
         elapsed = _nonnegative_number_or_none(result.data.get("tracking_duration"))
         if elapsed is None:
             return
-        remaining = max(1e-9, float(goal.track_duration) - elapsed)
-        self._saved_track_goal = replace(goal, track_duration=remaining)
+        self._saved_track_goal_by_step[step_id] = replace(
+            goal,
+            track_duration=max(1e-9, float(goal.track_duration) - elapsed),
+        )
 
-    def _planned_land_goal(self) -> LandGoal:
-        if self._task_plan is not None:
-            step = self._task_plan.steps[-1]
+    def _effective_recovery_policy(self, step: TaskStep) -> RecoveryPolicy | None:
+        if step.recovery is not None:
+            return step.recovery if step.recovery.max_attempts > 0 else None
+        # Compatibility boundary for the fixed MissionIntent compiler.  Its
+        # historical placeholder implied bounded Manager recovery.  A dynamic
+        # StepOutputRef with no policy intentionally disables recovery.
+        if (
+            step.skill is SkillName.TRACK
+            and step.params.get("target_id") == "$SEARCH.result.target_id"
+        ):
+            return RecoveryPolicy(
+                skill=SkillName.REACQUIRE,
+                max_attempts=2,
+                search_radius_m=self._reacquire_search_radius,
+                timeout_s=self._reacquire_timeout,
+            )
+        return None
+
+    def _planned_land_step(self) -> TaskStep | None:
+        if self._task_plan is None:
+            return None
+        return next(
+            (
+                step
+                for step in reversed(self._task_plan.steps)
+                if step.skill is SkillName.LAND
+            ),
+            None,
+        )
+
+    def _planned_land_goal(self, step: TaskStep | None) -> LandGoal:
+        if step is not None:
             try:
                 goal = self._goal_from_step(step)
                 if isinstance(goal, LandGoal):
@@ -835,6 +1037,16 @@ class SkillManager:
             except Exception:
                 pass
         return LandGoal()
+
+    def _land_completion_status(self, step_id: str | None) -> TaskStatus:
+        if self._task_plan is None or self._plan_index is None or step_id is None:
+            return TaskStatus.FAILED
+        if (
+            self._plan_index == len(self._task_plan.steps) - 1
+            and self._task_plan.steps[-1].step_id == step_id
+        ):
+            return TaskStatus.SUCCEEDED
+        return TaskStatus.FAILED
 
     def _goal_from_step(
         self,
@@ -844,44 +1056,31 @@ class SkillManager:
         validation_only: bool = False,
     ) -> SkillGoal:
         params = deepcopy(dict(step.params))
+        source_plan = plan or self._task_plan
         if step.skill is SkillName.TRACK:
-            raw_target = params.get("target_id", "$SEARCH.result.target_id")
-            if raw_target == "$SEARCH.result.target_id":
-                target_id = "__search_target__" if validation_only else self._active_target_id
-                if not isinstance(target_id, str) or not target_id:
-                    raise TaskPlanError("TRACK target_id requires SEARCH TARGET_FOUND")
-                params["target_id"] = target_id
-            elif not isinstance(raw_target, str) or not raw_target.strip():
-                raise TaskPlanError("TRACK target_id must be a non-empty string")
+            params["target_id"] = self._resolve_track_target(
+                params.get("target_id", "$SEARCH.result.target_id"),
+                step,
+                source_plan,
+                validation_only=validation_only,
+            )
             params.setdefault("track_duration", 30.0)
         if step.skill is SkillName.SEARCH and "search_altitude" not in params:
-            params["search_altitude"] = self._default_search_altitude(plan)
-
+            params["search_altitude"] = self._default_search_altitude(source_plan)
         if "yaw_mode" in params:
             params["yaw_mode"] = _yaw_mode(params["yaw_mode"])
         if step.skill is SkillName.GOTO and "motion_policy" in params:
             params["motion_policy"] = _motion_policy(params["motion_policy"])
-
-        vector_fields = {
+        for key in {
             "position",
             "center",
             "look_at_point",
             "last_seen_position",
             "last_seen_velocity",
-        }
-        for key in vector_fields & params.keys():
-            value = params[key]
-            if isinstance(value, list):
-                params[key] = tuple(value)
-
-        goal_types: dict[SkillName, type[SkillGoal]] = {
-            SkillName.TAKEOFF: TakeoffGoal,
-            SkillName.GOTO: GotoGoal,
-            SkillName.SEARCH: SearchGoal,
-            SkillName.TRACK: TrackGoal,
-            SkillName.LAND: LandGoal,
-        }
-        goal_type = goal_types.get(step.skill)
+        } & params.keys():
+            if isinstance(params[key], list):
+                params[key] = tuple(params[key])
+        goal_type = _GOAL_TYPES.get(step.skill)
         if goal_type is None:
             raise TaskPlanError(f"{step.skill.value} is not a planned task step")
         try:
@@ -889,19 +1088,108 @@ class SkillManager:
         except (TypeError, ValueError) as exc:
             raise TaskPlanError(f"invalid {step.skill.value} parameters: {exc}") from exc
 
+    def _resolve_track_target(
+        self,
+        raw_target: object,
+        step: TaskStep,
+        plan: TaskPlan | None,
+        *,
+        validation_only: bool,
+    ) -> str:
+        reference: StepOutputRef | None = None
+        if isinstance(raw_target, StepOutputRef):
+            reference = raw_target
+        elif raw_target == "$SEARCH.result.target_id":
+            reference = self._nearest_prior_search_ref(step, plan)
+        elif isinstance(raw_target, str) and raw_target.startswith("$"):
+            reference = StepOutputRef.from_string(raw_target)
+
+        if reference is not None:
+            self._validate_prior_search_reference(reference, step, plan)
+            if validation_only:
+                return "__validated_search_target__"
+            output = self._step_outputs.get(reference.step_id)
+            if output is None:
+                raise TaskPlanError(
+                    f"TRACK reference step {reference.step_id!r} has no output"
+                )
+            target_id = output.get(reference.field)
+            if not isinstance(target_id, str) or not target_id.strip():
+                raise TaskPlanError(
+                    f"TRACK reference {reference.to_string()} is not a non-empty target_id"
+                )
+            return target_id.strip()
+        if not isinstance(raw_target, str) or not raw_target.strip():
+            raise TaskPlanError("TRACK target_id must be a non-empty string or reference")
+        return raw_target.strip()
+
+    def _nearest_prior_search_ref(
+        self, step: TaskStep, plan: TaskPlan | None
+    ) -> StepOutputRef:
+        if plan is None:
+            raise TaskPlanError("legacy SEARCH reference requires a task plan")
+        index = self._index_of_step(plan, step)
+        for candidate in reversed(plan.steps[:index]):
+            if candidate.skill is SkillName.SEARCH:
+                return StepOutputRef(candidate.step_id)
+        raise TaskPlanError("legacy TRACK reference has no prior SEARCH step")
+
+    def _validate_prior_search_reference(
+        self,
+        reference: StepOutputRef,
+        step: TaskStep,
+        plan: TaskPlan | None,
+    ) -> None:
+        if plan is None:
+            raise TaskPlanError("TRACK output reference requires a task plan")
+        current_index = self._index_of_step(plan, step)
+        source_index = next(
+            (
+                index
+                for index, candidate in enumerate(plan.steps)
+                if candidate.step_id == reference.step_id
+            ),
+            None,
+        )
+        if source_index is None:
+            raise TaskPlanError(
+                f"TRACK reference step {reference.step_id!r} does not exist"
+            )
+        if source_index >= current_index:
+            raise TaskPlanError("TRACK output reference must point to a prior step")
+        if plan.steps[source_index].skill is not SkillName.SEARCH:
+            raise TaskPlanError("TRACK target_id reference must point to SEARCH")
+
+    @staticmethod
+    def _index_of_step(plan: TaskPlan, step: TaskStep) -> int:
+        for index, candidate in enumerate(plan.steps):
+            if candidate.step_id == step.step_id:
+                return index
+        raise TaskPlanError(f"step {step.step_id!r} is not in the task plan")
+
     def _default_search_altitude(self, plan: TaskPlan | None) -> float:
-        source = plan or self._task_plan
-        if source is not None:
-            takeoff_value = source.steps[0].params.get("target_altitude")
-            value = _positive_number_or_none(takeoff_value)
-            if value is not None:
-                return value
+        if plan is not None:
+            for step in plan.steps:
+                if step.skill is SkillName.TAKEOFF:
+                    value = _positive_number_or_none(
+                        step.params.get("target_altitude")
+                    )
+                    if value is not None:
+                        return value
         altitude = float(self._context.uav.get_pose().z)
         if not isfinite(altitude) or altitude <= 0.0:
             raise TaskPlanError(
                 "SEARCH search_altitude is required when no positive TAKEOFF altitude exists"
             )
         return altitude
+
+    def _step_by_id(self, step_id: str | None) -> TaskStep | None:
+        if self._task_plan is None or step_id is None:
+            return None
+        return next(
+            (step for step in self._task_plan.steps if step.step_id == step_id),
+            None,
+        )
 
     def _finish_task(
         self,
@@ -910,21 +1198,27 @@ class SkillManager:
         old_status: SkillStatus | None,
         result_code: SkillResultCode | None,
         reason: str,
+        *,
+        old_step_id: str | None,
     ) -> None:
         self._context.uav.stop()
         self._task_status = status
+        self._active_planned_step_id = None
+        self._active_execution_kind = None
         self._record_transition(
             old_skill=old_name,
             old_status=old_status,
             result_code=result_code,
             new_skill=None,
             reason=reason,
+            old_step_id=old_step_id,
+            new_step_id=None,
         )
 
     def _fail_without_landing(self, reason: str) -> None:
         old_name = self._active_name
         old_status = self.active_status
-        result: SkillResult | None = None
+        old_step_id = self._active_planned_step_id
         if old_name is not None:
             skill = self._active_skill()
             try:
@@ -934,32 +1228,32 @@ class SkillManager:
                 if result is not None:
                     self._reset_active_internal()
                 else:
-                    # A corrupted terminal hook may have lost its Result. Base
-                    # reset still returns the instance to IDLE, so release it
-                    # before trying the fail-safe LAND.
                     try:
                         skill.reset()
                     finally:
                         self._active_name = None
             except Exception:
                 self._active_name = None
-        internal_result = SkillResult(
-            status=SkillStatus.FAILED,
-            code=SkillResultCode.INTERNAL_ERROR,
-            message=reason,
-            data={},
-        )
-        self._task_failure_result = internal_result
+        failure = _internal_result(reason)
+        self._last_result = failure
+        self._task_failure_result = failure
         self._pending_task_result = TaskStatus.FAILED
         if old_name is not SkillName.LAND and SkillName.LAND in self._skills:
-            self._begin_landing(old_name, old_status, internal_result, reason)
+            self._begin_landing(
+                old_name,
+                old_status,
+                failure,
+                reason,
+                old_step_id=old_step_id,
+            )
             return
         self._finish_task(
             TaskStatus.FAILED,
             old_name,
             old_status,
-            None if result is None else result.code,
+            failure.code,
             reason,
+            old_step_id=old_step_id,
         )
 
     def _record_transition(
@@ -970,6 +1264,9 @@ class SkillManager:
         result_code: SkillResultCode | None,
         new_skill: SkillName | None,
         reason: str,
+        old_step_id: str | None,
+        new_step_id: str | None,
+        recovery_attempt: int | None = None,
     ) -> None:
         timestamp = self._read_transition_time()
         record = TransitionRecord(
@@ -979,17 +1276,25 @@ class SkillManager:
             result_code=result_code,
             new_skill=new_skill,
             reason=str(reason),
+            old_step_id=old_step_id,
+            new_step_id=new_step_id,
+            recovery_attempt=recovery_attempt,
         )
         self._transition_log.append(record)
         if self._logger is not None:
             try:
+                attempt = (
+                    ""
+                    if recovery_attempt is None
+                    else f" recovery_attempt={recovery_attempt}"
+                )
                 self._logger(
                     f"[SkillManager] t={timestamp:.3f} "
-                    f"{_name_or_none(old_skill)} -> {_name_or_none(new_skill)} "
-                    f"reason={record.reason}"
+                    f"{_name_or_none(old_skill)}[{old_step_id or '-'}] -> "
+                    f"{_name_or_none(new_skill)}[{new_step_id or '-'}] "
+                    f"reason={record.reason}{attempt}"
                 )
             except Exception:
-                # Logging is observational and must never alter flight safety.
                 pass
 
     def _read_transition_time(self) -> float:
@@ -1010,9 +1315,14 @@ class SkillManager:
         self._plan_index = None
         self._pending_task_result = None
         self._active_target_id = None
-        self._saved_track_goal = None
+        self._active_planned_step_id = None
+        self._active_execution_kind = None
         self._task_failure_result = None
         self._transition_log = []
+        self._step_outputs = {}
+        self._recovery_attempts = {}
+        self._saved_track_goal_by_step = {}
+        self._last_result = None
 
     def _active_skill_or_none(self) -> Skill | None:
         if self._active_name is None:
@@ -1026,6 +1336,15 @@ class SkillManager:
         return skill
 
 
+_EXPECTED_SUCCESS_CODES: dict[SkillName, SkillResultCode] = {
+    SkillName.TAKEOFF: SkillResultCode.TAKEOFF_COMPLETE,
+    SkillName.GOTO: SkillResultCode.GOAL_REACHED,
+    SkillName.SEARCH: SkillResultCode.TARGET_FOUND,
+    SkillName.TRACK: SkillResultCode.TRACK_COMPLETE,
+    SkillName.REACQUIRE: SkillResultCode.TARGET_FOUND,
+    SkillName.LAND: SkillResultCode.LAND_COMPLETE,
+}
+
 _GOAL_TYPES: dict[SkillName, type[SkillGoal]] = {
     SkillName.TAKEOFF: TakeoffGoal,
     SkillName.GOTO: GotoGoal,
@@ -1036,18 +1355,15 @@ _GOAL_TYPES: dict[SkillName, type[SkillGoal]] = {
 
 
 def _reject_unknown_goal_fields(
-    name: SkillName,
-    params: Mapping[str, object],
+    name: SkillName, params: Mapping[str, object]
 ) -> None:
     goal_type = _GOAL_TYPES.get(name)
     if goal_type is None:
-        raise TaskPlanError(f"{name.value} cannot appear in the standard TaskPlan")
+        raise TaskPlanError(f"{name.value} cannot appear in TaskPlan")
     allowed = {field.name for field in fields(goal_type)}
     unknown = sorted(set(params) - allowed)
     if unknown:
-        raise TaskPlanError(
-            f"unknown {name.value} parameter(s): {', '.join(unknown)}"
-        )
+        raise TaskPlanError(f"unknown {name.value} parameter(s): {', '.join(unknown)}")
     required = {
         field.name
         for field in fields(goal_type)
@@ -1059,12 +1375,10 @@ def _reject_unknown_goal_fields(
         required.discard("search_altitude")
     missing = sorted(required - set(params))
     if missing:
-        raise TaskPlanError(
-            f"missing {name.value} parameter(s): {', '.join(missing)}"
-        )
+        raise TaskPlanError(f"missing {name.value} parameter(s): {', '.join(missing)}")
 
 
-def _skill_name(value: SkillName | str | object) -> SkillName:
+def _manager_skill_name(value: SkillName | str | object) -> SkillName:
     if isinstance(value, SkillName):
         return value
     if isinstance(value, str):
@@ -1095,9 +1409,7 @@ def _motion_policy(value: object) -> MotionPolicy:
     allowed = {field.name for field in fields(MotionPolicy)}
     unknown = sorted(set(params) - allowed)
     if unknown:
-        raise TaskPlanError(
-            "unknown MotionPolicy parameter(s): " + ", ".join(unknown)
-        )
+        raise TaskPlanError("unknown MotionPolicy parameter(s): " + ", ".join(unknown))
     if "yaw_mode" in params:
         params["yaw_mode"] = _yaw_mode(params["yaw_mode"])
     if isinstance(params.get("look_at_point"), list):
@@ -1151,6 +1463,33 @@ def _copy_result(result: SkillResult | None) -> SkillResult | None:
     )
 
 
+def _copy_task_plan(plan: TaskPlan) -> TaskPlan:
+    """Rebuild a plan so no mutable params object is shared with its caller."""
+
+    return TaskPlan(
+        tuple(
+            TaskStep(
+                step.step_id,
+                step.skill,
+                step.params,
+                step.recovery,
+            )
+            for step in plan.steps
+        )
+    )
+
+
+def _internal_result(
+    message: str, data: dict[str, object] | None = None
+) -> SkillResult:
+    return SkillResult(
+        status=SkillStatus.FAILED,
+        code=SkillResultCode.INTERNAL_ERROR,
+        message=message,
+        data={} if data is None else data,
+    )
+
+
 def _failure_reason(name: SkillName, code: SkillResultCode) -> str:
     if name is SkillName.SEARCH and code is SkillResultCode.SEARCH_EXHAUSTED:
         return "search_exhausted"
@@ -1158,6 +1497,8 @@ def _failure_reason(name: SkillName, code: SkillResultCode) -> str:
         return "search_timeout"
     if name is SkillName.REACQUIRE and code is SkillResultCode.TIMEOUT:
         return "reacquire_timeout"
+    if name is SkillName.TRACK and code is SkillResultCode.TARGET_LOST:
+        return "target_lost_recovery_unavailable"
     return f"{name.value.lower()}_{code.name.lower()}"
 
 
@@ -1175,9 +1516,12 @@ def _name_or_none(name: SkillName | None) -> str:
 
 
 __all__ = [
+    "ExecutionKind",
+    "RecoveryPolicy",
     "SkillManager",
     "SkillManagerError",
     "SkillNotRegisteredError",
+    "StepOutputRef",
     "TaskPlan",
     "TaskPlanError",
     "TaskStatus",

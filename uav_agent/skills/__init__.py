@@ -9,13 +9,11 @@ from skills.base import (
 from skills.goto import GotoGoal, GotoSkill
 from skills.land import LandGoal, LandSkill
 from skills.manager import (
+    ExecutionKind,
     SkillManager,
     SkillManagerError,
     SkillNotRegisteredError,
-    TaskPlan,
-    TaskPlanError,
     TaskStatus,
-    TaskStep,
     TransitionRecord,
     create_default_skill_registry,
 )
@@ -27,6 +25,13 @@ from skills.motion_types import (
     move_toward_with_policy,
 )
 from skills.reacquire import ReacquireGoal, ReacquireSkill
+from skills.plan import (
+    RecoveryPolicy,
+    StepOutputRef,
+    TaskPlan,
+    TaskPlanError,
+    TaskStep,
+)
 from skills.search import SearchGoal, SearchSkill
 from skills.takeoff import TakeoffGoal, TakeoffSkill
 from skills.track import TrackGoal, TrackSkill
@@ -46,6 +51,7 @@ from skills.types import (
 
 __all__ = [
     "CameraSensor",
+    "ExecutionKind",
     "GotoGoal",
     "GotoSkill",
     "LandGoal",
@@ -55,6 +61,7 @@ __all__ = [
     "Observation",
     "ReacquireGoal",
     "ReacquireSkill",
+    "RecoveryPolicy",
     "SearchGoal",
     "SearchSkill",
     "Skill",
@@ -72,6 +79,7 @@ __all__ = [
     "SkillResult",
     "SkillResultCode",
     "SkillStatus",
+    "StepOutputRef",
     "TakeoffGoal",
     "TakeoffSkill",
     "TaskPlan",

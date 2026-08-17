@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run MissionAgent with a scripted or text-only Qwen planner in Isaac Sim."""
+"""Run MissionAgent with a legacy or dynamic text planner in Isaac Sim."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--planner",
-        choices=("scripted", "llm"),
+        choices=("scripted", "llm", "dynamic_scripted", "dynamic_llm"),
         default="scripted",
         help="high-level mission planner (default: scripted)",
     )
@@ -174,6 +174,69 @@ def _random_target_spawn(config: object) -> tuple[float, float, float]:
         rng.uniform(lower, upper)
         for lower, upper in zip(region.min_xyz_m, region.max_xyz_m)
     )
+
+
+def _standard_dynamic_draft_data(args: argparse.Namespace) -> dict[str, object]:
+    """Model-free dynamic baseline; geometry is intentionally absent."""
+
+    return {
+        "schema_version": 1,
+        "steps": [
+            {
+                "id": "takeoff_1",
+                "skill": "TAKEOFF",
+                "args": {"altitude_m": args.takeoff_altitude},
+            },
+            {
+                "id": "goto_search",
+                "skill": "GOTO",
+                "args": {
+                    "destination": "search_area",
+                    "altitude_m": args.takeoff_altitude,
+                    "yaw_mode": "COURSE_ALIGNED",
+                },
+            },
+            {
+                "id": "search_1",
+                "skill": "SEARCH",
+                "args": {
+                    "region": "search_area",
+                    "target_description": "moving target",
+                    "altitude_m": args.takeoff_altitude,
+                },
+            },
+            {
+                "id": "track_1",
+                "skill": "TRACK",
+                "args": {
+                    "target_ref": "$search_1.target_id",
+                    "duration_s": args.track_duration,
+                    "desired_altitude_m": args.takeoff_altitude,
+                    "desired_distance_m": 6.0,
+                },
+                "recovery": {
+                    "skill": "REACQUIRE",
+                    "max_attempts": 2,
+                    "search_radius_m": 10.0,
+                    "timeout_s": 30.0,
+                },
+            },
+            {
+                "id": "goto_home",
+                "skill": "GOTO",
+                "args": {
+                    "destination": "home",
+                    "altitude_m": args.takeoff_altitude,
+                    "yaw_mode": "COURSE_ALIGNED",
+                },
+            },
+            {
+                "id": "land_1",
+                "skill": "LAND",
+                "args": {"zone": "home"},
+            },
+        ],
+    }
 
 
 def _print_ground_truth(frame: object, timestamp_s: float) -> None:
@@ -334,16 +397,22 @@ def _best_effort_interrupt_land(
 
 
 def _print_plan(compiled: object) -> None:
-    print("[Planner] MissionIntent")
+    planner_output = compiled.planner_output
+    dynamic = compiled.skill_plan_draft is not None
+    print(
+        "[Planner] SkillPlanDraft (planner-selected)"
+        if dynamic
+        else "[Planner] MissionIntent"
+    )
     print(
         json.dumps(
-            compiled.intent.to_dict(),
+            planner_output.to_dict(),
             ensure_ascii=False,
             allow_nan=False,
             indent=2,
         )
     )
-    print("[Planner] Compiled TaskPlan")
+    print("[Planner] Compiled TaskPlan (trusted geometry/policy/timeouts)")
     print(
         json.dumps(
             compiled.task_plan.to_dicts(),
@@ -352,11 +421,35 @@ def _print_plan(compiled: object) -> None:
             indent=2,
         )
     )
+    if dynamic:
+        print("[Planner] Compiler Notes")
+        print(
+            json.dumps(
+                list(compiled.compiler_notes),
+                ensure_ascii=False,
+                allow_nan=False,
+                indent=2,
+            )
+        )
+
+
+def _landing_zone_name(compiled: object) -> str:
+    if compiled.intent is not None:
+        return compiled.intent.landing_zone
+    draft = compiled.skill_plan_draft
+    if draft is None or not draft.steps:
+        raise RuntimeError("compiled mission has no planner output")
+    final_step = draft.steps[-1]
+    zone = final_step.args.get("zone")
+    if final_step.skill != "LAND" or not isinstance(zone, str) or not zone:
+        raise RuntimeError("dynamic plan has no final named landing zone")
+    return zone
 
 
 def _print_runtime_summary(
     *,
     args: argparse.Namespace,
+    compiled: object,
     selected_model: str | None,
     model_calls: int,
     manager: object,
@@ -401,6 +494,23 @@ def _print_runtime_summary(
     last_result_code = None if last_result is None else last_result.code.name
     task_status = manager.task_status.name
     print(f"[Summary] planner={args.planner}")
+    draft = compiled.skill_plan_draft
+    print(
+        "[Summary] planner_output_type="
+        f"{type(compiled.planner_output).__name__}"
+    )
+    print(
+        "[Summary] draft_step_count="
+        f"{0 if draft is None else len(draft.steps)}"
+    )
+    print(f"[Summary] compiled_step_count={len(compiled.task_plan.steps)}")
+    recovery_budget = 0
+    if draft is not None:
+        recovery_budget = sum(
+            0 if step.recovery is None else step.recovery.max_attempts
+            for step in draft.steps
+        )
+    print(f"[Summary] planned_recovery_budget={recovery_budget}")
     print(f"[Summary] model={selected_model or 'none'}")
     print(f"[Summary] model_chat_calls={model_calls}")
     print(f"[Summary] agent_status={snapshot.status.value}")
@@ -463,8 +573,15 @@ def main() -> int:
     # These are all pure-Python planning/runtime definitions.  Construct the
     # planner's safe world view before importing or instantiating Isaac Sim.
     from models import OpenAICompatibleClient
-    from planner import LLMPlanner, MissionIntent, ScriptedPlanner
-    from runtime import PlanValidator, SafetySupervisor
+    from planner import (
+        DynamicLLMPlanner,
+        LLMPlanner,
+        MissionIntent,
+        ScriptedDynamicPlanner,
+        ScriptedPlanner,
+        SkillPlanDraft,
+    )
+    from runtime import PlanValidator, PlannerLimits, SafetySupervisor
     from runtime.world_context_builder import (
         WorldContextBuildError,
         build_planner_world_context,
@@ -485,6 +602,7 @@ def main() -> int:
         print(f"world context error: {exc}", file=sys.stderr)
         return 2
 
+    planner_limits = PlannerLimits.from_config(config.planner)
     counting_client: _CountingModelClient | None = None
     selected_model: str | None = None
     if args.planner == "scripted":
@@ -497,6 +615,10 @@ def main() -> int:
                 takeoff_altitude_m=args.takeoff_altitude,
             )
         )
+    elif args.planner == "dynamic_scripted":
+        planner = ScriptedDynamicPlanner(
+            SkillPlanDraft.from_dict(_standard_dynamic_draft_data(args))
+        )
     else:
         raw_client = OpenAICompatibleClient(
             base_url=args.base_url,
@@ -505,12 +627,19 @@ def main() -> int:
         )
         selected_model = raw_client.model
         counting_client = _CountingModelClient(raw_client)
-        planner = LLMPlanner(
-            counting_client,
-            PROJECT_ROOT / "prompts" / "mission_planner_system.txt",
-        )
+        if args.planner == "llm":
+            planner = LLMPlanner(
+                counting_client,
+                PROJECT_ROOT / "prompts" / "mission_planner_system.txt",
+            )
+        else:
+            planner = DynamicLLMPlanner(
+                counting_client,
+                PROJECT_ROOT / "prompts" / "dynamic_skill_planner_system.txt",
+                planner_limits=planner_limits,
+            )
 
-    validator = PlanValidator()
+    validator = PlanValidator(planner_limits)
     shutdown_guard_s = _shutdown_guard_s(
         # An LLM may validly select another altitude within the trusted scene.
         # Size the emergency guard for the highest validator-accepted Z.
@@ -525,6 +654,7 @@ def main() -> int:
         max_mission_time_s=args.max_sim_time + shutdown_guard_s + 1.0,
         position_margin_m=0.25,
         max_safe_altitude_m=world_context.scene_max_xyz_m[2],
+        planner_limits=planner_limits,
     )
 
     # Standalone ordering boundary: every Isaac-backed import is below the
@@ -623,9 +753,10 @@ def main() -> int:
 
         final_pose = environment.uav_controller.get_pose()
         final_xyz = (final_pose.x, final_pose.y, final_pose.z)
-        home = world_context.landing_zones[compiled.intent.landing_zone]
+        home = world_context.landing_zones[_landing_zone_name(compiled)]
         _, _, checks_passed = _print_runtime_summary(
             args=args,
+            compiled=compiled,
             selected_model=selected_model,
             model_calls=(0 if counting_client is None else counting_client.chat_calls),
             manager=manager,

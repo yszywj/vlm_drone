@@ -10,17 +10,53 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
-from math import isfinite
+from math import hypot, isfinite, pi
 from numbers import Real
 
 from planner.schemas import CompiledMission
-from skills.manager import TaskPlan, TaskStep
+from runtime.plan_validator import PlannerLimits
+from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskStep
 from skills.motion_types import (
     MotionPolicy,
     MotionPolicyValidationError,
     YawMode,
 )
 from skills.types import Observation, SkillName
+
+
+_ALLOWED_COMPILED_PARAMS: Mapping[SkillName, frozenset[str]] = {
+    SkillName.TAKEOFF: frozenset(
+        {"target_altitude", "tolerance", "climb_speed", "yaw_mode", "yaw_value", "timeout"}
+    ),
+    SkillName.GOTO: frozenset(
+        {"position", "tolerance", "motion_policy", "timeout"}
+    ),
+    SkillName.SEARCH: frozenset(
+        {
+            "center",
+            "radius",
+            "target_description",
+            "search_altitude",
+            "transit_speed",
+            "scan_yaw_rate",
+            "timeout",
+        }
+    ),
+    SkillName.TRACK: frozenset(
+        {
+            "target_id",
+            "desired_distance",
+            "desired_altitude",
+            "max_speed",
+            "max_target_lost_time",
+            "timeout",
+            "track_duration",
+        }
+    ),
+    SkillName.LAND: frozenset(
+        {"ground_altitude", "tolerance", "descent_speed", "yaw_mode", "yaw_value", "timeout"}
+    ),
+}
 
 
 class SafetyAction(str, Enum):
@@ -64,6 +100,7 @@ class SafetySupervisor:
         max_mission_time_s: float = 900.0,
         position_margin_m: float = 0.0,
         max_safe_altitude_m: float | None = None,
+        planner_limits: PlannerLimits | None = None,
     ) -> None:
         self._scene_min = _finite_vector3(scene_min_xyz_m, "scene_min_xyz_m")
         self._scene_max = _finite_vector3(scene_max_xyz_m, "scene_max_xyz_m")
@@ -94,6 +131,17 @@ class SafetySupervisor:
                 "max_safe_altitude_m must not be below the scene minimum Z"
         )
         self._max_safe_altitude_m = safe_altitude
+        self._max_track_distance_m = hypot(
+            self._scene_max[0] - self._scene_min[0],
+            self._scene_max[1] - self._scene_min[1],
+        )
+        if not isfinite(self._max_track_distance_m):
+            raise ValueError("scene horizontal span must be finite")
+        if planner_limits is None:
+            planner_limits = PlannerLimits()
+        if not isinstance(planner_limits, PlannerLimits):
+            raise TypeError("planner_limits must be a PlannerLimits")
+        self._planner_limits = planner_limits
         self._last_observation_timestamp: float | None = None
         self._last_mission_elapsed_s: float | None = None
 
@@ -220,8 +268,10 @@ class SafetySupervisor:
         snapshots: list[TaskStep] = []
         for index, step in enumerate(steps):
             try:
+                step_id = step.step_id
                 skill = step.skill
                 params = step.params
+                recovery = step.recovery
                 if not isinstance(skill, SkillName):
                     return _abort(f"TaskPlan step {index} contains an unknown Skill")
                 if skill is SkillName.REACQUIRE:
@@ -230,22 +280,22 @@ class SafetySupervisor:
                     return _abort(f"TaskPlan step {index} params must be a mapping")
                 # TaskStep performs a defensive deep copy, insulating all later
                 # checks from mutable input and surfacing damaged mappings here.
-                snapshots.append(TaskStep(skill, params))
+                snapshots.append(TaskStep(step_id, skill, params, recovery))
             except Exception as exc:
                 return _abort(
                     f"TaskPlan step {index} is structurally invalid: "
                     f"{_exception_text(exc)}"
                 )
 
-        if snapshots[-1].skill is not SkillName.LAND:
-            return _abort("TaskPlan final step must be LAND")
-
-        # Re-run the canonical structure/field-name validator because frozen
-        # TaskPlan objects can still contain mutable parameter dictionaries.
         try:
-            TaskPlan.from_dicts([step.to_dict() for step in snapshots])
+            structure_decision = self._validate_plan_structure(tuple(snapshots))
         except Exception as exc:
-            return _abort(f"TaskPlan structure is invalid: {_exception_text(exc)}")
+            return _abort(
+                "TaskPlan structure is invalid: "
+                f"{_exception_text(exc)}"
+            )
+        if structure_decision.action is not SafetyAction.CONTINUE:
+            return structure_decision
 
         try:
             for index, step in enumerate(snapshots):
@@ -255,9 +305,97 @@ class SafetySupervisor:
             return _abort(f"TaskPlan safety validation failed: {exc}")
         return _continue("preflight checks passed")
 
+    def _validate_plan_structure(
+        self,
+        steps: tuple[TaskStep, ...],
+    ) -> SafetyDecision:
+        limits = self._planner_limits
+        if not 2 <= len(steps) <= limits.max_plan_steps:
+            return _abort(
+                f"TaskPlan must contain 2-{limits.max_plan_steps} steps"
+            )
+        if steps[0].skill is not SkillName.TAKEOFF:
+            return _abort("TaskPlan first step must be TAKEOFF")
+        if steps[-1].skill is not SkillName.LAND:
+            return _abort("TaskPlan final step must be LAND")
+
+        ids = [step.step_id for step in steps]
+        if len(ids) != len(set(ids)):
+            return _abort("TaskPlan step ids must be unique")
+        counts = {
+            skill: sum(step.skill is skill for step in steps)
+            for skill in SkillName
+        }
+        if counts[SkillName.TAKEOFF] != 1:
+            return _abort("TaskPlan must contain exactly one TAKEOFF")
+        if counts[SkillName.LAND] != 1:
+            return _abort("TaskPlan must contain exactly one LAND")
+        if counts[SkillName.GOTO] > limits.max_goto_calls:
+            return _abort("TaskPlan GOTO call count exceeds planner limit")
+        if counts[SkillName.SEARCH] > limits.max_search_calls:
+            return _abort("TaskPlan SEARCH call count exceeds planner limit")
+        if counts[SkillName.TRACK] > limits.max_track_calls:
+            return _abort("TaskPlan TRACK call count exceeds planner limit")
+        if counts[SkillName.REACQUIRE]:
+            return _abort("TaskPlan must not contain explicit REACQUIRE")
+
+        previous: dict[str, SkillName] = {}
+        total_recovery_attempts = 0
+        for index, step in enumerate(steps):
+            prefix = f"TaskPlan step {index} ({step.step_id})"
+            target = step.params.get("target_id")
+            if (
+                step.skill is SkillName.TRACK
+                and SkillName.SEARCH not in previous.values()
+            ):
+                return _abort(f"{prefix} TRACK must appear after SEARCH")
+            if isinstance(target, StepOutputRef):
+                if step.skill is not SkillName.TRACK:
+                    return _abort(
+                        f"{prefix} contains a StepOutputRef outside TRACK"
+                    )
+                referenced_skill = previous.get(target.step_id)
+                if referenced_skill is None:
+                    return _abort(f"{prefix} target reference is not backward")
+                if referenced_skill is not SkillName.SEARCH:
+                    return _abort(f"{prefix} target reference must point to SEARCH")
+
+            recovery = step.recovery
+            if recovery is not None:
+                if step.skill is not SkillName.TRACK:
+                    return _abort(f"{prefix} recovery is only valid on TRACK")
+                if not isinstance(recovery, RecoveryPolicy):
+                    return _abort(f"{prefix} recovery policy is structurally invalid")
+                if recovery.skill is not SkillName.REACQUIRE:
+                    return _abort(f"{prefix} recovery Skill must be REACQUIRE")
+                if (
+                    recovery.max_attempts
+                    > limits.max_reacquire_attempts_per_track
+                ):
+                    return _abort(f"{prefix} recovery attempts exceed planner limit")
+                if not 3.0 <= recovery.search_radius_m <= 20.0:
+                    return _abort(f"{prefix} recovery radius is outside 3-20 m")
+                if not 5.0 <= recovery.timeout_s <= 60.0:
+                    return _abort(f"{prefix} recovery timeout is outside 5-60 s")
+                total_recovery_attempts += recovery.max_attempts
+            previous[step.step_id] = step.skill
+
+        if total_recovery_attempts > limits.max_total_reacquire_attempts:
+            return _abort("TaskPlan total recovery attempt budget exceeds planner limit")
+        return _continue("TaskPlan structure is safe")
+
     def _validate_step(self, index: int, step: TaskStep) -> None:
         params = step.params
         prefix = f"step[{index}] {step.skill.value}"
+        allowed = _ALLOWED_COMPILED_PARAMS.get(step.skill)
+        if allowed is None:
+            raise ValueError(f"{prefix} is not a supported top-level Skill")
+        unknown = sorted(set(params) - allowed)
+        if unknown:
+            raise ValueError(
+                f"{prefix} contains unknown compiled params: "
+                + ", ".join(unknown)
+            )
 
         if "timeout" in params:
             if params["timeout"] is None:
@@ -340,11 +478,15 @@ class SafetySupervisor:
                 _required(params, "track_duration", prefix),
                 f"{prefix} track_duration",
             )
-            if not self.MIN_TRACK_DURATION_S <= duration <= self.MAX_TRACK_DURATION_S:
+            if not (
+                self._planner_limits.min_track_duration_s
+                <= duration
+                <= self._planner_limits.max_track_duration_s
+            ):
                 raise ValueError(
                     f"{prefix} track_duration must be between "
-                    f"{self.MIN_TRACK_DURATION_S:g} and "
-                    f"{self.MAX_TRACK_DURATION_S:g} seconds"
+                    f"{self._planner_limits.min_track_duration_s:g} and "
+                    f"{self._planner_limits.max_track_duration_s:g} seconds"
                 )
             if "desired_altitude" in params:
                 altitude = _positive_finite(
@@ -366,9 +508,22 @@ class SafetySupervisor:
                 ),
                 allow_none=("timeout",),
             )
-            target_id = params.get("target_id", "$SEARCH.result.target_id")
-            if not isinstance(target_id, str) or not target_id.strip():
-                raise ValueError(f"{prefix} target_id must be non-empty")
+            if (
+                "desired_distance" in params
+                and float(params["desired_distance"]) > self._max_track_distance_m
+            ):
+                raise ValueError(
+                    f"{prefix} desired_distance exceeds the scene scale"
+                )
+            target_id = _required(params, "target_id", prefix)
+            if isinstance(target_id, StepOutputRef):
+                if target_id.field != "target_id":
+                    raise ValueError(f"{prefix} target reference field is invalid")
+            elif target_id != "$SEARCH.result.target_id":
+                raise ValueError(
+                    f"{prefix} target_id must be a validated StepOutputRef "
+                    "or the legacy SEARCH placeholder"
+                )
             return
 
         if step.skill is SkillName.LAND:
@@ -469,6 +624,10 @@ def _validate_vertical_yaw(params: Mapping[str, object], prefix: str) -> None:
         if params.get("yaw_value") is None:
             raise ValueError(f"{prefix} FIXED yaw_mode requires yaw_value")
         _finite_number(params["yaw_value"], f"{prefix} yaw_value")
+        if abs(float(params["yaw_value"])) > 2.0 * pi:
+            raise ValueError(f"{prefix} yaw_value exceeds one full rotation")
+    elif params.get("yaw_value") is not None:
+        raise ValueError(f"{prefix} yaw_value is only valid with FIXED yaw")
 
 
 def _validate_motion_policy(value: object, prefix: str) -> MotionPolicy:
@@ -501,6 +660,14 @@ def _validate_motion_policy(value: object, prefix: str) -> MotionPolicy:
         policy.validate()
     except (MotionPolicyValidationError, TypeError, ValueError) as exc:
         raise ValueError(f"{prefix} motion_policy is invalid: {exc}") from exc
+    if (
+        policy.yaw_mode is YawMode.FIXED
+        and policy.yaw_value is not None
+        and abs(float(policy.yaw_value)) > 2.0 * pi
+    ):
+        raise ValueError(
+            f"{prefix} motion_policy.yaw_value exceeds one full rotation"
+        )
     return policy
 
 

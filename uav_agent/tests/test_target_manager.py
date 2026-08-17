@@ -245,6 +245,17 @@ class TargetManagerTest(unittest.TestCase):
         self.assertEqual(snapshot.last_seen_velocity, (0.5, 0.0, 0.0))
         self.assertEqual(snapshot.last_seen_time_s, 6.0)
 
+    def test_finished_tracking_segment_returns_to_locked(self) -> None:
+        manager = tracking_manager()
+
+        manager.finish_tracking_segment(timestamp_s=5.0)
+
+        self.assertIs(manager.lifecycle, TargetLifecycle.LOCKED)
+        self.assertEqual(manager.snapshot().target_id, "target_0")
+        self.assertEqual(manager.events()[-1].reason, "tracking_segment_complete")
+        manager.start_tracking(timestamp_s=6.0)
+        self.assertIs(manager.lifecycle, TargetLifecycle.TRACKING)
+
     def test_mark_lost_keeps_existing_last_seen_values_when_omitted(self) -> None:
         manager = tracking_manager()
 

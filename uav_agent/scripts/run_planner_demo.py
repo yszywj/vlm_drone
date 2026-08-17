@@ -17,11 +17,14 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from planner.schemas import (  # noqa: E402
+    CompiledMission,
     LandingZoneSpec,
     MissionIntent,
+    PlannerOutput,
     PlannerRequest,
     PlannerWorldContext,
     SearchRegionSpec,
+    SkillPlanDraft,
 )
 from planner.scripted_planner import ScriptedPlanner  # noqa: E402
 from runtime.plan_validator import PlanValidator  # noqa: E402
@@ -33,6 +36,9 @@ DEFAULT_INSTRUCTION = (
 DEFAULT_TAKEOFF_ALTITUDE_M = 10.0
 DEFAULT_TRACK_DURATION_S = 30.0
 _SYSTEM_PROMPT_PATH = _PROJECT_ROOT / "prompts" / "mission_planner_system.txt"
+_DYNAMIC_SYSTEM_PROMPT_PATH = (
+    _PROJECT_ROOT / "prompts" / "dynamic_skill_planner_system.txt"
+)
 
 
 def _positive_finite_float(value: str) -> float:
@@ -50,13 +56,14 @@ def _positive_finite_float(value: str) -> float:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Parse one text instruction into MissionIntent and compile the "
-            "trusted six-step UAV TaskPlan. Isaac Sim is not used."
+            "Parse one text instruction into either the legacy MissionIntent "
+            "or a constrained dynamic SkillPlanDraft, then compile it with "
+            "trusted world geometry. Isaac Sim is not used."
         )
     )
     parser.add_argument(
         "--planner",
-        choices=("scripted", "llm"),
+        choices=("scripted", "llm", "dynamic_scripted", "dynamic_llm"),
         default="scripted",
         help="planner backend (default: %(default)s)",
     )
@@ -136,7 +143,72 @@ def _build_world_context(
     )
 
 
-def _plan(args: argparse.Namespace) -> tuple[MissionIntent, list[dict[str, object]]]:
+def _standard_dynamic_draft(args: argparse.Namespace) -> SkillPlanDraft:
+    """Return the model-free dynamic search/track baseline."""
+
+    return SkillPlanDraft.from_dict(
+        {
+            "schema_version": 1,
+            "steps": [
+                {
+                    "id": "takeoff_1",
+                    "skill": "TAKEOFF",
+                    "args": {"altitude_m": args.takeoff_altitude},
+                },
+                {
+                    "id": "goto_search",
+                    "skill": "GOTO",
+                    "args": {
+                        "destination": "search_area",
+                        "altitude_m": args.takeoff_altitude,
+                        "yaw_mode": "COURSE_ALIGNED",
+                    },
+                },
+                {
+                    "id": "search_1",
+                    "skill": "SEARCH",
+                    "args": {
+                        "region": "search_area",
+                        "target_description": "moving target",
+                        "altitude_m": args.takeoff_altitude,
+                    },
+                },
+                {
+                    "id": "track_1",
+                    "skill": "TRACK",
+                    "args": {
+                        "target_ref": "$search_1.target_id",
+                        "duration_s": args.track_duration,
+                        "desired_altitude_m": args.takeoff_altitude,
+                        "desired_distance_m": 6.0,
+                    },
+                    "recovery": {
+                        "skill": "REACQUIRE",
+                        "max_attempts": 2,
+                        "search_radius_m": 10.0,
+                        "timeout_s": 30.0,
+                    },
+                },
+                {
+                    "id": "goto_home",
+                    "skill": "GOTO",
+                    "args": {
+                        "destination": "home",
+                        "altitude_m": args.takeoff_altitude,
+                        "yaw_mode": "COURSE_ALIGNED",
+                    },
+                },
+                {
+                    "id": "land_1",
+                    "skill": "LAND",
+                    "args": {"zone": "home"},
+                },
+            ],
+        }
+    )
+
+
+def _plan(args: argparse.Namespace) -> tuple[PlannerOutput, CompiledMission]:
     context = _build_world_context(
         takeoff_altitude_m=args.takeoff_altitude,
         track_duration_s=args.track_duration,
@@ -155,10 +227,15 @@ def _plan(args: argparse.Namespace) -> tuple[MissionIntent, list[dict[str, objec
             takeoff_altitude_m=args.takeoff_altitude,
         )
         planner = ScriptedPlanner(supplied_intent)
+    elif args.planner == "dynamic_scripted":
+        from planner.scripted_dynamic_planner import ScriptedDynamicPlanner
+
+        planner = ScriptedDynamicPlanner(_standard_dynamic_draft(args))
     else:
         # Keep the model-specific stack out of the deterministic mode.  This
         # also makes ``scripted`` useful as an offline smoke test.
         from models.openai_compatible_client import OpenAICompatibleClient
+        from planner.dynamic_llm_planner import DynamicLLMPlanner
         from planner.llm_planner import LLMPlanner
 
         client = OpenAICompatibleClient(
@@ -166,42 +243,56 @@ def _plan(args: argparse.Namespace) -> tuple[MissionIntent, list[dict[str, objec
             model=args.model,
             api_key=args.api_key,
         )
-        planner = LLMPlanner(client, system_prompt_path=_SYSTEM_PROMPT_PATH)
+        if args.planner == "llm":
+            planner = LLMPlanner(client, system_prompt_path=_SYSTEM_PROMPT_PATH)
+        else:
+            planner = DynamicLLMPlanner(
+                client,
+                system_prompt_path=_DYNAMIC_SYSTEM_PROMPT_PATH,
+            )
 
-    intent = planner.plan(request)
+    planner_output = planner.plan(request)
     compiled = PlanValidator().validate_and_compile(
-        intent,
+        planner_output,
         context,
         source=args.planner,
     )
-    return intent, compiled.task_plan.to_dicts()
+    return planner_output, compiled
 
 
 def _render(
-    intent: MissionIntent,
-    task_plan: list[dict[str, object]],
+    planner_output: PlannerOutput,
+    compiled: CompiledMission,
     *,
     json_output: bool,
 ) -> None:
+    dynamic = isinstance(planner_output, SkillPlanDraft)
+    output_key = "skill_plan_draft" if dynamic else "mission_intent"
     payload = {
-        "mission_intent": intent.to_dict(),
-        "compiled_task_plan": task_plan,
+        output_key: planner_output.to_dict(),
+        "compiled_task_plan": compiled.task_plan.to_dicts(),
     }
+    if dynamic:
+        payload["planner_output_type"] = type(planner_output).__name__
+        payload["compiler_notes"] = list(compiled.compiler_notes)
     if json_output:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return
 
-    print("MissionIntent")
-    print(json.dumps(payload["mission_intent"], ensure_ascii=False, indent=2))
-    print("\nCompiled TaskPlan")
+    print("SkillPlanDraft (planner-selected)" if dynamic else "MissionIntent")
+    print(json.dumps(payload[output_key], ensure_ascii=False, indent=2))
+    print("\nCompiled TaskPlan (trusted coordinates, policies, and timeouts)")
     print(json.dumps(payload["compiled_task_plan"], ensure_ascii=False, indent=2))
+    if dynamic:
+        print("\nCompiler Notes")
+        print(json.dumps(payload["compiler_notes"], ensure_ascii=False, indent=2))
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        intent, task_plan = _plan(args)
-        _render(intent, task_plan, json_output=args.json_output)
+        planner_output, compiled = _plan(args)
+        _render(planner_output, compiled, json_output=args.json_output)
         return 0
     except Exception as exc:
         # Model client errors intentionally do not contain credentials.  Keep

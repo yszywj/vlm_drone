@@ -10,12 +10,14 @@ from env.kinematic_uav import UAVState
 from planner.schemas import (
     LandingZoneSpec,
     MissionIntent,
+    SkillPlanDraft,
     PlannerWorldContext,
     SearchRegionSpec,
 )
-from runtime.plan_validator import PlanValidator
+from runtime.plan_validator import PlannerLimits, PlanValidator
 from runtime.safety_supervisor import SafetyAction, SafetySupervisor
 from skills.manager import TaskPlan, TaskStep
+from skills.plan import RecoveryPolicy, StepOutputRef
 from skills.types import Observation, SkillName
 
 
@@ -44,6 +46,7 @@ class SafetySupervisorTests(unittest.TestCase):
             default_track_duration_s=30.0,
             search_timeout_s=75.0,
         )
+        self.context = context
         intent = MissionIntent(
             target_description="moving target",
             search_region="search_area",
@@ -71,6 +74,154 @@ class SafetySupervisorTests(unittest.TestCase):
     def test_preflight_accepts_bare_task_plan(self) -> None:
         decision = self.supervisor.preflight(self.compiled.task_plan)
         self.assertIs(decision.action, SafetyAction.CONTINUE)
+
+    def test_dynamic_plan_receives_independent_preflight_validation(self) -> None:
+        draft = SkillPlanDraft.from_dict(
+            {
+                "schema_version": 1,
+                "steps": [
+                    {"id": "takeoff_1", "skill": "TAKEOFF", "args": {"altitude_m": 10}},
+                    {"id": "goto_search", "skill": "GOTO", "args": {"destination": "search_area"}},
+                    {
+                        "id": "search_1",
+                        "skill": "SEARCH",
+                        "args": {"region": "search_area", "target_description": "moving target"},
+                    },
+                    {
+                        "id": "track_1",
+                        "skill": "TRACK",
+                        "args": {"target_ref": "$search_1.target_id", "duration_s": 10},
+                        "recovery": {
+                            "skill": "REACQUIRE",
+                            "max_attempts": 2,
+                            "search_radius_m": 10,
+                            "timeout_s": 30,
+                        },
+                    },
+                    {"id": "goto_home", "skill": "GOTO", "args": {"destination": "home"}},
+                    {"id": "land_1", "skill": "LAND", "args": {"zone": "home"}},
+                ],
+            }
+        )
+        compiled = PlanValidator().validate_and_compile(
+            draft,
+            self.context,
+            source="dynamic_scripted",
+        )
+        decision = self.supervisor.preflight(compiled)
+        self.assertIs(decision.action, SafetyAction.CONTINUE)
+
+    def test_dynamic_structure_guards_are_defense_in_depth(self) -> None:
+        steps = self.compiled.task_plan.steps
+        cases = (
+            (steps[1:], "TAKEOFF"),
+            (steps[:-1], "LAND"),
+            (
+                (
+                    steps[0],
+                    TaskStep(
+                        "track_early",
+                        SkillName.TRACK,
+                        {
+                            "target_id": StepOutputRef("search_later"),
+                            "track_duration": 10.0,
+                        },
+                    ),
+                    TaskStep(
+                        "search_later",
+                        SkillName.SEARCH,
+                        {
+                            "center": (20.0, 20.0, 0.0),
+                            "radius": 10.0,
+                            "target_description": "target",
+                            "search_altitude": 10.0,
+                            "timeout": 30.0,
+                        },
+                    ),
+                    steps[-1],
+                ),
+                "after SEARCH",
+            ),
+        )
+        for damaged_steps, reason in cases:
+            with self.subTest(reason=reason):
+                decision = self.supervisor.preflight(_unsafe_plan(tuple(damaged_steps)))
+                self.assertIs(decision.action, SafetyAction.ABORT)
+                self.assertIn(reason, decision.reason)
+
+        duplicate = list(steps)
+        object.__setattr__(duplicate[1], "step_id", duplicate[0].step_id)
+        try:
+            decision = self.supervisor.preflight(_unsafe_plan(tuple(duplicate)))
+            self.assertIs(decision.action, SafetyAction.ABORT)
+            self.assertIn("unique", decision.reason)
+        finally:
+            object.__setattr__(duplicate[1], "step_id", "step_02")
+
+    def test_step_output_ref_must_point_backward_to_search(self) -> None:
+        steps = list(self.compiled.task_plan.steps)
+        steps[3] = TaskStep(
+            "track_bad_ref",
+            SkillName.TRACK,
+            {
+                **steps[3].params,
+                "target_id": StepOutputRef(steps[1].step_id),
+            },
+        )
+        decision = self.supervisor.preflight(_unsafe_plan(tuple(steps)))
+        self.assertIs(decision.action, SafetyAction.ABORT)
+        self.assertIn("SEARCH", decision.reason)
+
+        direct_target = list(self.compiled.task_plan.steps)
+        direct_target[3] = TaskStep(
+            "track_direct_truth",
+            SkillName.TRACK,
+            {**direct_target[3].params, "target_id": "oracle_target_0"},
+        )
+        decision = self.supervisor.preflight(_unsafe_plan(tuple(direct_target)))
+        self.assertIs(decision.action, SafetyAction.ABORT)
+        self.assertIn("StepOutputRef", decision.reason)
+
+    def test_recovery_budget_is_rechecked_by_safety(self) -> None:
+        limits = PlannerLimits(max_total_reacquire_attempts=3)
+        supervisor = SafetySupervisor(
+            (-50.0, -50.0, 0.0),
+            (50.0, 50.0, 30.0),
+            planner_limits=limits,
+        )
+        recovery = RecoveryPolicy(SkillName.REACQUIRE, 2, 10.0, 30.0)
+        base = list(self.compiled.task_plan.steps)
+        first_track = TaskStep(
+            "track_one",
+            SkillName.TRACK,
+            base[3].params,
+            recovery,
+        )
+        second_track = TaskStep(
+            "track_two",
+            SkillName.TRACK,
+            base[3].params,
+            recovery,
+        )
+        dynamic_steps = (
+            base[0],
+            base[1],
+            base[2],
+            first_track,
+            second_track,
+            base[4],
+            base[5],
+        )
+        decision = supervisor.preflight(_unsafe_plan(dynamic_steps))
+        self.assertIs(decision.action, SafetyAction.ABORT)
+        self.assertIn("total recovery", decision.reason)
+
+    def test_unknown_compiled_parameter_aborts(self) -> None:
+        plan = _copy_plan(self.compiled.task_plan)
+        plan.steps[1].params["motor_value"] = 0.5
+        decision = self.supervisor.preflight(plan)
+        self.assertIs(decision.action, SafetyAction.ABORT)
+        self.assertIn("unknown compiled params", decision.reason)
 
     def test_track_timeout_none_is_valid(self) -> None:
         plan = _copy_plan(self.compiled.task_plan)
@@ -105,8 +256,14 @@ class SafetySupervisorTests(unittest.TestCase):
 
     def test_explicit_reacquire_aborts(self) -> None:
         steps = list(self.compiled.task_plan.steps)
-        steps[2] = TaskStep(
-            SkillName.REACQUIRE,
+        # The public TaskStep constructor already rejects this.  Corrupt a
+        # value deliberately to verify SafetySupervisor's independent guard.
+        damaged_step = object.__new__(TaskStep)
+        object.__setattr__(damaged_step, "step_id", "bad_reacquire")
+        object.__setattr__(damaged_step, "skill", SkillName.REACQUIRE)
+        object.__setattr__(
+            damaged_step,
+            "params",
             {
                 "target_id": "target_0",
                 "last_seen_position": (0.0, 0.0, 0.0),
@@ -114,6 +271,8 @@ class SafetySupervisorTests(unittest.TestCase):
                 "last_seen_time": 1.0,
             },
         )
+        object.__setattr__(damaged_step, "recovery", None)
+        steps[2] = damaged_step
         decision = self.supervisor.preflight(_unsafe_plan(tuple(steps)))
         self.assertIs(decision.action, SafetyAction.ABORT)
         self.assertIn("REACQUIRE", decision.reason)
@@ -152,6 +311,21 @@ class SafetySupervisorTests(unittest.TestCase):
         track.steps[3].params["track_duration"] = 600.1
         self.assertIs(
             self.supervisor.preflight(track).action,
+            SafetyAction.ABORT,
+        )
+
+        distance = _copy_plan(self.compiled.task_plan)
+        distance.steps[3].params["desired_distance"] = 1e308
+        self.assertIs(
+            self.supervisor.preflight(distance).action,
+            SafetyAction.ABORT,
+        )
+
+        yaw = _copy_plan(self.compiled.task_plan)
+        yaw.steps[0].params["yaw_mode"] = "KEEP_CURRENT"
+        yaw.steps[0].params["yaw_value"] = 0.5
+        self.assertIs(
+            self.supervisor.preflight(yaw).action,
             SafetyAction.ABORT,
         )
 

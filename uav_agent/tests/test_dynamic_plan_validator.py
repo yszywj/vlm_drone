@@ -216,7 +216,9 @@ class DynamicPlanValidatorTests(unittest.TestCase):
 
     def test_compiled_land_uses_only_trusted_zone_geometry(self) -> None:
         compiled = self.compile([_takeoff(), _goto("goto_home", "home"), _land()])
+        landing_approach = compiled.task_plan.steps[-2]
         land = compiled.task_plan.steps[-1]
+        self.assertEqual(landing_approach.params["tolerance"], 0.75)
         self.assertEqual(land.params["expected_position_xy"], (0.0, 0.0))
         self.assertEqual(land.params["zone_tolerance_m"], 0.75)
         self.assertNotIn("expected_position_xy", compiled.skill_plan_draft.steps[-1].args)

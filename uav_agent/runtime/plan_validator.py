@@ -542,6 +542,24 @@ class PlanValidator:
                     "motion_policy": motion_policy,
                     "timeout": world.goto_timeout,
                 }
+                # A GOTO immediately preceding LAND must satisfy the LAND
+                # zone contract before it may report GOAL_REACHED.  The
+                # generic GotoGoal tolerance is deliberately wider than some
+                # configured landing zones, so relying on its default can
+                # produce a valid compiled plan that fails as LAND starts.
+                if index + 1 < len(steps):
+                    next_step = steps[index + 1]
+                    if next_step.skill == SkillName.LAND.value:
+                        next_zone = next_step.args.get("zone")
+                        if next_zone == destination:
+                            landing_zone = _landing_zone(context, destination)
+                            _, _, landing_tolerance = (
+                                self._trusted_landing_geometry(
+                                    landing_zone,
+                                    world,
+                                )
+                            )
+                            params["tolerance"] = landing_tolerance
                 current_altitude = altitude
                 compiler_notes.append(
                     f"{step_id}: destination {destination!r} resolved by trusted context"

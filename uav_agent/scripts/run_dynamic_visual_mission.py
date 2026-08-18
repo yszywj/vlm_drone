@@ -113,6 +113,14 @@ def _nonnegative_float(value: str) -> float:
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--debug-visualization",
+        action="store_true",
+        help=(
+            "draw search geometry, camera frustum, planned route, "
+            "and skill-colored executed trajectory in the GUI viewport"
+        ),
+    )
+    parser.add_argument(
         "--config",
         default="configs/default.yaml",
         help="unified YAML config (default: %(default)s)",
@@ -794,6 +802,7 @@ def _create_visual_runtime(
 def _run_until_terminal(
     *,
     simulation_app: object,
+    debug_visualizer: object | None,
     environment: object,
     perception: object,
     agent: object,
@@ -871,6 +880,37 @@ def _run_until_terminal(
         # MissionAgent feeds the same fresh frame to the non-blocking visual
         # coordinator only after hard Safety permits it, then advances Manager.
         snapshot = agent.tick(observation)
+        if debug_visualizer is not None:
+            # 如果运行时计划修订成功，更新灰色计划路线和目标点。
+            revision_coordinator = (
+                None
+                if visual_runtime is None
+                else visual_runtime.revision_coordinator
+            )
+            accepted_revision = (
+                None
+                if revision_coordinator is None
+                else revision_coordinator.latest_accepted_revision
+            )
+            if (
+                accepted_revision is not None
+                and accepted_revision.compiled_mission.task_plan.plan_version
+                != debug_visualizer.plan_version
+            ):
+                debug_visualizer.set_plan(
+                    accepted_revision.compiled_mission
+                )
+
+            debug_visualizer.update(
+                uav_pose=observation.uav_pose,
+                camera_position_m=observation.camera_position_m,
+                camera_orientation_wxyz=(
+                    observation.camera_orientation_wxyz
+                ),
+                active_skill=snapshot.active_skill,
+                active_step_id=manager.active_planned_step_id,
+                target_lifecycle=snapshot.target.lifecycle,
+            )
         if visual_runtime is not None:
             visual_runtime.emit_new_reviews(
                 step_id=manager.active_planned_step_id,
@@ -1026,13 +1066,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     # successfully constructed SimulationApp.
     from isaacsim import SimulationApp
 
-    headless = config.simulation.headless if args.headless is None else args.headless
+    headless = (
+        config.simulation.headless
+        if args.headless is None
+        else args.headless
+    )
+
+    if args.debug_visualization and headless:
+        print(
+            "error: --debug-visualization requires --no-headless",
+            file=sys.stderr,
+        )
+        return 2
+
     simulation_app = SimulationApp({"headless": headless})
+
+    if args.debug_visualization:
+        from isaacsim.core.utils.extensions import enable_extension
+
+        enable_extension("isaacsim.util.debug_draw")
+        simulation_app.update()
     environment = None
     agent = None
     perception = None
     clock = None
     visual_runtime: _VisualRuntime | None = None
+    debug_visualizer = None
     interrupted = False
     try:
         from agents.mission_agent import MissionAgent
@@ -1176,6 +1235,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         task_start_s = clock.now()
         compiled = agent.start(args.instruction, world_context)
+        if args.debug_visualization:
+            from visualization import MissionDebugDraw
+
+            debug_visualizer = MissionDebugDraw(
+                world_context=world_context,
+                camera_config=config.camera,
+            )
+            debug_visualizer.set_plan(compiled)
         launch_snapshot = agent.snapshot()
         assert launch_snapshot.mission_id is not None
         for key, value in startup_fields(
@@ -1205,6 +1272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             loop_result = _run_until_terminal(
                 simulation_app=simulation_app,
+                debug_visualizer=debug_visualizer,
                 environment=environment,
                 perception=perception,
                 agent=agent,
@@ -1294,6 +1362,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         file=sys.stderr,
                     )
             if environment is not None:
+                if debug_visualizer is not None:
+                    try:
+                        debug_visualizer.close()
+                    except Exception as exc:
+                        print(
+                            f"debug visualization shutdown failed: "
+                            f"{type(exc).__name__}",
+                            file=sys.stderr,
+                        )
                 environment.close()
         finally:
             simulation_app.close()

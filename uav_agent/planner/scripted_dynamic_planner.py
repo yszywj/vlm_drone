@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from planner.base import MissionPlanner
 from planner.diagnostics import PlannerDiagnostics, PlannerExecution
-from planner.schemas import PlannerRequest, SkillPlanDraft
+from planner.schemas import (
+    PlannerRequest,
+    SkillPlanDraft,
+    SkillPlanDraftV2,
+    migrate_plan_v1_to_v2,
+)
 
 
 class ScriptedDynamicPlanner(MissionPlanner):
@@ -17,13 +22,23 @@ class ScriptedDynamicPlanner(MissionPlanner):
             raise TypeError("skill_plan_draft must be a SkillPlanDraft")
         self._draft_data = skill_plan_draft.to_dict()
 
-    def plan(self, request: PlannerRequest) -> SkillPlanDraft:
+    def plan(self, request: PlannerRequest) -> SkillPlanDraft | SkillPlanDraftV2:
         return self.plan_with_diagnostics(request).output
 
     def plan_with_diagnostics(self, request: PlannerRequest) -> PlannerExecution:
         if not isinstance(request, PlannerRequest):
             raise TypeError("request must be a PlannerRequest")
         output = SkillPlanDraft.from_dict(self._draft_data)
+        if request.has_routing_ids:
+            assert request.mission_id is not None
+            assert request.uav_id is not None
+            assert request.plan_version is not None
+            output = migrate_plan_v1_to_v2(
+                output,
+                mission_id=request.mission_id,
+                uav_id=request.uav_id,
+                plan_version=request.plan_version,
+            )
         diagnostics = PlannerDiagnostics(
             model_calls=0,
             repair_used=False,

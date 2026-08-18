@@ -186,12 +186,14 @@ def make_context() -> tuple[SkillContext, ManualClock]:
         camera=FakeCamera(),
         perception=None,
         clock=clock,
+        uav_id="uav_1",
     )
     return context, clock
 
 
 def observation(timestamp: float) -> Observation:
     return Observation(
+        uav_id="uav_1",
         timestamp=timestamp,
         uav_pose=UAVState(0.0, 0.0, 10.0, 0.0),
         uav_velocity=np.zeros(3),
@@ -243,7 +245,7 @@ class SkillManagerTaskTest(unittest.TestCase):
         self.assertEqual(manager.task_status, TaskStatus.IDLE)
         self.assertEqual(
             set(create_default_skill_registry()),
-            set(SkillName),
+            set(SkillName) - {SkillName.INSPECT},
         )
         self.assertEqual(manager.start_task(standard_plan()), TaskStatus.RUNNING)
         self.assertEqual(manager.active_name, SkillName.TAKEOFF)

@@ -50,11 +50,13 @@ def make_context(uav: KinematicUAV, clock: ManualClock) -> SkillContext:
         camera=FakeCamera(),
         perception=None,
         clock=clock,
+        uav_id="uav_1",
     )
 
 
 def make_observation(uav: KinematicUAV, clock: ManualClock) -> Observation:
     return Observation(
+        uav_id="uav_1",
         timestamp=clock.now(),
         uav_pose=uav.get_pose(),
         uav_velocity=uav.get_velocity(),
@@ -151,6 +153,7 @@ class LandSkillTest(unittest.TestCase):
             make_context(uav, clock),
         )
         drifted = Observation(
+            uav_id="uav_1",
             timestamp=0.0,
             uav_pose=UAVState(0.8, 0.0, 2.0, 0.0),
             uav_velocity=np.zeros(3),

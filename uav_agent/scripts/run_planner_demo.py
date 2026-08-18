@@ -25,7 +25,9 @@ from planner.schemas import (  # noqa: E402
     PlannerWorldContext,
     SearchRegionSpec,
     SkillPlanDraft,
+    SkillPlanDraftV2,
 )
+from common.ids import generate_routing_id, validate_uav_id  # noqa: E402
 from planner.diagnostics import PlannerDiagnostics  # noqa: E402
 from planner.scripted_planner import ScriptedPlanner  # noqa: E402
 from runtime.plan_validator import PlanValidator  # noqa: E402
@@ -67,6 +69,12 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("scripted", "llm", "dynamic_scripted", "dynamic_llm"),
         default="scripted",
         help="planner backend (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--uav-id",
+        default="uav_1",
+        type=validate_uav_id,
+        help="trusted UAV routing ID (default: %(default)s)",
     )
     parser.add_argument(
         "--instruction",
@@ -238,6 +246,9 @@ def _plan(
     request = PlannerRequest(
         instruction=args.instruction,
         world_context=context,
+        mission_id=generate_routing_id("mission"),
+        uav_id=args.uav_id,
+        plan_version=1,
     )
 
     if args.planner == "scripted":
@@ -287,6 +298,9 @@ def _plan(
             planner_output,
             context,
             source=args.planner,
+            mission_id=request.mission_id,
+            uav_id=request.uav_id,
+            plan_version=request.plan_version,
         )
     except Exception as exc:
         observed = getattr(planner, "last_diagnostics", None)
@@ -303,7 +317,7 @@ def _render(
     *,
     json_output: bool,
 ) -> None:
-    dynamic = isinstance(planner_output, SkillPlanDraft)
+    dynamic = isinstance(planner_output, (SkillPlanDraft, SkillPlanDraftV2))
     output_key = "skill_plan_draft" if dynamic else "mission_intent"
     payload = {
         output_key: planner_output.to_dict(),

@@ -178,11 +178,13 @@ def make_context(uav: object) -> SkillContext:
         camera=FakeCamera(),
         perception=None,
         clock=FakeClock(),
+        uav_id="uav_1",
     )
 
 
 def make_observation(pose: UAVState) -> Observation:
     return Observation(
+        uav_id="uav_1",
         timestamp=0.1,
         uav_pose=pose,
         uav_velocity=np.zeros(3),

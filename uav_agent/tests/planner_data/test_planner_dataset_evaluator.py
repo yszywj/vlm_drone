@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from hashlib import sha256
 import json
 from pathlib import Path
 import tempfile
@@ -22,6 +23,7 @@ from planner_data.evaluator import (
     planner_world_case_to_runtime_context,
 )
 from planner_data.dynamic_judge import build_gold_dynamic_draft
+from planner.schemas import migrate_plan_v1_to_v2
 from planner_data.renderers import world_case_to_runtime_context
 from planner_data.schemas import (
     PLANNER_DATASET_SCHEMA_VERSION,
@@ -154,7 +156,17 @@ def sample(index: int) -> PlannerDatasetSample:
 def dynamic_plan_dict(index: int = 1) -> dict[str, object]:
     """Return Gold semantics with deliberately non-Gold step identifiers."""
 
-    value = build_gold_dynamic_draft(sample(index).gold).to_dict()
+    dataset_sample = sample(index)
+    mission_id = (
+        "mission_"
+        + sha256(dataset_sample.sample_id.encode("utf-8")).hexdigest()[:20]
+    )
+    value = migrate_plan_v1_to_v2(
+        build_gold_dynamic_draft(dataset_sample.gold),
+        mission_id=mission_id,
+        uav_id="uav_1",
+        plan_version=1,
+    ).to_dict()
     replacements = {
         "gold_takeoff": "lift",
         "gold_goto_search": "approach",
@@ -290,6 +302,7 @@ class PlannerDatasetEvaluatorTest(unittest.TestCase):
         value = dynamic_plan_dict()
         extra = {
             "id": "follow_again",
+            "uav_id": "uav_1",
             "skill": "TRACK",
             "args": {
                 "target_ref": "$find_person.target_id",
@@ -330,6 +343,36 @@ class PlannerDatasetEvaluatorTest(unittest.TestCase):
         self.assertEqual(run.summary["explicit_fail_rate"], 1.0)
         self.assertEqual(run.summary["default_recovery_injected_rate"], 0.0)
         self.assertTrue(run.predictions[0]["explicit_fail"])
+
+    def test_dynamic_llm_records_deterministic_schema_v2_routing(self) -> None:
+        client = FakeModelClient([dynamic_output()])
+        evaluator = self.dynamic_llm_evaluator(client)
+        with tempfile.TemporaryDirectory() as temporary:
+            first = evaluator.evaluate((sample(1),), output_root=temporary)
+
+        parsed = first.predictions[0]["parsed_prediction"]
+        expected_mission_id = (
+            "mission_"
+            + sha256(sample(1).sample_id.encode("utf-8")).hexdigest()[:20]
+        )
+        self.assertEqual(parsed["schema_version"], 2)
+        self.assertEqual(parsed["mission_id"], expected_mission_id)
+        self.assertEqual(parsed["uav_id"], "uav_1")
+        self.assertEqual(parsed["plan_version"], 1)
+        self.assertTrue(
+            all(step["uav_id"] == "uav_1" for step in parsed["steps"])
+        )
+        prompt = json.loads(str(client.messages[0][1].content))
+        self.assertEqual(
+            prompt["trusted_routing"],
+            {
+                "schema_version": 2,
+                "mission_id": expected_mission_id,
+                "uav_id": "uav_1",
+                "plan_version": 1,
+                "step_uav_id_must_equal": "uav_1",
+            },
+        )
 
     def test_dynamic_resume_skips_completed_ids(self) -> None:
         evaluator = PlannerDatasetEvaluator(

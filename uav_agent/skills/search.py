@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import Enum
 from math import atan2, cos, isfinite, pi, radians, sin
 from numbers import Real
 
@@ -18,7 +18,13 @@ from skills.base import (
     require_vector3,
 )
 from skills.motion_types import MotionPolicy, YawMode, move_toward_with_policy
-from skills.types import Observation, SkillContext, SkillGoal, SkillResultCode
+from skills.types import (
+    Observation,
+    SkillContext,
+    SkillGoal,
+    SkillResultCode,
+    SkillStatus,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,9 +40,14 @@ class SearchGoal(SkillGoal):
     timeout: float = 60.0
 
 
-class _SearchPhase(Enum):
-    MOVING_TO_WAYPOINT = auto()
-    SCANNING = auto()
+class SearchPhase(str, Enum):
+    """Observable SEARCH phase without embedding another Skill lifecycle."""
+
+    TRANSIT = "TRANSIT"
+    SCANNING = "SCANNING"
+    CANDIDATE_PENDING = "CANDIDATE_PENDING"
+    WAITING_FOR_REVIEW = "WAITING_FOR_REVIEW"
+    TARGET_LOCKED = "TARGET_LOCKED"
 
 
 class SearchSkill(Skill):
@@ -56,7 +67,10 @@ class SearchSkill(Skill):
         self._waypoints: tuple[np.ndarray, ...] = ()
         self._waypoint_index = 0
         self._waypoint_tolerance_m = 0.25
-        self._phase: _SearchPhase | None = None
+        self._phase: SearchPhase | None = None
+        self._reported_phase: SearchPhase | None = None
+        self._candidate_id: str | None = None
+        self._candidate_source: str | None = None
         self._transit_policy: MotionPolicy | None = None
         self._start_time: float | None = None
         self._last_clock_time: float | None = None
@@ -70,6 +84,69 @@ class SearchSkill(Skill):
     @property
     def transit_yaw_mode(self) -> YawMode:
         return self._transit_yaw_mode
+
+    @property
+    def phase(self) -> SearchPhase | None:
+        return self._reported_phase
+
+    def report_candidate_pending(self, candidate_id: str, *, source: str) -> None:
+        """Expose a provisional candidate without declaring target success.
+
+        Candidate confirmation, HOVER and INSPECT are orchestration concerns;
+        this method deliberately does not call another Skill or fabricate an
+        identity result.
+        """
+
+        if self.status is not SkillStatus.RUNNING:
+            raise SkillExecutionStateError(
+                "candidate reporting requires a running SEARCH"
+            )
+        if not isinstance(candidate_id, str) or not candidate_id.strip():
+            raise ValueError("candidate_id must be a non-empty string")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("candidate source must be a non-empty string")
+        self._candidate_id = candidate_id.strip()
+        self._candidate_source = source.strip()
+        self._reported_phase = SearchPhase.CANDIDATE_PENDING
+        self._refresh_candidate_feedback("SEARCH candidate pending review")
+
+    def mark_waiting_for_review(self, candidate_id: str) -> None:
+        if self.status is not SkillStatus.RUNNING:
+            raise SkillExecutionStateError(
+                "review waiting requires a running SEARCH"
+            )
+        if self._candidate_id != candidate_id:
+            raise ValueError("candidate_id does not match pending SEARCH candidate")
+        self._reported_phase = SearchPhase.WAITING_FOR_REVIEW
+        self._refresh_candidate_feedback("SEARCH waiting for visual review")
+
+    def reject_candidate(self, candidate_id: str) -> None:
+        if self.status is not SkillStatus.RUNNING:
+            raise SkillExecutionStateError(
+                "candidate rejection requires a running SEARCH"
+            )
+        if self._candidate_id != candidate_id:
+            raise ValueError("candidate_id does not match pending SEARCH candidate")
+        self._candidate_id = None
+        self._candidate_source = None
+        self._reported_phase = self._phase
+        self._refresh_candidate_feedback("SEARCH candidate rejected")
+
+    def _refresh_candidate_feedback(self, message: str) -> None:
+        previous = self.get_feedback()
+        data = dict(previous.data)
+        data["phase"] = (
+            self._reported_phase.value
+            if self._reported_phase is not None
+            else "UNINITIALIZED"
+        )
+        if self._candidate_id is None:
+            data.pop("candidate_id", None)
+            data.pop("candidate_source", None)
+        else:
+            data["candidate_id"] = self._candidate_id
+            data["candidate_source"] = self._candidate_source
+        self._set_feedback(previous.progress, message, data)
 
     def _validate_goal(self, goal: SkillGoal) -> None:
         typed_goal = goal
@@ -123,7 +200,10 @@ class SearchSkill(Skill):
             0.5,
             max(0.05, 0.1 * float(typed_goal.radius)),
         )
-        self._phase = _SearchPhase.MOVING_TO_WAYPOINT
+        self._phase = SearchPhase.TRANSIT
+        self._reported_phase = SearchPhase.TRANSIT
+        self._candidate_id = None
+        self._candidate_source = None
         self._transit_policy = MotionPolicy(
             max_speed=typed_goal.transit_speed,
             yaw_mode=self._transit_yaw_mode,
@@ -206,9 +286,9 @@ class SearchSkill(Skill):
             )
             return
 
-        if self._phase is _SearchPhase.MOVING_TO_WAYPOINT:
+        if self._phase is SearchPhase.TRANSIT:
             self._tick_transit(observation, goal, elapsed)
-        elif self._phase is _SearchPhase.SCANNING:
+        elif self._phase is SearchPhase.SCANNING:
             self._tick_scan(observation, goal, elapsed)
         else:
             raise SkillExecutionStateError("SEARCH has an invalid internal phase")
@@ -255,7 +335,12 @@ class SearchSkill(Skill):
 
     def _begin_scan(self, observation: Observation, goal: SearchGoal) -> None:
         self._active_context.uav.stop()
-        self._phase = _SearchPhase.SCANNING
+        self._phase = SearchPhase.SCANNING
+        if self._reported_phase not in {
+            SearchPhase.CANDIDATE_PENDING,
+            SearchPhase.WAITING_FOR_REVIEW,
+        }:
+            self._reported_phase = SearchPhase.SCANNING
         self._scan_accumulated_rad = 0.0
         self._scan_last_yaw = float(observation.uav_pose.yaw)
         self._scan_last_timestamp = float(observation.timestamp)
@@ -312,7 +397,7 @@ class SearchSkill(Skill):
                     1.0,
                     "All search waypoints exhausted",
                     {
-                        "phase": _SearchPhase.SCANNING.name,
+                        "phase": SearchPhase.SCANNING.value,
                         "waypoint_index": len(self._waypoints),
                         "waypoint_count": len(self._waypoints),
                         "scan_angle_rad": self._scan_accumulated_rad,
@@ -332,7 +417,12 @@ class SearchSkill(Skill):
                 )
                 return
 
-            self._phase = _SearchPhase.MOVING_TO_WAYPOINT
+            self._phase = SearchPhase.TRANSIT
+            if self._reported_phase not in {
+                SearchPhase.CANDIDATE_PENDING,
+                SearchPhase.WAITING_FOR_REVIEW,
+            }:
+                self._reported_phase = SearchPhase.TRANSIT
             self._clear_scan_state()
             self._set_feedback(
                 self._overall_progress(),
@@ -400,6 +490,7 @@ class SearchSkill(Skill):
             data["oracle_target_velocity_mps"] = tuple(
                 float(value) for value in observation.oracle_target_velocity
             )
+        self._reported_phase = SearchPhase.TARGET_LOCKED
         self._set_feedback(
             self._overall_progress(),
             "Target visible in Camera FOV",
@@ -419,7 +510,11 @@ class SearchSkill(Skill):
         distance_to_waypoint: float | None = None,
     ) -> dict[str, object]:
         data: dict[str, object] = {
-            "phase": self._phase.name if self._phase is not None else "UNINITIALIZED",
+            "phase": (
+                self._reported_phase.value
+                if self._reported_phase is not None
+                else "UNINITIALIZED"
+            ),
             "waypoint_index": min(self._waypoint_index + 1, len(self._waypoints)),
             "waypoint_count": len(self._waypoints),
             "target_visible": target_visible,
@@ -427,7 +522,10 @@ class SearchSkill(Skill):
         }
         if distance_to_waypoint is not None:
             data["distance_to_waypoint"] = float(distance_to_waypoint)
-        if self._phase is _SearchPhase.SCANNING:
+        if self._candidate_id is not None:
+            data["candidate_id"] = self._candidate_id
+            data["candidate_source"] = self._candidate_source
+        if self._phase is SearchPhase.SCANNING:
             data["scan_angle_rad"] = self._scan_accumulated_rad
             data["scan_target_rad"] = self.FULL_SCAN_RAD
         return data
@@ -437,7 +535,7 @@ class SearchSkill(Skill):
             return 0.0
         scan_fraction = (
             min(1.0, self._scan_accumulated_rad / self.FULL_SCAN_RAD)
-            if self._phase is _SearchPhase.SCANNING
+            if self._phase is SearchPhase.SCANNING
             else 0.0
         )
         return min(
@@ -465,6 +563,9 @@ class SearchSkill(Skill):
         self._waypoint_index = 0
         self._waypoint_tolerance_m = 0.25
         self._phase = None
+        self._reported_phase = None
+        self._candidate_id = None
+        self._candidate_source = None
         self._transit_policy = None
         self._start_time = None
         self._last_clock_time = None

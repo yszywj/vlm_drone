@@ -9,20 +9,29 @@ from numbers import Real
 import re
 from types import MappingProxyType
 
+from common.ids import (
+    validate_mission_id,
+    validate_routing_id,
+    validate_uav_id,
+)
 from planner.text_safety import reject_forbidden_planner_text
 from skills.plan import TaskPlan
+from target.types import TargetSpec
 
 
 _STEP_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _TARGET_REF_PATTERN = re.compile(
     r"^\$(?P<step_id>[a-z][a-z0-9_]{0,31})\.target_id$"
 )
-_TOP_LEVEL_SKILLS = frozenset({"TAKEOFF", "GOTO", "SEARCH", "TRACK", "LAND"})
+_TOP_LEVEL_SKILLS = frozenset(
+    {"TAKEOFF", "GOTO", "HOVER", "SEARCH", "INSPECT", "TRACK", "LAND"}
+)
 _YAW_MODES = {
     "TAKEOFF": frozenset({"KEEP_CURRENT", "FIXED"}),
     "GOTO": frozenset(
         {"KEEP_CURRENT", "COURSE_ALIGNED", "FACE_POINT", "FIXED"}
     ),
+    "HOVER": frozenset({"KEEP_CURRENT", "FIXED"}),
     "LAND": frozenset({"KEEP_CURRENT", "FIXED"}),
 }
 
@@ -502,9 +511,24 @@ _STEP_ARGUMENT_FIELDS: dict[
         frozenset({"destination"}),
         frozenset({"altitude_m", "yaw_mode", "yaw_deg"}),
     ),
+    "HOVER": (
+        frozenset({"duration_s"}),
+        frozenset({"yaw_mode", "yaw_deg"}),
+    ),
     "SEARCH": (
         frozenset({"region", "target_description"}),
         frozenset({"altitude_m"}),
+    ),
+    "INSPECT": (
+        frozenset({"candidate_id"}),
+        frozenset(
+            {
+                "desired_observation_distance_m",
+                "viewpoint_change_deg",
+                "max_duration_s",
+                "approach_policy",
+            }
+        ),
     ),
     "TRACK": (
         frozenset({"target_ref", "duration_s"}),
@@ -540,12 +564,17 @@ def _validated_step_args(skill: str, value: object) -> Mapping[str, object]:
         "target_ref",
         "on_target_lost",
         "zone",
+        "candidate_id",
+        "approach_policy",
     }
     finite_number_fields = {
         "altitude_m",
         "duration_s",
         "desired_altitude_m",
         "desired_distance_m",
+        "desired_observation_distance_m",
+        "viewpoint_change_deg",
+        "max_duration_s",
     }
     for key, raw in data.items():
         if key in string_fields:
@@ -566,6 +595,19 @@ def _validated_step_args(skill: str, value: object) -> Mapping[str, object]:
             }:
                 raise ValueError(
                     "TRACK.args.on_target_lost must be REACQUIRE or FAIL"
+                )
+            if key == "candidate_id":
+                try:
+                    text = validate_routing_id(
+                        raw,
+                        "INSPECT.args.candidate_id",
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(str(exc)) from None
+            if key == "approach_policy" and text != "MAINTAIN_ALTITUDE_ORBIT":
+                raise ValueError(
+                    "INSPECT.args.approach_policy must be "
+                    "MAINTAIN_ALTITUDE_ORBIT"
                 )
             normalized[key] = text
         elif key in finite_number_fields:
@@ -595,6 +637,31 @@ def _validated_step_args(skill: str, value: object) -> Mapping[str, object]:
         raise ValueError(f"{skill}.args.yaw_deg is only allowed for FIXED yaw")
     if normalized.get("yaw_mode") == "FIXED" and "yaw_deg" not in normalized:
         raise ValueError(f"{skill}.args.yaw_deg is required for FIXED yaw")
+
+    if skill == "HOVER":
+        duration = float(normalized["duration_s"])
+        if not 1.0 <= duration <= 60.0:
+            raise ValueError("HOVER.args.duration_s must be between 1 and 60")
+    elif skill == "INSPECT":
+        distance = normalized.get("desired_observation_distance_m")
+        if distance is not None and not 2.0 <= float(distance) <= 20.0:
+            raise ValueError(
+                "INSPECT.args.desired_observation_distance_m must be between "
+                "2 and 20"
+            )
+        angle = normalized.get("viewpoint_change_deg")
+        if angle is not None and (
+            abs(float(angle)) <= 1e-9 or abs(float(angle)) > 90.0
+        ):
+            raise ValueError(
+                "INSPECT.args.viewpoint_change_deg must be non-zero and "
+                "between -90 and 90"
+            )
+        duration = normalized.get("max_duration_s")
+        if duration is not None and not 1.0 <= float(duration) <= 60.0:
+            raise ValueError(
+                "INSPECT.args.max_duration_s must be between 1 and 60"
+            )
     return MappingProxyType(normalized)
 
 
@@ -717,13 +784,314 @@ class SkillPlanDraft:
         }
 
 
-PlannerOutput = MissionIntent | SkillPlanDraft
+@dataclass(frozen=True, slots=True)
+class PlanStepDraftV2:
+    """Schema-v2 step carrying the UAV routing identity explicitly."""
+
+    id: str
+    uav_id: str
+    skill: str
+    args: Mapping[str, object]
+    recovery: RecoveryDraft | None = None
+
+    _REQUIRED_FIELDS = frozenset({"id", "uav_id", "skill", "args"})
+    _OPTIONAL_FIELDS = frozenset({"recovery"})
+
+    def __post_init__(self) -> None:
+        legacy = PlanStepDraft(
+            id=self.id,
+            skill=self.skill,
+            args=self.args,
+            recovery=self.recovery,
+        )
+        object.__setattr__(self, "id", legacy.id)
+        object.__setattr__(self, "uav_id", validate_uav_id(self.uav_id))
+        object.__setattr__(self, "skill", legacy.skill)
+        object.__setattr__(self, "args", legacy.args)
+        object.__setattr__(self, "recovery", legacy.recovery)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> PlanStepDraftV2:
+        parsed = _exact_mapping_fields(
+            data,
+            type_name="PlanStepDraftV2",
+            required=cls._REQUIRED_FIELDS,
+            optional=cls._OPTIONAL_FIELDS,
+        )
+        recovery = (
+            None
+            if "recovery" not in parsed
+            else RecoveryDraft.from_dict(parsed["recovery"])
+        )
+        return cls(
+            id=parsed["id"],
+            uav_id=parsed["uav_id"],
+            skill=parsed["skill"],
+            args=parsed["args"],
+            recovery=recovery,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "id": self.id,
+            "uav_id": self.uav_id,
+            "skill": self.skill,
+            "args": dict(self.args),
+        }
+        if self.recovery is not None:
+            result["recovery"] = self.recovery.to_dict()
+        return result
+
+    def to_v1(self) -> PlanStepDraft:
+        return PlanStepDraft(
+            id=self.id,
+            skill=self.skill,
+            args=self.args,
+            recovery=self.recovery,
+        )
 
 
 @dataclass(frozen=True, slots=True)
+class SkillPlanDraftV2:
+    """Strict routed model output used by all new dynamic Qwen requests."""
+
+    schema_version: int
+    mission_id: str
+    uav_id: str
+    plan_version: int
+    steps: tuple[PlanStepDraftV2, ...]
+    target_spec: TargetSpec | None = None
+
+    _REQUIRED_FIELDS = frozenset(
+        {"schema_version", "mission_id", "uav_id", "plan_version", "steps"}
+    )
+    _OPTIONAL_FIELDS = frozenset({"target_spec"})
+
+    def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or not isinstance(
+            self.schema_version, int
+        ):
+            raise TypeError("schema_version must be the integer 2")
+        if self.schema_version != 2:
+            raise ValueError("schema_version must equal 2")
+        object.__setattr__(
+            self,
+            "mission_id",
+            validate_mission_id(self.mission_id),
+        )
+        object.__setattr__(self, "uav_id", validate_uav_id(self.uav_id))
+        if isinstance(self.plan_version, bool) or not isinstance(
+            self.plan_version, int
+        ) or self.plan_version <= 0:
+            raise ValueError("plan_version must be a positive integer")
+        if isinstance(self.steps, (str, bytes)) or not isinstance(
+            self.steps, Sequence
+        ):
+            raise TypeError("steps must be an array of PlanStepDraftV2 values")
+        steps = tuple(self.steps)
+        if not 2 <= len(steps) <= 10:
+            raise ValueError("steps must contain between 2 and 10 entries")
+        if any(not isinstance(step, PlanStepDraftV2) for step in steps):
+            raise TypeError("steps must contain only PlanStepDraftV2 values")
+        if any(step.uav_id != self.uav_id for step in steps):
+            raise ValueError("every step.uav_id must equal the top-level uav_id")
+        object.__setattr__(self, "steps", steps)
+        target_spec = self.target_spec
+        if target_spec is None:
+            # Trusted compatibility path for programmatic v1 migration and
+            # older internal fixtures. Dynamic Qwen parsing separately requires
+            # the explicit field before constructing this value.
+            target_spec = _target_spec_from_steps(steps)
+        if not isinstance(target_spec, TargetSpec):
+            raise TypeError("target_spec must be a TargetSpec")
+        _validate_planner_target_spec(target_spec)
+        object.__setattr__(self, "target_spec", target_spec)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> SkillPlanDraftV2:
+        """Parse an initial routed plan model response.
+
+        Runtime suffix revisions use :class:`PlanRevisionDraft` and its
+        candidate-bound parser.  Consequently an initial ``SkillPlanDraftV2``
+        mapping must never contain INSPECT, whose candidate ID cannot exist
+        before CandidateBank evidence is available.
+        """
+
+        parsed = _exact_mapping_fields(
+            data,
+            type_name="SkillPlanDraftV2",
+            required=cls._REQUIRED_FIELDS,
+            optional=cls._OPTIONAL_FIELDS,
+        )
+        raw_steps = parsed["steps"]
+        if isinstance(raw_steps, (str, bytes)) or not isinstance(
+            raw_steps, Sequence
+        ):
+            raise TypeError("SkillPlanDraftV2.steps must be an array")
+        result = cls(
+            schema_version=parsed["schema_version"],
+            mission_id=parsed["mission_id"],
+            uav_id=parsed["uav_id"],
+            plan_version=parsed["plan_version"],
+            steps=tuple(PlanStepDraftV2.from_dict(step) for step in raw_steps),
+            target_spec=(
+                None
+                if "target_spec" not in parsed
+                else TargetSpec.from_dict(parsed["target_spec"])
+            ),
+        )
+        if any(step.skill == "INSPECT" for step in result.steps):
+            raise ValueError(
+                "INSPECT is unavailable in an initial plan without a trusted "
+                "runtime CandidateBank revision"
+            )
+        return result
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": 2,
+            "mission_id": self.mission_id,
+            "uav_id": self.uav_id,
+            "plan_version": self.plan_version,
+            "target_spec": self.target_spec.to_dict(),
+            "steps": [step.to_dict() for step in self.steps],
+        }
+
+    def to_v1(self) -> SkillPlanDraft:
+        """Return a structural v1 view for shared symbolic/compiler logic."""
+
+        return SkillPlanDraft(
+            schema_version=1,
+            steps=tuple(step.to_v1() for step in self.steps),
+        )
+
+
+def _target_spec_from_steps(steps: Sequence[PlanStepDraftV2]) -> TargetSpec:
+    description = next(
+        (
+            str(step.args["target_description"]).strip()
+            for step in steps
+            if step.skill == "SEARCH"
+            and isinstance(step.args.get("target_description"), str)
+            and str(step.args["target_description"]).strip()
+        ),
+        "unspecified mission target",
+    )
+    return TargetSpec(
+        original_description=description,
+        category="unspecified",
+        immutable_identity_summary=description,
+    )
+
+
+def _validate_planner_target_spec(target_spec: TargetSpec) -> None:
+    if target_spec.mutable_appearance_notes:
+        raise ValueError(
+            "initial planner target_spec.mutable_appearance_notes must be empty"
+        )
+    values: tuple[tuple[str, str], ...] = (
+        ("original_description", target_spec.original_description),
+        ("category", target_spec.category),
+        ("immutable_identity_summary", target_spec.immutable_identity_summary),
+        *tuple(
+            (f"hard_attributes[{index}]", value)
+            for index, value in enumerate(target_spec.hard_attributes)
+        ),
+        *tuple(
+            (f"soft_attributes[{index}]", value)
+            for index, value in enumerate(target_spec.soft_attributes)
+        ),
+        *tuple(
+            (f"negative_constraints[{index}]", value)
+            for index, value in enumerate(target_spec.negative_constraints)
+        ),
+        *tuple(
+            (f"relation_constraints[{index}]", value)
+            for index, value in enumerate(target_spec.relation_constraints)
+        ),
+        *tuple(
+            (f"query_ladder[{index}]", value)
+            for index, value in enumerate(target_spec.query_ladder)
+        ),
+        *tuple(
+            (f"inspection_questions[{index}]", value)
+            for index, value in enumerate(target_spec.inspection_questions)
+        ),
+    )
+    for field_name, value in values:
+        reject_forbidden_planner_text(value, f"target_spec.{field_name}")
+
+
+def migrate_plan_v1_to_v2(
+    old_plan: SkillPlanDraft | Mapping[str, object],
+    *,
+    mission_id: str,
+    uav_id: str,
+    plan_version: int,
+) -> SkillPlanDraftV2:
+    """Explicitly bind an old schema-v1 plan to trusted routing identities."""
+
+    if isinstance(old_plan, Mapping):
+        parsed = SkillPlanDraft.from_dict(old_plan)
+    elif isinstance(old_plan, SkillPlanDraft):
+        parsed = SkillPlanDraft.from_dict(old_plan.to_dict())
+    else:
+        raise TypeError("old_plan must be a SkillPlanDraft or mapping")
+    trusted_mission_id = validate_mission_id(mission_id)
+    trusted_uav_id = validate_uav_id(uav_id)
+    if isinstance(plan_version, bool) or not isinstance(
+        plan_version, int
+    ) or plan_version <= 0:
+        raise ValueError("plan_version must be a positive integer")
+    return SkillPlanDraftV2(
+        schema_version=2,
+        mission_id=trusted_mission_id,
+        uav_id=trusted_uav_id,
+        plan_version=plan_version,
+        steps=tuple(
+            PlanStepDraftV2(
+                id=step.id,
+                uav_id=trusted_uav_id,
+                skill=step.skill,
+                args=step.args,
+                recovery=step.recovery,
+            )
+            for step in parsed.steps
+        ),
+    )
+
+
+PlannerOutput = MissionIntent | SkillPlanDraft | SkillPlanDraftV2
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class PlannerRequest:
     instruction: str
     world_context: PlannerWorldContext
+    mission_id: str | None
+    uav_id: str | None
+    plan_version: int | None
+
+    def __init__(
+        self,
+        instruction: str,
+        world_context: PlannerWorldContext,
+        *,
+        mission_id: str | None = None,
+        uav_id: str | None = None,
+        plan_version: int | None = None,
+    ) -> None:
+        supplied = (mission_id is not None, uav_id is not None, plan_version is not None)
+        if any(supplied) and not all(supplied):
+            raise ValueError(
+                "mission_id, uav_id, and plan_version must be supplied together"
+            )
+        object.__setattr__(self, "instruction", instruction)
+        object.__setattr__(self, "world_context", world_context)
+        object.__setattr__(self, "mission_id", mission_id)
+        object.__setattr__(self, "uav_id", uav_id)
+        object.__setattr__(self, "plan_version", plan_version)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -733,6 +1101,21 @@ class PlannerRequest:
         )
         if not isinstance(self.world_context, PlannerWorldContext):
             raise TypeError("world_context must be a PlannerWorldContext")
+        if self.mission_id is not None:
+            object.__setattr__(
+                self,
+                "mission_id",
+                validate_mission_id(self.mission_id),
+            )
+            object.__setattr__(self, "uav_id", validate_uav_id(self.uav_id))
+            if isinstance(self.plan_version, bool) or not isinstance(
+                self.plan_version, int
+            ) or self.plan_version <= 0:
+                raise ValueError("plan_version must be a positive integer")
+
+    @property
+    def has_routing_ids(self) -> bool:
+        return self.mission_id is not None
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -760,9 +1143,10 @@ class CompiledMission:
         if planner_output is not None and intent is not None:
             raise TypeError("provide planner_output or intent, not both")
         output = intent if planner_output is None else planner_output
-        if not isinstance(output, (MissionIntent, SkillPlanDraft)):
+        if not isinstance(output, (MissionIntent, SkillPlanDraft, SkillPlanDraftV2)):
             raise TypeError(
-                "planner_output must be a MissionIntent or SkillPlanDraft"
+                "planner_output must be a MissionIntent, SkillPlanDraft, or "
+                "SkillPlanDraftV2"
             )
         if not isinstance(task_plan, TaskPlan):
             raise TypeError("task_plan must be a skills.plan.TaskPlan")
@@ -792,10 +1176,43 @@ class CompiledMission:
         return None
 
     @property
-    def skill_plan_draft(self) -> SkillPlanDraft | None:
-        if isinstance(self.planner_output, SkillPlanDraft):
+    def skill_plan_draft(self) -> SkillPlanDraft | SkillPlanDraftV2 | None:
+        if isinstance(self.planner_output, (SkillPlanDraft, SkillPlanDraftV2)):
             return self.planner_output
         return None
+
+    @property
+    def skill_plan_draft_v2(self) -> SkillPlanDraftV2 | None:
+        if isinstance(self.planner_output, SkillPlanDraftV2):
+            return self.planner_output
+        return None
+
+    @property
+    def target_spec(self) -> TargetSpec:
+        """Return the immutable mission target semantics used at runtime.
+
+        New routed dynamic plans carry this value explicitly. Legacy outputs
+        are adapted deterministically so target lifecycle code has one stable
+        interface without pretending that a model produced richer semantics.
+        """
+
+        output = self.planner_output
+        if isinstance(output, SkillPlanDraftV2):
+            assert output.target_spec is not None
+            return output.target_spec
+        if isinstance(output, MissionIntent):
+            return TargetSpec(output.target_description)
+        description = next(
+            (
+                str(step.args["target_description"]).strip()
+                for step in output.steps
+                if step.skill == "SEARCH"
+                and isinstance(step.args.get("target_description"), str)
+                and str(step.args["target_description"]).strip()
+            ),
+            "unspecified mission target",
+        )
+        return TargetSpec(description)
 
 
 def _readonly_spec_mapping(

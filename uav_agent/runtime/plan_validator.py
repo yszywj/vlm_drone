@@ -8,6 +8,7 @@ from enum import Enum
 from math import hypot, isfinite, radians
 from numbers import Real
 
+from common.ids import validate_mission_id, validate_routing_id, validate_uav_id
 from planner.schemas import (
     CompiledMission,
     LandingZoneSpec,
@@ -15,6 +16,8 @@ from planner.schemas import (
     PlannerWorldContext,
     SearchRegionSpec,
     SkillPlanDraft,
+    SkillPlanDraftV2,
+    migrate_plan_v1_to_v2,
 )
 from planner.policy import PlannerLimits, PlannerPolicy, TargetLostAction
 from planner.symbolic_checker import SymbolicPlanChecker
@@ -55,8 +58,18 @@ _DYNAMIC_ARGUMENTS: Mapping[SkillName, frozenset[str]] = {
     SkillName.GOTO: frozenset(
         {"destination", "altitude_m", "yaw_mode", "yaw_deg"}
     ),
+    SkillName.HOVER: frozenset({"duration_s", "yaw_mode", "yaw_deg"}),
     SkillName.SEARCH: frozenset(
         {"region", "target_description", "altitude_m"}
+    ),
+    SkillName.INSPECT: frozenset(
+        {
+            "candidate_id",
+            "desired_observation_distance_m",
+            "viewpoint_change_deg",
+            "max_duration_s",
+            "approach_policy",
+        }
     ),
     SkillName.TRACK: frozenset(
         {
@@ -69,6 +82,35 @@ _DYNAMIC_ARGUMENTS: Mapping[SkillName, frozenset[str]] = {
     ),
     SkillName.LAND: frozenset({"zone", "yaw_mode", "yaw_deg"}),
 }
+
+
+def _trusted_inspect_candidate_ids(value: object) -> frozenset[str]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise TypeError("trusted_inspect_candidate_ids must be a sequence")
+    result = tuple(
+        validate_routing_id(candidate_id, "trusted_inspect_candidate_ids entry")
+        for candidate_id in value
+    )
+    if len(result) != len(set(result)):
+        raise PlanValidationError(
+            "trusted_inspect_candidate_ids must not contain duplicates"
+        )
+    return frozenset(result)
+
+
+def _require_trusted_inspect_candidates(
+    draft: SkillPlanDraft,
+    trusted_candidate_ids: frozenset[str],
+) -> None:
+    for step in draft.steps:
+        if step.skill != "INSPECT":
+            continue
+        candidate_id = step.args.get("candidate_id")
+        if candidate_id not in trusted_candidate_ids:
+            raise PlanValidationError(
+                f"step {step.id} INSPECT candidate_id is not authorized by "
+                "trusted runtime CandidateBank input"
+            )
 
 
 class PlanValidator:
@@ -86,6 +128,19 @@ class PlanValidator:
     TRUSTED_TARGET_LOST_TIME_S = 2.0
     TRUSTED_TRACK_TIMEOUT_GRACE_S = 5.0
     DEFAULT_DESIRED_DISTANCE_M = 6.0
+    MIN_PLANNED_HOVER_DURATION_S = 1.0
+    MAX_PLANNED_HOVER_DURATION_S = 60.0
+    TRUSTED_HOVER_POSITION_TOLERANCE_M = 0.25
+    TRUSTED_HOVER_MAX_CORRECTION_SPEED_MPS = 0.5
+    TRUSTED_HOVER_MAX_YAW_RATE_RAD_S = 1.0
+    DEFAULT_INSPECT_OBSERVATION_DISTANCE_M = 4.0
+    MIN_INSPECT_OBSERVATION_DISTANCE_M = 2.0
+    MAX_INSPECT_OBSERVATION_DISTANCE_M = 20.0
+    DEFAULT_INSPECT_VIEWPOINT_CHANGE_DEG = 45.0
+    MAX_INSPECT_VIEWPOINT_CHANGE_DEG = 90.0
+    DEFAULT_INSPECT_MAX_DURATION_S = 15.0
+    MAX_INSPECT_MAX_DURATION_S = 60.0
+
     def __init__(
         self,
         limits: PlannerLimits | None = None,
@@ -122,12 +177,22 @@ class PlanValidator:
 
     def validate_and_compile(
         self,
-        planner_output: MissionIntent | SkillPlanDraft,
+        planner_output: MissionIntent | SkillPlanDraft | SkillPlanDraftV2,
         context: PlannerWorldContext,
         *,
         source: str,
+        mission_id: str | None = None,
+        uav_id: str | None = None,
+        plan_version: int | None = None,
+        trusted_inspect_candidate_ids: Sequence[str] = (),
     ) -> CompiledMission:
-        """Dispatch to the legacy or dynamic compiler based on output type."""
+        """Dispatch to the legacy or dynamic compiler based on output type.
+
+        ``INSPECT`` is runtime-revision-only.  Candidate IDs must be supplied
+        explicitly by the trusted coordinator after CandidateBank validation;
+        ordinary initial planning leaves this allow-list empty and fails
+        closed before compilation.
+        """
 
         if not isinstance(context, PlannerWorldContext):
             raise TypeError("context must be a PlannerWorldContext")
@@ -135,12 +200,96 @@ class PlanValidator:
             raise PlanValidationError(
                 "source must be scripted, llm, dynamic_scripted, or dynamic_llm"
             )
+        trusted_inspect_ids = _trusted_inspect_candidate_ids(
+            trusted_inspect_candidate_ids
+        )
+        supplied = (
+            mission_id is not None,
+            uav_id is not None,
+            plan_version is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise PlanValidationError(
+                "mission_id, uav_id, and plan_version must be supplied together"
+            )
+        trusted_mission_id = (
+            "mission_legacy"
+            if mission_id is None
+            else validate_mission_id(mission_id)
+        )
+        trusted_uav_id = "uav_1" if uav_id is None else validate_uav_id(uav_id)
+        trusted_plan_version = 1 if plan_version is None else plan_version
+        if isinstance(trusted_plan_version, bool) or not isinstance(
+            trusted_plan_version, int
+        ) or trusted_plan_version <= 0:
+            raise PlanValidationError("plan_version must be a positive integer")
         if isinstance(planner_output, MissionIntent):
+            if trusted_inspect_ids:
+                raise PlanValidationError(
+                    "trusted INSPECT candidates are invalid for MissionIntent"
+                )
             if source not in _LEGACY_SOURCES:
                 raise PlanValidationError(
                     "MissionIntent requires source 'scripted' or 'llm'"
                 )
-            return self._compile_legacy(planner_output, context, source)
+            return self._compile_legacy(
+                planner_output,
+                context,
+                source,
+                mission_id=trusted_mission_id,
+                uav_id=trusted_uav_id,
+                plan_version=trusted_plan_version,
+            )
+        if isinstance(planner_output, SkillPlanDraftV2):
+            if source not in _DYNAMIC_SOURCES:
+                raise PlanValidationError(
+                    "SkillPlanDraftV2 requires source 'dynamic_scripted' or "
+                    "'dynamic_llm'"
+                )
+            if mission_id is None:
+                raise PlanValidationError(
+                    "SkillPlanDraftV2 requires trusted mission_id, uav_id, and "
+                    "plan_version values"
+                )
+            if mission_id is not None and (
+                planner_output.mission_id != trusted_mission_id
+                or planner_output.uav_id != trusted_uav_id
+                or planner_output.plan_version != trusted_plan_version
+            ):
+                raise PlanValidationError(
+                    "schema-v2 routing IDs do not match trusted runtime values"
+                )
+            semantic_draft = planner_output.to_v1()
+            result = getattr(
+                self,
+                "_symbolic_checker",
+                SymbolicPlanChecker(),
+            ).check(
+                semantic_draft,
+                world_context=context,
+                limits=self.limits,
+                policy=self.policy,
+            )
+            if not result.valid:
+                issue = result.issues[0]
+                location = "" if issue.step_id is None else f" at {issue.step_id}"
+                raise PlanValidationError(
+                    f"symbolic plan invalid [{issue.code.value}]{location}: "
+                    f"{issue.message}"
+                )
+            _require_trusted_inspect_candidates(
+                semantic_draft,
+                trusted_inspect_ids,
+            )
+            return self._compile_dynamic(
+                semantic_draft,
+                context,
+                source,
+                mission_id=planner_output.mission_id,
+                uav_id=planner_output.uav_id,
+                plan_version=planner_output.plan_version,
+                public_output=planner_output,
+            )
         if isinstance(planner_output, SkillPlanDraft):
             if source not in _DYNAMIC_SOURCES:
                 raise PlanValidationError(
@@ -164,14 +313,43 @@ class PlanValidator:
                     f"symbolic plan invalid [{issue.code.value}]{location}: "
                     f"{issue.message}"
                 )
-            return self._compile_dynamic(planner_output, context, source)
-        raise TypeError("planner_output must be MissionIntent or SkillPlanDraft")
+            _require_trusted_inspect_candidates(
+                planner_output,
+                trusted_inspect_ids,
+            )
+            # Parsing schema v1 remains supported, but routing it into a new
+            # mission is always performed through the explicit adapter.
+            public_output: SkillPlanDraft | SkillPlanDraftV2 = (
+                migrate_plan_v1_to_v2(
+                    planner_output,
+                    mission_id=trusted_mission_id,
+                    uav_id=trusted_uav_id,
+                    plan_version=trusted_plan_version,
+                )
+            )
+            return self._compile_dynamic(
+                planner_output,
+                context,
+                source,
+                mission_id=trusted_mission_id,
+                uav_id=trusted_uav_id,
+                plan_version=trusted_plan_version,
+                public_output=public_output,
+            )
+        raise TypeError(
+            "planner_output must be MissionIntent, SkillPlanDraft, or "
+            "SkillPlanDraftV2"
+        )
 
     def _compile_legacy(
         self,
         intent: MissionIntent,
         context: PlannerWorldContext,
         source: str,
+        *,
+        mission_id: str,
+        uav_id: str,
+        plan_version: int,
     ) -> CompiledMission:
         """Compile the original MissionIntent to its unchanged six-step plan."""
 
@@ -246,7 +424,12 @@ class PlanValidator:
                 "timeout": world.land_timeout,
             },
         ]
-        task_plan = self._task_plan_from_dicts(raw_plan)
+        task_plan = self._task_plan_from_dicts(
+            raw_plan,
+            mission_id=mission_id,
+            uav_id=uav_id,
+            plan_version=plan_version,
+        )
         return CompiledMission(
             planner_output=intent,
             task_plan=task_plan,
@@ -262,6 +445,11 @@ class PlanValidator:
         draft: SkillPlanDraft,
         context: PlannerWorldContext,
         source: str,
+        *,
+        mission_id: str,
+        uav_id: str,
+        plan_version: int,
+        public_output: SkillPlanDraft | SkillPlanDraftV2,
     ) -> CompiledMission:
         world = self._trusted_world(context)
         self._require_unambiguous_named_locations(context)
@@ -359,6 +547,55 @@ class PlanValidator:
                     f"{step_id}: destination {destination!r} resolved by trusted context"
                 )
 
+            elif skill is SkillName.HOVER:
+                self._require_airborne(state, skill)
+                duration = _bounded_finite_number(
+                    _required_value(
+                        args,
+                        "duration_s",
+                        f"step {step_id} HOVER",
+                    ),
+                    f"step {step_id} HOVER duration_s",
+                    minimum=self.MIN_PLANNED_HOVER_DURATION_S,
+                    maximum=self.MAX_PLANNED_HOVER_DURATION_S,
+                )
+                yaw_mode, yaw_value = _vertical_yaw_args(
+                    args,
+                    default=YawMode.KEEP_CURRENT,
+                    prefix=f"step {step_id} HOVER",
+                )
+                motion_policy = MotionPolicy(
+                    max_speed=self.TRUSTED_HOVER_MAX_CORRECTION_SPEED_MPS,
+                    max_yaw_rate=self.TRUSTED_HOVER_MAX_YAW_RATE_RAD_S,
+                    yaw_mode=yaw_mode,
+                    yaw_value=yaw_value,
+                )
+                try:
+                    motion_policy.validate()
+                except (TypeError, ValueError) as exc:
+                    raise PlanValidationError(
+                        f"step {step_id} HOVER motion policy is invalid: {exc}"
+                    ) from exc
+                from skills.hover import HoverMode
+
+                params = {
+                    "mode": HoverMode.TIMED,
+                    "duration_s": duration,
+                    "max_wait_s": duration,
+                    "position_tolerance_m": (
+                        self.TRUSTED_HOVER_POSITION_TOLERANCE_M
+                    ),
+                    "max_correction_speed_mps": (
+                        self.TRUSTED_HOVER_MAX_CORRECTION_SPEED_MPS
+                    ),
+                    "reason_code": "PLANNED_HOVER",
+                    "motion_policy": motion_policy,
+                }
+                compiler_notes.append(
+                    f"{step_id}: supervisory-only HOVER fields supplied by "
+                    "trusted compiler"
+                )
+
             elif skill is SkillName.SEARCH:
                 if state is not _MissionState.AIRBORNE_NO_TARGET:
                     raise PlanValidationError(
@@ -399,6 +636,81 @@ class PlanValidator:
                 state = _MissionState.AIRBORNE_TARGET_AVAILABLE
                 compiler_notes.append(
                     f"{step_id}: region center/radius resolved by trusted context"
+                )
+
+            elif skill is SkillName.INSPECT:
+                if state is not _MissionState.AIRBORNE_TARGET_AVAILABLE:
+                    raise PlanValidationError("INSPECT must appear after SEARCH")
+                raw_candidate_id = _required_value(
+                    args,
+                    "candidate_id",
+                    f"step {step_id} INSPECT",
+                )
+                try:
+                    candidate_id = validate_routing_id(
+                        raw_candidate_id,
+                        "candidate_id",
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise PlanValidationError(str(exc)) from None
+                distance = _bounded_finite_number(
+                    args.get(
+                        "desired_observation_distance_m",
+                        self.DEFAULT_INSPECT_OBSERVATION_DISTANCE_M,
+                    ),
+                    (
+                        f"step {step_id} INSPECT "
+                        "desired_observation_distance_m"
+                    ),
+                    minimum=self.MIN_INSPECT_OBSERVATION_DISTANCE_M,
+                    maximum=self.MAX_INSPECT_OBSERVATION_DISTANCE_M,
+                )
+                viewpoint_degrees = _bounded_finite_number(
+                    args.get(
+                        "viewpoint_change_deg",
+                        self.DEFAULT_INSPECT_VIEWPOINT_CHANGE_DEG,
+                    ),
+                    f"step {step_id} INSPECT viewpoint_change_deg",
+                    minimum=-self.MAX_INSPECT_VIEWPOINT_CHANGE_DEG,
+                    maximum=self.MAX_INSPECT_VIEWPOINT_CHANGE_DEG,
+                )
+                if abs(viewpoint_degrees) <= 1e-9:
+                    raise PlanValidationError(
+                        f"step {step_id} INSPECT viewpoint_change_deg must be "
+                        "non-zero"
+                    )
+                max_duration = _bounded_finite_number(
+                    args.get(
+                        "max_duration_s",
+                        self.DEFAULT_INSPECT_MAX_DURATION_S,
+                    ),
+                    f"step {step_id} INSPECT max_duration_s",
+                    minimum=1.0,
+                    maximum=self.MAX_INSPECT_MAX_DURATION_S,
+                )
+                from skills.inspect import InspectApproachPolicy
+
+                raw_approach = args.get(
+                    "approach_policy",
+                    InspectApproachPolicy.MAINTAIN_ALTITUDE_ORBIT.value,
+                )
+                try:
+                    approach_policy = InspectApproachPolicy(raw_approach)
+                except (TypeError, ValueError):
+                    raise PlanValidationError(
+                        f"step {step_id} INSPECT approach_policy must be "
+                        "MAINTAIN_ALTITUDE_ORBIT"
+                    ) from None
+                params = {
+                    "candidate_id": candidate_id,
+                    "desired_observation_distance_m": distance,
+                    "viewpoint_change_rad": radians(viewpoint_degrees),
+                    "max_duration_s": max_duration,
+                    "approach_policy": approach_policy,
+                }
+                compiler_notes.append(
+                    f"{step_id}: candidate semantics compiled without world "
+                    "geometry"
                 )
 
             elif skill is SkillName.TRACK:
@@ -518,11 +830,16 @@ class PlanValidator:
         if state is not _MissionState.LANDED:
             raise PlanValidationError("dynamic plan did not end in LANDED state")
         try:
-            task_plan = TaskPlan(tuple(compiled_steps))
+            task_plan = TaskPlan(
+                tuple(compiled_steps),
+                mission_id=mission_id,
+                uav_id=uav_id,
+                plan_version=plan_version,
+            )
         except TaskPlanError as exc:
             raise PlanValidationError(f"compiled TaskPlan is invalid: {exc}") from exc
         return CompiledMission(
-            planner_output=draft,
+            planner_output=public_output,
             task_plan=task_plan,
             source=source,
             compiler_notes=tuple(compiler_notes),
@@ -905,9 +1222,20 @@ class PlanValidator:
             )
 
     @staticmethod
-    def _task_plan_from_dicts(raw_plan: Sequence[Mapping[str, object]]) -> TaskPlan:
+    def _task_plan_from_dicts(
+        raw_plan: Sequence[Mapping[str, object]],
+        *,
+        mission_id: str,
+        uav_id: str,
+        plan_version: int,
+    ) -> TaskPlan:
         try:
-            return TaskPlan.from_dicts(raw_plan)
+            return TaskPlan.from_dicts(
+                raw_plan,
+                mission_id=mission_id,
+                uav_id=uav_id,
+                plan_version=plan_version,
+            )
         except TaskPlanError as exc:
             raise PlanValidationError(f"compiled TaskPlan is invalid: {exc}") from exc
 
@@ -1120,6 +1448,21 @@ def _positive_finite_number(
     parsed = _finite_number(value, name, error_type=error_type)
     if parsed <= 0.0:
         raise error_type(f"{name} must be greater than zero")
+    return parsed
+
+
+def _bounded_finite_number(
+    value: object,
+    name: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    parsed = _finite_number(value, name)
+    if not minimum <= parsed <= maximum:
+        raise PlanValidationError(
+            f"{name} must be between {minimum:g} and {maximum:g}"
+        )
     return parsed
 
 

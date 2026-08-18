@@ -141,7 +141,7 @@ QWEN_MODEL=Qwen3-VL-4B-Instruct \
   --instruction "起飞到十米，前往 search_area 搜寻移动目标，找到后跟踪十秒，返回 home 降落"
 ```
 
-当前能力边界必须明确：Qwen3-VL 在此阶段只接收文本，不接收 Camera 图像；SEARCH / TRACK / REACQUIRE 仍消费带 `oracle_` 前缀的真值字段；LOCK 只是 `TargetManager` 的逻辑生命周期状态。真实图片 detector、视觉 tracker、VLM 语义验证和 ReID 尚未实现，`DetectorTrackerPerception`、`VLMVerifier` 与 `ReIDVerifier` 调用时仍明确抛出 `NotImplementedError`，绝不返回占位命中。因此 Stage 1A/1B 都是 Oracle 集成里程碑，不能称为真实视觉搜索闭环。
+当前能力边界必须明确：文本 Planner 仍只接收文字和受限 world context；新增的 `QwenVLMVerifier` 则能在显式启用后通过异步 worker 接收最多三张新鲜 Camera RGB 帧，并只返回严格的语义审查 JSON。它不是 detector、tracker 或 ReID，也不能输出可信世界坐标、速度或控制命令。SEARCH / TRACK / REACQUIRE 的 ideal 执行目前仍消费带 `oracle_` 前缀的真值字段，因此这仍是带视觉语义审查的 Oracle 评测架构，不能称为真实视觉搜索闭环。
 
 感知运行时默认使用 `PerceptionRuntimeProfile.PRODUCTION`。`GuardedPerceptionBackend` 会拒绝声明为 `PRIVILEGED_ORACLE` 的 backend，也会二次检查任何伪装成视觉 backend 却输出 `oracle_target_*` 的 Observation；`MissionAgent` 在 Safety 和 Skill 之前还有同样的 production gate。Oracle 只能在明确选择 `ORACLE_EVALUATION` 并设置 `acknowledge_privileged_oracle=True` 后运行，两个 Oracle demo 会在控制台打印醒目标记。该 profile 仅用于上界、回归测试、数据标注和专家轨迹，不是部署配置，也不能与真实视觉配置静默互换。
 
@@ -165,7 +165,7 @@ TargetManager.LOCKED → TRACKING
 
 ## 本地 Qwen OpenAI-compatible 服务
 
-`uav_agent/models/` 是纯 Python 客户端包，与仓库根目录存放权重的 `models/` 不同。客户端只使用标准库 `urllib`，默认访问 `http://127.0.0.1:8000/v1` 的 `GET /models` 与 `POST /chat/completions`；Stage 1B 仅通过 `LLMPlanner` 发送文本消息，不发送 Camera、Oracle 或完整环境对象。可通过 `QWEN_API_BASE / QWEN_API_KEY / QWEN_MODEL / QWEN_REQUEST_TIMEOUT_S` 设置默认值，显式构造参数优先。
+`uav_agent/models/` 是纯 Python 客户端包，与仓库根目录存放权重的 `models/` 不同。客户端只使用标准库 `urllib`，默认访问 `http://127.0.0.1:8000/v1` 的 `GET /models` 与 `POST /chat/completions`。`LLMPlanner` 只发送文字；显式启用的视觉 smoke/动态审查入口才发送经尺寸和 JPEG 质量硬限制编码的 Camera RGB，且请求中永远没有 Oracle 字段或完整环境对象。可通过 `QWEN_API_BASE / QWEN_API_KEY / QWEN_MODEL / QWEN_REQUEST_TIMEOUT_S` 设置默认值，显式构造参数优先。
 
 服务脚本不会安装 vLLM，也不会修改 `r_isaac_sim`。请先进入服务器上已有的兼容 vLLM 环境，或把 `VLLM_BIN` 指向该环境中的可执行文件，再运行：
 
@@ -185,6 +185,52 @@ QWEN_MODEL_PATH=/home/amax/ry/vlm_drones/models/initial_model/Qwen3-VL-4B-Instru
 ```
 
 检查器先调用 models endpoint，再发送一个最小文本 completion；普通失败只显示连接、HTTP 或协议错误类型，`--debug` 才附带已脱敏 traceback。
+
+## 动态视觉审查、路由与受控恢复
+
+三个感知角色必须分开理解：Qwen3-VL 负责低频语义审查；当前 `OraclePerception` 只负责 `ORACLE_EVALUATION` 中的理想几何/实例上界；未来的 detector、短轨迹 tracker 和 ReID 才应负责生产候选、图像运动与身份连续性。Qwen 的 bbox 始终是归一化图像坐标，不能被当作飞行坐标；Oracle pose/velocity 不会进入 Qwen prompt，日志也分别使用 `semantic_source=qwen_vl` 与 `geometry_source=oracle_evaluation|none`，绝不把 Oracle 几何归因给 Qwen。
+
+视觉审查默认关闭，显式启用后有两种模式：
+
+- `shadow` 会真正异步调用 Qwen、打印并写入稀疏审查记录，但不能锁定/切换目标、修改 Skill、请求重规划或触发 HOVER。GOTO/SEARCH/INSPECT/TRACK 的普通周期审查不会让仿真 tick 等待 HTTP。
+- `gate` 是实验控制模式，除 `--enable-qwen-vision` 外还必须给出 `--acknowledge-vision-gate`。单次视觉结果不会锁定/切换目标，也不会直接插入 `INSPECT` 或修改计划；候选驱动的控制建议至少需要同一可信 candidate ID 下的多次时间一致结果。由可信运行时产生的 typed `PATH_BLOCKED` 事件使用独立授权策略，不把 Qwen 自报建议当成权限。在没有真实 ReID 时系统不会伪造 ReID evidence。阻塞事件等待模型时由可信运行时插入 `HOVER`，模型只能建议有限动作，不能直接调用 controller。
+
+`HOVER` 是可恢复的监督性暂停，不是硬安全机制：它每个 tick 都继续发送有界位置保持 setpoint，并有有限等待超时和可信 fallback。`qwen_visual_review.hover_position_tolerance_m`、`hover_max_correction_speed_mps`、`blocking_hover_timeout_s` 与 `blocking_timeout_fallback` 都由受限配置加载；模型无权设置这些参数。越界、非法 Observation、时间倒退等硬安全判定优先于任何模型请求，不等待 Qwen，直接走现有 `CANCEL_AND_LAND` 或 `ABORT`。
+
+计划修订采用独立的第二阶段 Planner，视觉 review 本身不能夹带飞行计划。修订只能原子替换当前被中断步骤或未执行后缀，已完成前缀和 target immutable identity 不可改；routing ID、基础/新版本、步数与 revision 预算、cooldown、Symbolic checker、`PlanValidator` 和 Safety preflight 任一检查失败都保留原计划。默认最多三次修订；LAND 已开始后不接受普通语义修订。Qwen 永远不能在修订中绕过具名区域产生任意坐标、速度或控制量。
+
+所有 Planner v2 step、Observation、review、event、invocation、execution report 和 transition 都带 `uav_id`，并与 `mission_id`、`plan_version` 一起逐边界精确比对。当前仍是“一架 UAV 一个 `MissionAgent`”，不是并发机群调度；属于 `uav_2` 的帧、review 或 revision 会被绑定到 `uav_1` 的 Agent 立即拒绝。
+
+本仓库尚未实现真实 detector/tracker/ReID，所以动态飞行 demo 的 `production` profile 会在创建 Isaac Sim 前 fail closed。保留的 Oracle 路径要求两个明确动作：选择 `--perception-runtime-profile oracle_evaluation`，再提供 `--acknowledge-privileged-oracle`。下面的 shadow 命令读取每个新鲜 Camera sample，将 RGB 送到后台模型 worker；主仿真 tick 不同步等待 HTTP，也不保存连续图片或视频：
+
+```bash
+./python.sh scripts/run_dynamic_visual_mission.py \
+  --planner dynamic_llm \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen3-VL-4B-Instruct \
+  --api-key EMPTY \
+  --uav-id uav_1 \
+  --enable-qwen-vision \
+  --vision-review-mode shadow \
+  --perception-runtime-profile oracle_evaluation \
+  --acknowledge-privileged-oracle \
+  --instruction "起飞到十米，前往 search_area 搜寻红色立方体，找到后跟踪十秒，返回 home 降落" \
+  --headless
+```
+
+要实验 gate mode，把 `shadow` 改成 `gate` 并额外添加 `--acknowledge-vision-gate`。仅用于恢复路径测试的三个选项是 `--inject-path-blocked-at-s`、`--inject-progress-stall-at-s` 与 `--inject-identity-conflict-at-s`；它们产生的事件和 CSV 都明确写 `source=test_injection`，不伪装成 detector 或 Qwen 发现。启动时会打印 UAV/mission routing、Planner、视觉模式、感知 profile 与 Oracle acknowledgement。每次运行只在 `logs/dynamic_visual_missions/<mission_id>/` 写有界 `qwen_reviews.jsonl`、`mission_events.csv`、`skill_transitions.csv` 和原子更新的 `run_manifest.json`；manifest 汇总模型与配置、review 接受/过期/超时计数、修订次数、监督性 HOVER 次数/时长、终态和调试图片占用。默认不写 base64 prompt、原图或视频。
+
+在启动 Isaac demo 前，可先用一张用户指定图片验证真实 Qwen 多模态协议。该 smoke 只输出严格目标存在判断和归一化 bbox，不接触 Oracle 或 controller：
+
+```bash
+./python.sh scripts/run_qwen_vision_smoke.py \
+  --image /absolute/path/to/frame.png \
+  --uav-id uav_1 \
+  --target-description "red cube" \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen3-VL-4B-Instruct \
+  --api-key EMPTY
+```
 
 ## 场景与稳定 prim 路径
 
@@ -294,7 +340,7 @@ observation = agent_view.observe()
 - `SkillManager` 同时只推进一个注册 Skill；手动模式不做隐式切换，显式 `start_task()` 后才启用 Stage-0 自动任务状态机；
 - 生命周期完成后必须显式 `reset_active()`，才能启动下一项。
 
-Phase 5 最初建立的 TAKEOFF、GOTO、SEARCH、TRACK、REACQUIRE 与 LAND 六个类型合同现在均已有 ideal-kinematic 实现。`HOVER / ORBIT / FOLLOW_PATH / RETURN_HOME` 尚未加入。
+Phase 5 最初建立的 TAKEOFF、GOTO、SEARCH、TRACK、REACQUIRE 与 LAND 六个类型合同现在均已有 ideal-kinematic 实现；另外已有受信运行时使用的监督性 `HOVER`，以及只消费候选 ID、不接受任意世界坐标的理想 `INSPECT`。`ORBIT / FOLLOW_PATH / RETURN_HOME` 仍未作为独立 Skill 加入。
 
 MotionPolicy 支持：
 
@@ -528,29 +574,46 @@ while manager.task_status.name == "RUNNING":
 
 `planner.schemas` 定义不可变的 `MissionIntent`、具名 `SearchRegionSpec` / `LandingZoneSpec` 和只读 `PlannerWorldContext`。高层意图只包含目标描述、区域名、跟踪时长、降落区名和可选起飞高度，不允许携带 Target/Oracle 坐标，也不包含低层 timeout 或控制参数。`MissionIntent.from_dict()` 对未知字段、缺失字段、bool、NaN 和 Inf 严格报错。
 
-`ScriptedPlanner` / `LLMPlanner` 继续返回 `MissionIntent` 并走固定模板。`ScriptedDynamicPlanner` / `DynamicLLMPlanner` 返回严格 `SkillPlanDraft`：对象拒绝未知字段、重复 step id、bool 数字、NaN/Inf、未知 Skill/参数、前向或非 SEARCH 引用；LLM 首次输出不合法时最多修复一次，temperature 固定为 0。动态 `source` 为 `dynamic_scripted` 或 `dynamic_llm`。
+`ScriptedPlanner` / `LLMPlanner` 继续返回 `MissionIntent` 并走固定模板。`ScriptedDynamicPlanner` / `DynamicLLMPlanner` 返回严格的 routed `SkillPlanDraftV2`：对象拒绝未知字段、重复 step id、bool 数字、NaN/Inf、未知 Skill/参数、前向或非 SEARCH 引用；LLM 首次输出不合法时最多修复一次，temperature 固定为 0。动态 `source` 为 `dynamic_scripted` 或 `dynamic_llm`。
 
-`SkillPlanDraft` 是模型唯一允许输出的动态协议；其中只保留具名地点、高层语义参数和前序 SEARCH 输出引用，不含解析后的坐标、速度或普通 Skill timeout。例如导航任务可以省略 SEARCH/TRACK：
+历史 schema v1 只保留给旧数据集、Gold 评测和显式兼容读取。它不会在缺少路由信息时被新 Qwen 入口自动执行；可信运行时必须调用 `migrate_plan_v1_to_v2(old_plan, mission_id=..., uav_id=..., plan_version=...)`，明确提供三个路由值后才能形成 v2。新的 `DynamicLLMPlanner` 在模型调用前就拒绝没有 routing IDs 的 `PlannerRequest`，首次生成和 repair 均只发送 schema v2；不存在隐式补 `mission_legacy` 或默认 UAV ID 的 Qwen 生成路径。
+
+`SkillPlanDraftV2` 是新动态模型唯一允许输出的协议；其中只保留 routing IDs、结构化目标语义、具名地点、高层参数和前序 SEARCH 输出引用，不含解析后的坐标、速度或普通 Skill timeout。例如导航任务可以省略 SEARCH/TRACK：
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "mission_id": "mission_001",
+  "uav_id": "uav_1",
+  "plan_version": 1,
+  "target_spec": {
+    "original_description": "unspecified mission target",
+    "category": "unspecified",
+    "hard_attributes": [],
+    "soft_attributes": [],
+    "negative_constraints": [],
+    "relation_constraints": [],
+    "query_ladder": [],
+    "inspection_questions": [],
+    "immutable_identity_summary": "unspecified mission target",
+    "mutable_appearance_notes": []
+  },
   "steps": [
-    {"id": "takeoff_1", "skill": "TAKEOFF", "args": {"altitude_m": 8.0}},
-    {"id": "goto_search", "skill": "GOTO", "args": {"destination": "search_area"}},
-    {"id": "goto_home", "skill": "GOTO", "args": {"destination": "home"}},
-    {"id": "land_1", "skill": "LAND", "args": {"zone": "home"}}
+    {"id": "takeoff_1", "uav_id": "uav_1", "skill": "TAKEOFF", "args": {"altitude_m": 8.0}},
+    {"id": "goto_search", "uav_id": "uav_1", "skill": "GOTO", "args": {"destination": "search_area"}},
+    {"id": "goto_home", "uav_id": "uav_1", "skill": "GOTO", "args": {"destination": "home"}},
+    {"id": "land_1", "uav_id": "uav_1", "skill": "LAND", "args": {"zone": "home"}}
   ]
 }
 ```
 
 需要跟踪时，`TRACK.args.target_ref` 只能写成 `$<先前SEARCH步骤id>.target_id`。`REACQUIRE` 不占顶层步骤，只能附着在 TRACK 的 `recovery` 中，并由 `max_attempts` 和全局恢复预算共同限制。TRACK 还可用 `on_target_lost` 表达 `REACQUIRE` 或 `FAIL`；未写该字段时继承可信 `PlannerPolicy`，默认是 `REACQUIRE`。显式 `FAIL` 禁止同时携带 `recovery`，编译结果不含恢复策略；它表示目标丢失后任务失败并原地紧急降落，不表示条件式返航。当前协议没有实现 `RETURN_HOME`、无目标继续执行或运行时询问 LLM。
 
-Skill Catalog 是模型可见的功能标签白名单，当前只注册已实现的 TAKEOFF/GOTO/SEARCH/TRACK/REACQUIRE/LAND。REACQUIRE 标记为 recovery-only。默认可信限制为最多 10 个顶层步骤、5 次 GOTO、1 次 SEARCH、2 次 TRACK、每个 TRACK 最多 2 次恢复、总计最多 4 次恢复，TRACK duration 为 1～600 s；可在 `configs/default.yaml` 的 `planner` 段收紧。`PlannerPolicy` 另行保存默认目标丢失动作及可信的恢复次数、半径和 timeout。模型可以选择允许的动作或给出有界覆盖，但不能修改这些边界。v1 仍是单目标、有限线性计划，不支持分支图、多目标或运行时 LLM 重规划。
+完整 Skill Catalog 注册 TAKEOFF/GOTO/HOVER/SEARCH/INSPECT/TRACK/REACQUIRE/LAND；REACQUIRE 标记为 recovery-only。初始 Planner 没有可信 CandidateBank ID，因此它的模型可见投影只开放 TAKEOFF/GOTO/HOVER/SEARCH/TRACK/LAND，并明确隐藏 INSPECT。只有受信 revision 触发携带一个已验证 candidate ID 时，revision Catalog/Schema 才开放 INSPECT，且 `candidate_id` 被绑定为该 ID 的 `const`，模型不能自行编造。默认可信限制为最多 10 个顶层步骤、5 次 GOTO、1 次 SEARCH、2 次 TRACK、每个 TRACK 最多 2 次恢复、总计最多 4 次恢复，TRACK duration 为 1～600 s；可在 `configs/default.yaml` 的 `planner` 段收紧。`PlannerPolicy` 另行保存默认目标丢失动作及可信的恢复次数、半径和 timeout。模型可以选择允许的动作或给出有界覆盖，但不能修改这些边界。历史 v1 仍只是单目标有限线性计划；v2 的运行时 revision 也只能原子替换受限后缀，不是自由分支图或多目标 Planner。
 
 ### Structured output、符号检查与可信编译
 
-`DynamicLLMPlanner` 的首次生成和唯一一次 repair 都使用同一份 `SkillPlanDraft` JSON Schema structured output。请求通过 OpenAI-compatible `response_format.type=json_schema` 发送；若服务端不支持并返回错误，客户端会明确失败，不会静默降级为自由文本。Schema 用 `oneOf` 区分五种顶层 Skill，只暴露 world context 中的具名区域、降落区和导航点枚举，不包含这些名称背后的坐标，也不包含 Oracle 数据、速度或底层控制参数。受约束生成之后仍执行严格 JSON、duplicate key、有限数值、dataclass 和 Catalog 校验，不能把 JSON Schema 当作唯一信任边界。
+`DynamicLLMPlanner` 的首次生成和唯一一次 repair 都使用同一份 `SkillPlanDraftV2` JSON Schema structured output。请求通过 OpenAI-compatible `response_format.type=json_schema` 发送；若服务端不支持并返回错误，客户端会明确失败，不会静默降级为自由文本。初始 Schema 用 `oneOf` 区分六种允许的顶层 Skill；revision Schema 只在有可信候选时增加受 const 约束的 INSPECT 变体。两者都只暴露 world context 中的具名区域、降落区和导航点枚举，不包含这些名称背后的坐标，也不包含 Oracle 数据、速度或底层控制参数。受约束生成之后仍执行严格 JSON、duplicate key、有限数值、dataclass 和 Catalog 校验，不能把 JSON Schema 当作唯一信任边界。
 
 跨步骤规则集中由共享 `SymbolicPlanChecker` 检查，包括 TAKEOFF/LAND 位置与次数、LAND 前匹配的 GOTO、调用预算、TRACK 引用、顶层 REACQUIRE 禁止项，以及 `FAIL` 与 recovery 的冲突。`DynamicLLMPlanner` 用稳定的 `PlanIssueCode` 生成结构化 repair 请求，`PlanValidator` 在可信编译前复用同一个 Checker；后者仍独占具名地点到坐标、速度/timeout、安全参数、默认 recovery 和正常 LAND 几何的编译权。`SafetySupervisor` 随后独立检查编译后的 `TaskPlan`，属于不同的运行时安全边界。
 
@@ -601,6 +664,20 @@ cd /path/to/vlm_drones/uav_agent
 ```
 
 已存在输出时生成器默认拒绝覆盖；只有确认替换整个正式数据集时才加入 `--overwrite`。若目录内存在尚未审核的 `_candidates/`，覆盖也会被拒绝，须先移动或完成审核，避免丢失候选。相同资源、配置和 seed 会产生相同的 JSONL 内容与 checksums。pilot 的精确数量为 train 1,000、validation 200、test_iid 200、test_compositional 200、test_language 200、test_robustness 100，共 1,900 条；它们全部标记为 `generation_source=template`、`review_status=unreviewed`，不会把自动模板伪装成人工数据。
+
+原有 Planner v1 数据及解析接口保持不变。若要检查带 `mission_id`、`uav_id`、`plan_version`、逐 step `uav_id` 和结构化 `TargetSpec` 的动态 schema v2，可从同一份可信 Gold 生成独立的 pilot 预览目录：
+
+```bash
+./python.sh scripts/generate_planner_dataset.py \
+  --config resources/planner_v1/dataset_config.yaml \
+  --output-root /tmp/planner_v2_preview \
+  --seed 42 \
+  --profile pilot \
+  --schema-version 2 \
+  --uav-id uav_1
+```
+
+该路径不调用 Qwen、不修改 `datasets/planner_v1/`，也不伪装成已人工审核的正式 v2 数据集；当前只开放 pilot 预览，`full` v2 发布流程会明确拒绝。
 
 `full` profile 定义了 8,000 / 1,000 / 1,000 / 1,000 / 1,000 / 500，共 12,500 条的候选规模，但它不是“自动生成即正式发布”的捷径。正式 full 数据必须先在人工审核流程中达到 test_language 至少 50% 人工编写或逐条审核、test_robustness 100% 人工审核，并保留真实 provenance；当前仓库不冒充或自动执行这项人工工作。因此未审核的 `--profile full` 正式写盘会按预期失败，validator 也拒绝把未达比例的数据当作 full。当前可直接复现并通过完整验收的是下述 1,900 条 pilot。
 
@@ -738,7 +815,7 @@ uav_agent/
 ├── models/        # 纯 Python 模型合同与 OpenAI-compatible HTTP 客户端
 ├── agents/        # VLM/LLM Agent
 ├── experiments/   # 轻量运行目录、CSV/TensorBoard、checkpoint、评测与图表
-├── skills/        # 统一 Skill API、MotionPolicy、Manager 与六类 Goal 合同
+├── skills/        # 统一 Skill API、MotionPolicy、Manager 与分型 Goal 合同
 ├── perception/    # 视觉感知；Stage-0 含 evaluator-only OraclePerception
 ├── planner/       # 任务分解与层次规划
 ├── tasks/         # 独立 Gold Spec、封闭目标 ontology 与 Intent Judge

@@ -47,7 +47,7 @@ from runtime.safety_supervisor import (
     SafetySupervisor,
 )
 from skills.base import Skill
-from skills.manager import SkillManager, TaskPlan, TaskStatus
+from skills.manager import SkillManager, TaskPlan, TaskStatus, TransitionRecord
 from skills.types import (
     Observation,
     SkillContext,
@@ -336,6 +336,7 @@ def observation(
     pose: UAVState | None = None,
 ) -> Observation:
     return Observation(
+        uav_id="uav_1",
         timestamp=float(timestamp),
         uav_pose=pose or UAVState(0.0, 0.0, 10.0, 0.0),
         uav_velocity=np.zeros(3),
@@ -393,6 +394,7 @@ def make_harness(
         camera=FakeCamera(),
         perception=None,
         clock=clock,
+        uav_id="uav_1",
     )
     configured = default_outcomes()
     if outcomes is not None:
@@ -550,6 +552,34 @@ class MissionAgentStartTests(unittest.TestCase):
 
 
 class MissionAgentTickAndTargetTests(unittest.TestCase):
+    def test_inspection_detour_return_preserves_existing_search_lifecycle(self) -> None:
+        harness = make_harness()
+        harness.start()
+        harness.tick(1.0)
+        harness.tick(2.0)
+        self.assertIs(harness.target.lifecycle, TargetLifecycle.SEARCHING)
+        events_before = harness.target.events()
+
+        # Manager's trusted detour emits INSPECT -> SEARCH without completing
+        # SEARCH. The Agent must retain the existing TargetSpec/search state,
+        # not create a second target lifecycle or claim a lock.
+        harness.agent._apply_target_transition(  # type: ignore[attr-defined]
+            TransitionRecord(
+                timestamp=2.5,
+                old_skill=SkillName.INSPECT,
+                old_status=SkillStatus.SUCCEEDED,
+                result_code=SkillResultCode.GOAL_REACHED,
+                new_skill=SkillName.SEARCH,
+                reason="inspection_evidence_collected_search_resumed",
+                old_step_id="inspect_candidate",
+                new_step_id="search",
+            )
+        )
+
+        self.assertIs(harness.target.lifecycle, TargetLifecycle.SEARCHING)
+        self.assertEqual(harness.target.events(), events_before)
+        self.assertIsNone(harness.target.snapshot().target_id)
+
     def test_duplicate_timestamp_does_not_tick_or_consume_transition_twice(self) -> None:
         harness = make_harness(
             outcomes={
@@ -956,6 +986,7 @@ class MissionAgentSafetyAndLifecycleTests(unittest.TestCase):
         harness = make_harness()
         harness.start()
         damaged = object.__new__(Observation)
+        object.__setattr__(damaged, "uav_id", "uav_1")
 
         snapshot = harness.agent.tick(damaged)
 

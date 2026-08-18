@@ -14,7 +14,7 @@ from models.base import (
     ModelConnectionError,
     ModelResponse,
 )
-from planner.base import MissionPlanner, PlannerOutputError
+from planner.base import MissionPlanner, PlannerError, PlannerOutputError
 from planner.dynamic_llm_planner import DynamicLLMPlanner
 from planner.prompt_builder import (
     build_dynamic_skill_planner_messages,
@@ -27,6 +27,8 @@ from planner.schemas import (
     PlannerWorldContext,
     SearchRegionSpec,
     SkillPlanDraft,
+    SkillPlanDraftV2,
+    migrate_plan_v1_to_v2,
 )
 from planner.scripted_dynamic_planner import ScriptedDynamicPlanner
 from planner.skill_catalog import SkillCatalog, build_default_skill_catalog
@@ -53,7 +55,12 @@ LIMITS = {
 }
 
 
-def _draft_dict() -> dict[str, object]:
+MISSION_ID = "mission_test"
+UAV_ID = "uav_1"
+PLAN_VERSION = 1
+
+
+def _v1_draft_dict() -> dict[str, object]:
     return {
         "schema_version": 1,
         "steps": [
@@ -99,6 +106,34 @@ def _draft_dict() -> dict[str, object]:
     }
 
 
+def _draft_dict() -> dict[str, object]:
+    legacy = _v1_draft_dict()
+    steps = []
+    for raw_step in legacy["steps"]:
+        step = dict(raw_step)
+        step["uav_id"] = UAV_ID
+        steps.append(step)
+    return {
+        "schema_version": 2,
+        "mission_id": MISSION_ID,
+        "uav_id": UAV_ID,
+        "plan_version": PLAN_VERSION,
+        "target_spec": {
+            "original_description": "moving target",
+            "category": "unspecified",
+            "hard_attributes": [],
+            "soft_attributes": [],
+            "negative_constraints": [],
+            "relation_constraints": [],
+            "query_ladder": [],
+            "inspection_questions": [],
+            "immutable_identity_summary": "moving target",
+            "mutable_appearance_notes": [],
+        },
+        "steps": steps,
+    }
+
+
 def _draft_json() -> str:
     return json.dumps(_draft_dict(), ensure_ascii=False)
 
@@ -139,6 +174,16 @@ def _world_context() -> PlannerWorldContext:
 
 
 def _request() -> PlannerRequest:
+    return PlannerRequest(
+        "起飞后前往 search_area 搜索目标，跟踪十秒后返回 home 降落",
+        _world_context(),
+        mission_id=MISSION_ID,
+        uav_id=UAV_ID,
+        plan_version=PLAN_VERSION,
+    )
+
+
+def _unrouted_request() -> PlannerRequest:
     return PlannerRequest(
         "起飞后前往 search_area 搜索目标，跟踪十秒后返回 home 降落",
         _world_context(),
@@ -200,7 +245,7 @@ class DynamicLLMPlannerTest(unittest.TestCase):
 
         self.assertIsInstance(planner, MissionPlanner)
         self.assertEqual(planner.source, "dynamic_llm")
-        self.assertIsInstance(result, SkillPlanDraft)
+        self.assertIsInstance(result, SkillPlanDraftV2)
         self.assertNotIsInstance(result, TaskPlan)
         self.assertEqual(len(client.calls), 1)
 
@@ -209,7 +254,7 @@ class DynamicLLMPlannerTest(unittest.TestCase):
 
         execution = planner.plan_with_diagnostics(_request())
 
-        self.assertIsInstance(execution.output, SkillPlanDraft)
+        self.assertIsInstance(execution.output, SkillPlanDraftV2)
         self.assertEqual(execution.diagnostics.model_calls, 1)
         self.assertFalse(execution.diagnostics.repair_used)
         self.assertTrue(execution.diagnostics.initial_output_valid)
@@ -254,13 +299,19 @@ class DynamicLLMPlannerTest(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
 
     def test_one_invalid_output_can_be_repaired_once(self) -> None:
-        invalid = '{"schema_version":1,"steps":[]}'
+        invalid_value = _draft_dict()
+        invalid_value["steps"] = []
+        invalid = json.dumps(invalid_value, ensure_ascii=False)
         planner, client = self._planner([invalid, _draft_json()])
 
         result = planner.plan(_request())
 
         self.assertEqual(len(result.steps), 6)
         self.assertEqual(len(client.calls), 2)
+        self.assertEqual(
+            [message.role for message in client.calls[1][0]],
+            ["system", "user", "user"],
+        )
         repair_payload = json.loads(str(client.calls[1][0][-1].content))
         self.assertEqual(repair_payload["original_output"], invalid)
         self.assertEqual(
@@ -291,6 +342,10 @@ class DynamicLLMPlannerTest(unittest.TestCase):
             "LAND must be preceded by matching GOTO",
             repair_payload["validation_issues"][0]["message"],
         )
+        self.assertIn(
+            "Insert exactly one GOTO immediately before the final LAND",
+            repair_payload["mandatory_repairs"][0],
+        )
 
     def test_two_invalid_outputs_fail_and_never_make_third_call(self) -> None:
         planner, client = self._planner(["not json", "[]", _draft_json()])
@@ -313,6 +368,47 @@ class DynamicLLMPlannerTest(unittest.TestCase):
         with self.assertRaises(PlannerOutputError):
             planner.plan(_request())
         self.assertEqual(len(client.calls), 2)
+
+    def test_initial_plan_cannot_invent_inspect_candidate_id(self) -> None:
+        output = _draft_dict()
+        output["steps"].insert(  # type: ignore[union-attr]
+            3,
+            {
+                "id": "inspect_1",
+                "uav_id": UAV_ID,
+                "skill": "INSPECT",
+                "args": {"candidate_id": "candidate_hallucinated"},
+            },
+        )
+        raw = json.dumps(output, ensure_ascii=False)
+        planner, client = self._planner([raw, raw])
+
+        with self.assertRaisesRegex(
+            PlannerOutputError,
+            "INSPECT is unavailable in an initial plan",
+        ):
+            planner.plan(_request())
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(
+            planner.last_diagnostics.initial_error_code,  # type: ignore[union-attr]
+            "SCHEMA_INVALID",
+        )
+
+        schema = client.calls[0][1].response_format.schema  # type: ignore[union-attr]
+        variants = schema["properties"]["steps"]["items"]["oneOf"]
+        self.assertNotIn(
+            "INSPECT",
+            {variant["properties"]["skill"]["const"] for variant in variants},
+        )
+        prompt = json.loads(str(client.calls[0][0][1].content))
+        self.assertNotIn(
+            "INSPECT",
+            {item["name"] for item in prompt["skill_catalog"]["skills"]},
+        )
+        with self.assertRaisesRegex(ValueError, "INSPECT is unavailable"):
+            SkillPlanDraftV2.from_dict(output)
+        with self.assertRaisesRegex(ValueError, "INSPECT is unavailable"):
+            DynamicLLMPlanner._parse_plan_draft_v2(raw)
 
     def test_active_catalog_enforces_value_contracts(self) -> None:
         cases: list[tuple[str, str, dict[str, object], dict[str, object]]] = [
@@ -396,7 +492,7 @@ class DynamicLLMPlannerTest(unittest.TestCase):
 
     def test_duplicate_keys_and_nonfinite_numbers_are_rejected(self) -> None:
         duplicate = (
-            '{"schema_version":1,"schema_version":1,"steps":'
+            '{"schema_version":2,"schema_version":2,"steps":'
             + json.dumps(_draft_dict()["steps"])
             + "}"
         )
@@ -434,6 +530,10 @@ class DynamicLLMPlannerTest(unittest.TestCase):
         for _, options in client.calls:
             self.assertIsInstance(options, GenerationOptions)
             self.assertEqual(options.temperature, 0.0)
+        self.assertEqual(
+            [options.max_tokens for _, options in client.calls],
+            [768, 512],
+        )
 
     def test_runtime_messages_equal_shared_builder_byte_for_byte(self) -> None:
         planner, client = self._planner([_draft_json()])
@@ -445,6 +545,9 @@ class DynamicLLMPlannerTest(unittest.TestCase):
             build_default_skill_catalog(),
             LIMITS,
             PROMPT_PATH.read_text(encoding="utf-8"),
+            mission_id=request.mission_id,
+            uav_id=request.uav_id,
+            plan_version=request.plan_version,
         )
         self.assertEqual(client.calls[0][0], expected)
         self.assertEqual(
@@ -459,6 +562,9 @@ class DynamicLLMPlannerTest(unittest.TestCase):
             build_default_skill_catalog(),
             LIMITS,
             PROMPT_PATH.read_text(encoding="utf-8"),
+            mission_id=MISSION_ID,
+            uav_id=UAV_ID,
+            plan_version=PLAN_VERSION,
         )
         payload = json.loads(str(messages[1].content))
         self.assertEqual(
@@ -469,6 +575,7 @@ class DynamicLLMPlannerTest(unittest.TestCase):
                 "skill_catalog",
                 "planner_limits",
                 "trusted_planner_policy",
+                "trusted_routing",
                 "user_instruction",
             },
         )
@@ -587,16 +694,39 @@ class DynamicLLMPlannerTest(unittest.TestCase):
         self.assertEqual(len(planner.plan(_request()).steps), 6)
         self.assertEqual(len(client.calls), 1)
 
+    def test_unrouted_request_is_rejected_before_model_call(self) -> None:
+        planner, client = self._planner([_draft_json()])
+
+        with self.assertRaisesRegex(PlannerError, "trusted mission_id"):
+            planner.plan(_unrouted_request())
+
+        self.assertEqual(client.calls, [])
+        self.assertIsNotNone(planner.last_diagnostics)
+        self.assertEqual(planner.last_diagnostics.model_calls, 0)
+        self.assertEqual(
+            planner.last_diagnostics.initial_error_code,
+            "ROUTING_IDS_REQUIRED",
+        )
+
     def test_scripted_dynamic_planner_returns_fresh_drafts(self) -> None:
-        source = SkillPlanDraft.from_dict(_draft_dict())
+        source = SkillPlanDraft.from_dict(_v1_draft_dict())
         planner = ScriptedDynamicPlanner(source)
         first = planner.plan(_request())
         second = planner.plan(_request())
         self.assertEqual(first, second)
         self.assertIsNot(first, second)
+        self.assertEqual(
+            first,
+            migrate_plan_v1_to_v2(
+                source,
+                mission_id=MISSION_ID,
+                uav_id=UAV_ID,
+                plan_version=PLAN_VERSION,
+            ),
+        )
         self.assertEqual(planner.source, "dynamic_scripted")
         execution = planner.plan_with_diagnostics(_request())
-        self.assertEqual(execution.output, source)
+        self.assertEqual(execution.output, first)
         self.assertEqual(execution.diagnostics.model_calls, 0)
         self.assertFalse(execution.diagnostics.structured_output_enabled)
 

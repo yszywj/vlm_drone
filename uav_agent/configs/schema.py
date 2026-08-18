@@ -7,7 +7,9 @@ depend on the configuration contract without importing the loader itself.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from common.ids import validate_uav_id
 from planner.policy import PlannerLimits, PlannerPolicy
 
 
@@ -30,6 +32,10 @@ class UavConfig:
     initial_position_xyz_m: tuple[float, float, float]
     max_speed_mps: float
     max_yaw_rate_deg_s: float
+    id: str = "uav_1"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "id", validate_uav_id(self.id))
 
 
 @dataclass(frozen=True)
@@ -69,6 +75,59 @@ class SearchConfig:
     radius_m: float
     timeout_s: float
     transit_yaw_mode: str
+
+
+@dataclass(frozen=True, slots=True)
+class ModelWorkerConfig:
+    """Trusted limits for the per-UAV asynchronous model worker."""
+
+    max_inflight_per_uav: int = 1
+    request_timeout_s: float = 20.0
+
+
+@dataclass(frozen=True, slots=True)
+class QwenVisualReviewConfig:
+    """Sampling and image limits for Qwen visual review."""
+
+    enabled: bool = False
+    mode: str = "shadow"
+    goto_interval_s: float = 5.0
+    search_interval_s: float = 2.0
+    inspect_interval_s: float = 1.0
+    track_interval_s: float = 5.0
+    max_recent_frames: int = 3
+    max_image_side_px: int = 1024
+    jpeg_quality: int = 80
+    hover_position_tolerance_m: float = 0.25
+    hover_max_correction_speed_mps: float = 0.5
+    blocking_hover_timeout_s: float = 20.0
+    blocking_timeout_fallback: str = "CANCEL_AND_LAND"
+
+
+@dataclass(frozen=True, slots=True)
+class PlanRevisionConfig:
+    """Hard cap and cooldown for controlled plan-suffix revisions."""
+
+    enabled: bool = True
+    max_revisions: int = 3
+    cooldown_s: float = 5.0
+
+
+@dataclass(frozen=True, slots=True)
+class FrameStoreConfig:
+    """Three independent bounds for the in-memory image store."""
+
+    max_frames: int = 24
+    max_bytes: int = 67_108_864
+    max_age_s: float = 20.0
+
+
+@dataclass(frozen=True, slots=True)
+class DebugImagesConfig:
+    """Opt-in and bounded sampled debug-image output."""
+
+    enabled: bool = False
+    max_images_per_run: int = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +265,16 @@ class AppConfig:
     artifacts: ArtifactsConfig
     figures: FiguresConfig
     storage: StorageConfig
+    # These runtime-vision blocks were added after the public v1 config.  A
+    # default factory keeps construction of older trusted AppConfig fixtures
+    # backward compatible while the loader validates any explicit YAML block.
+    model_worker: ModelWorkerConfig = field(default_factory=ModelWorkerConfig)
+    qwen_visual_review: QwenVisualReviewConfig = field(
+        default_factory=QwenVisualReviewConfig
+    )
+    plan_revision: PlanRevisionConfig = field(default_factory=PlanRevisionConfig)
+    frame_store: FrameStoreConfig = field(default_factory=FrameStoreConfig)
+    debug_images: DebugImagesConfig = field(default_factory=DebugImagesConfig)
 
 
 __all__ = [
@@ -216,10 +285,15 @@ __all__ = [
     "ExperimentConfig",
     "ArtifactsConfig",
     "FiguresConfig",
+    "FrameStoreConfig",
+    "DebugImagesConfig",
     "LoggingConfig",
+    "ModelWorkerConfig",
+    "PlanRevisionConfig",
     "PlannerConfig",
     "SceneConfig",
     "SearchConfig",
+    "QwenVisualReviewConfig",
     "StorageConfig",
     "SimulationConfig",
     "TargetConfig",

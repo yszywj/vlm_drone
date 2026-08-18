@@ -7,6 +7,7 @@ from skills.base import (
     SkillLifecycleError,
 )
 from skills.goto import GotoGoal, GotoSkill
+from skills.hover import HoverGoal, HoverMode, HoverSkill, HoverTimeoutFallback
 from skills.land import LandGoal, LandSkill
 from skills.manager import (
     ExecutionKind,
@@ -32,7 +33,7 @@ from skills.plan import (
     TaskPlanError,
     TaskStep,
 )
-from skills.search import SearchGoal, SearchSkill
+from skills.search import SearchGoal, SearchPhase, SearchSkill
 from skills.takeoff import TakeoffGoal, TakeoffSkill
 from skills.track import TrackGoal, TrackSkill
 from skills.types import (
@@ -41,7 +42,9 @@ from skills.types import (
     SkillClock,
     SkillContext,
     SkillFeedback,
+    SkillExecutionReport,
     SkillGoal,
+    SkillInvocation,
     SkillName,
     SkillResult,
     SkillResultCode,
@@ -54,6 +57,16 @@ __all__ = [
     "ExecutionKind",
     "GotoGoal",
     "GotoSkill",
+    "HoverGoal",
+    "HoverMode",
+    "HoverSkill",
+    "HoverTimeoutFallback",
+    "InspectApproachPolicy",
+    "InspectGoal",
+    "InspectPhase",
+    "InspectPolicy",
+    "InspectSkill",
+    "InspectionEvidenceHandle",
     "LandGoal",
     "LandSkill",
     "MotionPolicy",
@@ -63,13 +76,16 @@ __all__ = [
     "ReacquireSkill",
     "RecoveryPolicy",
     "SearchGoal",
+    "SearchPhase",
     "SearchSkill",
     "Skill",
     "SkillClock",
     "SkillContext",
     "SkillExecutionStateError",
+    "SkillExecutionReport",
     "SkillFeedback",
     "SkillGoal",
+    "SkillInvocation",
     "SkillGoalValidationError",
     "SkillLifecycleError",
     "SkillManager",
@@ -95,3 +111,27 @@ __all__ = [
     "create_default_skill_registry",
     "move_toward_with_policy",
 ]
+
+
+_LAZY_INSPECT_EXPORTS = frozenset(
+    {
+        "InspectApproachPolicy",
+        "InspectGoal",
+        "InspectPhase",
+        "InspectPolicy",
+        "InspectSkill",
+        "InspectionEvidenceHandle",
+    }
+)
+
+
+def __getattr__(name: str) -> object:
+    """Load INSPECT's perception-heavy symbols without import cycles."""
+
+    if name in _LAZY_INSPECT_EXPORTS:
+        from skills import inspect as inspect_module
+
+        value = getattr(inspect_module, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -80,6 +80,11 @@ from .validator import (
     ValidationIssue,
     validate_dataset,
 )
+from .v2_preview import (
+    PLANNER_DATASET_V2_PREVIEW_SCHEMA,
+    build_v2_preview_record,
+    write_v2_preview_dataset,
+)
 
 
 __all__ = [
@@ -102,6 +107,7 @@ __all__ = [
     "LeakageReport",
     "PLANNER_DATASET_SCHEMA_VERSION",
     "PLANNER_DATASET_SPLITS",
+    "PLANNER_DATASET_V2_PREVIEW_SCHEMA",
     "PLANNER_REVIEW_STATUSES",
     "ParaphraseCandidateValidation",
     "PlannerDataSchemaError",
@@ -126,6 +132,7 @@ __all__ = [
     "assign_splits",
     "build_statistics",
     "build_gold_dynamic_draft",
+    "build_v2_preview_record",
     "check_dataset_leakage",
     "compute_semantic_spec_family",
     "generate_and_write_dataset",
@@ -147,4 +154,5 @@ __all__ = [
     "validate_splits",
     "world_case_to_runtime_context",
     "write_generated_dataset",
+    "write_v2_preview_dataset",
 ]

@@ -8,10 +8,11 @@ timeout, or low-level control parameters.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from numbers import Real
 
+from common.ids import validate_routing_id
 from planner.text_safety import reject_forbidden_planner_text
 
 
@@ -19,7 +20,17 @@ _ARGUMENT_TYPES = frozenset({"string", "number", "integer"})
 _MODEL_VISIBLE_ARGUMENTS: dict[str, frozenset[str]] = {
     "TAKEOFF": frozenset({"altitude_m", "yaw_mode", "yaw_deg"}),
     "GOTO": frozenset({"destination", "altitude_m", "yaw_mode", "yaw_deg"}),
+    "HOVER": frozenset({"duration_s", "yaw_mode", "yaw_deg"}),
     "SEARCH": frozenset({"region", "target_description", "altitude_m"}),
+    "INSPECT": frozenset(
+        {
+            "candidate_id",
+            "desired_observation_distance_m",
+            "viewpoint_change_deg",
+            "max_duration_s",
+            "approach_policy",
+        }
+    ),
     "TRACK": frozenset(
         {
             "target_ref",
@@ -303,7 +314,12 @@ def _argument(
 
 
 def build_default_skill_catalog() -> SkillCatalog:
-    """Build the stable v1 catalog for the six implemented Skills."""
+    """Build the complete catalog used by planning and runtime revision.
+
+    ``INSPECT`` is present because a trusted runtime candidate may make it
+    available during suffix revision.  Initial generation must use
+    :func:`initial_planner_catalog`, which removes that runtime-only ability.
+    """
 
     return SkillCatalog(
         skills=(
@@ -378,6 +394,39 @@ def build_default_skill_catalog() -> SkillCatalog:
                 outputs=("goal_reached",),
             ),
             SkillContract(
+                name="HOVER",
+                description="在当前位置执行有界定时悬停；仅支持定时模式。",
+                top_level_allowed=True,
+                recovery_only=False,
+                arguments=(
+                    _argument(
+                        "duration_s",
+                        "定时悬停持续时间（秒）。",
+                        "number",
+                        minimum=1.0,
+                        maximum=60.0,
+                    ),
+                    _argument(
+                        "yaw_mode",
+                        "悬停时机头策略。",
+                        "string",
+                        required=False,
+                        allowed_values=("KEEP_CURRENT", "FIXED"),
+                    ),
+                    _argument(
+                        "yaw_deg",
+                        "固定机头航向角（度）。",
+                        "number",
+                        required=False,
+                        minimum=-360.0,
+                        maximum=360.0,
+                        condition="only allowed and required when yaw_mode is FIXED",
+                    ),
+                ),
+                preconditions=("UAV is airborne",),
+                outputs=("hover_complete",),
+            ),
+            SkillContract(
                 name="SEARCH",
                 description="在一个具名搜索区域内寻找单个任务目标；最多一次。",
                 top_level_allowed=True,
@@ -398,6 +447,56 @@ def build_default_skill_catalog() -> SkillCatalog:
                 ),
                 preconditions=("UAV is airborne", "no prior SEARCH in this plan"),
                 outputs=("target_id",),
+            ),
+            SkillContract(
+                name="INSPECT",
+                description=(
+                    "对先前 SEARCH 产生的候选目标执行有界观察；候选标识必须来自可信运行时。"
+                ),
+                top_level_allowed=True,
+                recovery_only=False,
+                arguments=(
+                    _argument(
+                        "candidate_id",
+                        "可信候选库中的候选标识。",
+                        "string",
+                    ),
+                    _argument(
+                        "desired_observation_distance_m",
+                        "期望观察距离（米）。",
+                        "number",
+                        required=False,
+                        minimum=2.0,
+                        maximum=20.0,
+                    ),
+                    _argument(
+                        "viewpoint_change_deg",
+                        "非零且有界的视角变化角（度）。",
+                        "number",
+                        required=False,
+                        minimum=-90.0,
+                        maximum=90.0,
+                    ),
+                    _argument(
+                        "max_duration_s",
+                        "本次观察的最大持续时间（秒）。",
+                        "number",
+                        required=False,
+                        minimum=1.0,
+                        maximum=60.0,
+                    ),
+                    _argument(
+                        "approach_policy",
+                        "候选观察的有界接近策略。",
+                        "string",
+                        required=False,
+                        allowed_values=("MAINTAIN_ALTITUDE_ORBIT",),
+                    ),
+                ),
+                preconditions=(
+                    "a prior SEARCH has produced a trusted candidate",
+                ),
+                outputs=("inspection_evidence",),
             ),
             SkillContract(
                 name="TRACK",
@@ -506,9 +605,67 @@ def build_default_skill_catalog() -> SkillCatalog:
     )
 
 
+def initial_planner_catalog(catalog: SkillCatalog) -> SkillCatalog:
+    """Project the catalog to skills safe for an initial mission plan.
+
+    An initial request has no CandidateBank evidence.  Hiding ``INSPECT`` here
+    prevents a model from inventing a candidate identifier while retaining the
+    full contract for trusted runtime revision.
+    """
+
+    if not isinstance(catalog, SkillCatalog):
+        raise TypeError("catalog must be a SkillCatalog")
+    return SkillCatalog(
+        tuple(contract for contract in catalog if contract.name != "INSPECT")
+    )
+
+
+def revision_planner_catalog(
+    catalog: SkillCatalog,
+    *,
+    trusted_inspect_candidate_id: str | None,
+) -> SkillCatalog:
+    """Project a revision catalog, binding INSPECT to one trusted candidate.
+
+    With no trusted candidate this is the initial-planning projection.  When
+    the coordinator has resolved a CandidateBank entry, the only advertised
+    ``candidate_id`` is that exact identifier.  Schema and response validation
+    independently enforce the same binding.
+    """
+
+    if not isinstance(catalog, SkillCatalog):
+        raise TypeError("catalog must be a SkillCatalog")
+    if trusted_inspect_candidate_id is None:
+        return initial_planner_catalog(catalog)
+    candidate_id = validate_routing_id(
+        trusted_inspect_candidate_id,
+        "trusted_inspect_candidate_id",
+    )
+    try:
+        catalog.get("INSPECT")
+    except KeyError:
+        return initial_planner_catalog(catalog)
+
+    projected: list[SkillContract] = []
+    for contract in catalog:
+        if contract.name != "INSPECT":
+            projected.append(contract)
+            continue
+        arguments = tuple(
+            replace(argument, allowed_values=(candidate_id,))
+            if argument.name == "candidate_id"
+            else argument
+            for argument in contract.arguments
+        )
+        projected.append(replace(contract, arguments=arguments))
+    return SkillCatalog(tuple(projected))
+
+
 __all__ = [
     "SkillArgumentSpec",
     "SkillCatalog",
     "SkillContract",
     "build_default_skill_catalog",
+    "initial_planner_catalog",
+    "revision_planner_catalog",
 ]

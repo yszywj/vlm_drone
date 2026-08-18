@@ -67,6 +67,7 @@ def make_context(uav: KinematicUAV, clock: ManualClock) -> SkillContext:
         camera=FakeCamera(uav),
         perception=None,
         clock=clock,
+        uav_id="uav_1",
     )
 
 
@@ -149,6 +150,7 @@ def make_observation(
         target_in_camera_fov(state, target_pose) if visible is None else visible
     )
     return Observation(
+        uav_id="uav_1",
         timestamp=clock.now() if timestamp is None else timestamp,
         uav_pose=state,
         uav_velocity=uav.get_velocity(),

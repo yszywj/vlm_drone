@@ -9,6 +9,8 @@ from planner.skill_catalog import (
     SkillCatalog,
     SkillContract,
     build_default_skill_catalog,
+    initial_planner_catalog,
+    revision_planner_catalog,
 )
 
 
@@ -18,7 +20,16 @@ class SkillCatalogTest(unittest.TestCase):
 
         self.assertEqual(
             [contract.name for contract in catalog],
-            ["TAKEOFF", "GOTO", "SEARCH", "TRACK", "REACQUIRE", "LAND"],
+            [
+                "TAKEOFF",
+                "GOTO",
+                "HOVER",
+                "SEARCH",
+                "INSPECT",
+                "TRACK",
+                "REACQUIRE",
+                "LAND",
+            ],
         )
         self.assertEqual(
             catalog.to_prompt_dict(),
@@ -40,16 +51,54 @@ class SkillCatalogTest(unittest.TestCase):
             [argument.required for argument in reacquire.arguments],
             [True, False, False],
         )
-        for name in ("TAKEOFF", "GOTO", "SEARCH", "TRACK", "LAND"):
+        for name in (
+            "TAKEOFF",
+            "GOTO",
+            "HOVER",
+            "SEARCH",
+            "INSPECT",
+            "TRACK",
+            "LAND",
+        ):
             self.assertTrue(catalog.get(name).top_level_allowed)
             self.assertFalse(catalog.get(name).recovery_only)
+
+    def test_initial_and_revision_catalogs_gate_inspect_candidate_identity(self) -> None:
+        complete = build_default_skill_catalog()
+        initial = initial_planner_catalog(complete)
+        self.assertNotIn("INSPECT", {contract.name for contract in initial})
+
+        ordinary_revision = revision_planner_catalog(
+            complete,
+            trusted_inspect_candidate_id=None,
+        )
+        self.assertEqual(ordinary_revision, initial)
+
+        trusted_revision = revision_planner_catalog(
+            complete,
+            trusted_inspect_candidate_id="candidate_1",
+        )
+        candidate_arg = next(
+            argument
+            for argument in trusted_revision.get("INSPECT").arguments
+            if argument.name == "candidate_id"
+        )
+        self.assertEqual(candidate_arg.allowed_values, ("candidate_1",))
 
     def test_contract_argument_allow_lists_match_dynamic_protocol(self) -> None:
         catalog = build_default_skill_catalog()
         expected = {
             "TAKEOFF": {"altitude_m", "yaw_mode", "yaw_deg"},
             "GOTO": {"destination", "altitude_m", "yaw_mode", "yaw_deg"},
+            "HOVER": {"duration_s", "yaw_mode", "yaw_deg"},
             "SEARCH": {"region", "target_description", "altitude_m"},
+            "INSPECT": {
+                "candidate_id",
+                "desired_observation_distance_m",
+                "viewpoint_change_deg",
+                "max_duration_s",
+                "approach_policy",
+            },
             "TRACK": {
                 "target_ref",
                 "duration_s",

@@ -16,6 +16,7 @@ import numpy as np
 
 from env.moving_target import TargetState
 from perception.runtime import PerceptionCapability
+from common.ids import validate_uav_id
 from skills.types import Observation
 
 if TYPE_CHECKING:
@@ -37,6 +38,10 @@ class OraclePerception:
     it means geometric in-frustum visibility and currently ignores occlusion.
     """
 
+    # Routing is part of the observation producer contract.  Keeping this
+    # required prevents a non-default UAV from silently receiving an
+    # Observation labelled with the historical ``uav_1`` compatibility ID.
+    uav_id: str
     target_id: str = "target"
 
     # Runtime policy code uses this declaration to prevent this adapter from
@@ -44,6 +49,10 @@ class OraclePerception:
     capability = PerceptionCapability.PRIVILEGED_ORACLE
 
     def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "uav_id", validate_uav_id(self.uav_id))
+        except (TypeError, ValueError) as exc:
+            raise OraclePerceptionError(str(exc)) from None
         if not isinstance(self.target_id, str) or not self.target_id.strip():
             raise OraclePerceptionError("target_id must be a non-empty string")
         object.__setattr__(self, "target_id", self.target_id.strip())
@@ -87,6 +96,7 @@ class OraclePerception:
 
         try:
             observation = Observation(
+                uav_id=self.uav_id,
                 timestamp=float(agent.camera_timestamp_s),
                 uav_pose=agent.uav_state,
                 uav_velocity=np.asarray(agent.uav_velocity_mps).copy(),

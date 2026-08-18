@@ -15,6 +15,7 @@ from urllib import request as urllib_request
 
 from models.base import (
     ChatMessage,
+    DEFAULT_MAX_IMAGES_PER_REQUEST,
     GenerationOptions,
     ModelConnectionError,
     ModelHTTPError,
@@ -48,6 +49,7 @@ class OpenAICompatibleClient:
         max_retries: int = 2,
         *,
         transport: Transport | None = None,
+        max_images_per_request: int = DEFAULT_MAX_IMAGES_PER_REQUEST,
     ) -> None:
         selected_base = (
             base_url
@@ -90,6 +92,20 @@ class OpenAICompatibleClient:
         if max_retries < 0:
             raise ValueError("max_retries must be non-negative")
         self.max_retries = max_retries
+
+        if (
+            isinstance(max_images_per_request, bool)
+            or not isinstance(max_images_per_request, int)
+        ):
+            raise TypeError("max_images_per_request must be an integer")
+        if max_images_per_request <= 0:
+            raise ValueError("max_images_per_request must be greater than zero")
+        if max_images_per_request > DEFAULT_MAX_IMAGES_PER_REQUEST:
+            raise ValueError(
+                "max_images_per_request cannot exceed the validated content "
+                f"limit of {DEFAULT_MAX_IMAGES_PER_REQUEST}"
+            )
+        self.max_images_per_request = max_images_per_request
 
         if transport is not None and not callable(transport):
             raise TypeError("transport must be callable")
@@ -160,17 +176,24 @@ class OpenAICompatibleClient:
         *,
         options: GenerationOptions | None = None,
     ) -> ModelResponse:
-        """Send a text-only OpenAI-compatible chat completion request."""
+        """Send a text or validated multimodal chat completion request."""
 
         if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence):
             raise TypeError("messages must be a sequence of ChatMessage objects")
         if not messages:
             raise ValueError("messages must not be empty")
         serialized_messages: list[dict[str, object]] = []
+        image_count = 0
         for index, message in enumerate(messages):
             if not isinstance(message, ChatMessage):
                 raise TypeError(f"messages[{index}] must be a ChatMessage")
             serialized_messages.append(message.to_dict())
+            image_count += message.image_count
+        if image_count > self.max_images_per_request:
+            raise ValueError(
+                "request image count exceeds max_images_per_request "
+                f"({self.max_images_per_request})"
+            )
 
         selected_options = options if options is not None else GenerationOptions()
         if not isinstance(selected_options, GenerationOptions):

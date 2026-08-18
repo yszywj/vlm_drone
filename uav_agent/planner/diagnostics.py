@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from planner.schemas import MissionIntent, PlannerOutput, SkillPlanDraft
+from planner.schemas import (
+    MissionIntent,
+    PlannerOutput,
+    SkillPlanDraft,
+    SkillPlanDraftV2,
+)
 
 
 def _optional_text(value: object, field_name: str) -> str | None:
@@ -88,8 +93,14 @@ class PlannerExecution:
     diagnostics: PlannerDiagnostics
 
     def __post_init__(self) -> None:
-        if not isinstance(self.output, (MissionIntent, SkillPlanDraft)):
-            raise TypeError("output must be a MissionIntent or SkillPlanDraft")
+        if not isinstance(
+            self.output,
+            (MissionIntent, SkillPlanDraft, SkillPlanDraftV2),
+        ):
+            raise TypeError(
+                "output must be a MissionIntent, SkillPlanDraft, or "
+                "SkillPlanDraftV2"
+            )
         if not isinstance(self.diagnostics, PlannerDiagnostics):
             raise TypeError("diagnostics must be PlannerDiagnostics")
 

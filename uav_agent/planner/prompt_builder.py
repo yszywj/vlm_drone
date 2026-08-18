@@ -16,9 +16,10 @@ import re
 import unicodedata
 
 from models.base import ChatMessage
+from common.ids import validate_mission_id, validate_uav_id
 from planner.schemas import PlannerWorldContext
 from planner.policy import PlannerLimits, PlannerPolicy
-from planner.skill_catalog import SkillCatalog
+from planner.skill_catalog import SkillCatalog, initial_planner_catalog
 from planner.text_safety import reject_forbidden_planner_text
 
 
@@ -171,6 +172,10 @@ def build_dynamic_skill_planner_messages(
     planner_limits: object,
     system_prompt: str,
     planner_policy: object = None,
+    *,
+    mission_id: str | None = None,
+    uav_id: str | None = None,
+    plan_version: int | None = None,
 ) -> tuple[ChatMessage, ...]:
     """Build the deterministic, text-only prompt for ``SkillPlanDraft``.
 
@@ -225,10 +230,13 @@ def build_dynamic_skill_planner_messages(
     }
     projected_limits = _project_dynamic_limits(planner_limits)
     trusted_limits = PlannerLimits(**projected_limits)
+    # Initial mission planning has no trusted CandidateBank entry.  INSPECT is
+    # a runtime-revision-only capability and must never be advertised here.
+    model_catalog = initial_planner_catalog(skill_catalog)
     payload = {
         "task": "Create one constrained SkillPlanDraft JSON object.",
         "trusted_world_context": safe_context,
-        "skill_catalog": skill_catalog.to_prompt_dict(),
+        "skill_catalog": model_catalog.to_prompt_dict(),
         "planner_limits": projected_limits,
         "trusted_planner_policy": _project_dynamic_policy(
             planner_policy,
@@ -236,6 +244,34 @@ def build_dynamic_skill_planner_messages(
         ),
         "user_instruction": normalized_instruction,
     }
+    routing_supplied = (
+        mission_id is not None,
+        uav_id is not None,
+        plan_version is not None,
+    )
+    if any(routing_supplied) and not all(routing_supplied):
+        raise ValueError(
+            "mission_id, uav_id, and plan_version must be supplied together"
+        )
+    if all(routing_supplied):
+        trusted_mission_id = validate_mission_id(mission_id)
+        trusted_uav_id = validate_uav_id(uav_id)
+        if isinstance(plan_version, bool) or not isinstance(
+            plan_version, int
+        ) or plan_version <= 0:
+            raise ValueError("plan_version must be a positive integer")
+        payload["task"] = (
+            "Create one constrained SkillPlanDraft schema-v2 JSON object, "
+            "extract one immutable TargetSpec from the user instruction, and "
+            "echo every trusted routing field exactly."
+        )
+        payload["trusted_routing"] = {
+            "schema_version": 2,
+            "mission_id": trusted_mission_id,
+            "uav_id": trusted_uav_id,
+            "plan_version": plan_version,
+            "step_uav_id_must_equal": trusted_uav_id,
+        }
     user_prompt = json.dumps(
         payload,
         ensure_ascii=False,

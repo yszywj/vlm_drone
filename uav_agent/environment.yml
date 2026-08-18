@@ -13,6 +13,9 @@ dependencies:
       - PyYAML==6.0.2
       - Pillow==11.3.0
       - matplotlib==3.10.3
+      # Test runner used by the architecture checklists.  The repository's
+      # tests also remain compatible with stdlib unittest discovery.
+      - pytest==8.4.1
       # Optional reader/UI for the scalar-only TFEvent files emitted by the
       # lightweight experiment logger.  The writer itself has no hard runtime
       # dependency on TensorBoard.

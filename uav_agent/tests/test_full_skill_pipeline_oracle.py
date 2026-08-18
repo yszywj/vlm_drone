@@ -205,7 +205,7 @@ class FullOracleSkillPipelineIsaacTest(unittest.TestCase):
         try:
             environment.setup()
             oracle = GuardedPerceptionBackend(
-                OraclePerception(target_id="target"),
+                OraclePerception(uav_id="uav_1", target_id="target"),
                 profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
                 acknowledge_privileged_oracle=True,
             )

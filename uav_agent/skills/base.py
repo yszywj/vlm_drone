@@ -168,6 +168,13 @@ class Skill(ABC):
                 str(exc),
             )
             return self._status
+        if self._context is not None and observation.uav_id != self._context.uav_id:
+            self._complete(
+                SkillStatus.FAILED,
+                SkillResultCode.INVALID_STATE,
+                "Observation.uav_id does not match SkillContext.uav_id",
+            )
+            return self._status
         try:
             self._on_tick(observation)
         except SkillExecutionStateError as exc:

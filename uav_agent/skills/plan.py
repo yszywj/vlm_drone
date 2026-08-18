@@ -16,6 +16,7 @@ from math import isfinite
 from numbers import Real
 import re
 
+from common.ids import validate_mission_id, validate_uav_id
 from skills.types import SkillName
 
 
@@ -241,6 +242,9 @@ class TaskPlan:
     """
 
     steps: tuple[TaskStep, ...]
+    mission_id: str = "mission_legacy"
+    uav_id: str = "uav_1"
+    plan_version: int = 1
 
     def __post_init__(self) -> None:
         if not isinstance(self.steps, tuple) or not self.steps:
@@ -252,9 +256,25 @@ class TaskPlan:
             raise TaskPlanError("TaskPlan step ids must be unique")
         if any(step.skill is SkillName.REACQUIRE for step in self.steps):
             raise TaskPlanError("TaskPlan must not contain top-level REACQUIRE")
+        try:
+            validate_mission_id(self.mission_id)
+            validate_uav_id(self.uav_id)
+        except (TypeError, ValueError) as exc:
+            raise TaskPlanError(str(exc)) from exc
+        if isinstance(self.plan_version, bool) or not isinstance(
+            self.plan_version, int
+        ) or self.plan_version <= 0:
+            raise TaskPlanError("TaskPlan.plan_version must be a positive integer")
 
     @classmethod
-    def from_dicts(cls, entries: Sequence[Mapping[str, object]]) -> TaskPlan:
+    def from_dicts(
+        cls,
+        entries: Sequence[Mapping[str, object]],
+        *,
+        mission_id: str = "mission_legacy",
+        uav_id: str = "uav_1",
+        plan_version: int = 1,
+    ) -> TaskPlan:
         if isinstance(entries, (str, bytes)) or not isinstance(entries, Sequence):
             raise TaskPlanError("task plan must be a sequence of mappings")
         explicit_ids = {
@@ -288,10 +308,25 @@ class TaskPlan:
             skill = normalized.pop("skill")
             recovery = normalized.pop("recovery", None)
             parsed.append(TaskStep(step_id, skill, normalized, recovery))
-        return cls(tuple(parsed))
+        return cls(
+            tuple(parsed),
+            mission_id=mission_id,
+            uav_id=uav_id,
+            plan_version=plan_version,
+        )
 
     def to_dicts(self) -> list[dict[str, object]]:
         return [step.to_dict() for step in self.steps]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the routed runtime-plan envelope."""
+
+        return {
+            "mission_id": self.mission_id,
+            "uav_id": self.uav_id,
+            "plan_version": self.plan_version,
+            "steps": self.to_dicts(),
+        }
 
 
 def _to_json_compatible(value: object) -> object:

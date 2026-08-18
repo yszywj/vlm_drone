@@ -546,6 +546,7 @@ def _observation(
     velocity: np.ndarray | None = None,
 ) -> Observation:
     return Observation(
+        uav_id="uav_1",
         timestamp=timestamp,
         uav_pose=pose,
         uav_velocity=(

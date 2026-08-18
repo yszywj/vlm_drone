@@ -19,7 +19,7 @@ from perception import (
 
 class PerceptionInterfaceTests(unittest.TestCase):
     def test_oracle_perception_structurally_satisfies_backend(self) -> None:
-        oracle = OraclePerception(target_id="target_0")
+        oracle = OraclePerception(uav_id="uav_1", target_id="target_0")
 
         self.assertIsInstance(oracle, PerceptionBackend)
         self.assertTrue(callable(oracle.observe))

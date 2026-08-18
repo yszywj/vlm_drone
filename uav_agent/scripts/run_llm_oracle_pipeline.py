@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from math import hypot, isfinite
 import os
@@ -27,6 +27,24 @@ if str(PROJECT_ROOT) not in sys.path:
 # In particular, no Isaac-backed environment module may be imported until
 # ``SimulationApp`` has been constructed in :func:`main`.
 from configs.loader import ConfigError, load_config  # noqa: E402
+from common.ids import validate_uav_id  # noqa: E402
+
+
+def _build_oracle_evaluation_backend(uav_id: str) -> object:
+    """Build the explicitly privileged backend with one trusted UAV route."""
+
+    from perception import (
+        GuardedPerceptionBackend,
+        OraclePerception,
+        PerceptionRuntimeProfile,
+    )
+
+    trusted_uav_id = validate_uav_id(uav_id)
+    return GuardedPerceptionBackend(
+        OraclePerception(uav_id=trusted_uav_id, target_id="target"),
+        profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
+        acknowledge_privileged_oracle=True,
+    )
 
 
 def _positive_float(value: str) -> float:
@@ -47,6 +65,12 @@ def _finite_float(value: str) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--uav-id",
+        default="uav_1",
+        type=validate_uav_id,
+        help="trusted UAV routing ID (default: %(default)s)",
+    )
     parser.add_argument(
         "--config",
         default="configs/default.yaml",
@@ -554,6 +578,7 @@ def main() -> int:
 
     try:
         config = load_config(args.config)
+        config = replace(config, uav=replace(config.uav, id=args.uav_id))
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
@@ -675,8 +700,6 @@ def main() -> int:
         from agents.mission_agent import MissionAgent
         from env.simple_uav_search_env import SimpleUavSearchEnv
         from perception import (
-            GuardedPerceptionBackend,
-            OraclePerception,
             PerceptionRuntimeProfile,
         )
         from skills.manager import SkillManager, create_default_skill_registry
@@ -700,11 +723,7 @@ def main() -> int:
             "[Perception] PRIVILEGED ORACLE_EVALUATION profile enabled; "
             "this is an upper-bound/regression path, not production vision"
         )
-        oracle = GuardedPerceptionBackend(
-            OraclePerception(target_id="target"),
-            profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
-            acknowledge_privileged_oracle=True,
-        )
+        oracle = _build_oracle_evaluation_backend(args.uav_id)
         clock = IsaacSimulationClock(environment)
         context = environment.make_skill_context(clock, perception=oracle)
         manager = SkillManager(

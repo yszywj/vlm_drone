@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 import csv
+from hashlib import sha256
 import io
 import json
 import os
@@ -22,6 +23,7 @@ import tempfile
 import time
 
 from models.base import ChatMessage, GenerationOptions, ModelClient, ModelResponse
+from common.ids import validate_mission_id, validate_uav_id
 from planner.llm_planner import LLMPlanner
 from planner.dynamic_llm_planner import DynamicLLMPlanner
 from planner.policy import PlannerLimits, PlannerPolicy
@@ -30,6 +32,7 @@ from planner.schemas import (
     PlannerRequest,
     PlannerWorldContext,
     SkillPlanDraft,
+    SkillPlanDraftV2,
 )
 from planner.skill_catalog import SkillCatalog, build_default_skill_catalog
 from runtime.plan_validator import PlanValidator
@@ -191,6 +194,15 @@ def planner_world_case_to_runtime_context(
     return _renderer_world_case_to_runtime_context(world)
 
 
+def _mission_id_for_sample(sample_id: str) -> str:
+    """Derive a stable trusted route without exposing dataset prose."""
+
+    if not isinstance(sample_id, str) or not sample_id:
+        raise ValueError("sample_id must be a non-empty string")
+    digest = sha256(sample_id.encode("utf-8")).hexdigest()[:20]
+    return validate_mission_id(f"mission_{digest}")
+
+
 class PlannerDatasetEvaluator:
     """Evaluate scripted Gold or production LLM Planner outputs sample by sample."""
 
@@ -207,6 +219,7 @@ class PlannerDatasetEvaluator:
         planner_policy: PlannerPolicy | None = None,
         validator: PlanValidator | None = None,
         logger: object | None = None,
+        uav_id: str = "uav_1",
     ) -> None:
         planner_modes = {"scripted", "llm", "dynamic_scripted", "dynamic_llm"}
         if planner not in planner_modes:
@@ -226,6 +239,7 @@ class PlannerDatasetEvaluator:
             checked_worlds[context_id] = world
 
         self.planner_mode = planner
+        self.uav_id = validate_uav_id(uav_id)
         self.world_cases = checked_worlds
         self.ontology = ontology or TargetOntology.load_default()
         self.judge = IntentJudge(self.ontology)
@@ -567,12 +581,15 @@ class PlannerDatasetEvaluator:
         assert self._dynamic_llm_planner is not None
         recorder = self._recording_client
         recorder.reset()
-        predicted: SkillPlanDraft | None = None
+        predicted: SkillPlanDraftV2 | None = None
         diagnostics: object | None = None
         request_failed = False
         request = PlannerRequest(
             instruction=sample.metadata.instruction,
             world_context=context,
+            mission_id=_mission_id_for_sample(sample.sample_id),
+            uav_id=self.uav_id,
+            plan_version=1,
         )
         try:
             plan_with_diagnostics = getattr(
@@ -600,22 +617,32 @@ class PlannerDatasetEvaluator:
             if recorder.calls <= 1
             else (recorder.responses[1] if len(recorder.responses) > 1 else "")
         )
+        initial_draft = self._strict_parse_dynamic_or_none(
+            initial_raw,
+            request=request,
+        )
+        final_draft = predicted or self._strict_parse_dynamic_or_none(
+            final_raw,
+            request=request,
+        )
         initial_result = self._dynamic_judge.judge(
             gold=sample.gold,
             world=world,
             world_context=context,
-            raw_output=initial_raw,
+            raw_output=("" if initial_draft is None else None),
+            draft=(
+                None if initial_draft is None else initial_draft.to_v1()
+            ),
             source="dynamic_llm",
         )
         final_result = self._dynamic_judge.judge(
             gold=sample.gold,
             world=world,
             world_context=context,
-            raw_output=final_raw,
-            draft=predicted,
+            raw_output=("" if final_draft is None else None),
+            draft=(None if final_draft is None else final_draft.to_v1()),
             source="dynamic_llm",
         )
-        initial_draft = self._strict_parse_dynamic_or_none(initial_raw)
 
         if recorder.calls > 2:
             raise PlannerEvaluationError(
@@ -665,7 +692,7 @@ class PlannerDatasetEvaluator:
             initial_raw=initial_raw,
             final_raw=final_raw,
             initial_draft=initial_draft,
-            final_draft=predicted,
+            final_draft=final_draft,
             initial_result=initial_result,
             final_result=final_result,
             model_calls=recorder.calls,
@@ -677,9 +704,13 @@ class PlannerDatasetEvaluator:
         )
 
     @staticmethod
-    def _strict_parse_dynamic_or_none(raw: str) -> SkillPlanDraft | None:
+    def _strict_parse_dynamic_or_none(
+        raw: str,
+        *,
+        request: PlannerRequest,
+    ) -> SkillPlanDraftV2 | None:
         try:
-            return DynamicLLMPlanner._parse_plan_draft(raw)
+            draft = DynamicLLMPlanner._parse_plan_draft_v2(raw)
         except (
             json.JSONDecodeError,
             OverflowError,
@@ -688,6 +719,13 @@ class PlannerDatasetEvaluator:
             ValueError,
         ):
             return None
+        if (
+            draft.mission_id != request.mission_id
+            or draft.uav_id != request.uav_id
+            or draft.plan_version != request.plan_version
+        ):
+            return None
+        return draft
 
     @staticmethod
     def _dynamic_record(
@@ -698,8 +736,8 @@ class PlannerDatasetEvaluator:
         gold_draft: SkillPlanDraft,
         initial_raw: str,
         final_raw: str,
-        initial_draft: SkillPlanDraft | None,
-        final_draft: SkillPlanDraft | None,
+        initial_draft: SkillPlanDraft | SkillPlanDraftV2 | None,
+        final_draft: SkillPlanDraft | SkillPlanDraftV2 | None,
         initial_result: DynamicPlanJudgeResult,
         final_result: DynamicPlanJudgeResult,
         model_calls: int,

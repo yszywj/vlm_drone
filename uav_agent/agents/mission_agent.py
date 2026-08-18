@@ -9,18 +9,25 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from math import isfinite
 from numbers import Real
+import inspect
 
+from common.ids import generate_routing_id, validate_mission_id, validate_uav_id
 from perception.runtime import (
     PerceptionBoundaryError,
     PerceptionRuntimeProfile,
     observation_contains_oracle_data,
 )
 from planner.base import MissionPlanner
-from planner.schemas import CompiledMission, PlannerRequest, PlannerWorldContext
+from planner.schemas import (
+    CompiledMission,
+    PlannerRequest,
+    PlannerWorldContext,
+    SkillPlanDraftV2,
+)
 from runtime.plan_validator import PlanValidator
 from runtime.safety_supervisor import (
     SafetyAction,
@@ -38,6 +45,21 @@ from skills.types import (
 )
 from target.target_manager import TargetManager
 from target.types import TargetLifecycle, TargetSnapshot, TargetSpec
+from agents.visual_review_coordinator import (
+    RevisionCompletionAction,
+    VisualReviewCoordinator,
+)
+from agents.plan_revision_coordinator import (
+    PlanRevisionCoordinator,
+    PlanRevisionState,
+)
+from runtime.events import MissionEvent
+from runtime.world_belief import (
+    CandidateSummary,
+    QwenRequestState,
+    QwenRequestStatus,
+    WorldBelief,
+)
 
 
 class AgentStatus(str, Enum):
@@ -59,6 +81,13 @@ class MissionAgentSnapshot:
     target: TargetSnapshot
     feedback: dict[str, object] | None
     last_error: str | None
+    # Public state must always carry the Agent's explicit routing identity.
+    uav_id: str = field(kw_only=True)
+    mission_id: str | None = None
+    plan_version: int | None = None
+    skill_report: dict[str, object] | None = None
+    visual_review: dict[str, object] | None = None
+    plan_revision: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, AgentStatus):
@@ -77,6 +106,27 @@ class MissionAgentSnapshot:
             object.__setattr__(self, "feedback", deepcopy(self.feedback))
         if self.last_error is not None and not isinstance(self.last_error, str):
             raise TypeError("last_error must be a string or None")
+        object.__setattr__(self, "uav_id", validate_uav_id(self.uav_id))
+        if self.mission_id is not None:
+            validate_mission_id(self.mission_id)
+        if self.plan_version is not None and (
+            isinstance(self.plan_version, bool)
+            or not isinstance(self.plan_version, int)
+            or self.plan_version <= 0
+        ):
+            raise ValueError("plan_version must be a positive integer or None")
+        if self.skill_report is not None:
+            if not isinstance(self.skill_report, dict):
+                raise TypeError("skill_report must be a dict or None")
+            object.__setattr__(self, "skill_report", deepcopy(self.skill_report))
+        if self.visual_review is not None:
+            if not isinstance(self.visual_review, dict):
+                raise TypeError("visual_review must be a dict or None")
+            object.__setattr__(self, "visual_review", deepcopy(self.visual_review))
+        if self.plan_revision is not None:
+            if not isinstance(self.plan_revision, dict):
+                raise TypeError("plan_revision must be a dict or None")
+            object.__setattr__(self, "plan_revision", deepcopy(self.plan_revision))
 
     def to_dict(self) -> dict[str, object]:
         """Return a fresh JSON-compatible view with stable enum strings."""
@@ -90,6 +140,18 @@ class MissionAgentSnapshot:
                 None if self.feedback is None else deepcopy(self.feedback)
             ),
             "last_error": self.last_error,
+            "uav_id": self.uav_id,
+            "mission_id": self.mission_id,
+            "plan_version": self.plan_version,
+            "skill_report": (
+                None if self.skill_report is None else deepcopy(self.skill_report)
+            ),
+            "visual_review": (
+                None if self.visual_review is None else deepcopy(self.visual_review)
+            ),
+            "plan_revision": (
+                None if self.plan_revision is None else deepcopy(self.plan_revision)
+            ),
         }
 
 
@@ -132,6 +194,9 @@ class MissionAgent:
             PerceptionRuntimeProfile.PRODUCTION
         ),
         acknowledge_privileged_oracle: bool = False,
+        uav_id: str | None = None,
+        visual_review_coordinator: VisualReviewCoordinator | None = None,
+        plan_revision_coordinator: PlanRevisionCoordinator | None = None,
     ) -> None:
         if not isinstance(planner, MissionPlanner):
             raise TypeError("planner must be a MissionPlanner")
@@ -173,6 +238,49 @@ class MissionAgent:
             raise MissionAgentError("skill_manager must be IDLE at construction")
         if target_manager.lifecycle is not TargetLifecycle.UNINITIALIZED:
             raise MissionAgentError("target_manager must be UNINITIALIZED")
+        bound_uav_id = (
+            skill_manager.uav_id
+            if uav_id is None
+            else validate_uav_id(uav_id)
+        )
+        if bound_uav_id != skill_manager.uav_id:
+            raise MissionAgentError(
+                "MissionAgent.uav_id must match SkillManager.uav_id"
+            )
+        if visual_review_coordinator is not None:
+            if not isinstance(visual_review_coordinator, VisualReviewCoordinator):
+                raise TypeError(
+                    "visual_review_coordinator must be a VisualReviewCoordinator or None"
+                )
+            if visual_review_coordinator.uav_id != bound_uav_id:
+                raise MissionAgentError(
+                    "VisualReviewCoordinator.uav_id must match MissionAgent.uav_id"
+                )
+            visual_review_coordinator.validate_agent_bindings(
+                skill_manager,
+                target_manager,
+            )
+        if plan_revision_coordinator is not None:
+            if not isinstance(
+                plan_revision_coordinator,
+                PlanRevisionCoordinator,
+            ):
+                raise TypeError(
+                    "plan_revision_coordinator must be a "
+                    "PlanRevisionCoordinator or None"
+                )
+            if plan_revision_coordinator.uav_id != bound_uav_id:
+                raise MissionAgentError(
+                    "PlanRevisionCoordinator.uav_id must match MissionAgent.uav_id"
+                )
+            plan_revision_coordinator.validate_agent_bindings(
+                skill_manager,
+                safety,
+            )
+            if visual_review_coordinator is None:
+                raise MissionAgentError(
+                    "runtime plan revision requires a VisualReviewCoordinator"
+                )
 
         self._planner = planner
         self._validator = validator
@@ -182,6 +290,9 @@ class MissionAgent:
         self._clock = clock
         self._logger = logger
         self._perception_runtime_profile = perception_runtime_profile
+        self._uav_id = bound_uav_id
+        self._visual_review_coordinator = visual_review_coordinator
+        self._plan_revision_coordinator = plan_revision_coordinator
 
         self._status = AgentStatus.IDLE
         self._compiled_mission: CompiledMission | None = None
@@ -192,6 +303,14 @@ class MissionAgent:
         # A runtime safety ABORT must finish LAND as FAILED; an ordinary cancel
         # or CANCEL_AND_LAND finishes as CANCELED.
         self._shutdown_outcome: AgentStatus | None = None
+        self._mission_id: str | None = None
+        self._plan_version: int | None = None
+        self._original_instruction: str | None = None
+        self._world_context: PlannerWorldContext | None = None
+
+    @property
+    def uav_id(self) -> str:
+        return self._uav_id
 
     def start(
         self,
@@ -208,14 +327,29 @@ class MissionAgent:
             raise MissionAgentError("skill_manager is not IDLE")
         if self._target_manager.lifecycle is not TargetLifecycle.UNINITIALIZED:
             raise MissionAgentError("target_manager is not UNINITIALIZED")
+        if self._plan_revision_coordinator is not None:
+            try:
+                self._plan_revision_coordinator.validate_mission_start(
+                    instruction,
+                    world_context,
+                )
+            except Exception as exc:
+                raise MissionAgentError(
+                    self._error_text("revision coordinator context rejected", exc)
+                ) from exc
 
         self._status = AgentStatus.PLANNING
         self._last_error = None
+        self._mission_id = generate_routing_id("mission")
+        self._plan_version = 1
         self._safe_log("[MissionAgent] planner_started")
         try:
             request = PlannerRequest(
                 instruction=instruction,
                 world_context=world_context,
+                mission_id=self._mission_id,
+                uav_id=self._uav_id,
+                plan_version=self._plan_version,
             )
             planner_output = self._planner.plan(request)
         except Exception as exc:
@@ -224,11 +358,41 @@ class MissionAgent:
         self._safe_log("[MissionAgent] planner_finished status=SUCCEEDED")
 
         try:
-            compiled = self._validator.validate_and_compile(
-                planner_output,
-                world_context,
-                source=self._planner_source(),
-            )
+            validator_method = self._validator.validate_and_compile
+            validator_parameters = inspect.signature(validator_method).parameters
+            if {"mission_id", "uav_id", "plan_version"}.issubset(
+                validator_parameters
+            ):
+                compiled = validator_method(
+                    planner_output,
+                    world_context,
+                    source=self._planner_source(),
+                    mission_id=self._mission_id,
+                    uav_id=self._uav_id,
+                    plan_version=self._plan_version,
+                )
+                if (
+                    compiled.task_plan.mission_id != self._mission_id
+                    or compiled.task_plan.uav_id != self._uav_id
+                    or compiled.task_plan.plan_version != self._plan_version
+                ):
+                    raise MissionAgentError(
+                        "validator returned mismatched task routing IDs"
+                    )
+            else:
+                # Compatibility for old test/adapter subclasses.  The trusted
+                # Agent, never the planner output, binds their compiled plan.
+                compiled = validator_method(
+                    planner_output,
+                    world_context,
+                    source=self._planner_source(),
+                )
+                compiled = _rebind_compiled_mission(
+                    compiled,
+                    mission_id=self._mission_id,
+                    uav_id=self._uav_id,
+                    plan_version=self._plan_version,
+                )
             owned_compiled = _copy_compiled_mission(compiled)
         except Exception as exc:
             self._raise_start_failure("plan validation failed", exc)
@@ -268,6 +432,8 @@ class MissionAgent:
         # separate copy so callers cannot mutate future target metadata or
         # control-flow queries after Safety preflight.
         self._compiled_mission = owned_compiled
+        self._original_instruction = instruction.strip()
+        self._world_context = world_context
         self._mission_start_time_s = mission_start_time
         self._last_observation_timestamp = None
         self._transition_cursor = 0
@@ -289,6 +455,15 @@ class MissionAgent:
         if self._status is not AgentStatus.RUNNING:
             raise MissionAgentError(
                 f"tick requires RUNNING, current status is {self._status.value}"
+            )
+        observation_uav_id = (
+            getattr(observation, "uav_id", None)
+            if isinstance(observation, Observation)
+            else None
+        )
+        if observation_uav_id is not None and observation_uav_id != self._uav_id:
+            raise MissionAgentError(
+                "Observation.uav_id does not match this MissionAgent"
             )
 
         # Enforce the information boundary before timestamp de-duplication,
@@ -356,6 +531,18 @@ class MissionAgent:
             decision = self._runtime_safety_decision(observation)
             self._log_safety(decision, phase="runtime")
             if decision.action is SafetyAction.CONTINUE:
+                revision = self._plan_revision_coordinator
+                if revision is not None and revision.is_inflight:
+                    # The visual and revision planners intentionally share one
+                    # per-UAV AsyncModelWorker. While revision owns it, do not
+                    # let the visual coordinator drain that routed result as
+                    # an orphan. Both branches remain non-blocking.
+                    self._tick_plan_revision()
+                else:
+                    self._tick_visual_review(observation, decision)
+                    self._handoff_visual_plan_revision()
+                    if revision is not None and revision.is_inflight:
+                        self._tick_plan_revision()
                 self._tick_manager_or_abort(observation)
             else:
                 forced_outcome = (
@@ -431,12 +618,20 @@ class MissionAgent:
             )
 
         self._safety.reset()
+        if self._plan_revision_coordinator is not None:
+            self._plan_revision_coordinator.reset()
+        if self._visual_review_coordinator is not None:
+            self._visual_review_coordinator.reset()
         self._compiled_mission = None
         self._transition_cursor = 0
         self._last_observation_timestamp = None
         self._mission_start_time_s = None
         self._last_error = None
         self._shutdown_outcome = None
+        self._mission_id = None
+        self._plan_version = None
+        self._original_instruction = None
+        self._world_context = None
         self._status = AgentStatus.IDLE
         self._safe_log("[MissionAgent] reset status=IDLE")
         return self.snapshot()
@@ -447,12 +642,32 @@ class MissionAgent:
         task_status = self._skill_manager.task_status
         active_name = self._skill_manager.active_name
         feedback: dict[str, object] | None = None
+        skill_report: dict[str, object] | None = None
+        visual_review: dict[str, object] | None = None
+        plan_revision: dict[str, object] | None = None
         if active_name is not None:
             try:
                 feedback = self._skill_manager.get_feedback().to_dict()
             except Exception:
                 # Feedback is observational; losing it must not alter control.
                 feedback = None
+        try:
+            report = self._skill_manager.get_execution_report()
+            skill_report = None if report is None else report.to_dict()
+        except Exception:
+            skill_report = None
+        if self._visual_review_coordinator is not None:
+            try:
+                visual_review = self._visual_review_coordinator.snapshot().to_dict()
+            except Exception:
+                visual_review = None
+        if self._plan_revision_coordinator is not None:
+            try:
+                plan_revision = (
+                    self._plan_revision_coordinator.snapshot().to_dict()
+                )
+            except Exception:
+                plan_revision = None
         return MissionAgentSnapshot(
             status=self._status,
             task_status=_enum_text(task_status),
@@ -462,7 +677,129 @@ class MissionAgent:
             target=self._target_manager.snapshot(),
             feedback=None if feedback is None else deepcopy(feedback),
             last_error=self._last_error,
+            uav_id=self._uav_id,
+            mission_id=self._mission_id,
+            plan_version=self._plan_version,
+            skill_report=skill_report,
+            visual_review=visual_review,
+            plan_revision=plan_revision,
         )
+
+    def submit_review_event(self, event: MissionEvent) -> None:
+        """Queue a routed semantic event without exposing the environment.
+
+        Event submission does not call a model and does not change controller
+        state. The next distinct, Safety-approved observation lets the review
+        coordinator decide whether an asynchronous request is due.
+        """
+
+        if self._status is not AgentStatus.RUNNING:
+            raise MissionAgentError(
+                "submit_review_event requires a RUNNING MissionAgent"
+            )
+        if self._visual_review_coordinator is None:
+            raise MissionAgentError("visual review is not configured")
+        if not isinstance(event, MissionEvent):
+            raise TypeError("event must be a MissionEvent")
+        if (
+            event.uav_id != self._uav_id
+            or event.mission_id != self._mission_id
+            or event.plan_version != self._plan_version
+        ):
+            raise MissionAgentError("review event routing IDs do not match mission")
+        try:
+            self._visual_review_coordinator.submit_event(event)
+        except Exception as exc:
+            raise MissionAgentError(
+                self._error_text("review event rejected", exc)
+            ) from exc
+
+    def complete_visual_plan_revision(
+        self,
+        action: RevisionCompletionAction | str,
+        *,
+        replacement_plan: TaskPlan | None = None,
+    ) -> MissionAgentSnapshot:
+        """Finish a deferred blocking review after trusted revision work.
+
+        A replacement must already be compiled and validated by the separate
+        revision pipeline. The Agent performs a final Safety preflight before
+        asking SkillManager to atomically replace the interrupted suffix.
+        """
+
+        if self._status is not AgentStatus.RUNNING:
+            raise MissionAgentError(
+                "complete_visual_plan_revision requires a RUNNING MissionAgent"
+            )
+        if self._plan_revision_coordinator is not None:
+            raise MissionAgentError(
+                "automatic PlanRevisionCoordinator owns revision completion"
+            )
+        coordinator = self._visual_review_coordinator
+        compiled = self._compiled_mission
+        if coordinator is None or compiled is None:
+            raise MissionAgentError("visual review is not configured")
+        try:
+            selected = RevisionCompletionAction(action)
+        except (TypeError, ValueError):
+            raise MissionAgentError("revision action must be RESUME or REPLACE") from None
+
+        replacement_compiled: CompiledMission | None = None
+        if selected is RevisionCompletionAction.REPLACE:
+            if not isinstance(replacement_plan, TaskPlan):
+                raise TypeError("REPLACE requires a validated replacement TaskPlan")
+            if (
+                replacement_plan.mission_id != self._mission_id
+                or replacement_plan.uav_id != self._uav_id
+                or self._plan_version is None
+                or replacement_plan.plan_version != self._plan_version + 1
+            ):
+                raise MissionAgentError("replacement TaskPlan routing/version mismatch")
+            replacement_compiled = CompiledMission(
+                planner_output=compiled.planner_output,
+                task_plan=replacement_plan,
+                source=compiled.source,
+                compiler_notes=(
+                    *compiled.compiler_notes,
+                    "runtime suffix revision preflight-approved",
+                ),
+            )
+            try:
+                decision = self._safety.preflight(replacement_compiled)
+            except Exception as exc:
+                raise MissionAgentError(
+                    self._error_text("revision safety preflight failed", exc)
+                ) from exc
+            if not isinstance(decision, SafetyDecision):
+                raise MissionAgentError(
+                    "revision safety preflight returned an invalid decision"
+                )
+            self._log_safety(decision, phase="revision_preflight")
+            if decision.action is not SafetyAction.CONTINUE:
+                raise MissionAgentError(
+                    "revision safety preflight rejected replacement: "
+                    f"{decision.action.value}: {decision.reason}"
+                )
+        elif replacement_plan is not None:
+            raise ValueError("RESUME does not accept replacement_plan")
+
+        try:
+            coordinator.complete_revision(
+                selected,
+                replacement_plan=replacement_plan,
+            )
+        except Exception as exc:
+            raise MissionAgentError(
+                self._error_text("revision completion failed", exc)
+            ) from exc
+        if replacement_compiled is not None:
+            self._compiled_mission = _copy_compiled_mission(replacement_compiled)
+            self._plan_version = replacement_plan.plan_version
+        self._safe_log(
+            "[MissionAgent] visual_revision_completed "
+            f"action={selected.value} plan_version={self._plan_version}"
+        )
+        return self.snapshot()
 
     def _planner_source(self) -> str:
         explicit = getattr(self._planner, "source", None)
@@ -530,6 +867,249 @@ class MissionAgent:
             )
         return decision
 
+    def _tick_visual_review(
+        self,
+        observation: Observation,
+        safety_decision: SafetyDecision,
+    ) -> None:
+        coordinator = self._visual_review_coordinator
+        compiled = self._compiled_mission
+        if coordinator is None or compiled is None:
+            return
+        if self._mission_id is None or self._plan_version is None:
+            raise MissionAgentError("visual review route is missing")
+        active_skill = self._skill_manager.active_name
+        active_step_id = self._skill_manager.active_planned_step_id
+        feedback: Mapping[str, object] | None = None
+        if active_skill is not None:
+            try:
+                feedback = self._skill_manager.get_feedback().to_dict()
+            except Exception:
+                feedback = None
+        try:
+            now = self._read_clock()
+            start = self._mission_start_time_s
+            elapsed = 0.0 if start is None else max(0.0, now - start)
+            coordinator.tick(
+                observation,
+                mission_id=self._mission_id,
+                plan_version=self._plan_version,
+                active_skill=active_skill,
+                active_step_id=active_step_id,
+                target_spec=compiled.target_spec,
+                target_snapshot=self._target_manager.snapshot(),
+                safety_decision=safety_decision,
+                skill_feedback=feedback,
+                mission_elapsed_s=elapsed,
+            )
+        except Exception as exc:
+            # A shadow/non-blocking review is observational and can never make
+            # an otherwise safe flight fail. If a gate-mode request had already
+            # entered HOVER, its trusted manager timeout policy remains active.
+            self._safe_log(
+                "[MissionAgent] visual_review_error "
+                + self._error_text("review tick failed", exc)
+            )
+
+    def _handoff_visual_plan_revision(self) -> None:
+        """Transfer one visual request while preserving its blocking HOVER."""
+
+        visual = self._visual_review_coordinator
+        revision = self._plan_revision_coordinator
+        compiled = self._compiled_mission
+        if visual is None or revision is None or compiled is None:
+            return
+        pending = visual.pending_revision
+        if pending is None:
+            return
+        semantic_plan = compiled.planner_output
+        if not isinstance(semantic_plan, SkillPlanDraftV2):
+            # Legacy plans have no routed/versioned suffix schema.  Do not
+            # weaken that boundary merely to satisfy a model recommendation.
+            try:
+                visual.complete_revision(RevisionCompletionAction.RESUME)
+            except Exception as exc:
+                self._safe_log(
+                    "[MissionAgent] revision_handoff_error "
+                    + self._error_text("legacy plan resume failed", exc)
+                )
+            return
+        try:
+            belief = self._build_revision_world_belief(
+                semantic_plan,
+                recent_event=pending.event,
+                candidate_id=pending.candidate_id,
+            )
+            snapshot = revision.submit_event(
+                pending.event,
+                current_plan=semantic_plan,
+                world_belief=belief,
+            )
+            if snapshot.state is PlanRevisionState.IN_FLIGHT:
+                # This is a clear-only ownership transfer. The independent
+                # coordinator has actually accepted the request and is now the
+                # sole component allowed to resume/replace Manager. A rejected
+                # submission leaves the visual coordinator owning its wait.
+                visual.acknowledge_revision_handoff(
+                    event_id=pending.event.event_id,
+                )
+            self._safe_log(
+                "[MissionAgent] revision_handoff "
+                f"state={snapshot.state.value} "
+                f"request_id={snapshot.request_id}"
+            )
+        except Exception as exc:
+            # The visual coordinator still owns the wait if acknowledgement
+            # did not happen; its trusted HOVER timeout remains authoritative.
+            self._safe_log(
+                "[MissionAgent] revision_handoff_error "
+                + self._error_text("revision request rejected", exc)
+            )
+
+    def _tick_plan_revision(self) -> None:
+        """Poll the second-stage worker once and synchronize accepted version."""
+
+        coordinator = self._plan_revision_coordinator
+        compiled = self._compiled_mission
+        if coordinator is None or compiled is None:
+            return
+        semantic_plan = compiled.planner_output
+        if not isinstance(semantic_plan, SkillPlanDraftV2):
+            return
+        try:
+            belief = self._build_revision_world_belief(semantic_plan)
+            snapshot = coordinator.tick(
+                current_plan=semantic_plan,
+                world_belief=belief,
+            )
+            if snapshot.state is not PlanRevisionState.ACCEPTED:
+                return
+            accepted = coordinator.latest_accepted_revision
+            if accepted is None:
+                raise MissionAgentError(
+                    "accepted revision has no validated compiled mission"
+                )
+            revised = accepted.compiled_mission
+            if (
+                self._mission_id is None
+                or self._plan_version is None
+                or revised.task_plan.mission_id != self._mission_id
+                or revised.task_plan.uav_id != self._uav_id
+            ):
+                raise MissionAgentError("accepted revision routing mismatch")
+            if revised.task_plan.plan_version == self._plan_version:
+                return
+            if revised.task_plan.plan_version != self._plan_version + 1:
+                raise MissionAgentError("accepted revision version jump")
+            self._compiled_mission = _copy_compiled_mission(revised)
+            self._plan_version = revised.task_plan.plan_version
+            self._safe_log(
+                "[MissionAgent] revision_adopted "
+                f"request_id={snapshot.request_id} "
+                f"plan_version={self._plan_version}"
+            )
+        except Exception as exc:
+            # The coordinator owns a trusted HOVER timeout/fallback. A model
+            # or parsing failure must not crash the simulation tick.
+            self._safe_log(
+                "[MissionAgent] plan_revision_error "
+                + self._error_text("revision tick failed", exc)
+            )
+
+    def _build_revision_world_belief(
+        self,
+        semantic_plan: SkillPlanDraftV2,
+        *,
+        recent_event: MissionEvent | None = None,
+        candidate_id: str | None = None,
+    ) -> WorldBelief:
+        """Create a bounded, image-free main-thread snapshot for revision."""
+
+        step_id = self._skill_manager.active_planned_step_id
+        active_name = self._skill_manager.active_name
+        if step_id is None or active_name is None:
+            raise MissionAgentError("revision requires an active planned step")
+        feedback: Mapping[str, object] | None
+        try:
+            feedback = self._skill_manager.get_feedback().to_dict()
+        except Exception:
+            feedback = None
+        runtime_spec = self._target_manager.target_spec
+        target_spec = (
+            semantic_plan.target_spec if runtime_spec is None else runtime_spec
+        )
+        target_snapshot = (
+            None if runtime_spec is None else self._target_manager.snapshot()
+        )
+        revision_snapshot = (
+            None
+            if self._plan_revision_coordinator is None
+            else self._plan_revision_coordinator.snapshot()
+        )
+        if (
+            revision_snapshot is not None
+            and revision_snapshot.state is PlanRevisionState.IN_FLIGHT
+            and revision_snapshot.request_id is not None
+            and revision_snapshot.review_id is not None
+            and revision_snapshot.submitted_timestamp_s is not None
+        ):
+            qwen_status = QwenRequestStatus(
+                state=QwenRequestState.IN_FLIGHT,
+                request_id=revision_snapshot.request_id,
+                review_id=revision_snapshot.review_id,
+                blocking=True,
+                submitted_timestamp_s=(
+                    revision_snapshot.submitted_timestamp_s
+                ),
+            )
+        else:
+            qwen_status = QwenRequestStatus()
+        latest_frame = None
+        if self._visual_review_coordinator is not None:
+            try:
+                latest_frame = (
+                    self._visual_review_coordinator.snapshot().latest_frame_ref
+                )
+            except Exception:
+                latest_frame = None
+        now = self._read_clock()
+        start = self._mission_start_time_s
+        elapsed = 0.0 if start is None else max(0.0, now - start)
+        candidate_summaries = (
+            ()
+            if (
+                candidate_id is None
+                or recent_event is None
+                or not isinstance(recent_event.payload.get("source"), str)
+                or not recent_event.payload["source"].strip()
+            )
+            else (
+                CandidateSummary(
+                    candidate_id=candidate_id,
+                    confidence=None,
+                    last_seen_timestamp_s=recent_event.timestamp_s,
+                    source=recent_event.payload["source"],
+                    observation_count=1,
+                ),
+            )
+        )
+        return WorldBelief(
+            mission_id=semantic_plan.mission_id,
+            uav_id=semantic_plan.uav_id,
+            plan_version=semantic_plan.plan_version,
+            current_step_id=step_id,
+            current_skill=_enum_text(active_name),
+            skill_feedback=feedback,
+            target_spec=target_spec,
+            target_snapshot=target_snapshot,
+            candidate_summaries=candidate_summaries,
+            recent_events=(() if recent_event is None else (recent_event,)),
+            qwen_request_status=qwen_status,
+            latest_frame_ref=latest_frame,
+            mission_elapsed_s=elapsed,
+            plan_id=f"plan_{semantic_plan.plan_version}",
+        )
+
     def _tick_manager_or_abort(self, observation: Observation) -> None:
         try:
             self._skill_manager.tick(observation)
@@ -579,18 +1159,34 @@ class MissionAgent:
     def _apply_target_transition(self, record: TransitionRecord) -> None:
         if not isinstance(record, TransitionRecord):
             raise MissionAgentError("SkillManager emitted an invalid transition")
+        if record.uav_id != self._uav_id:
+            raise MissionAgentError(
+                "SkillManager transition uav_id does not match MissionAgent"
+            )
         compiled = self._compiled_mission
         if compiled is None:
             raise MissionAgentError("compiled mission is missing")
 
         if record.new_skill is SkillName.SEARCH:
+            if (
+                record.old_skill is SkillName.INSPECT
+                and self._target_manager.lifecycle
+                in {TargetLifecycle.SEARCHING, TargetLifecycle.CANDIDATE}
+            ):
+                # A runtime suffix revision may temporarily replace an
+                # interrupted SEARCH with INSPECT and then return to the same
+                # semantic search. Preserve the existing TargetSpec/candidate
+                # lifecycle instead of fabricating a second search target.
+                return
             if self._target_manager.lifecycle is not TargetLifecycle.UNINITIALIZED:
                 raise MissionAgentError("SEARCH entered with an active target")
-            target_description = self._search_target_description(
-                getattr(record, "new_step_id", None)
-            )
+            # The initial planner identity is immutable. SEARCH's compiled
+            # string remains useful for legacy plan compatibility, but a routed
+            # schema-v2 plan must use its structured TargetSpec throughout the
+            # target lifecycle.
+            self._search_target_description(getattr(record, "new_step_id", None))
             self._target_manager.start_search(
-                TargetSpec(target_description), record.timestamp
+                compiled.target_spec, record.timestamp
             )
             return
 
@@ -845,6 +1441,7 @@ class MissionAgent:
     def _log_skill_transition(self, record: TransitionRecord) -> None:
         self._safe_log(
             "[MissionAgent] skill_transition "
+            f"uav_id={record.uav_id} mission_id={record.mission_id} "
             f"old={_optional_enum_text(record.old_skill)} "
             f"old_step_id={getattr(record, 'old_step_id', None)} "
             f"status={_optional_enum_text(record.old_status)} "
@@ -867,7 +1464,13 @@ class MissionAgent:
         if self._logger is None:
             return
         try:
-            self._logger(str(message))
+            mission_id = self._mission_id or "NONE"
+            plan_version = self._plan_version or 0
+            self._logger(
+                f"[Routing] uav_id={self._uav_id} "
+                f"mission_id={mission_id} plan_version={plan_version} "
+                f"{message}"
+            )
         except Exception:
             # Logging is observational and never changes mission execution.
             pass
@@ -890,7 +1493,36 @@ def _copy_compiled_mission(compiled: CompiledMission) -> CompiledMission:
                 step.recovery,
             )
             for step in compiled.task_plan.steps
-        )
+        ),
+        mission_id=compiled.task_plan.mission_id,
+        uav_id=compiled.task_plan.uav_id,
+        plan_version=compiled.task_plan.plan_version,
+    )
+    return CompiledMission(
+        planner_output=compiled.planner_output,
+        task_plan=plan,
+        source=compiled.source,
+        compiler_notes=compiled.compiler_notes,
+    )
+
+
+def _rebind_compiled_mission(
+    compiled: CompiledMission,
+    *,
+    mission_id: str,
+    uav_id: str,
+    plan_version: int,
+) -> CompiledMission:
+    """Trusted compatibility adapter for validators predating routing IDs."""
+
+    plan = TaskPlan(
+        tuple(
+            TaskStep(step.step_id, step.skill, step.params, step.recovery)
+            for step in compiled.task_plan.steps
+        ),
+        mission_id=mission_id,
+        uav_id=uav_id,
+        plan_version=plan_version,
     )
     return CompiledMission(
         planner_output=compiled.planner_output,

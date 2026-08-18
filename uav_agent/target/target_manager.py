@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from target.types import (
     TargetEvent,
     TargetLifecycle,
@@ -46,6 +48,7 @@ class TargetManager:
     def __init__(self) -> None:
         self._lifecycle = TargetLifecycle.UNINITIALIZED
         self._description = _UNINITIALIZED_DESCRIPTION
+        self._target_spec: TargetSpec | None = None
         self._target_id: str | None = None
         self._confidence: float | None = None
         self._last_seen_position: tuple[float, float, float] | None = None
@@ -62,6 +65,34 @@ class TargetManager:
     def lifecycle(self) -> TargetLifecycle:
         return self._lifecycle
 
+    @property
+    def target_spec(self) -> TargetSpec | None:
+        """Return the immutable mission TargetSpec, if SEARCH has started."""
+
+        return self._target_spec
+
+    def update_mutable_appearance_notes(
+        self,
+        notes: Sequence[str],
+    ) -> TargetSpec:
+        """Update appearance notes without permitting mission identity drift."""
+
+        if self._lifecycle not in _ACTIVE_STATES:
+            raise TargetStateError(
+                "appearance notes require an active target lifecycle"
+            )
+        if self._target_spec is None:
+            raise TargetStateError("active target has no TargetSpec")
+        updated = self._target_spec.with_mutable_appearance_notes(notes)
+        if (
+            updated.original_description != self._target_spec.original_description
+            or updated.immutable_identity_summary
+            != self._target_spec.immutable_identity_summary
+        ):
+            raise TargetStateError("appearance update attempted to change identity")
+        self._target_spec = updated
+        return updated
+
     def start_search(self, target_spec: TargetSpec, timestamp_s: float) -> None:
         if not isinstance(target_spec, TargetSpec):
             raise TypeError("target_spec must be a TargetSpec")
@@ -72,6 +103,7 @@ class TargetManager:
         )
 
         self._description = target_spec.description
+        self._target_spec = target_spec
         self._target_id = None
         self._confidence = None
         self._last_seen_position = None
@@ -466,6 +498,7 @@ class TargetManager:
             )
         self._lifecycle = TargetLifecycle.UNINITIALIZED
         self._description = _UNINITIALIZED_DESCRIPTION
+        self._target_spec = None
         self._target_id = None
         self._confidence = None
         self._last_seen_position = None

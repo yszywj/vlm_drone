@@ -14,7 +14,7 @@ from math import hypot
 import re
 
 from planner.policy import PlannerLimits, PlannerPolicy
-from planner.schemas import PlannerWorldContext, SkillPlanDraft
+from planner.schemas import PlannerWorldContext, SkillPlanDraft, SkillPlanDraftV2
 
 
 _TARGET_REF_PATTERN = re.compile(
@@ -36,6 +36,7 @@ class PlanIssueCode(str, Enum):
     TRACK_LIMIT_EXCEEDED = "TRACK_LIMIT_EXCEEDED"
     TOP_LEVEL_REACQUIRE_FORBIDDEN = "TOP_LEVEL_REACQUIRE_FORBIDDEN"
     TRACK_WITHOUT_SEARCH = "TRACK_WITHOUT_SEARCH"
+    INSPECT_WITHOUT_SEARCH = "INSPECT_WITHOUT_SEARCH"
     TARGET_REF_INVALID = "TARGET_REF_INVALID"
     TARGET_REF_FORWARD = "TARGET_REF_FORWARD"
     TARGET_REF_NOT_SEARCH = "TARGET_REF_NOT_SEARCH"
@@ -86,14 +87,16 @@ class SymbolicPlanChecker:
 
     def check(
         self,
-        draft: SkillPlanDraft,
+        draft: SkillPlanDraft | SkillPlanDraftV2,
         *,
         world_context: PlannerWorldContext,
         limits: PlannerLimits,
         policy: PlannerPolicy,
     ) -> SymbolicCheckResult:
-        if not isinstance(draft, SkillPlanDraft):
-            raise TypeError("draft must be a SkillPlanDraft")
+        if isinstance(draft, SkillPlanDraftV2):
+            draft = draft.to_v1()
+        elif not isinstance(draft, SkillPlanDraft):
+            raise TypeError("draft must be a SkillPlanDraft or SkillPlanDraftV2")
         if not isinstance(world_context, PlannerWorldContext):
             raise TypeError("world_context must be a PlannerWorldContext")
         if not isinstance(limits, PlannerLimits):
@@ -260,6 +263,14 @@ class SymbolicPlanChecker:
                 )
 
             if step.skill != "TRACK":
+                if step.skill == "INSPECT" and not any(
+                    previous.skill == "SEARCH" for previous in steps[:index]
+                ):
+                    add(
+                        PlanIssueCode.INSPECT_WITHOUT_SEARCH,
+                        "INSPECT requires a prior SEARCH step",
+                        step.id,
+                    )
                 continue
 
             reference = step.args.get("target_ref")

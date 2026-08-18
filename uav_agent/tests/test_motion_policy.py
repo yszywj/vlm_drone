@@ -34,7 +34,13 @@ class PolicySkill(Skill):
 
 
 def context_for(uav: KinematicUAV) -> SkillContext:
-    return SkillContext(uav=uav, camera=FakeCamera(), perception=None, clock=FakeClock())
+    return SkillContext(
+        uav=uav,
+        camera=FakeCamera(),
+        perception=None,
+        clock=FakeClock(),
+        uav_id="uav_1",
+    )
 
 
 class MotionPolicyTest(unittest.TestCase):

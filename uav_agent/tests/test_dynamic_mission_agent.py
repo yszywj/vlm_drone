@@ -239,6 +239,7 @@ class Harness:
         self.clock.set(timestamp)
         return self.agent.tick(
             Observation(
+                uav_id="uav_1",
                 timestamp=float(timestamp),
                 uav_pose=UAVState(0.0, 0.0, 10.0, 0.0),
                 uav_velocity=np.zeros(3, dtype=np.float64),
@@ -271,6 +272,7 @@ def make_harness(
             camera=FakeCamera(),
             perception=None,
             clock=clock,
+            uav_id="uav_1",
         ),
         registry=registry,
     )

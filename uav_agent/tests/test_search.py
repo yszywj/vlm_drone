@@ -8,7 +8,7 @@ import numpy as np
 from env.kinematic_uav import KinematicUAV, UAVState
 from env.moving_target import MovingTarget, TargetState
 from skills.motion_types import YawMode
-from skills.search import SearchGoal, SearchSkill
+from skills.search import SearchGoal, SearchPhase, SearchSkill
 from skills.types import Observation, SkillContext, SkillResultCode, SkillStatus
 
 
@@ -55,6 +55,7 @@ def make_context(uav: KinematicUAV, clock: ManualClock) -> SkillContext:
         camera=FakeCamera(uav),
         perception=None,
         clock=clock,
+        uav_id="uav_1",
     )
 
 
@@ -92,6 +93,7 @@ def make_observation(
     state = uav.get_pose()
     camera_position, camera_orientation = camera_pose(state)
     return Observation(
+        uav_id="uav_1",
         timestamp=clock.now(),
         uav_pose=state,
         uav_velocity=uav.get_velocity(),
@@ -211,6 +213,25 @@ def search_goal(**overrides: object) -> SearchGoal:
 
 
 class SearchSkillTest(unittest.TestCase):
+    def test_provisional_candidate_never_directly_completes_search(self) -> None:
+        uav = make_uav((0.0, 0.0, 5.0))
+        skill = SearchSkill()
+        skill.start(search_goal(), make_context(uav, ManualClock()))
+
+        skill.report_candidate_pending("candidate_1", source="qwen_vl")
+
+        self.assertIs(skill.status, SkillStatus.RUNNING)
+        self.assertIsNone(skill.get_result())
+        self.assertIs(skill.phase, SearchPhase.CANDIDATE_PENDING)
+        feedback = skill.get_feedback().data
+        self.assertEqual(feedback["phase"], "CANDIDATE_PENDING")
+        self.assertEqual(feedback["candidate_id"], "candidate_1")
+        skill.mark_waiting_for_review("candidate_1")
+        self.assertEqual(skill.get_feedback().data["phase"], "WAITING_FOR_REVIEW")
+        skill.reject_candidate("candidate_1")
+        self.assertIs(skill.phase, SearchPhase.TRANSIT)
+        self.assertNotIn("candidate_id", skill.get_feedback().data)
+
     def test_goal_defaults_and_validation(self) -> None:
         defaults = SearchGoal(
             center=(1.0, 2.0, 0.5),

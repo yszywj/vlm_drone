@@ -5,6 +5,7 @@ import math
 import os
 import socket
 import unittest
+import base64
 from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 from urllib import error as urllib_error
@@ -12,10 +13,12 @@ from urllib import error as urllib_error
 from models.base import (
     ChatMessage,
     GenerationOptions,
+    ImageURLContentPart,
     JsonSchemaResponseFormat,
     ModelConnectionError,
     ModelHTTPError,
     ModelProtocolError,
+    TextContentPart,
 )
 from models.openai_compatible_client import OpenAICompatibleClient
 
@@ -86,7 +89,7 @@ def chat_payload(content: object = "{\"status\":\"ok\"}") -> dict[str, object]:
 
 
 class ModelSchemaTest(unittest.TestCase):
-    def test_chat_message_is_text_only_and_json_compatible(self) -> None:
+    def test_chat_message_keeps_text_compatibility(self) -> None:
         message = ChatMessage("user", "只返回 JSON")
         self.assertEqual(
             message.to_dict(),
@@ -94,8 +97,60 @@ class ModelSchemaTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             ChatMessage("tool", "hello")
+
+    def test_chat_message_accepts_only_typed_multimodal_parts(self) -> None:
+        data_url = "data:image/jpeg;base64," + base64.b64encode(b"jpeg").decode()
+        message = ChatMessage(
+            "user",
+            [
+                TextContentPart("find the target"),
+                ImageURLContentPart(data_url),
+            ],
+        )
+        expected = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "find the target"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+        self.assertEqual(message.to_dict(), expected)
+        first = message.to_dict()
+        first["content"][1]["image_url"]["url"] = "changed"  # type: ignore[index]
+        self.assertEqual(message.to_dict(), expected)
+
         with self.assertRaises(TypeError):
-            ChatMessage("user", [{"type": "text", "text": "future"}])
+            ChatMessage("user", [{"type": "text", "text": "untrusted"}])
+        with self.assertRaises(TypeError):
+            ChatMessage("user", [TextContentPart("ok"), object()])
+        with self.assertRaises(ValueError):
+            ChatMessage("user", [])
+
+    def test_image_content_validates_mime_data_url_base64_and_size(self) -> None:
+        for mime_type in ("image/jpeg", "image/png", "image/webp"):
+            with self.subTest(mime_type=mime_type):
+                part = ImageURLContentPart(
+                    f"data:{mime_type};base64," + base64.b64encode(b"pixels").decode()
+                )
+                self.assertEqual(part.mime_type, mime_type)
+                self.assertEqual(part.decoded_size_bytes, len(b"pixels"))
+
+        invalid_urls = (
+            "https://example.test/image.jpg",
+            "data:text/plain;base64,SGVsbG8=",
+            "data:image/gif;base64,R0lGODlh",
+            "data:image/jpeg;base64,%%%",
+            "data:image/jpeg;base64,",
+        )
+        for url in invalid_urls:
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                ImageURLContentPart(url)
+
+        with patch("models.base.DEFAULT_MAX_IMAGE_BYTES", 3):
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                ImageURLContentPart(
+                    "data:image/jpeg;base64," + base64.b64encode(b"four").decode()
+                )
 
     def test_generation_options_validate_numeric_values_strictly(self) -> None:
         options = GenerationOptions(temperature=1, max_tokens=8, top_p=0.5)
@@ -238,6 +293,45 @@ class OpenAICompatibleClientTest(unittest.TestCase):
         self.assertEqual(body["max_tokens"], 16)
         self.assertEqual(body["top_p"], 0.8)
         self.assertNotIn("response_format", body)
+
+    def test_chat_completion_preserves_multimodal_payload_shape(self) -> None:
+        data_url = "data:image/jpeg;base64," + base64.b64encode(b"frame").decode()
+        transport = QueueTransport(FakeResponse(chat_payload()))
+        client = self.make_client(transport)
+
+        client.chat(
+            [
+                ChatMessage("system", "Return JSON"),
+                ChatMessage(
+                    "user",
+                    (
+                        TextContentPart("inspect this frame"),
+                        ImageURLContentPart(data_url),
+                    ),
+                ),
+            ]
+        )
+
+        request, _ = transport.calls[0]
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(
+            body["messages"][1]["content"],
+            [
+                {"type": "text", "text": "inspect this frame"},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        )
+        self.assertIsInstance(body["messages"][1]["content"], list)
+
+    def test_chat_completion_enforces_cross_message_image_limit(self) -> None:
+        data_url = "data:image/jpeg;base64," + base64.b64encode(b"frame").decode()
+        transport = QueueTransport(FakeResponse(chat_payload()))
+        client = self.make_client(transport, max_images_per_request=1)
+        message = lambda: ChatMessage("user", [ImageURLContentPart(data_url)])
+
+        with self.assertRaisesRegex(ValueError, "image count"):
+            client.chat([message(), message()])
+        self.assertEqual(transport.calls, [])
 
     def test_chat_completion_sends_json_schema_response_format(self) -> None:
         schema = {

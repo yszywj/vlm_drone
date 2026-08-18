@@ -19,7 +19,7 @@ class MissionPlanner(ABC):
     """Convert natural language into a high-level semantic plan.
 
     A planner may return the legacy ``MissionIntent`` or a dynamic
-    ``SkillPlanDraft``.  It must never return world-coordinate-resolved
+    ``SkillPlanDraft``/routed ``SkillPlanDraftV2``.  It must never return world-coordinate-resolved
     ``SkillGoal`` or ``TaskPlan`` values; those belong to trusted runtime code.
     """
 

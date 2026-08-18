@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import json
@@ -40,6 +42,12 @@ class ModelProtocolError(ModelClientError):
 
 _CHAT_ROLES = frozenset({"system", "user", "assistant"})
 _JSON_SCHEMA_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_IMAGE_DATA_URL_PATTERN = re.compile(
+    r"^data:(image/(?:jpeg|png|webp));base64,([A-Za-z0-9+/]*={0,2})$"
+)
+
+DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_IMAGES_PER_REQUEST = 4
 
 
 class _FrozenJSONDict(dict[str, object]):
@@ -186,35 +194,137 @@ class JsonSchemaResponseFormat:
 
 
 @dataclass(frozen=True, slots=True)
-class ChatMessage:
-    """One OpenAI-compatible chat message.
+class TextContentPart:
+    """Validated immutable text part in a multimodal chat message."""
 
-    ``content`` is deliberately typed as ``object`` so a later phase can add
-    OpenAI-compatible multimodal content lists without changing this public
-    schema.  This phase only permits text.
+    text: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("text must be a string")
+        if not self.text:
+            raise ValueError("text must be non-empty")
+
+    def to_dict(self) -> dict[str, str]:
+        """Return a fresh OpenAI-compatible content-part object."""
+
+        return {"type": "text", "text": self.text}
+
+
+@dataclass(frozen=True, slots=True)
+class ImageURLContentPart:
+    """Validated immutable base64 image data-URL content part.
+
+    Remote URLs and arbitrary mappings are intentionally not supported.  The
+    decoded-size check happens before a message can cross the model boundary.
+    """
+
+    url: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.url, str):
+            raise TypeError("url must be a string")
+        match = _IMAGE_DATA_URL_PATTERN.fullmatch(self.url)
+        if match is None:
+            raise ValueError(
+                "url must be a base64 data URL with MIME type "
+                "image/jpeg, image/png, or image/webp"
+            )
+        encoded = match.group(2)
+        if not encoded:
+            raise ValueError("image data URL payload must be non-empty")
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("image data URL contains invalid base64") from None
+        if not decoded:
+            raise ValueError("image data URL payload must be non-empty")
+        if len(decoded) > DEFAULT_MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"decoded image exceeds {DEFAULT_MAX_IMAGE_BYTES} byte limit"
+            )
+
+    @property
+    def mime_type(self) -> str:
+        """Return the already-validated MIME type without decoding the image."""
+
+        return self.url[5 : self.url.index(";base64,")]
+
+    @property
+    def decoded_size_bytes(self) -> int:
+        """Return the decoded size using base64 length arithmetic."""
+
+        encoded = self.url.split(",", 1)[1]
+        return (len(encoded) * 3) // 4 - len(encoded) + len(encoded.rstrip("="))
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a fresh OpenAI-compatible content-part object."""
+
+        return {"type": "image_url", "image_url": {"url": self.url}}
+
+
+ChatContentPart = TextContentPart | ImageURLContentPart
+
+
+@dataclass(frozen=True, slots=True)
+class ChatMessage:
+    """One validated text or multimodal OpenAI-compatible chat message.
+
+    A plain string remains fully backward compatible.  Multimodal content is
+    snapshotted as a tuple of typed immutable parts; caller-provided mappings
+    are never accepted at this trust boundary.
     """
 
     role: str
-    content: object
+    content: str | Sequence[ChatContentPart]
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, str) or self.role not in _CHAT_ROLES:
             allowed = ", ".join(sorted(_CHAT_ROLES))
             raise ValueError(f"role must be one of: {allowed}")
-        if not isinstance(self.content, str):
-            raise TypeError("content must be a string in the text-only client")
+        if isinstance(self.content, str):
+            return
+        if isinstance(self.content, (bytes, bytearray)) or not isinstance(
+            self.content,
+            Sequence,
+        ):
+            raise TypeError(
+                "content must be a string or a sequence of typed content parts"
+            )
+        parts = tuple(self.content)
+        if not parts:
+            raise ValueError("multimodal content must not be empty")
+        image_count = 0
+        for index, part in enumerate(parts):
+            if not isinstance(part, (TextContentPart, ImageURLContentPart)):
+                raise TypeError(
+                    f"content[{index}] must be TextContentPart or "
+                    "ImageURLContentPart"
+                )
+            image_count += isinstance(part, ImageURLContentPart)
+        if image_count > DEFAULT_MAX_IMAGES_PER_REQUEST:
+            raise ValueError(
+                "message image count exceeds the default per-request limit of "
+                f"{DEFAULT_MAX_IMAGES_PER_REQUEST}"
+            )
+        object.__setattr__(self, "content", parts)
 
-        # Keep JSON serializability an explicit boundary invariant.  The check
-        # remains useful when multimodal content objects are introduced later.
-        try:
-            json.dumps(self.content, allow_nan=False)
-        except (TypeError, ValueError) as exc:
-            raise TypeError("content must be JSON serializable") from exc
+    @property
+    def image_count(self) -> int:
+        """Return the number of image parts in this message."""
+
+        if isinstance(self.content, str):
+            return 0
+        return sum(isinstance(part, ImageURLContentPart) for part in self.content)
 
     def to_dict(self) -> dict[str, object]:
         """Return a fresh JSON-compatible representation."""
 
-        return {"role": self.role, "content": self.content}
+        if isinstance(self.content, str):
+            content: object = self.content
+        else:
+            content = [part.to_dict() for part in self.content]
+        return {"role": self.role, "content": content}
 
 
 @dataclass(frozen=True, slots=True)

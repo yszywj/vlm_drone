@@ -13,12 +13,20 @@ import numpy as np
 
 from env.moving_target import TargetState
 from env.uav_controller import UAVController, UAVState
+from common.ids import (
+    validate_invocation_id,
+    validate_mission_id,
+    validate_routing_id,
+    validate_uav_id,
+)
 
 
 class SkillName(str, Enum):
     TAKEOFF = "TAKEOFF"
     GOTO = "GOTO"
+    HOVER = "HOVER"
     SEARCH = "SEARCH"
+    INSPECT = "INSPECT"
     TRACK = "TRACK"
     REACQUIRE = "REACQUIRE"
     LAND = "LAND"
@@ -39,6 +47,7 @@ class SkillResultCode(Enum):
     LAND_COMPLETE = auto()
 
     GOAL_REACHED = auto()
+    HOVER_COMPLETE = auto()
     TRACK_COMPLETE = auto()
 
     TARGET_FOUND = auto()
@@ -59,6 +68,7 @@ _SUCCESS_RESULT_CODES = frozenset(
         SkillResultCode.TAKEOFF_COMPLETE,
         SkillResultCode.LAND_COMPLETE,
         SkillResultCode.GOAL_REACHED,
+        SkillResultCode.HOVER_COMPLETE,
         SkillResultCode.TRACK_COMPLETE,
         SkillResultCode.TARGET_FOUND,
     }
@@ -159,8 +169,11 @@ class SkillContext:
     camera: CameraSensor
     perception: object | None
     clock: SkillClock
+    # Routing is a trust boundary: callers must bind the context explicitly.
+    uav_id: str = field(kw_only=True)
 
     def validate(self) -> None:
+        validate_uav_id(getattr(self, "uav_id", None))
         if not isinstance(self.uav, UAVController):
             raise TypeError("SkillContext.uav must satisfy UAVController")
         if not isinstance(self.camera, CameraSensor):
@@ -187,8 +200,12 @@ class Observation:
     oracle_target_visible: bool | None = None
     oracle_target_pose: TargetState | None = None
     oracle_target_velocity: np.ndarray | None = None
+    # Kept keyword-only so a frame cannot silently inherit another UAV's
+    # identity from positional compatibility or a process-wide default.
+    uav_id: str = field(kw_only=True)
 
     def validate(self) -> None:
+        validate_uav_id(getattr(self, "uav_id", None))
         _finite_scalar(self.timestamp, "Observation.timestamp")
         if not isinstance(self.uav_pose, UAVState):
             raise TypeError("Observation.uav_pose must be a UAVState")
@@ -269,3 +286,107 @@ def _validate_vector4(value: object, name: str) -> None:
         or not np.all(np.isfinite(value))
     ):
         raise ValueError(f"{name} must be a finite numeric numpy array with shape (4,)")
+
+
+@dataclass(frozen=True, slots=True)
+class SkillInvocation:
+    """Immutable routing envelope for one concrete Skill start."""
+
+    mission_id: str
+    uav_id: str
+    plan_version: int
+    step_id: str
+    invocation_id: str
+    skill_name: SkillName
+    goal: SkillGoal
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "mission_id", validate_mission_id(self.mission_id))
+        object.__setattr__(self, "uav_id", validate_uav_id(self.uav_id))
+        if isinstance(self.plan_version, bool) or not isinstance(
+            self.plan_version, int
+        ) or self.plan_version <= 0:
+            raise ValueError("plan_version must be a positive integer")
+        object.__setattr__(
+            self,
+            "step_id",
+            validate_routing_id(self.step_id, "step_id"),
+        )
+        object.__setattr__(
+            self,
+            "invocation_id",
+            validate_invocation_id(self.invocation_id),
+        )
+        if not isinstance(self.skill_name, SkillName):
+            raise TypeError("skill_name must be a SkillName")
+        if not isinstance(self.goal, SkillGoal):
+            raise TypeError("goal must be a SkillGoal")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "mission_id": self.mission_id,
+            "uav_id": self.uav_id,
+            "plan_version": self.plan_version,
+            "step_id": self.step_id,
+            "invocation_id": self.invocation_id,
+            "skill_name": self.skill_name.value,
+            "goal_type": type(self.goal).__name__,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SkillExecutionReport:
+    """Routed public feedback/result emitted for one Skill invocation."""
+
+    mission_id: str
+    uav_id: str
+    plan_version: int
+    step_id: str
+    invocation_id: str
+    skill_name: SkillName
+    status: SkillStatus
+    result_code: SkillResultCode | None
+    feedback_or_result: dict[str, object]
+    timestamp_s: float
+
+    def __post_init__(self) -> None:
+        validate_mission_id(self.mission_id)
+        validate_uav_id(self.uav_id)
+        if isinstance(self.plan_version, bool) or not isinstance(
+            self.plan_version, int
+        ) or self.plan_version <= 0:
+            raise ValueError("plan_version must be a positive integer")
+        validate_routing_id(self.step_id, "step_id")
+        validate_invocation_id(self.invocation_id)
+        if not isinstance(self.skill_name, SkillName):
+            raise TypeError("skill_name must be a SkillName")
+        if not isinstance(self.status, SkillStatus):
+            raise TypeError("status must be a SkillStatus")
+        if self.result_code is not None and not isinstance(
+            self.result_code, SkillResultCode
+        ):
+            raise TypeError("result_code must be a SkillResultCode or None")
+        if not isinstance(self.feedback_or_result, dict):
+            raise TypeError("feedback_or_result must be a dict")
+        _finite_scalar(self.timestamp_s, "timestamp_s")
+        object.__setattr__(
+            self,
+            "feedback_or_result",
+            deepcopy(self.feedback_or_result),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "mission_id": self.mission_id,
+            "uav_id": self.uav_id,
+            "plan_version": self.plan_version,
+            "step_id": self.step_id,
+            "invocation_id": self.invocation_id,
+            "skill_name": self.skill_name.value,
+            "status": self.status.name,
+            "result_code": (
+                None if self.result_code is None else self.result_code.name
+            ),
+            "feedback_or_result": deepcopy(self.feedback_or_result),
+            "timestamp_s": float(self.timestamp_s),
+        }

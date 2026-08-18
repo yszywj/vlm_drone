@@ -13,6 +13,7 @@ from enum import Enum
 from math import hypot, isfinite, pi
 from numbers import Real
 
+from common.ids import validate_routing_id
 from planner.schemas import CompiledMission
 from runtime.plan_validator import PlannerLimits
 from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskStep
@@ -30,6 +31,17 @@ _ALLOWED_COMPILED_PARAMS: Mapping[SkillName, frozenset[str]] = {
     ),
     SkillName.GOTO: frozenset(
         {"position", "tolerance", "motion_policy", "timeout"}
+    ),
+    SkillName.HOVER: frozenset(
+        {
+            "mode",
+            "duration_s",
+            "max_wait_s",
+            "position_tolerance_m",
+            "max_correction_speed_mps",
+            "reason_code",
+            "motion_policy",
+        }
     ),
     SkillName.SEARCH: frozenset(
         {
@@ -51,6 +63,15 @@ _ALLOWED_COMPILED_PARAMS: Mapping[SkillName, frozenset[str]] = {
             "max_target_lost_time",
             "timeout",
             "track_duration",
+        }
+    ),
+    SkillName.INSPECT: frozenset(
+        {
+            "candidate_id",
+            "desired_observation_distance_m",
+            "viewpoint_change_rad",
+            "max_duration_s",
+            "approach_policy",
         }
     ),
     SkillName.LAND: frozenset(
@@ -358,6 +379,11 @@ class SafetySupervisor:
                 and SkillName.SEARCH not in previous.values()
             ):
                 return _abort(f"{prefix} TRACK must appear after SEARCH")
+            if (
+                step.skill is SkillName.INSPECT
+                and SkillName.SEARCH not in previous.values()
+            ):
+                return _abort(f"{prefix} INSPECT must appear after SEARCH")
             if isinstance(target, StepOutputRef):
                 if step.skill is not SkillName.TRACK:
                     return _abort(
@@ -450,6 +476,87 @@ class SafetySupervisor:
                     )
             return
 
+        if step.skill is SkillName.HOVER:
+            from skills.hover import HoverMode
+
+            raw_mode = _required(params, "mode", prefix)
+            try:
+                mode = (
+                    raw_mode
+                    if isinstance(raw_mode, HoverMode)
+                    else HoverMode(raw_mode)
+                )
+            except (TypeError, ValueError):
+                raise ValueError(f"{prefix} mode must be TIMED") from None
+            if mode is not HoverMode.TIMED:
+                raise ValueError(f"{prefix} only TIMED mode is plan-safe")
+            duration = _positive_finite(
+                _required(params, "duration_s", prefix),
+                f"{prefix} duration_s",
+            )
+            if not 1.0 <= duration <= 60.0:
+                raise ValueError(f"{prefix} duration_s must be between 1 and 60")
+            max_wait = _positive_finite(
+                _required(params, "max_wait_s", prefix),
+                f"{prefix} max_wait_s",
+            )
+            if max_wait < duration or max_wait > 60.0:
+                raise ValueError(
+                    f"{prefix} max_wait_s must cover duration_s and not exceed 60"
+                )
+            position_tolerance = _positive_finite(
+                _required(params, "position_tolerance_m", prefix),
+                f"{prefix} position_tolerance_m",
+            )
+            if position_tolerance > 1.0:
+                raise ValueError(
+                    f"{prefix} position_tolerance_m exceeds the trusted bound"
+                )
+            correction_speed = _positive_finite(
+                _required(params, "max_correction_speed_mps", prefix),
+                f"{prefix} max_correction_speed_mps",
+            )
+            if correction_speed > 0.5:
+                raise ValueError(
+                    f"{prefix} max_correction_speed_mps exceeds the trusted bound"
+                )
+            reason_code = _required(params, "reason_code", prefix)
+            try:
+                validated_reason = validate_routing_id(
+                    reason_code,
+                    f"{prefix} reason_code",
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from None
+            if validated_reason != "PLANNED_HOVER":
+                raise ValueError(f"{prefix} reason_code is not a planned HOVER")
+            motion_policy = _validate_motion_policy(
+                _required(params, "motion_policy", prefix),
+                prefix,
+            )
+            if motion_policy.yaw_mode not in {
+                YawMode.KEEP_CURRENT,
+                YawMode.FIXED,
+            }:
+                raise ValueError(
+                    f"{prefix} motion_policy yaw must be KEEP_CURRENT or FIXED"
+                )
+            if (
+                motion_policy.max_speed is None
+                or motion_policy.max_speed > correction_speed
+            ):
+                raise ValueError(
+                    f"{prefix} motion_policy.max_speed exceeds correction speed"
+                )
+            if (
+                motion_policy.max_yaw_rate is None
+                or motion_policy.max_yaw_rate > 1.0
+            ):
+                raise ValueError(
+                    f"{prefix} motion_policy.max_yaw_rate exceeds the trusted bound"
+                )
+            return
+
         if step.skill is SkillName.SEARCH:
             center = _finite_vector3(
                 _required(params, "center", prefix),
@@ -480,6 +587,58 @@ class SafetySupervisor:
             description = _required(params, "target_description", prefix)
             if not isinstance(description, str) or not description.strip():
                 raise ValueError(f"{prefix} target_description must be non-empty")
+            return
+
+        if step.skill is SkillName.INSPECT:
+            candidate_id = _required(params, "candidate_id", prefix)
+            try:
+                validate_routing_id(candidate_id, f"{prefix} candidate_id")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from None
+            distance = _positive_finite(
+                _required(
+                    params,
+                    "desired_observation_distance_m",
+                    prefix,
+                ),
+                f"{prefix} desired_observation_distance_m",
+            )
+            if not 2.0 <= distance <= 20.0:
+                raise ValueError(
+                    f"{prefix} desired_observation_distance_m must be between "
+                    "2 and 20"
+                )
+            angle = _finite_number(
+                _required(params, "viewpoint_change_rad", prefix),
+                f"{prefix} viewpoint_change_rad",
+            )
+            if abs(angle) <= 1e-9 or abs(angle) > pi / 2.0:
+                raise ValueError(
+                    f"{prefix} viewpoint_change_rad must be non-zero and no "
+                    "greater than pi/2"
+                )
+            duration = _positive_finite(
+                _required(params, "max_duration_s", prefix),
+                f"{prefix} max_duration_s",
+            )
+            if duration > 60.0:
+                raise ValueError(f"{prefix} max_duration_s exceeds 60")
+            from skills.inspect import InspectApproachPolicy
+
+            raw_approach = _required(params, "approach_policy", prefix)
+            try:
+                approach = (
+                    raw_approach
+                    if isinstance(raw_approach, InspectApproachPolicy)
+                    else InspectApproachPolicy(raw_approach)
+                )
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"{prefix} approach_policy must be "
+                    "MAINTAIN_ALTITUDE_ORBIT"
+                ) from None
+            if approach is not InspectApproachPolicy.MAINTAIN_ALTITUDE_ORBIT:
+                raise ValueError(f"{prefix} approach_policy is unsupported")
             return
 
         if step.skill is SkillName.TRACK:

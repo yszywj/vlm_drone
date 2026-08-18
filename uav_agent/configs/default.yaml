@@ -14,6 +14,7 @@ scene:
   size_xyz_m: [100.0, 100.0, 30.0]
 
 uav:
+  id: uav_1
   # Initial orientation is identity: yaw=0, with the UAV nose along world +X.
   initial_position_xyz_m: [0.0, 0.0, 10.0]
   max_speed_mps: 5.0
@@ -70,6 +71,41 @@ planner:
   default_reacquire_max_attempts: 2
   default_reacquire_search_radius_m: 10.0
   default_reacquire_timeout_s: 30.0
+
+# Runtime model and visual-review limits.  Every block is finite and bounded;
+# the visual reviewer remains opt-in and non-controlling by default.
+model_worker:
+  max_inflight_per_uav: 1
+  request_timeout_s: 20.0
+
+qwen_visual_review:
+  enabled: false
+  mode: shadow  # shadow | gate
+  goto_interval_s: 5.0
+  search_interval_s: 2.0
+  inspect_interval_s: 1.0
+  track_interval_s: 5.0
+  max_recent_frames: 3
+  max_image_side_px: 1024
+  jpeg_quality: 80
+  hover_position_tolerance_m: 0.25
+  hover_max_correction_speed_mps: 0.5
+  blocking_hover_timeout_s: 20.0
+  blocking_timeout_fallback: CANCEL_AND_LAND  # RESUME_PREVIOUS | CANCEL_AND_LAND
+
+plan_revision:
+  enabled: true
+  max_revisions: 3
+  cooldown_s: 5.0
+
+frame_store:
+  max_frames: 24
+  max_bytes: 67108864
+  max_age_s: 20.0
+
+debug_images:
+  enabled: false
+  max_images_per_run: 20
 
 # Lightweight experiment-output defaults.  Raw sensor artifacts and periodic
 # checkpoints remain deliberately disabled on the shared server.

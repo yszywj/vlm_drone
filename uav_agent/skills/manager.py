@@ -9,8 +9,20 @@ from enum import Enum, auto
 from math import isfinite
 from numbers import Real
 
+from common.ids import (
+    validate_invocation_id,
+    validate_mission_id,
+    validate_routing_id,
+    validate_uav_id,
+)
 from skills.base import Skill, SkillLifecycleError
 from skills.goto import GotoGoal, GotoSkill
+from skills.hover import (
+    HoverGoal,
+    HoverMode,
+    HoverSkill,
+    HoverTimeoutFallback,
+)
 from skills.land import LandGoal, LandSkill
 from skills.motion_types import MotionPolicy, YawMode
 from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskPlanError, TaskStep
@@ -22,7 +34,9 @@ from skills.types import (
     Observation,
     SkillContext,
     SkillFeedback,
+    SkillExecutionReport,
     SkillGoal,
+    SkillInvocation,
     SkillName,
     SkillResult,
     SkillResultCode,
@@ -52,6 +66,53 @@ class ExecutionKind(str, Enum):
     PLANNED = "PLANNED"
     RECOVERY = "RECOVERY"
     EMERGENCY = "EMERGENCY"
+    SUPERVISORY = "SUPERVISORY"
+
+
+@dataclass(frozen=True, slots=True)
+class _InterruptedExecution:
+    """Owned snapshot of trusted runtime state at a soft interruption."""
+
+    plan_index: int
+    step: TaskStep
+    resolved_goal: SkillGoal
+    plan: TaskPlan
+    step_outputs: dict[str, dict[str, object]]
+    active_target_id: str | None
+    recovery_attempts: dict[str, int]
+    saved_track_goals: dict[str, TrackGoal]
+    timeout_fallback: HoverTimeoutFallback
+
+
+class _SupervisoryContinuation(str, Enum):
+    RESUME = "RESUME"
+    REPLACE = "REPLACE"
+    SEARCH_CANDIDATE_HANDOFF = "SEARCH_CANDIDATE_HANDOFF"
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingSearchCandidateHandoff:
+    """Trusted metadata for completing SEARCH without claiming a target lock."""
+
+    candidate_id: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SearchInspectionDetour:
+    """One INSPECT detour that must return to the exact saved SEARCH.
+
+    The validated plan remains ``SEARCH -> INSPECT -> suffix``. Runtime visits
+    INSPECT first, restarts the interrupted SEARCH, and skips the already-run
+    INSPECT only after SEARCH produces its real ``target_id`` output.
+    """
+
+    search_index: int
+    inspect_index: int
+    search_step: TaskStep
+    search_goal: SearchGoal
+    inspect_step_id: str
+    candidate_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +128,20 @@ class TransitionRecord:
     old_step_id: str | None = None
     new_step_id: str | None = None
     recovery_attempt: int | None = None
+    uav_id: str = "uav_1"
+    mission_id: str = "mission_legacy"
+    plan_version: int = 1
+    invocation_id: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_uav_id(self.uav_id)
+        validate_mission_id(self.mission_id)
+        if isinstance(self.plan_version, bool) or not isinstance(
+            self.plan_version, int
+        ) or self.plan_version <= 0:
+            raise ValueError("plan_version must be a positive integer")
+        if self.invocation_id is not None:
+            validate_invocation_id(self.invocation_id)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -79,20 +154,36 @@ class TransitionRecord:
             "old_step_id": self.old_step_id,
             "new_step_id": self.new_step_id,
             "recovery_attempt": self.recovery_attempt,
+            "uav_id": self.uav_id,
+            "mission_id": self.mission_id,
+            "plan_version": self.plan_version,
+            "invocation_id": self.invocation_id,
         }
 
 
 def create_default_skill_registry(
-    *, transit_yaw_mode: YawMode | str = YawMode.FACE_POINT
+    *,
+    transit_yaw_mode: YawMode | str = YawMode.FACE_POINT,
+    inspect_skill: Skill | None = None,
 ) -> dict[SkillName, Skill]:
-    return {
+    registry: dict[SkillName, Skill] = {
         SkillName.TAKEOFF: TakeoffSkill(),
         SkillName.GOTO: GotoSkill(),
+        SkillName.HOVER: HoverSkill(),
         SkillName.SEARCH: SearchSkill(transit_yaw_mode=transit_yaw_mode),
         SkillName.TRACK: TrackSkill(),
         SkillName.REACQUIRE: ReacquireSkill(),
         SkillName.LAND: LandSkill(),
     }
+    # INSPECT owns runtime-specific CandidateBank/Resolver/FrameStore
+    # dependencies, so callers must inject the correctly routed instance.
+    if inspect_skill is not None:
+        from skills.inspect import InspectSkill
+
+        if not isinstance(inspect_skill, InspectSkill):
+            raise TypeError("inspect_skill must be an InspectSkill or None")
+        registry[SkillName.INSPECT] = inspect_skill
+    return registry
 
 
 class SkillManager:
@@ -118,6 +209,7 @@ class SkillManager:
         if logger is not None and not callable(logger):
             raise TypeError("logger must be callable or None")
         self._context = context
+        self._uav_id = validate_uav_id(context.uav_id)
         self._logger = logger
         self._reacquire_search_radius = _positive_number(
             reacquire_search_radius, "reacquire_search_radius"
@@ -143,6 +235,18 @@ class SkillManager:
         self._active_planned_step_id: str | None = None
         self._active_execution_kind: ExecutionKind | None = None
         self._saved_track_goal_by_step: dict[str, TrackGoal] = {}
+        self._active_invocation: SkillInvocation | None = None
+        self._last_invocation: SkillInvocation | None = None
+        self._execution_reports: list[SkillExecutionReport] = []
+        self._invocation_counter = 0
+        self._interrupted_execution: _InterruptedExecution | None = None
+        self._supervisory_continuation: _SupervisoryContinuation | None = None
+        self._pending_replacement_plan: TaskPlan | None = None
+        self._pending_search_candidate_handoff: (
+            _PendingSearchCandidateHandoff | None
+        ) = None
+        self._search_inspection_detour: _SearchInspectionDetour | None = None
+        self._supervisory_waiting = False
 
         if registry is not None:
             if not isinstance(registry, Mapping):
@@ -153,6 +257,18 @@ class SkillManager:
     @property
     def active_name(self) -> SkillName | None:
         return self._active_name
+
+    @property
+    def uav_id(self) -> str:
+        return self._uav_id
+
+    @property
+    def active_invocation(self) -> SkillInvocation | None:
+        return self._active_invocation
+
+    @property
+    def execution_reports(self) -> tuple[SkillExecutionReport, ...]:
+        return tuple(_copy_report(report) for report in self._execution_reports)
 
     @property
     def active_status(self) -> SkillStatus | None:
@@ -186,6 +302,12 @@ class SkillManager:
     @property
     def active_execution_kind(self) -> ExecutionKind | None:
         return self._active_execution_kind
+
+    @property
+    def is_supervisory_paused(self) -> bool:
+        """Whether a task owns an interrupted step awaiting/residing in HOVER."""
+
+        return self._interrupted_execution is not None
 
     @property
     def step_outputs(self) -> dict[str, dict[str, object]]:
@@ -222,13 +344,75 @@ class SkillManager:
     def available_skills(self) -> tuple[SkillName, ...]:
         return tuple(self._skills)
 
+    def report_candidate_pending(
+        self,
+        candidate_id: str,
+        *,
+        source: str,
+    ) -> None:
+        """Forward trusted provisional evidence to the active SEARCH only.
+
+        This narrow main-thread API does not confirm a target, start another
+        Skill, or change the plan. It exists so asynchronous perception
+        orchestration never reaches into Manager/Skill private state.
+        """
+
+        if self._task_status is not TaskStatus.RUNNING:
+            raise SkillManagerError("candidate reporting requires a RUNNING task")
+        if (
+            self._active_name is not SkillName.SEARCH
+            or self._active_execution_kind is not ExecutionKind.PLANNED
+            or self.active_status is not SkillStatus.RUNNING
+        ):
+            raise SkillManagerError(
+                "candidate reporting requires the active planned SEARCH"
+            )
+        skill = self._active_skill()
+        if not isinstance(skill, SearchSkill):
+            raise SkillManagerError("registered SEARCH does not support candidate reports")
+        skill.report_candidate_pending(candidate_id, source=source)
+
+    def report_search_candidate_pending(
+        self,
+        candidate_id: str,
+        *,
+        source: str,
+    ) -> None:
+        """Backward-compatible, explicit alias for SEARCH candidate reports."""
+
+        self.report_candidate_pending(candidate_id, source=source)
+
     # Manual single-Skill compatibility API.
     def start(self, name: SkillName | str, goal: SkillGoal) -> SkillStatus:
         if self._task_status is not TaskStatus.IDLE:
             raise SkillManagerError("reset the task before using manual Skill dispatch")
         return self._start_registered(_manager_skill_name(name), goal)
 
+    def invoke(self, invocation: SkillInvocation) -> SkillStatus:
+        """Start one manually dispatched routed invocation."""
+
+        if not isinstance(invocation, SkillInvocation):
+            raise TypeError("invocation must be a SkillInvocation")
+        if invocation.uav_id != self._uav_id:
+            raise SkillManagerError(
+                "SkillInvocation.uav_id does not match this SkillManager"
+            )
+        if self._task_status is not TaskStatus.IDLE:
+            raise SkillManagerError("cannot invoke manually while a task is active")
+        return self._start_registered(
+            invocation.skill_name,
+            invocation.goal,
+            invocation=invocation,
+        )
+
     def tick(self, observation: Observation) -> SkillStatus | TaskStatus:
+        if (
+            isinstance(observation, Observation)
+            and getattr(observation, "uav_id", self._uav_id) != self._uav_id
+        ):
+            raise SkillManagerError(
+                "Observation.uav_id does not match this SkillManager"
+            )
         if self._task_status is TaskStatus.RUNNING:
             return self._tick_task(observation)
         if self._task_status is not TaskStatus.IDLE:
@@ -246,6 +430,34 @@ class SkillManager:
     def get_result(self) -> SkillResult | None:
         return self._active_skill().get_result()
 
+    def get_execution_report(self) -> SkillExecutionReport | None:
+        """Return routed feedback/result without exposing an unbound payload."""
+
+        if self._active_name is not None and self._active_invocation is not None:
+            skill = self._active_skill()
+            result = skill.get_result()
+            if result is None:
+                payload = skill.get_feedback().to_dict()
+                result_code = None
+            else:
+                payload = result.to_dict()
+                result_code = result.code
+            return SkillExecutionReport(
+                mission_id=self._active_invocation.mission_id,
+                uav_id=self._active_invocation.uav_id,
+                plan_version=self._active_invocation.plan_version,
+                step_id=self._active_invocation.step_id,
+                invocation_id=self._active_invocation.invocation_id,
+                skill_name=self._active_invocation.skill_name,
+                status=skill.status,
+                result_code=result_code,
+                feedback_or_result=payload,
+                timestamp_s=self._read_transition_time(),
+            )
+        if self._execution_reports:
+            return _copy_report(self._execution_reports[-1])
+        return None
+
     def reset_active(self) -> None:
         if self._task_status is TaskStatus.RUNNING:
             raise SkillManagerError(
@@ -258,15 +470,36 @@ class SkillManager:
         result = skill.get_result()
         if result is None:
             raise SkillLifecycleError("active Skill has no terminal result to reset")
+        invocation = self._active_invocation
+        if invocation is not None:
+            report = SkillExecutionReport(
+                mission_id=invocation.mission_id,
+                uav_id=invocation.uav_id,
+                plan_version=invocation.plan_version,
+                step_id=invocation.step_id,
+                invocation_id=invocation.invocation_id,
+                skill_name=invocation.skill_name,
+                status=result.status,
+                result_code=result.code,
+                feedback_or_result=result.to_dict(),
+                timestamp_s=self._read_transition_time(),
+            )
+            self._execution_reports.append(report)
         try:
             skill.reset()
         finally:
             self._last_result = result
             self._active_name = None
+            self._last_invocation = invocation
+            self._active_invocation = None
 
     def start_task(self, plan: TaskPlan) -> TaskStatus:
         if not isinstance(plan, TaskPlan):
             raise TypeError("plan must be a TaskPlan")
+        if plan.uav_id != self._uav_id:
+            raise SkillManagerError(
+                "TaskPlan.uav_id does not match this SkillManager"
+            )
         if self._task_status is not TaskStatus.IDLE:
             raise SkillManagerError("reset_task() is required before starting another task")
         if self._active_name is not None:
@@ -309,6 +542,11 @@ class SkillManager:
             if self._effective_recovery_policy(step) is not None
         }
         self._saved_track_goal_by_step = {}
+        self._active_invocation = None
+        self._last_invocation = None
+        self._execution_reports = []
+        self._invocation_counter = 0
+        self._discard_supervisory_state()
         self._active_planned_step_id = owned_plan.steps[0].step_id
         self._active_execution_kind = ExecutionKind.PLANNED
         self._task_status = TaskStatus.RUNNING
@@ -378,6 +616,307 @@ class SkillManager:
         )
         return self._task_status
 
+    def interrupt_with_hover(
+        self,
+        reason_code: str,
+        *,
+        max_wait_s: float = 20.0,
+        position_tolerance_m: float = 0.25,
+        max_correction_speed_mps: float = 0.5,
+        timeout_fallback: HoverTimeoutFallback | str = (
+            HoverTimeoutFallback.CANCEL_AND_LAND
+        ),
+        motion_policy: MotionPolicy | None = None,
+    ) -> TaskStatus:
+        """Soft-pause one idempotent planned Skill in continuously commanded HOVER.
+
+        This API is a trusted-runtime boundary.  In particular, its hold
+        tolerance, correction limit, timeout, and fallback are not sourced
+        from model output.
+        """
+
+        if self._task_status is not TaskStatus.RUNNING:
+            raise SkillManagerError("supervisory HOVER requires a RUNNING task")
+        if self._interrupted_execution is not None:
+            raise SkillManagerError("a supervisory interruption is already active")
+        if self._active_name is None or self._active_name.value not in {
+            "GOTO",
+            "SEARCH",
+            "INSPECT",
+            "TRACK",
+        }:
+            active = "NONE" if self._active_name is None else self._active_name.value
+            raise SkillManagerError(
+                f"Skill {active} cannot be interrupted by supervisory HOVER"
+            )
+        if self._active_execution_kind is not ExecutionKind.PLANNED:
+            raise SkillManagerError(
+                "only a planned Skill can be interrupted by supervisory HOVER"
+            )
+        if self.active_status is not SkillStatus.RUNNING:
+            raise SkillManagerError("only a RUNNING Skill can be interrupted")
+        if (
+            self._task_plan is None
+            or self._plan_index is None
+            or self._active_planned_step_id is None
+            or self._active_invocation is None
+        ):
+            raise SkillManagerError("task state is incomplete at interruption boundary")
+        step = self._task_plan.steps[self._plan_index]
+        if (
+            step.step_id != self._active_planned_step_id
+            or step.skill is not self._active_name
+        ):
+            raise SkillManagerError("active Skill does not match the current plan step")
+
+        fallback = _hover_timeout_fallback(timeout_fallback)
+        normalized_reason = validate_routing_id(reason_code, "reason_code")
+        policy = (
+            MotionPolicy(yaw_mode=YawMode.KEEP_CURRENT)
+            if motion_policy is None
+            else motion_policy
+        )
+        if not isinstance(policy, MotionPolicy):
+            raise TypeError("motion_policy must be a MotionPolicy or None")
+        policy.validate()
+        goal = HoverGoal(
+            mode=HoverMode.UNTIL_RELEASED,
+            duration_s=None,
+            max_wait_s=_positive_number(max_wait_s, "max_wait_s"),
+            position_tolerance_m=_positive_number(
+                position_tolerance_m, "position_tolerance_m"
+            ),
+            max_correction_speed_mps=_positive_number(
+                max_correction_speed_mps, "max_correction_speed_mps"
+            ),
+            reason_code=normalized_reason,
+            motion_policy=policy,
+        )
+        # Validate all trusted values before canceling the active Skill.
+        _validate_hover_goal_for_manager(goal, supervisory=True)
+
+        resolved_goal = deepcopy(self._active_invocation.goal)
+        if self._active_name is SkillName.TRACK:
+            if not isinstance(resolved_goal, TrackGoal):
+                raise SkillManagerError("active TRACK invocation has an invalid Goal")
+            trusted_target = self._active_target_id
+            if trusted_target is not None and resolved_goal.target_id != trusted_target:
+                raise SkillManagerError(
+                    "active TRACK target_id disagrees with trusted target state"
+                )
+        interrupted = _InterruptedExecution(
+            plan_index=self._plan_index,
+            step=TaskStep(step.step_id, step.skill, step.params, step.recovery),
+            resolved_goal=resolved_goal,
+            plan=_copy_task_plan(self._task_plan),
+            step_outputs=deepcopy(self._step_outputs),
+            active_target_id=self._active_target_id,
+            recovery_attempts=dict(self._recovery_attempts),
+            saved_track_goals=deepcopy(self._saved_track_goal_by_step),
+            timeout_fallback=fallback,
+        )
+
+        old_name = self._active_name
+        old_step_id = self._active_planned_step_id
+        skill = self._active_skill()
+        skill.cancel()
+        canceled = skill.get_result()
+        self._reset_active_internal()
+        self._interrupted_execution = interrupted
+        self._supervisory_continuation = None
+        self._pending_replacement_plan = None
+        self._supervisory_waiting = False
+        self._start_transition(
+            old_name,
+            SkillStatus.CANCELED,
+            None if canceled is None else canceled.code,
+            SkillName.HOVER,
+            goal,
+            "supervisory_hover_started",
+            old_step_id=old_step_id,
+            new_step_id=old_step_id,
+            execution_kind=ExecutionKind.SUPERVISORY,
+        )
+        return self._task_status
+
+    def release_supervisory_hover(self) -> TaskStatus:
+        """Thread-safe release request; HOVER completes on a later task tick."""
+
+        self._require_supervisory_interruption()
+        if self._active_name is not SkillName.HOVER:
+            raise SkillManagerError("supervisory HOVER is not currently RUNNING")
+        skill = self._active_skill()
+        if not isinstance(skill, HoverSkill) or skill.status is not SkillStatus.RUNNING:
+            raise SkillManagerError("supervisory HOVER is not releasable")
+        skill.request_release()
+        self._record_transition(
+            old_skill=SkillName.HOVER,
+            old_status=SkillStatus.RUNNING,
+            result_code=None,
+            new_skill=SkillName.HOVER,
+            reason="supervisory_hover_release_requested",
+            old_step_id=self._active_planned_step_id,
+            new_step_id=self._active_planned_step_id,
+        )
+        return self._task_status
+
+    def resume_interrupted_step(self) -> TaskStatus:
+        """Resume the exact owned Goal saved at the interruption boundary."""
+
+        self._require_supervisory_interruption()
+        if self._supervisory_continuation is not None:
+            raise SkillManagerError("a supervisory continuation is already selected")
+        self._supervisory_continuation = _SupervisoryContinuation.RESUME
+        if self._active_name is SkillName.HOVER:
+            return self.release_supervisory_hover()
+        if not self._supervisory_waiting or self._active_name is not None:
+            raise SkillManagerError("supervisory HOVER has not reached a resumable state")
+        self._resume_saved_interruption(
+            old_status=SkillStatus.SUCCEEDED,
+            result_code=SkillResultCode.HOVER_COMPLETE,
+            reason="interrupted_step_resumed",
+        )
+        return self._task_status
+
+    def replace_interrupted_step_and_suffix(self, plan: TaskPlan) -> TaskStatus:
+        """Atomically select a validated current-step/suffix replacement.
+
+        The caller supplies a complete routed plan.  The already-completed
+        prefix must be byte-for-byte equivalent at the TaskStep data level,
+        and the plan version must advance by exactly one.
+        """
+
+        interrupted = self._require_supervisory_interruption()
+        if self._supervisory_continuation is not None:
+            raise SkillManagerError("a supervisory continuation is already selected")
+        owned = self._validate_replacement_plan(plan, interrupted)
+        self._pending_replacement_plan = owned
+        self._supervisory_continuation = _SupervisoryContinuation.REPLACE
+        self._record_transition(
+            old_skill=self._active_name,
+            old_status=self.active_status,
+            result_code=None,
+            new_skill=self._active_name,
+            reason="plan_suffix_replacement_accepted",
+            old_step_id=self._active_planned_step_id,
+            new_step_id=self._active_planned_step_id,
+        )
+        if self._active_name is SkillName.HOVER:
+            return self.release_supervisory_hover()
+        if not self._supervisory_waiting or self._active_name is not None:
+            raise SkillManagerError("supervisory HOVER has not reached a replaceable state")
+        self._start_replacement_after_interruption(
+            old_status=SkillStatus.SUCCEEDED,
+            result_code=SkillResultCode.HOVER_COMPLETE,
+        )
+        return self._task_status
+
+    def handoff_interrupted_search_candidate_to_inspect(
+        self,
+        plan: TaskPlan,
+        *,
+        candidate_id: str,
+        source: str,
+    ) -> TaskStatus:
+        """Run INSPECT as a detour, then restart the interrupted SEARCH.
+
+        This is deliberately narrower than ordinary suffix replacement.  The
+        replacement must retain the interrupted SEARCH byte-for-byte at the
+        same index and put an INSPECT for the trusted candidate immediately
+        after it. SEARCH is not completed here and receives no synthetic
+        output; only the restarted SEARCH may later publish ``target_id``.
+
+        All validation completes before continuation state is selected, so a
+        rejected call leaves the active HOVER and authoritative plan intact.
+        """
+
+        interrupted = self._require_supervisory_interruption()
+        if self._supervisory_continuation is not None:
+            raise SkillManagerError("a supervisory continuation is already selected")
+        normalized_candidate_id = validate_routing_id(
+            candidate_id,
+            "candidate_id",
+        )
+        if not isinstance(source, str):
+            raise TypeError("source must be a string")
+        normalized_source = source.strip()
+        if normalized_source not in {"qwen_vl", "oracle_evaluation"}:
+            raise SkillManagerError(
+                "candidate handoff source must be qwen_vl or oracle_evaluation"
+            )
+        if interrupted.step.skill is not SkillName.SEARCH:
+            raise SkillManagerError(
+                "candidate handoff requires an interrupted planned SEARCH"
+            )
+        if interrupted.active_target_id is not None:
+            raise SkillManagerError(
+                "candidate handoff cannot inherit an already locked target"
+            )
+        if interrupted.step.step_id in interrupted.step_outputs:
+            raise SkillManagerError(
+                "interrupted SEARCH already has a completed step output"
+            )
+        if self._search_inspection_detour is not None:
+            raise SkillManagerError(
+                "the interrupted SEARCH already consumed an INSPECT detour"
+            )
+
+        # This validates route, exact +1 version, completed prefix, registry,
+        # and every Goal shape without changing Manager state.
+        owned = self._validate_replacement_plan(plan, interrupted)
+        index = interrupted.plan_index
+        if owned.steps[index].to_dict() != interrupted.step.to_dict():
+            raise SkillManagerError(
+                "candidate handoff must preserve the interrupted SEARCH step"
+            )
+        inspect_index = index + 1
+        if inspect_index >= len(owned.steps):
+            raise SkillManagerError(
+                "candidate handoff requires INSPECT immediately after SEARCH"
+            )
+        inspect_step = owned.steps[inspect_index]
+        if inspect_step.skill is not SkillName.INSPECT:
+            raise SkillManagerError(
+                "candidate handoff requires INSPECT immediately after SEARCH"
+            )
+        if inspect_step.params.get("candidate_id") != normalized_candidate_id:
+            raise SkillManagerError(
+                "INSPECT candidate_id does not match the trusted candidate"
+            )
+        if not isinstance(interrupted.resolved_goal, SearchGoal):
+            raise SkillManagerError(
+                "interrupted SEARCH does not own a validated SearchGoal"
+            )
+
+        self._pending_replacement_plan = owned
+        self._pending_search_candidate_handoff = _PendingSearchCandidateHandoff(
+            candidate_id=normalized_candidate_id,
+            source=normalized_source,
+        )
+        self._supervisory_continuation = (
+            _SupervisoryContinuation.SEARCH_CANDIDATE_HANDOFF
+        )
+        self._record_transition(
+            old_skill=self._active_name,
+            old_status=self.active_status,
+            result_code=None,
+            new_skill=self._active_name,
+            reason="search_candidate_handoff_accepted",
+            old_step_id=interrupted.step.step_id,
+            new_step_id=inspect_step.step_id,
+        )
+        if self._active_name is SkillName.HOVER:
+            return self.release_supervisory_hover()
+        if not self._supervisory_waiting or self._active_name is not None:
+            raise SkillManagerError(
+                "supervisory HOVER has not reached a replaceable state"
+            )
+        self._start_search_candidate_handoff_after_interruption(
+            old_status=SkillStatus.SUCCEEDED,
+            result_code=SkillResultCode.HOVER_COMPLETE,
+        )
+        return self._task_status
+
     def reset_task(self) -> None:
         if self._task_status not in {
             TaskStatus.SUCCEEDED,
@@ -389,7 +928,13 @@ class SkillManager:
             raise SkillManagerError("terminal task unexpectedly still owns a Skill")
         self._clear_task_to_idle()
 
-    def _start_registered(self, name: SkillName, goal: SkillGoal) -> SkillStatus:
+    def _start_registered(
+        self,
+        name: SkillName,
+        goal: SkillGoal,
+        *,
+        invocation: SkillInvocation | None = None,
+    ) -> SkillStatus:
         if self._active_name is not None:
             raise SkillManagerError("reset the active Skill before starting another")
         try:
@@ -398,17 +943,53 @@ class SkillManager:
             raise SkillNotRegisteredError(f"Skill {name.value} is not registered") from exc
         if skill.status is not SkillStatus.IDLE:
             raise SkillManagerError(f"registered Skill {name.value} is not IDLE")
+        if invocation is None:
+            invocation = self._make_invocation(name, goal)
+        elif invocation.uav_id != self._uav_id:
+            raise SkillManagerError(
+                "SkillInvocation.uav_id does not match this SkillManager"
+            )
+        if invocation.skill_name is not name:
+            raise SkillManagerError(
+                "SkillInvocation.skill_name does not match requested Skill"
+            )
         self._active_name = name
+        self._active_invocation = invocation
         try:
             skill.start(goal, self._context)
         except BaseException:
             if skill.status is SkillStatus.IDLE:
                 self._active_name = None
+                self._active_invocation = None
             raise
         return skill.status
 
+    def _make_invocation(
+        self,
+        name: SkillName,
+        goal: SkillGoal,
+    ) -> SkillInvocation:
+        self._invocation_counter += 1
+        task_plan = self._task_plan
+        mission_id = (
+            "mission_manual" if task_plan is None else task_plan.mission_id
+        )
+        plan_version = 1 if task_plan is None else task_plan.plan_version
+        step_id = self._active_planned_step_id or f"manual_{name.value.lower()}"
+        return SkillInvocation(
+            mission_id=mission_id,
+            uav_id=self._uav_id,
+            plan_version=plan_version,
+            step_id=step_id,
+            invocation_id=f"invocation_{self._invocation_counter:08d}",
+            skill_name=name,
+            goal=goal,
+        )
+
     def _tick_task(self, observation: Observation) -> TaskStatus:
         if self._active_name is None:
+            if self._supervisory_waiting and self._interrupted_execution is not None:
+                return self._task_status
             self._fail_without_landing("task has no active Skill")
             return self._task_status
         skill = self._active_skill()
@@ -518,6 +1099,51 @@ class SkillManager:
                     )
             return
 
+        if old_name is SkillName.HOVER and old_kind is ExecutionKind.SUPERVISORY:
+            self._transition_from_supervisory_hover(
+                old_status,
+                result,
+                old_step_id,
+            )
+            return
+
+        if (
+            old_name is SkillName.INSPECT
+            and old_kind is ExecutionKind.PLANNED
+            and self._search_inspection_detour is not None
+        ):
+            if (
+                old_status is SkillStatus.SUCCEEDED
+                and result.code is SkillResultCode.GOAL_REACHED
+            ):
+                if old_step_id != self._search_inspection_detour.inspect_step_id:
+                    self._fail_inspection_detour(
+                        old_status,
+                        old_step_id,
+                        "inspection_detour_step_mismatch",
+                    )
+                    return
+                self._step_outputs[old_step_id] = deepcopy(result.data)
+                self._resume_search_after_inspection(
+                    old_status,
+                    result,
+                    reason="inspection_evidence_collected_search_resumed",
+                )
+                return
+            if (
+                old_status is SkillStatus.FAILED
+                and result.code
+                in {SkillResultCode.TIMEOUT, SkillResultCode.INVALID_STATE}
+            ):
+                self._resume_search_after_inspection(
+                    old_status,
+                    result,
+                    reason="inspection_rejected_search_resumed",
+                )
+                return
+            # INVALID_GOAL/INTERNAL_ERROR and cancellation are trusted-boundary
+            # failures and follow the normal fail-safe LAND path below.
+
         if old_status is SkillStatus.CANCELED:
             self._pending_task_result = TaskStatus.CANCELED
             self._begin_landing(
@@ -607,6 +1233,399 @@ class SkillManager:
             # or cancel replaces it before LAND commits the terminal status.
             self._pending_task_result = TaskStatus.SUCCEEDED
         self._start_next_planned(old_name, old_status, result, old_step_id)
+
+    def _transition_from_supervisory_hover(
+        self,
+        old_status: SkillStatus,
+        result: SkillResult,
+        old_step_id: str | None,
+    ) -> None:
+        interrupted = self._interrupted_execution
+        if interrupted is None:
+            self._task_failure_result = _internal_result(
+                "supervisory HOVER completed without interrupted state"
+            )
+            self._last_result = self._task_failure_result
+            self._pending_task_result = TaskStatus.FAILED
+            self._begin_landing(
+                SkillName.HOVER,
+                old_status,
+                self._task_failure_result,
+                "supervisory_state_missing",
+                old_step_id=old_step_id,
+            )
+            return
+
+        if (
+            old_status is SkillStatus.SUCCEEDED
+            and result.code is SkillResultCode.HOVER_COMPLETE
+        ):
+            if self._supervisory_continuation is _SupervisoryContinuation.RESUME:
+                self._resume_saved_interruption(
+                    old_status=old_status,
+                    result_code=result.code,
+                    reason="interrupted_step_resumed",
+                )
+                return
+            if self._supervisory_continuation is _SupervisoryContinuation.REPLACE:
+                self._start_replacement_after_interruption(
+                    old_status=old_status,
+                    result_code=result.code,
+                )
+                return
+            if (
+                self._supervisory_continuation
+                is _SupervisoryContinuation.SEARCH_CANDIDATE_HANDOFF
+            ):
+                self._start_search_candidate_handoff_after_interruption(
+                    old_status=old_status,
+                    result_code=result.code,
+                )
+                return
+            self._supervisory_waiting = True
+            self._record_transition(
+                old_skill=SkillName.HOVER,
+                old_status=old_status,
+                result_code=result.code,
+                new_skill=None,
+                reason="supervisory_hover_released",
+                old_step_id=old_step_id,
+                new_step_id=old_step_id,
+            )
+            return
+
+        if (
+            old_status is SkillStatus.FAILED
+            and result.code is SkillResultCode.TIMEOUT
+            and interrupted.timeout_fallback
+            is HoverTimeoutFallback.RESUME_PREVIOUS
+        ):
+            self._resume_saved_interruption(
+                old_status=old_status,
+                result_code=result.code,
+                reason="supervisory_hover_timeout_resume_previous",
+            )
+            return
+
+        self._task_failure_result = result
+        self._pending_task_result = TaskStatus.FAILED
+        reason = (
+            "supervisory_hover_timeout_cancel_and_land"
+            if result.code is SkillResultCode.TIMEOUT
+            else "supervisory_hover_failed"
+        )
+        self._begin_landing(
+            SkillName.HOVER,
+            old_status,
+            result,
+            reason,
+            old_step_id=old_step_id,
+        )
+
+    def _require_supervisory_interruption(self) -> _InterruptedExecution:
+        if self._task_status is not TaskStatus.RUNNING:
+            raise SkillManagerError("there is no RUNNING supervisory interruption")
+        interrupted = self._interrupted_execution
+        if interrupted is None:
+            raise SkillManagerError("there is no interrupted step")
+        return interrupted
+
+    def _resume_saved_interruption(
+        self,
+        *,
+        old_status: SkillStatus,
+        result_code: SkillResultCode,
+        reason: str,
+    ) -> None:
+        interrupted = self._require_supervisory_interruption()
+        current_plan = self._task_plan
+        if (
+            current_plan is None
+            or current_plan.mission_id != interrupted.plan.mission_id
+            or current_plan.uav_id != interrupted.plan.uav_id
+            or current_plan.plan_version != interrupted.plan.plan_version
+        ):
+            raise SkillManagerError(
+                "task routing/version changed during supervisory HOVER"
+            )
+        goal = deepcopy(interrupted.resolved_goal)
+        if interrupted.step.skill is SkillName.TRACK:
+            if not isinstance(goal, TrackGoal):
+                raise SkillManagerError("saved TRACK Goal has invalid type")
+            if (
+                interrupted.active_target_id is not None
+                and goal.target_id != interrupted.active_target_id
+            ):
+                raise SkillManagerError(
+                    "saved TRACK target_id changed during supervisory HOVER"
+                )
+
+        self._task_plan = _copy_task_plan(interrupted.plan)
+        self._plan_index = interrupted.plan_index
+        self._step_outputs = deepcopy(interrupted.step_outputs)
+        self._active_target_id = interrupted.active_target_id
+        self._recovery_attempts = dict(interrupted.recovery_attempts)
+        self._saved_track_goal_by_step = deepcopy(interrupted.saved_track_goals)
+        step = interrupted.step
+        self._discard_supervisory_state()
+        self._start_transition(
+            SkillName.HOVER,
+            old_status,
+            result_code,
+            step.skill,
+            goal,
+            reason,
+            old_step_id=step.step_id,
+            new_step_id=step.step_id,
+            recovery_attempt=(
+                self._recovery_attempts.get(step.step_id)
+                if step.skill is SkillName.TRACK
+                else None
+            ),
+            execution_kind=ExecutionKind.PLANNED,
+        )
+
+    def _validate_replacement_plan(
+        self,
+        plan: TaskPlan,
+        interrupted: _InterruptedExecution,
+    ) -> TaskPlan:
+        if not isinstance(plan, TaskPlan):
+            raise TypeError("plan must be a TaskPlan")
+        owned = _copy_task_plan(plan)
+        original = interrupted.plan
+        if owned.uav_id != self._uav_id or owned.uav_id != original.uav_id:
+            raise SkillManagerError("replacement TaskPlan.uav_id mismatch")
+        if owned.mission_id != original.mission_id:
+            raise SkillManagerError("replacement TaskPlan.mission_id mismatch")
+        if owned.plan_version != original.plan_version + 1:
+            raise SkillManagerError(
+                "replacement plan_version must advance by exactly one"
+            )
+        index = interrupted.plan_index
+        if index >= len(owned.steps):
+            raise SkillManagerError("replacement removed the interrupted step slot")
+        if [step.to_dict() for step in owned.steps[:index]] != [
+            step.to_dict() for step in original.steps[:index]
+        ]:
+            raise SkillManagerError("replacement modified the completed plan prefix")
+
+        required = {step.skill for step in owned.steps[index:]} | {SkillName.LAND}
+        if any(
+            self._effective_recovery_policy(step) is not None
+            for step in owned.steps[index:]
+        ):
+            required.add(SkillName.REACQUIRE)
+        missing = sorted(name.value for name in required if name not in self._skills)
+        if missing:
+            raise SkillNotRegisteredError(
+                "replacement registry is missing: " + ", ".join(missing)
+            )
+        for candidate_index, step in enumerate(owned.steps[index:], start=index):
+            _reject_unknown_goal_fields(step.skill, step.params)
+            candidate_goal = self._goal_from_step(
+                step,
+                plan=owned,
+                validation_only=candidate_index != index,
+            )
+            if (
+                candidate_index == index
+                and step.skill is SkillName.TRACK
+                and interrupted.active_target_id is not None
+            ):
+                if (
+                    not isinstance(candidate_goal, TrackGoal)
+                    or candidate_goal.target_id != interrupted.active_target_id
+                ):
+                    raise SkillManagerError(
+                        "replacement TRACK cannot change the active target identity"
+                    )
+        return owned
+
+    def _start_replacement_after_interruption(
+        self,
+        *,
+        old_status: SkillStatus,
+        result_code: SkillResultCode,
+    ) -> None:
+        interrupted = self._require_supervisory_interruption()
+        replacement = self._pending_replacement_plan
+        if replacement is None:
+            raise SkillManagerError("replacement continuation has no TaskPlan")
+        index = interrupted.plan_index
+        step = replacement.steps[index]
+
+        self._task_plan = _copy_task_plan(replacement)
+        self._plan_index = index
+        self._step_outputs = deepcopy(interrupted.step_outputs)
+        self._active_target_id = interrupted.active_target_id
+        self._recovery_attempts = {
+            candidate.step_id: interrupted.recovery_attempts.get(
+                candidate.step_id, 0
+            )
+            for candidate in replacement.steps
+            if self._effective_recovery_policy(candidate) is not None
+        }
+        self._saved_track_goal_by_step = {
+            step_id: deepcopy(goal)
+            for step_id, goal in interrupted.saved_track_goals.items()
+            if any(candidate.step_id == step_id for candidate in replacement.steps)
+        }
+        try:
+            goal = self._goal_from_step(step)
+        except Exception as exc:
+            # Validation above makes this an internal state/routing failure,
+            # never a partially accepted revision that continues unchecked.
+            failure = _internal_result(
+                f"could not resolve replacement step {step.step_id}: {exc}",
+                {"step_id": step.step_id, "error": str(exc)},
+            )
+            self._last_result = failure
+            self._task_failure_result = failure
+            self._pending_task_result = TaskStatus.FAILED
+            self._discard_supervisory_state()
+            self._begin_landing(
+                SkillName.HOVER,
+                old_status,
+                failure,
+                "replacement_goal_invalid",
+                old_step_id=interrupted.step.step_id,
+            )
+            return
+        if step.skill is SkillName.TRACK:
+            if not isinstance(goal, TrackGoal):
+                raise SkillManagerError("replacement TRACK compiled to invalid Goal")
+            if (
+                interrupted.active_target_id is not None
+                and goal.target_id != interrupted.active_target_id
+            ):
+                raise SkillManagerError(
+                    "replacement TRACK cannot change the active target identity"
+                )
+            self._saved_track_goal_by_step[step.step_id] = goal
+
+        old_step_id = interrupted.step.step_id
+        self._discard_supervisory_state()
+        self._start_transition(
+            SkillName.HOVER,
+            old_status,
+            result_code,
+            step.skill,
+            goal,
+            "interrupted_step_and_suffix_replaced",
+            old_step_id=old_step_id,
+            new_step_id=step.step_id,
+            recovery_attempt=(
+                self._recovery_attempts.get(step.step_id)
+                if step.skill is SkillName.TRACK
+                else None
+            ),
+            execution_kind=ExecutionKind.PLANNED,
+        )
+
+    def _start_search_candidate_handoff_after_interruption(
+        self,
+        *,
+        old_status: SkillStatus,
+        result_code: SkillResultCode,
+    ) -> None:
+        interrupted = self._require_supervisory_interruption()
+        replacement = self._pending_replacement_plan
+        handoff = self._pending_search_candidate_handoff
+        if replacement is None or handoff is None:
+            raise SkillManagerError(
+                "candidate handoff continuation is missing trusted state"
+            )
+        index = interrupted.plan_index
+        inspect_index = index + 1
+        # The public API already validated these invariants.  Re-check before
+        # publication because this is the exact state-changing boundary.
+        if (
+            interrupted.step.skill is not SkillName.SEARCH
+            or inspect_index >= len(replacement.steps)
+            or replacement.steps[index].to_dict() != interrupted.step.to_dict()
+            or replacement.steps[inspect_index].skill is not SkillName.INSPECT
+            or replacement.steps[inspect_index].params.get("candidate_id")
+            != handoff.candidate_id
+        ):
+            raise SkillManagerError("candidate handoff state changed before release")
+
+        inspect_step = replacement.steps[inspect_index]
+        self._task_plan = _copy_task_plan(replacement)
+        self._plan_index = inspect_index
+        self._step_outputs = deepcopy(interrupted.step_outputs)
+        self._active_target_id = interrupted.active_target_id
+        self._recovery_attempts = {
+            candidate.step_id: interrupted.recovery_attempts.get(
+                candidate.step_id,
+                0,
+            )
+            for candidate in replacement.steps
+            if self._effective_recovery_policy(candidate) is not None
+        }
+        self._saved_track_goal_by_step = {
+            step_id: deepcopy(goal)
+            for step_id, goal in interrupted.saved_track_goals.items()
+            if any(candidate.step_id == step_id for candidate in replacement.steps)
+        }
+        try:
+            goal = self._goal_from_step(inspect_step)
+        except Exception as exc:
+            failure = _internal_result(
+                f"could not resolve handoff INSPECT {inspect_step.step_id}: {exc}",
+                {"step_id": inspect_step.step_id, "error": str(exc)},
+            )
+            self._last_result = failure
+            self._task_failure_result = failure
+            self._pending_task_result = TaskStatus.FAILED
+            self._discard_supervisory_state()
+            self._begin_landing(
+                SkillName.HOVER,
+                old_status,
+                failure,
+                "candidate_handoff_goal_invalid",
+                old_step_id=interrupted.step.step_id,
+            )
+            return
+
+        old_step_id = interrupted.step.step_id
+        search_goal = interrupted.resolved_goal
+        if not isinstance(search_goal, SearchGoal):
+            raise SkillManagerError(
+                "candidate handoff saved an invalid SEARCH goal"
+            )
+        self._search_inspection_detour = _SearchInspectionDetour(
+            search_index=index,
+            inspect_index=inspect_index,
+            search_step=TaskStep(
+                interrupted.step.step_id,
+                interrupted.step.skill,
+                interrupted.step.params,
+                interrupted.step.recovery,
+            ),
+            search_goal=deepcopy(search_goal),
+            inspect_step_id=inspect_step.step_id,
+            candidate_id=handoff.candidate_id,
+        )
+        self._discard_supervisory_state()
+        self._start_transition(
+            SkillName.HOVER,
+            old_status,
+            result_code,
+            SkillName.INSPECT,
+            goal,
+            "search_candidate_handoff_to_inspect",
+            old_step_id=old_step_id,
+            new_step_id=inspect_step.step_id,
+            execution_kind=ExecutionKind.PLANNED,
+        )
+
+    def _discard_supervisory_state(self) -> None:
+        self._interrupted_execution = None
+        self._supervisory_continuation = None
+        self._pending_replacement_plan = None
+        self._pending_search_candidate_handoff = None
+        self._supervisory_waiting = False
 
     def _try_start_recovery(
         self,
@@ -767,6 +1786,22 @@ class SkillManager:
             self._fail_without_landing("task plan state is missing")
             return
         next_index = self._plan_index + 1
+        transition_reason = _normal_transition_reason(old_name)
+        detour = self._search_inspection_detour
+        if (
+            detour is not None
+            and old_name is SkillName.SEARCH
+            and old_step_id == detour.search_step.step_id
+            and self._plan_index == detour.search_index
+        ):
+            if next_index != detour.inspect_index:
+                self._fail_without_landing(
+                    "inspection detour no longer matches the authoritative plan"
+                )
+                return
+            next_index += 1
+            transition_reason = "target_found_after_inspection_detour"
+            self._search_inspection_detour = None
         if next_index >= len(self._task_plan.steps):
             failure = _internal_result(
                 "validated plan ended without a terminal LAND",
@@ -815,10 +1850,77 @@ class SkillManager:
             result.code,
             step.skill,
             goal,
-            _normal_transition_reason(old_name),
+            transition_reason,
             old_step_id=old_step_id,
             new_step_id=step.step_id,
             execution_kind=ExecutionKind.PLANNED,
+        )
+
+    def _resume_search_after_inspection(
+        self,
+        old_status: SkillStatus,
+        result: SkillResult,
+        *,
+        reason: str,
+    ) -> None:
+        """Return a completed/rejected INSPECT detour to the exact SEARCH."""
+
+        detour = self._search_inspection_detour
+        plan = self._task_plan
+        if detour is None or plan is None:
+            self._fail_inspection_detour(
+                old_status,
+                self._active_planned_step_id,
+                "inspection_detour_state_missing",
+            )
+            return
+        if (
+            detour.search_index >= len(plan.steps)
+            or detour.inspect_index >= len(plan.steps)
+            or plan.steps[detour.search_index].to_dict()
+            != detour.search_step.to_dict()
+            or plan.steps[detour.inspect_index].step_id != detour.inspect_step_id
+            or plan.steps[detour.inspect_index].skill is not SkillName.INSPECT
+        ):
+            self._fail_inspection_detour(
+                old_status,
+                detour.inspect_step_id,
+                "inspection_detour_plan_mismatch",
+            )
+            return
+        self._plan_index = detour.search_index
+        self._start_transition(
+            SkillName.INSPECT,
+            old_status,
+            result.code,
+            SkillName.SEARCH,
+            deepcopy(detour.search_goal),
+            reason,
+            old_step_id=detour.inspect_step_id,
+            new_step_id=detour.search_step.step_id,
+            execution_kind=ExecutionKind.PLANNED,
+        )
+
+    def _fail_inspection_detour(
+        self,
+        old_status: SkillStatus,
+        old_step_id: str | None,
+        reason: str,
+    ) -> None:
+        failure = _internal_result(
+            "INSPECT detour could not return to its interrupted SEARCH",
+            {"reason": reason},
+        )
+        self._last_result = failure
+        self._task_failure_result = failure
+        self._pending_task_result = TaskStatus.FAILED
+        self._search_inspection_detour = None
+        self._begin_landing(
+            SkillName.INSPECT,
+            old_status,
+            failure,
+            reason,
+            old_step_id=old_step_id,
         )
 
     def _start_transition(
@@ -892,6 +1994,8 @@ class SkillManager:
         old_step_id: str | None,
         recovery_attempt: int | None = None,
     ) -> None:
+        self._discard_supervisory_state()
+        self._search_inspection_detour = None
         if old_name is SkillName.LAND:
             self._finish_task(
                 TaskStatus.FAILED,
@@ -1105,9 +2209,16 @@ class SkillManager:
             params.setdefault("track_duration", 30.0)
         if step.skill is SkillName.SEARCH and "search_altitude" not in params:
             params["search_altitude"] = self._default_search_altitude(source_plan)
+        if step.skill is SkillName.HOVER:
+            if "mode" in params:
+                params["mode"] = _hover_mode(params["mode"])
+            if params.get("mode", HoverMode.TIMED) is not HoverMode.TIMED:
+                raise TaskPlanError(
+                    "TaskPlan HOVER must use TIMED mode; UNTIL_RELEASED is trusted-runtime only"
+                )
         if "yaw_mode" in params:
             params["yaw_mode"] = _yaw_mode(params["yaw_mode"])
-        if step.skill is SkillName.GOTO and "motion_policy" in params:
+        if step.skill in {SkillName.GOTO, SkillName.HOVER} and "motion_policy" in params:
             params["motion_policy"] = _motion_policy(params["motion_policy"])
         for key in {
             "position",
@@ -1119,7 +2230,7 @@ class SkillManager:
         } & params.keys():
             if isinstance(params[key], list):
                 params[key] = tuple(params[key])
-        goal_type = _GOAL_TYPES.get(step.skill)
+        goal_type = _goal_type_for_name(step.skill)
         if goal_type is None:
             raise TaskPlanError(f"{step.skill.value} is not a planned task step")
         try:
@@ -1244,6 +2355,7 @@ class SkillManager:
         self._task_status = status
         self._active_planned_step_id = None
         self._active_execution_kind = None
+        self._search_inspection_detour = None
         self._record_transition(
             old_skill=old_name,
             old_status=old_status,
@@ -1318,6 +2430,26 @@ class SkillManager:
             old_step_id=old_step_id,
             new_step_id=new_step_id,
             recovery_attempt=recovery_attempt,
+            uav_id=self._uav_id,
+            mission_id=(
+                self._task_plan.mission_id
+                if self._task_plan is not None
+                else "mission_manual"
+            ),
+            plan_version=(
+                self._task_plan.plan_version
+                if self._task_plan is not None
+                else 1
+            ),
+            invocation_id=(
+                self._active_invocation.invocation_id
+                if self._active_invocation is not None
+                else (
+                    None
+                    if self._last_invocation is None
+                    else self._last_invocation.invocation_id
+                )
+            ),
         )
         self._transition_log.append(record)
         if self._logger is not None:
@@ -1329,6 +2461,7 @@ class SkillManager:
                 )
                 self._logger(
                     f"[SkillManager] t={timestamp:.3f} "
+                    f"uav_id={self._uav_id} mission_id={record.mission_id} "
                     f"{_name_or_none(old_skill)}[{old_step_id or '-'}] -> "
                     f"{_name_or_none(new_skill)}[{new_step_id or '-'}] "
                     f"reason={record.reason}{attempt}"
@@ -1362,6 +2495,12 @@ class SkillManager:
         self._recovery_attempts = {}
         self._saved_track_goal_by_step = {}
         self._last_result = None
+        self._active_invocation = None
+        self._last_invocation = None
+        self._execution_reports = []
+        self._invocation_counter = 0
+        self._search_inspection_detour = None
+        self._discard_supervisory_state()
 
     def _active_skill_or_none(self) -> Skill | None:
         if self._active_name is None:
@@ -1378,7 +2517,9 @@ class SkillManager:
 _EXPECTED_SUCCESS_CODES: dict[SkillName, SkillResultCode] = {
     SkillName.TAKEOFF: SkillResultCode.TAKEOFF_COMPLETE,
     SkillName.GOTO: SkillResultCode.GOAL_REACHED,
+    SkillName.HOVER: SkillResultCode.HOVER_COMPLETE,
     SkillName.SEARCH: SkillResultCode.TARGET_FOUND,
+    SkillName.INSPECT: SkillResultCode.GOAL_REACHED,
     SkillName.TRACK: SkillResultCode.TRACK_COMPLETE,
     SkillName.REACQUIRE: SkillResultCode.TARGET_FOUND,
     SkillName.LAND: SkillResultCode.LAND_COMPLETE,
@@ -1387,6 +2528,7 @@ _EXPECTED_SUCCESS_CODES: dict[SkillName, SkillResultCode] = {
 _GOAL_TYPES: dict[SkillName, type[SkillGoal]] = {
     SkillName.TAKEOFF: TakeoffGoal,
     SkillName.GOTO: GotoGoal,
+    SkillName.HOVER: HoverGoal,
     SkillName.SEARCH: SearchGoal,
     SkillName.TRACK: TrackGoal,
     SkillName.LAND: LandGoal,
@@ -1396,7 +2538,7 @@ _GOAL_TYPES: dict[SkillName, type[SkillGoal]] = {
 def _reject_unknown_goal_fields(
     name: SkillName, params: Mapping[str, object]
 ) -> None:
-    goal_type = _GOAL_TYPES.get(name)
+    goal_type = _goal_type_for_name(name)
     if goal_type is None:
         raise TaskPlanError(f"{name.value} cannot appear in TaskPlan")
     allowed = {field.name for field in fields(goal_type)}
@@ -1415,6 +2557,17 @@ def _reject_unknown_goal_fields(
     missing = sorted(required - set(params))
     if missing:
         raise TaskPlanError(f"missing {name.value} parameter(s): {', '.join(missing)}")
+
+
+def _goal_type_for_name(name: SkillName) -> type[SkillGoal] | None:
+    if name is SkillName.INSPECT:
+        # INSPECT's grounding dependencies traverse perception/runtime
+        # packages.  Import lazily so importing the foundational skills.plan
+        # module cannot create a planner.schemas -> runtime cycle.
+        from skills.inspect import InspectGoal
+
+        return InspectGoal
+    return _GOAL_TYPES.get(name)
 
 
 def _manager_skill_name(value: SkillName | str | object) -> SkillName:
@@ -1437,6 +2590,59 @@ def _yaw_mode(value: object) -> YawMode:
         except KeyError as exc:
             raise TaskPlanError(f"unknown yaw_mode: {value}") from exc
     raise TaskPlanError("yaw_mode must be a YawMode or string")
+
+
+def _hover_mode(value: object) -> HoverMode:
+    if isinstance(value, HoverMode):
+        return value
+    if isinstance(value, str):
+        try:
+            return HoverMode(value.upper())
+        except ValueError as exc:
+            raise TaskPlanError(f"unknown HOVER mode: {value}") from exc
+    raise TaskPlanError("HOVER mode must be a HoverMode or string")
+
+
+def _hover_timeout_fallback(
+    value: HoverTimeoutFallback | str | object,
+) -> HoverTimeoutFallback:
+    if isinstance(value, HoverTimeoutFallback):
+        return value
+    if isinstance(value, str):
+        try:
+            return HoverTimeoutFallback(value.upper())
+        except ValueError as exc:
+            raise SkillManagerError(
+                f"unknown supervisory HOVER timeout fallback: {value}"
+            ) from exc
+    raise TypeError("timeout_fallback must be a HoverTimeoutFallback or string")
+
+
+def _validate_hover_goal_for_manager(
+    goal: HoverGoal,
+    *,
+    supervisory: bool,
+) -> None:
+    if supervisory:
+        if goal.mode is not HoverMode.UNTIL_RELEASED or goal.duration_s is not None:
+            raise SkillManagerError(
+                "supervisory HOVER must be UNTIL_RELEASED with duration_s=None"
+            )
+    elif goal.mode is not HoverMode.TIMED:
+        raise TaskPlanError("planned HOVER must use TIMED mode")
+    _positive_number(goal.max_wait_s, "max_wait_s")
+    _positive_number(goal.position_tolerance_m, "position_tolerance_m")
+    _positive_number(
+        goal.max_correction_speed_mps, "max_correction_speed_mps"
+    )
+    if goal.mode is HoverMode.TIMED:
+        duration = _positive_number(goal.duration_s, "duration_s")
+        if duration > float(goal.max_wait_s):
+            raise TaskPlanError("HOVER duration_s must not exceed max_wait_s")
+    validate_routing_id(goal.reason_code, "reason_code")
+    if not isinstance(goal.motion_policy, MotionPolicy):
+        raise TypeError("HOVER motion_policy must be a MotionPolicy")
+    goal.motion_policy.validate()
 
 
 def _motion_policy(value: object) -> MotionPolicy:
@@ -1514,7 +2720,25 @@ def _copy_task_plan(plan: TaskPlan) -> TaskPlan:
                 step.recovery,
             )
             for step in plan.steps
-        )
+        ),
+        mission_id=plan.mission_id,
+        uav_id=plan.uav_id,
+        plan_version=plan.plan_version,
+    )
+
+
+def _copy_report(report: SkillExecutionReport) -> SkillExecutionReport:
+    return SkillExecutionReport(
+        mission_id=report.mission_id,
+        uav_id=report.uav_id,
+        plan_version=report.plan_version,
+        step_id=report.step_id,
+        invocation_id=report.invocation_id,
+        skill_name=report.skill_name,
+        status=report.status,
+        result_code=report.result_code,
+        feedback_or_result=deepcopy(report.feedback_or_result),
+        timestamp_s=report.timestamp_s,
     )
 
 
@@ -1556,6 +2780,7 @@ def _name_or_none(name: SkillName | None) -> str:
 
 __all__ = [
     "ExecutionKind",
+    "HoverTimeoutFallback",
     "RecoveryPolicy",
     "SkillManager",
     "SkillManagerError",

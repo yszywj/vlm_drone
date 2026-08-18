@@ -233,6 +233,7 @@ class SimpleUavSearchEnv:
             camera=self.scene.camera_sensor,
             perception=perception,
             clock=clock,
+            uav_id=self.config.uav.id,
         )
 
     def configure_overview_viewport(self) -> None:
@@ -411,6 +412,7 @@ class SimpleUavSearchEnv:
         if not include_oracle:
             agent = self.get_agent_observation()
             return Observation(
+                uav_id=self.config.uav.id,
                 timestamp=agent.camera_timestamp_s,
                 uav_pose=agent.uav_state,
                 uav_velocity=agent.uav_velocity_mps.copy(),
@@ -423,6 +425,7 @@ class SimpleUavSearchEnv:
         # do not independently fetch two caches when constructing Oracle data.
         agent = evaluator.observation
         return Observation(
+            uav_id=self.config.uav.id,
             timestamp=agent.camera_timestamp_s,
             uav_pose=agent.uav_state,
             uav_velocity=agent.uav_velocity_mps.copy(),

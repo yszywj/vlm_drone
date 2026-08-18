@@ -114,11 +114,13 @@ def make_context() -> SkillContext:
         camera=FakeCamera(),
         perception=None,
         clock=FakeClock(),
+        uav_id="uav_1",
     )
 
 
 def make_observation() -> Observation:
     return Observation(
+        uav_id="uav_1",
         timestamp=0.1,
         uav_pose=UAVState(0.0, 0.0, 1.0, 0.3),
         uav_velocity=np.zeros(3),
@@ -288,6 +290,7 @@ class SkillBaseTest(unittest.TestCase):
         skill = ScriptedSkill()
         skill.start(ScriptedGoal(outcome="running"), make_context())
         bad_observation = Observation(
+            uav_id="uav_1",
             timestamp=float("nan"),
             uav_pose=UAVState(0.0, 0.0, 1.0, 0.0),
             uav_velocity=np.zeros(3),

@@ -102,6 +102,7 @@ def context() -> tuple[SkillContext, ManualClock]:
             camera=FakeCamera(),
             perception=None,
             clock=clock,
+            uav_id="uav_1",
         ),
         clock,
     )
@@ -109,6 +110,7 @@ def context() -> tuple[SkillContext, ManualClock]:
 
 def observation(timestamp: float) -> Observation:
     return Observation(
+        uav_id="uav_1",
         timestamp=timestamp,
         uav_pose=UAVState(0.0, 0.0, 8.0, 0.0),
         uav_velocity=np.zeros(3),

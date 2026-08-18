@@ -97,7 +97,7 @@ class SkillPlanDraftJsonSchemaTest(unittest.TestCase):
         variants = _variants(self.schema)
         self.assertEqual(
             list(variants),
-            ["TAKEOFF", "GOTO", "SEARCH", "TRACK", "LAND"],
+            ["TAKEOFF", "GOTO", "HOVER", "SEARCH", "TRACK", "LAND"],
         )
         for variant in variants.values():
             self.assertEqual(variant["required"], ["id", "skill", "args"])

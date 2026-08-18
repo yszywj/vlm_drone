@@ -19,14 +19,15 @@ from models.base import (
 )
 from planner.base import MissionPlanner, PlannerError, PlannerOutputError
 from planner.diagnostics import PlannerDiagnostics, PlannerExecution
-from planner.json_schema import build_skill_plan_draft_json_schema
+from planner.json_schema import build_skill_plan_v2_json_schema
 from planner.policy import PlannerLimits, PlannerPolicy
 from planner.prompt_builder import build_dynamic_skill_planner_messages
-from planner.schemas import PlannerRequest, SkillPlanDraft
+from planner.schemas import PlannerRequest, SkillPlanDraft, SkillPlanDraftV2
 from planner.skill_catalog import (
     SkillArgumentSpec,
     SkillCatalog,
     build_default_skill_catalog,
+    initial_planner_catalog,
 )
 from planner.symbolic_checker import PlanIssue, SymbolicPlanChecker
 
@@ -36,6 +37,11 @@ _JSON_FENCE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 _FIXED_YAW_CONDITION = "only allowed and required when yaw_mode is FIXED"
+# The documented local Qwen service uses a 4096-token context.  Initial output
+# has enough room for a ten-step draft; the one repair call uses a smaller
+# bounded budget because its prompt also contains the prior JSON and issues.
+_DYNAMIC_PLAN_MAX_TOKENS = 768
+_DYNAMIC_REPAIR_MAX_TOKENS = 512
 
 
 class _DuplicateJSONKeyError(ValueError):
@@ -131,7 +137,10 @@ class DynamicLLMPlanner(MissionPlanner):
 
         self._model_client = model_client
         self._system_prompt = prompt.strip()
-        self._skill_catalog = skill_catalog
+        # The complete catalog includes runtime-revision-only INSPECT.  An
+        # initial model request has no trusted CandidateBank ID, so expose and
+        # enforce only the initial-planning projection.
+        self._skill_catalog = initial_planner_catalog(skill_catalog)
         self._planner_limits = limits
         self._planner_policy = policy
         self._symbolic_checker = SymbolicPlanChecker()
@@ -146,7 +155,7 @@ class DynamicLLMPlanner(MissionPlanner):
     def last_diagnostics(self) -> PlannerDiagnostics | None:
         return self._last_diagnostics
 
-    def plan(self, request: PlannerRequest) -> SkillPlanDraft:
+    def plan(self, request: PlannerRequest) -> SkillPlanDraftV2:
         return self.plan_with_diagnostics(request).output
 
     def plan_with_diagnostics(self, request: PlannerRequest) -> PlannerExecution:
@@ -154,6 +163,27 @@ class DynamicLLMPlanner(MissionPlanner):
             raise TypeError("request must be a PlannerRequest")
 
         self._last_diagnostics = None
+        if not request.has_routing_ids:
+            self._last_diagnostics = PlannerDiagnostics(
+                model_calls=0,
+                repair_used=False,
+                repair_succeeded=False,
+                initial_output_valid=False,
+                final_output_valid=False,
+                initial_error_code="ROUTING_IDS_REQUIRED",
+                initial_error_message=(
+                    "dynamic Qwen planning requires trusted routing IDs"
+                ),
+                structured_output_enabled=True,
+            )
+            raise PlannerError(
+                "DynamicLLMPlanner requires trusted mission_id, uav_id, and "
+                "plan_version before any model call"
+            )
+
+        assert request.mission_id is not None
+        assert request.uav_id is not None
+        assert request.plan_version is not None
         initial_messages = build_dynamic_skill_planner_messages(
             request.instruction,
             request.world_context,
@@ -161,17 +191,30 @@ class DynamicLLMPlanner(MissionPlanner):
             self._planner_limits,
             self._system_prompt,
             self._planner_policy,
+            mission_id=request.mission_id,
+            uav_id=request.uav_id,
+            plan_version=request.plan_version,
+        )
+        schema = build_skill_plan_v2_json_schema(
+            world_context=request.world_context,
+            skill_catalog=self._skill_catalog,
+            limits=self._planner_limits,
+            mission_id=request.mission_id,
+            uav_id=request.uav_id,
+            plan_version=request.plan_version,
         )
         response_format = JsonSchemaResponseFormat(
-            name="skill_plan_draft",
-            schema=build_skill_plan_draft_json_schema(
-                world_context=request.world_context,
-                skill_catalog=self._skill_catalog,
-                limits=self._planner_limits,
-            ),
+            name="skill_plan_draft_v2",
+            schema=schema,
         )
         generation_options = GenerationOptions(
             temperature=0.0,
+            max_tokens=_DYNAMIC_PLAN_MAX_TOKENS,
+            response_format=response_format,
+        )
+        repair_generation_options = GenerationOptions(
+            temperature=0.0,
+            max_tokens=_DYNAMIC_REPAIR_MAX_TOKENS,
             response_format=response_format,
         )
         self._safe_log("debug", "dynamic Skill plan model call started")
@@ -213,7 +256,6 @@ class DynamicLLMPlanner(MissionPlanner):
 
         repair_messages = (
             *initial_messages,
-            ChatMessage(role="assistant", content=first_output),
             ChatMessage(
                 role="user",
                 content=self._build_repair_prompt(
@@ -223,7 +265,10 @@ class DynamicLLMPlanner(MissionPlanner):
             ),
         )
         try:
-            repaired_output = self._chat_content(repair_messages, generation_options)
+            repaired_output = self._chat_content(
+                repair_messages,
+                repair_generation_options,
+            )
         except Exception:
             self._last_diagnostics = self._failure_diagnostics(
                 model_calls=2,
@@ -280,7 +325,7 @@ class DynamicLLMPlanner(MissionPlanner):
         self,
         raw_output: str,
         request: PlannerRequest,
-    ) -> SkillPlanDraft:
+    ) -> SkillPlanDraftV2:
         try:
             parsed = self._parse_json_object(raw_output)
         except (
@@ -296,21 +341,38 @@ class DynamicLLMPlanner(MissionPlanner):
                 self._describe_validation_error(exc),
             ) from None
         try:
-            draft = SkillPlanDraft.from_dict(parsed)
+            if "target_spec" not in parsed:
+                raise ValueError(
+                    "schema-v2 initial plan must include target_spec"
+                )
+            draft = SkillPlanDraftV2.from_dict(parsed)
+            self._require_initial_plan_skills(draft)
+            if draft.mission_id != request.mission_id:
+                raise ValueError(
+                    "mission_id must exactly echo the trusted PlannerRequest"
+                )
+            if draft.uav_id != request.uav_id:
+                raise ValueError(
+                    "uav_id must exactly echo the trusted PlannerRequest"
+                )
+            if draft.plan_version != request.plan_version:
+                raise ValueError(
+                    "plan_version must exactly echo the trusted PlannerRequest"
+                )
         except (OverflowError, RecursionError, TypeError, ValueError) as exc:
             raise _DraftValidationFailure(
                 "SCHEMA_INVALID",
                 self._describe_validation_error(exc),
             ) from None
         try:
-            self._validate_against_catalog(draft)
+            self._validate_against_catalog(draft.to_v1())
         except (OverflowError, RecursionError, TypeError, ValueError) as exc:
             raise _DraftValidationFailure(
                 "CATALOG_CONTRACT_VIOLATION",
                 self._describe_validation_error(exc),
             ) from None
         result = self._symbolic_checker.check(
-            draft,
+            draft.to_v1(),
             world_context=request.world_context,
             limits=self._planner_limits,
             policy=self._planner_policy,
@@ -516,13 +578,19 @@ class DynamicLLMPlanner(MissionPlanner):
                     "message": validation_failure.message,
                 }
             ]
+        mandatory_repairs = [
+            hint
+            for issue in validation_issues
+            if (hint := DynamicLLMPlanner._repair_hint(issue["code"])) is not None
+        ]
         payload = {
             "task": (
-                "Repair the previous output into one valid SkillPlanDraft "
-                "JSON object."
+                "Repair the previous output into one valid routed "
+                "SkillPlanDraft schema-v2 JSON object."
             ),
             "original_output": original_output,
             "validation_issues": validation_issues,
+            "mandatory_repairs": mandatory_repairs,
             "requirements": (
                 "Follow the system rules, trusted world context, Skill Catalog, "
                 "and planner limits. Return only corrected JSON with no Markdown "
@@ -537,9 +605,44 @@ class DynamicLLMPlanner(MissionPlanner):
             separators=(",", ":"),
         )
 
+    @staticmethod
+    def _repair_hint(code: object) -> str | None:
+        if code == "LAND_GOTO_MISSING":
+            return (
+                "Insert exactly one GOTO immediately before the final LAND. "
+                "Set GOTO.args.destination exactly equal to LAND.args.zone, "
+                "use a new unique step id, and preserve the trusted uav_id."
+            )
+        return None
+
     @classmethod
     def _parse_plan_draft(cls, raw_output: str) -> SkillPlanDraft:
+        """Parse the retained schema-v1 compatibility representation only."""
+
         return SkillPlanDraft.from_dict(cls._parse_json_object(raw_output))
+
+    @classmethod
+    def _parse_plan_draft_v2(cls, raw_output: str) -> SkillPlanDraftV2:
+        """Parse one initial routed schema-v2 response without invoking a model.
+
+        INSPECT is intentionally revision-only: an initial plan has no trusted
+        CandidateBank identifier to bind its candidate argument to.
+        """
+
+        parsed = cls._parse_json_object(raw_output)
+        if "target_spec" not in parsed:
+            raise ValueError("schema-v2 initial plan must include target_spec")
+        draft = SkillPlanDraftV2.from_dict(parsed)
+        cls._require_initial_plan_skills(draft)
+        return draft
+
+    @staticmethod
+    def _require_initial_plan_skills(draft: SkillPlanDraftV2) -> None:
+        if any(step.skill == "INSPECT" for step in draft.steps):
+            raise ValueError(
+                "INSPECT is unavailable in an initial plan without a trusted "
+                "runtime candidate"
+            )
 
     @classmethod
     def _parse_json_object(cls, raw_output: str) -> Mapping[str, object]:

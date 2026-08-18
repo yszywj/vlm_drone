@@ -15,6 +15,7 @@ if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
 from models.openai_compatible_client import OpenAICompatibleClient  # noqa: E402
+from common.ids import validate_uav_id  # noqa: E402
 from planner_data.evaluator import (  # noqa: E402
     DEFAULT_DYNAMIC_SYSTEM_PROMPT_PATH,
     DEFAULT_SYSTEM_PROMPT_PATH,
@@ -77,6 +78,12 @@ def _parser() -> argparse.ArgumentParser:
             "scripted/dynamic_scripted validate the evaluator; "
             "llm/dynamic_llm call the configured text-model service"
         ),
+    )
+    parser.add_argument(
+        "--uav-id",
+        type=validate_uav_id,
+        default="uav_1",
+        help="trusted routing ID for schema-v2 dynamic_llm outputs",
     )
     parser.add_argument(
         "--output-root",
@@ -168,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:
             ontology=ontology,
             model_client=model_client,
             system_prompt_path=args.system_prompt,
+            uav_id=args.uav_id,
         )
         run = evaluator.evaluate(
             samples,

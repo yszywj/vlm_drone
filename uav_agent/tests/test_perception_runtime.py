@@ -21,6 +21,7 @@ from skills.types import Observation
 
 def observation(*, oracle: bool = False) -> Observation:
     return Observation(
+        uav_id="uav_1",
         timestamp=1.0,
         uav_pose=UAVState(0.0, 0.0, 1.0, 0.0),
         uav_velocity=np.zeros(3),
@@ -51,17 +52,17 @@ class PerceptionRuntimeTests(unittest.TestCase):
 
     def test_production_rejects_oracle_backend_before_observe(self) -> None:
         with self.assertRaisesRegex(PerceptionBoundaryError, "forbidden"):
-            GuardedPerceptionBackend(OraclePerception())
+            GuardedPerceptionBackend(OraclePerception(uav_id="uav_1"))
 
     def test_oracle_evaluation_requires_explicit_acknowledgement(self) -> None:
         with self.assertRaisesRegex(PerceptionBoundaryError, "explicit"):
             GuardedPerceptionBackend(
-                OraclePerception(),
+                OraclePerception(uav_id="uav_1"),
                 profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
             )
 
         guarded = GuardedPerceptionBackend(
-            OraclePerception(),
+            OraclePerception(uav_id="uav_1"),
             profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
             acknowledge_privileged_oracle=True,
         )

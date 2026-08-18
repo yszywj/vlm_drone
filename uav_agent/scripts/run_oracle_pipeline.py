@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import os
 import random
 import sys
@@ -24,6 +25,24 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from configs.loader import ConfigError, load_config  # noqa: E402
+from common.ids import validate_uav_id  # noqa: E402
+
+
+def _build_oracle_evaluation_backend(uav_id: str) -> object:
+    """Build the explicitly privileged backend with one trusted UAV route."""
+
+    from perception import (
+        GuardedPerceptionBackend,
+        OraclePerception,
+        PerceptionRuntimeProfile,
+    )
+
+    trusted_uav_id = validate_uav_id(uav_id)
+    return GuardedPerceptionBackend(
+        OraclePerception(uav_id=trusted_uav_id, target_id="target"),
+        profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
+        acknowledge_privileged_oracle=True,
+    )
 
 
 def _positive_float(value: str) -> float:
@@ -42,6 +61,7 @@ def _finite_float(value: str) -> float:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--uav-id", default="uav_1", type=validate_uav_id)
     parser.add_argument("--config", required=True, help="path to the unified YAML config")
     parser.add_argument(
         "--track-duration",
@@ -192,6 +212,7 @@ def main() -> int:
 
     try:
         config = load_config(args.config)
+        config = replace(config, uav=replace(config.uav, id=args.uav_id))
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
@@ -214,11 +235,6 @@ def main() -> int:
     environment = None
     try:
         from env.simple_uav_search_env import SimpleUavSearchEnv
-        from perception import (
-            GuardedPerceptionBackend,
-            OraclePerception,
-            PerceptionRuntimeProfile,
-        )
         from skills.manager import (
             SkillManager,
             TaskPlan,
@@ -248,18 +264,19 @@ def main() -> int:
             "[Perception] PRIVILEGED ORACLE_EVALUATION profile enabled; "
             "not a production visual-perception runtime"
         )
-        oracle = GuardedPerceptionBackend(
-            OraclePerception(target_id="target"),
-            profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
-            acknowledge_privileged_oracle=True,
-        )
+        oracle = _build_oracle_evaluation_backend(args.uav_id)
         clock = IsaacSimulationClock(environment)
         context = environment.make_skill_context(clock, perception=oracle)
         registry = create_default_skill_registry(
             transit_yaw_mode=config.search.transit_yaw_mode
         )
         manager = SkillManager(context, registry=registry)
-        plan = TaskPlan.from_dicts(_task_plan_dicts(config, args))
+        plan = TaskPlan.from_dicts(
+            _task_plan_dicts(config, args),
+            mission_id="mission_oracle_demo",
+            uav_id=args.uav_id,
+            plan_version=1,
+        )
 
         print("[TaskManager] Task started")
         manager.start_task(plan)

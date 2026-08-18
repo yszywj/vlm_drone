@@ -10,18 +10,24 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
+from common.ids import validate_uav_id
 from configs.schema import (
     AppConfig,
     ArtifactsConfig,
     CameraConfig,
     CheckpointConfig,
+    DebugImagesConfig,
     EvaluationConfig,
     ExperimentConfig,
     FiguresConfig,
+    FrameStoreConfig,
     LoggingConfig,
+    ModelWorkerConfig,
+    PlanRevisionConfig,
     PlannerConfig,
     SceneConfig,
     SearchConfig,
+    QwenVisualReviewConfig,
     StorageConfig,
     SimulationConfig,
     TargetConfig,
@@ -39,6 +45,25 @@ class ConfigError(ValueError):
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _DEFAULT_PLANNER_CONFIG = PlannerConfig()
+_DEFAULT_MODEL_WORKER_CONFIG = ModelWorkerConfig()
+_DEFAULT_QWEN_VISUAL_REVIEW_CONFIG = QwenVisualReviewConfig()
+_DEFAULT_PLAN_REVISION_CONFIG = PlanRevisionConfig()
+_DEFAULT_FRAME_STORE_CONFIG = FrameStoreConfig()
+_DEFAULT_DEBUG_IMAGES_CONFIG = DebugImagesConfig()
+
+_MAX_REQUEST_TIMEOUT_S = 300.0
+_MAX_REVIEW_INTERVAL_S = 3_600.0
+_MAX_IMAGE_SIDE_PX = 4_096
+_MAX_HOVER_POSITION_TOLERANCE_M = 5.0
+_MAX_HOVER_CORRECTION_SPEED_MPS = 10.0
+# Keep the configuration boundary aligned with planner.revision.RevisionLimits;
+# a value accepted here must remain constructible by the trusted runtime.
+_MAX_PLAN_REVISIONS = 3
+_MAX_REVISION_COOLDOWN_S = 3_600.0
+_MAX_FRAME_STORE_FRAMES = 4_096
+_MAX_FRAME_STORE_BYTES = 1_073_741_824
+_MAX_FRAME_STORE_AGE_S = 3_600.0
+_MAX_DEBUG_IMAGES_PER_RUN = 10_000
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -79,6 +104,58 @@ def _positive_integer(value: Any, path: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ConfigError(f"{path} must be a positive integer")
     return value
+
+
+def _nonnegative_integer(value: Any, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"{path} must be a non-negative integer")
+    return value
+
+
+def _bounded_positive_number(value: Any, path: str, maximum: float) -> float:
+    result = _positive_number(value, path)
+    if result > maximum:
+        raise ConfigError(f"{path} must not exceed {maximum:g}")
+    return result
+
+
+def _bounded_positive_integer(value: Any, path: str, maximum: int) -> int:
+    result = _positive_integer(value, path)
+    if result > maximum:
+        raise ConfigError(f"{path} must not exceed {maximum}")
+    return result
+
+
+def _strict_optional_block(
+    root: Mapping[str, Any],
+    name: str,
+    expected_keys: frozenset[str],
+) -> Mapping[str, Any] | None:
+    """Return a supplied post-v1 block after exact-key validation.
+
+    Omitting the entire block is backward compatible.  Supplying a partial or
+    extended block is rejected so a typo cannot silently weaken a limit.
+    """
+
+    if name not in root:
+        return None
+    raw = _mapping(root[name], name)
+    if any(not isinstance(key, str) for key in raw):
+        raise ConfigError(f"{name} keys must be strings")
+    missing = sorted(expected_keys - set(raw))
+    unknown = sorted(set(raw) - expected_keys)
+    if missing:
+        raise ConfigError(f"{name} is missing required keys: " + ", ".join(missing))
+    if unknown:
+        raise ConfigError(f"{name} contains unknown keys: " + ", ".join(unknown))
+    return raw
+
+
+def _uav_id(value: Any, path: str) -> str:
+    try:
+        return validate_uav_id(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
 
 
 def _nonnegative_number(value: Any, path: str) -> float:
@@ -222,6 +299,7 @@ def load_config(path: str | Path) -> AppConfig:
 
     uav_raw = _mapping(_required(root, "uav", "config"), "uav")
     uav = UavConfig(
+        id=_uav_id(uav_raw.get("id", "uav_1"), "uav.id"),
         initial_position_xyz_m=_float_vector(
             _required(uav_raw, "initial_position_xyz_m", "uav"), "uav.initial_position_xyz_m", 3
         ),
@@ -438,6 +516,214 @@ def load_config(path: str | Path) -> AppConfig:
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"invalid planner configuration: {exc}") from exc
 
+    model_worker_raw = _strict_optional_block(
+        root,
+        "model_worker",
+        frozenset({"max_inflight_per_uav", "request_timeout_s"}),
+    )
+    if model_worker_raw is None:
+        model_worker = _DEFAULT_MODEL_WORKER_CONFIG
+    else:
+        max_inflight = _positive_integer(
+            model_worker_raw["max_inflight_per_uav"],
+            "model_worker.max_inflight_per_uav",
+        )
+        # The worker contract deliberately supports one in-flight request per
+        # UAV.  A larger value would reintroduce out-of-order control results.
+        if max_inflight != 1:
+            raise ConfigError("model_worker.max_inflight_per_uav must be exactly 1")
+        model_worker = ModelWorkerConfig(
+            max_inflight_per_uav=max_inflight,
+            request_timeout_s=_bounded_positive_number(
+                model_worker_raw["request_timeout_s"],
+                "model_worker.request_timeout_s",
+                _MAX_REQUEST_TIMEOUT_S,
+            ),
+        )
+
+    visual_review_raw = _strict_optional_block(
+        root,
+        "qwen_visual_review",
+        frozenset(
+            {
+                "enabled",
+                "mode",
+                "goto_interval_s",
+                "search_interval_s",
+                "inspect_interval_s",
+                "track_interval_s",
+                "max_recent_frames",
+                "max_image_side_px",
+                "jpeg_quality",
+                "hover_position_tolerance_m",
+                "hover_max_correction_speed_mps",
+                "blocking_hover_timeout_s",
+                "blocking_timeout_fallback",
+            }
+        ),
+    )
+    if visual_review_raw is None:
+        qwen_visual_review = _DEFAULT_QWEN_VISUAL_REVIEW_CONFIG
+    else:
+        mode = visual_review_raw["mode"]
+        if not isinstance(mode, str) or mode not in {"shadow", "gate"}:
+            raise ConfigError("qwen_visual_review.mode must be shadow or gate")
+        max_recent_frames = _bounded_positive_integer(
+            visual_review_raw["max_recent_frames"],
+            "qwen_visual_review.max_recent_frames",
+            3,
+        )
+        image_side = _bounded_positive_integer(
+            visual_review_raw["max_image_side_px"],
+            "qwen_visual_review.max_image_side_px",
+            _MAX_IMAGE_SIDE_PX,
+        )
+        jpeg_quality = _bounded_positive_integer(
+            visual_review_raw["jpeg_quality"],
+            "qwen_visual_review.jpeg_quality",
+            95,
+        )
+        blocking_timeout_fallback = visual_review_raw[
+            "blocking_timeout_fallback"
+        ]
+        if not isinstance(blocking_timeout_fallback, str) or blocking_timeout_fallback not in {
+            "RESUME_PREVIOUS",
+            "CANCEL_AND_LAND",
+        }:
+            raise ConfigError(
+                "qwen_visual_review.blocking_timeout_fallback must be "
+                "RESUME_PREVIOUS or CANCEL_AND_LAND"
+            )
+        qwen_visual_review = QwenVisualReviewConfig(
+            enabled=_boolean(
+                visual_review_raw["enabled"], "qwen_visual_review.enabled"
+            ),
+            mode=mode,
+            goto_interval_s=_bounded_positive_number(
+                visual_review_raw["goto_interval_s"],
+                "qwen_visual_review.goto_interval_s",
+                _MAX_REVIEW_INTERVAL_S,
+            ),
+            search_interval_s=_bounded_positive_number(
+                visual_review_raw["search_interval_s"],
+                "qwen_visual_review.search_interval_s",
+                _MAX_REVIEW_INTERVAL_S,
+            ),
+            inspect_interval_s=_bounded_positive_number(
+                visual_review_raw["inspect_interval_s"],
+                "qwen_visual_review.inspect_interval_s",
+                _MAX_REVIEW_INTERVAL_S,
+            ),
+            track_interval_s=_bounded_positive_number(
+                visual_review_raw["track_interval_s"],
+                "qwen_visual_review.track_interval_s",
+                _MAX_REVIEW_INTERVAL_S,
+            ),
+            max_recent_frames=max_recent_frames,
+            max_image_side_px=image_side,
+            jpeg_quality=jpeg_quality,
+            hover_position_tolerance_m=_bounded_positive_number(
+                visual_review_raw["hover_position_tolerance_m"],
+                "qwen_visual_review.hover_position_tolerance_m",
+                _MAX_HOVER_POSITION_TOLERANCE_M,
+            ),
+            hover_max_correction_speed_mps=_bounded_positive_number(
+                visual_review_raw["hover_max_correction_speed_mps"],
+                "qwen_visual_review.hover_max_correction_speed_mps",
+                _MAX_HOVER_CORRECTION_SPEED_MPS,
+            ),
+            blocking_hover_timeout_s=_bounded_positive_number(
+                visual_review_raw["blocking_hover_timeout_s"],
+                "qwen_visual_review.blocking_hover_timeout_s",
+                _MAX_REQUEST_TIMEOUT_S,
+            ),
+            blocking_timeout_fallback=blocking_timeout_fallback,
+        )
+
+    plan_revision_raw = _strict_optional_block(
+        root,
+        "plan_revision",
+        frozenset({"enabled", "max_revisions", "cooldown_s"}),
+    )
+    if plan_revision_raw is None:
+        plan_revision = _DEFAULT_PLAN_REVISION_CONFIG
+    else:
+        max_revisions = _nonnegative_integer(
+            plan_revision_raw["max_revisions"], "plan_revision.max_revisions"
+        )
+        if max_revisions > _MAX_PLAN_REVISIONS:
+            raise ConfigError(
+                f"plan_revision.max_revisions must not exceed {_MAX_PLAN_REVISIONS}"
+            )
+        revision_enabled = _boolean(
+            plan_revision_raw["enabled"],
+            "plan_revision.enabled",
+        )
+        if revision_enabled and max_revisions == 0:
+            raise ConfigError(
+                "plan_revision.max_revisions must be positive when revision is enabled"
+            )
+        plan_revision = PlanRevisionConfig(
+            enabled=revision_enabled,
+            max_revisions=max_revisions,
+            cooldown_s=_nonnegative_number(
+                plan_revision_raw["cooldown_s"], "plan_revision.cooldown_s"
+            ),
+        )
+        if plan_revision.cooldown_s > _MAX_REVISION_COOLDOWN_S:
+            raise ConfigError(
+                "plan_revision.cooldown_s must not exceed "
+                f"{_MAX_REVISION_COOLDOWN_S:g}"
+            )
+
+    frame_store_raw = _strict_optional_block(
+        root,
+        "frame_store",
+        frozenset({"max_frames", "max_bytes", "max_age_s"}),
+    )
+    if frame_store_raw is None:
+        frame_store = _DEFAULT_FRAME_STORE_CONFIG
+    else:
+        frame_store = FrameStoreConfig(
+            max_frames=_bounded_positive_integer(
+                frame_store_raw["max_frames"],
+                "frame_store.max_frames",
+                _MAX_FRAME_STORE_FRAMES,
+            ),
+            max_bytes=_bounded_positive_integer(
+                frame_store_raw["max_bytes"],
+                "frame_store.max_bytes",
+                _MAX_FRAME_STORE_BYTES,
+            ),
+            max_age_s=_bounded_positive_number(
+                frame_store_raw["max_age_s"],
+                "frame_store.max_age_s",
+                _MAX_FRAME_STORE_AGE_S,
+            ),
+        )
+
+    debug_images_raw = _strict_optional_block(
+        root,
+        "debug_images",
+        frozenset({"enabled", "max_images_per_run"}),
+    )
+    if debug_images_raw is None:
+        debug_images = _DEFAULT_DEBUG_IMAGES_CONFIG
+    else:
+        max_debug_images = _nonnegative_integer(
+            debug_images_raw["max_images_per_run"],
+            "debug_images.max_images_per_run",
+        )
+        if max_debug_images > _MAX_DEBUG_IMAGES_PER_RUN:
+            raise ConfigError(
+                "debug_images.max_images_per_run must not exceed "
+                f"{_MAX_DEBUG_IMAGES_PER_RUN}"
+            )
+        debug_images = DebugImagesConfig(
+            enabled=_boolean(debug_images_raw["enabled"], "debug_images.enabled"),
+            max_images_per_run=max_debug_images,
+        )
+
     experiment_raw = _mapping(_required(root, "experiment", "config"), "experiment")
     experiment_name = _required(experiment_raw, "name", "experiment")
     if not isinstance(experiment_name, str) or not _EXPERIMENT_NAME_RE.fullmatch(experiment_name):
@@ -630,6 +916,11 @@ def load_config(path: str | Path) -> AppConfig:
         artifacts=artifacts,
         figures=figures,
         storage=storage,
+        model_worker=model_worker,
+        qwen_visual_review=qwen_visual_review,
+        plan_revision=plan_revision,
+        frame_store=frame_store,
+        debug_images=debug_images,
     )
     _validate_spatial_bounds(config)
     return config

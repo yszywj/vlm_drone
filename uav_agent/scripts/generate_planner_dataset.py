@@ -20,6 +20,8 @@ from planner_data.generator import (  # noqa: E402
     generate_and_write_dataset,
     stage_external_candidates,
 )
+from planner_data.v2_preview import write_v2_preview_dataset  # noqa: E402
+from common.ids import validate_uav_id  # noqa: E402
 
 
 def _strict_json_loads(text: str) -> object:
@@ -43,12 +45,28 @@ def _strict_json_loads(text: str) -> object:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate Planner v1 text-only MissionIntent data without Isaac or Qwen."
+        description=(
+            "Generate Planner-v1 MissionIntent data or an explicit routed "
+            "schema-v2 dynamic-plan preview without Isaac or Qwen."
+        )
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_DATASET_CONFIG_PATH)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--profile", choices=("pilot", "full"), default="pilot")
+    parser.add_argument(
+        "--schema-version",
+        choices=(1, 2),
+        default=1,
+        type=int,
+        help="output schema (default: v1; v2 is a routed preview)",
+    )
+    parser.add_argument(
+        "--uav-id",
+        default="uav_1",
+        type=validate_uav_id,
+        help="trusted UAV ID embedded in every schema-v2 step",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--paraphraser", choices=("none", "external"), default="none")
     parser.add_argument("--candidate-only", action="store_true")
@@ -67,6 +85,19 @@ def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     if arguments.seed < 0:
         print("generation error: --seed must be non-negative", file=sys.stderr)
+        return 2
+    if arguments.schema_version == 2 and arguments.profile != "pilot":
+        print(
+            "generation error: schema v2 export is a pilot preview; the reviewed "
+            "full-v2 publication workflow is not implemented",
+            file=sys.stderr,
+        )
+        return 2
+    if arguments.schema_version == 2 and arguments.candidate_only:
+        print(
+            "generation error: external candidate staging remains a Planner-v1 workflow",
+            file=sys.stderr,
+        )
         return 2
     if arguments.paraphraser == "external" and not arguments.candidate_only:
         print(
@@ -117,17 +148,32 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        manifest = generate_and_write_dataset(
-            config_path=arguments.config,
-            output_root=arguments.output_root,
-            seed=arguments.seed,
-            profile=arguments.profile,
-            overwrite=arguments.overwrite,
-        )
+        if arguments.schema_version == 1:
+            manifest = generate_and_write_dataset(
+                config_path=arguments.config,
+                output_root=arguments.output_root,
+                seed=arguments.seed,
+                profile=arguments.profile,
+                overwrite=arguments.overwrite,
+            )
+            payload = manifest.to_dict()
+        else:
+            generator = PlannerDatasetGenerator(arguments.config)
+            generated = generator.generate(
+                seed=arguments.seed,
+                profile=arguments.profile,
+            )
+            payload = write_v2_preview_dataset(
+                generated,
+                arguments.output_root,
+                uav_id=arguments.uav_id,
+                ontology=generator.ontology,
+                overwrite=arguments.overwrite,
+            )
     except (DatasetGenerationError, FileExistsError, OSError, TypeError, ValueError) as exc:
         print(f"generation error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(manifest.to_dict(), ensure_ascii=False, allow_nan=False, sort_keys=True))
+    print(json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True))
     return 0
 
 

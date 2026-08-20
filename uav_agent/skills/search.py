@@ -26,6 +26,35 @@ from skills.types import (
     SkillStatus,
 )
 
+_SEARCH_WAYPOINT_ANGLES_DEG: tuple[float, ...] = (
+    30.0,
+    90.0,
+    150.0,
+    210.0,
+    270.0,
+    330.0,
+)
+
+
+def build_search_waypoints(
+    center_xyz_m: tuple[float, float, float],
+    radius_m: float,
+    altitude_m: float,
+) -> tuple[tuple[float, float, float], ...]:
+    """Build the deterministic six-point SEARCH perimeter route."""
+
+    center = require_vector3(center_xyz_m, "center_xyz_m")
+    radius = require_positive(radius_m, "radius_m")
+    altitude = require_positive(altitude_m, "altitude_m")
+
+    return tuple(
+        (
+            float(center[0] + radius * cos(radians(angle_deg))),
+            float(center[1] + radius * sin(radians(angle_deg))),
+            float(altitude),
+        )
+        for angle_deg in _SEARCH_WAYPOINT_ANGLES_DEG
+    )
 
 @dataclass(frozen=True, slots=True)
 class SearchGoal(SkillGoal):
@@ -54,7 +83,7 @@ class SearchSkill(Skill):
     """Search six fixed perimeter points without reading hidden target position."""
 
     goal_type = SearchGoal
-    WAYPOINT_COUNT = 6
+    WAYPOINT_COUNT = len(_SEARCH_WAYPOINT_ANGLES_DEG)
     FULL_SCAN_RAD = 2.0 * pi
 
     def __init__(
@@ -174,15 +203,12 @@ class SearchSkill(Skill):
         )
         start_time = self._read_clock(context)
         waypoints = tuple(
-            np.asarray(
-                [
-                    center[0] + typed_goal.radius * cos(radians(angle_deg)),
-                    center[1] + typed_goal.radius * sin(radians(angle_deg)),
-                    typed_goal.search_altitude,
-                ],
-                dtype=np.float64,
+            np.asarray(point, dtype=np.float64)
+            for point in build_search_waypoints(
+                tuple(float(value) for value in center),
+                typed_goal.radius,
+                typed_goal.search_altitude,
             )
-            for angle_deg in (30.0, 90.0, 150.0, 210.0, 270.0, 330.0)
         )
         look_at_point = (
             tuple(float(value) for value in center)

@@ -106,7 +106,7 @@ SkillManager
 Oracle-backed Ideal Skills     # SEARCH / TRACK / REACQUIRE 使用 evaluator truth
 ```
 
-旧的 `scripted` / `llm` 模式保持不变：Planner 输出严格五字段 `MissionIntent`，可信编译器生成固定六步 baseline。新增的 `dynamic_scripted` / `dynamic_llm` 显式启用受约束动态规划：Planner 输出 2～10 步的 `SkillPlanDraft`，可以按指令省略 SEARCH/TRACK、有限重复 GOTO/TRACK，并为 TRACK 选择是否启用有界 REACQUIRE。两条路径都只在 `MissionAgent.start()` 规划一次；仿真 tick 不调用模型，也没有运行时 LLM replanning。
+旧的 `scripted` / `llm` 模式保持不变：Planner 输出严格五字段 `MissionIntent`，可信编译器生成固定六步 baseline。新增的 `dynamic_scripted` / `dynamic_llm` 显式启用受约束动态规划：Planner 输出 2～10 步的 `SkillPlanDraft`，可以按指令省略 SEARCH/TRACK、有限重复 GOTO/TRACK，并为 TRACK 选择是否启用有界 REACQUIRE。这个 Stage 1 基线只在 `MissionAgent.start()` 做初始规划；后文显式启用的视觉 gate、计划修订和障碍路线修订是在此基础上的独立运行时能力。
 
 动态模式不会把飞控交给 Qwen。模型只看到场景总边界、默认高度/时长、Skill Catalog、调用上限、具名区域/降落区/导航点及文字描述，并只能填写高层参数；它看不到这些名称背后的具体坐标、搜索中心/半径、目标 spawn/真值、图像、速度向量、实际 max speed 或普通 Skill timeout。`PlanValidator` 才负责把名称解析为可信世界坐标、补充 motion policy/timeout/速度上限、检查引用与计划状态，并拒绝缺失 TAKEOFF/LAND、越界高度或非法顺序，而不是静默补步骤。
 
@@ -197,7 +197,7 @@ QWEN_MODEL_PATH=/home/amax/ry/vlm_drones/models/initial_model/Qwen3-VL-4B-Instru
 
 `HOVER` 是可恢复的监督性暂停，不是硬安全机制：它每个 tick 都继续发送有界位置保持 setpoint，并有有限等待超时和可信 fallback。`qwen_visual_review.hover_position_tolerance_m`、`hover_max_correction_speed_mps`、`blocking_hover_timeout_s` 与 `blocking_timeout_fallback` 都由受限配置加载；模型无权设置这些参数。越界、非法 Observation、时间倒退等硬安全判定优先于任何模型请求，不等待 Qwen，直接走现有 `CANCEL_AND_LAND` 或 `ABORT`。
 
-计划修订采用独立的第二阶段 Planner，视觉 review 本身不能夹带飞行计划。修订只能原子替换当前被中断步骤或未执行后缀，已完成前缀和 target immutable identity 不可改；routing ID、基础/新版本、步数与 revision 预算、cooldown、Symbolic checker、`PlanValidator` 和 Safety preflight 任一检查失败都保留原计划。默认最多三次修订；LAND 已开始后不接受普通语义修订。Qwen 永远不能在修订中绕过具名区域产生任意坐标、速度或控制量。
+计划修订采用独立的第二阶段 Planner，视觉 review 本身不能夹带飞行计划。普通语义修订只能原子替换当前被中断步骤或未执行后缀，已完成前缀和 target immutable identity 不可改；routing ID、基础/新版本、步数与 revision 预算、cooldown、Symbolic checker、`PlanValidator` 和 Safety preflight 任一检查失败都保留原计划。默认最多三次修订；LAND 已开始后不接受普通语义修订。V3 的障碍专用修订使用独立多模态 schema，只允许在可信 `UAV_HOLD_FLU` 锚点中提出有限航点，并始终通过 RouteRegistry、可配置 Critic 和再次 Safety preflight；模型仍不能输出速度或控制量。
 
 所有 Planner v2 step、Observation、review、event、invocation、execution report 和 transition 都带 `uav_id`，并与 `mission_id`、`plan_version` 一起逐边界精确比对。当前仍是“一架 UAV 一个 `MissionAgent`”，不是并发机群调度；属于 `uav_2` 的帧、review 或 revision 会被绑定到 `uav_1` 的 Agent 立即拒绝。
 
@@ -220,6 +220,20 @@ QWEN_MODEL_PATH=/home/amax/ry/vlm_drones/models/initial_model/Qwen3-VL-4B-Instru
 
 要实验 gate mode，把 `shadow` 改成 `gate` 并额外添加 `--acknowledge-vision-gate`。仅用于恢复路径测试的三个选项是 `--inject-path-blocked-at-s`、`--inject-progress-stall-at-s` 与 `--inject-identity-conflict-at-s`；它们产生的事件和 CSV 都明确写 `source=test_injection`，不伪装成 detector 或 Qwen 发现。启动时会打印 UAV/mission routing、Planner、视觉模式、感知 profile 与 Oracle acknowledgement。每次运行只在 `logs/dynamic_visual_missions/<mission_id>/` 写有界 `qwen_reviews.jsonl`、`mission_events.csv`、`skill_transitions.csv` 和原子更新的 `run_manifest.json`；manifest 汇总模型与配置、review 接受/过期/超时计数、修订次数、监督性 HOVER 次数/时长、终态和调试图片占用。默认不写 base64 prompt、原图或视频。
 
+### Spatial Contract V3 与障碍路线实验
+
+V2 保持默认兼容合同；只有显式传入 `--planning-contract v3` 才允许 Qwen 构造点、相对点和区域。V3 坐标均带 frame：`WORLD_ENU`（东、北、上）、`HOME_ENU`（home 原点，轴仍为 ENU）、`UAV_START_FLU`（任务开始机头前、左、上）、`UAV_HOLD_FLU`（障碍 HOLD 时机头前、左、上）以及仅供摄像机观测的 `CAMERA_FLU`。未绑定 pose 或未经过视觉 grounding 的相对对象会明确失败，不由编译器猜测“左边”的参考系。
+
+SEARCH V3 支持 `CIRCLE / RECTANGLE / SECTOR / POLYGON / CORRIDOR / RELATIONAL`，以及 PERIMETER、割草、螺旋、扇区扫描、走廊跟随、随机覆盖和模型宏观观察点等策略。`ADAPTIVE_NEXT_BEST_VIEW` 仅在显式传入 `--enable-qwen-next-best-view` 时启用：每到达一个宏观观察点后，后台 Qwen worker 接收最新 RGB、覆盖率和可信区域边界，异步选择一个新的区域内 `WORLD_ENU` 观察点或返回 `EXHAUSTED`；它不输出 60 Hz 控制量，也不重写整份任务。连续 SEARCH 是同一个 Target 生命周期内的有限回退链，总步骤和总 SEARCH 时间仍受可信预算约束。
+
+障碍物只来自 `configs/default.yaml` 的共享 registry。`ideal_camera` 是带 frustum、像素面积、遮挡、距离和 active-corridor 约束的 privileged 上界感知，不会把相机外的全局障碍表发给 Qwen。低层报告或 Qwen 疑似报告任一方都可立即触发 HOVER；只有 registry-backed camera geometry 才能启动坐标路线生成。模式差异如下：
+
+- `open_sim` 只做结构检查，原样执行模型航点，并由运行时 swept-volume CollisionMonitor 记录碰撞后取消/降落；
+- `critic_sim` 返回几何反例，模型最多自行修订三次，Critic 不生成替代航点；
+- `strict` 拒绝不安全路线，预算耗尽或发布失败时可信取消/降落。
+
+实验开关的默认值仍是 `v2 / linear / strict / disabled`。MissionProgram 的不可变图类型、线性适配器、纯 Python executor、事件边和 suffix-only `ProgramPatch` 已接入 `SkillManager` 调度；静态 `PATH_BLOCKED` 边或 Qwen patch 都先建立 supervisory HOVER，再原子发布新图版本，并拒绝修改已完成节点或前缀边。当前 CLI 只开放不含障碍 TaskPlan 重规划的 graph 运行；graph 障碍模式仍会在启动 Isaac/Qwen 前明确 fail-closed，因为图片与 grounded 障碍几何尚未接到 `ProgramPatchCoordinator`。默认不保存 RGB、原始帧或视频，模型原始结构化提案、Critic 结果和最终执行计划则写入有界稀疏日志。
+
 在启动 Isaac demo 前，可先用一张用户指定图片验证真实 Qwen 多模态协议。该 smoke 只输出严格目标存在判断和归一化 bbox，不接触 Oracle 或 controller：
 
 ```bash
@@ -237,7 +251,7 @@ QWEN_MODEL_PATH=/home/amax/ry/vlm_drones/models/initial_model/Qwen3-VL-4B-Instru
 场景完全由本地 primitive 创建，不依赖在线 USD 资产：
 
 - 白色平坦 Ground、DomeLight 和斜向 DistantLight；
-- 三个带碰撞的彩色固定 Cube 障碍物；
+- 由共享配置 registry 创建的带碰撞彩色固定 Cube 障碍物；
 - 矩形机身、十字机臂、电机块和 Nose 拼成的 UAV 简模，不使用四旋翼 USD；
 - 固定在 UAV 根节点上的 RGB Camera，以及 GUI 中可见的 CameraHousing；
 - 红色 Cube Target，后续可替换成 Person USD。
@@ -317,7 +331,7 @@ Camera 配置包含 `[width, height]` resolution、采样 frequency、水平 FOV
 - `LINEAR`：以固定速度直线运动，在边界反射；
 - `RANDOM_WALK`：每隔配置时间随机改变 XY 速度方向，并在边界反射。
 
-Target root 只在 `target.motion.region` 闭区间内运动，速度受 `target.max_speed_mps` 限制。随机序列使用配置 seed，可重复复现实验；默认测试覆盖连续五分钟的 60 Hz 随机运动且不越界。第一版不做 obstacle avoidance/collision response，Target 可能穿过障碍物；region 约束的是 root，不是视觉几何边缘。底层提供 `get_pose()`、`get_velocity()`、`reset()` 和 `step()`。
+Target root 只在 `target.motion.region` 闭区间内运动，速度受 `target.max_speed_mps` 限制。随机序列使用配置 seed，可重复复现实验；默认测试覆盖连续五分钟的 60 Hz 随机运动且不越界。运动更新对共享 registry 中的 collidable AABB 加上 Target half extent 后做连续碰撞预测并反射速度，因此不会穿过固定障碍；region 约束的仍是 root。底层提供 `get_pose()`、`get_velocity()`、`reset()` 和 `step()`。
 
 环境内部知道 Target 真值以便仿真和评估，但不会把移动目标控制器交给 Planner/VLM。默认 Agent 入口：
 
@@ -340,7 +354,7 @@ observation = agent_view.observe()
 - `SkillManager` 同时只推进一个注册 Skill；手动模式不做隐式切换，显式 `start_task()` 后才启用 Stage-0 自动任务状态机；
 - 生命周期完成后必须显式 `reset_active()`，才能启动下一项。
 
-Phase 5 最初建立的 TAKEOFF、GOTO、SEARCH、TRACK、REACQUIRE 与 LAND 六个类型合同现在均已有 ideal-kinematic 实现；另外已有受信运行时使用的监督性 `HOVER`，以及只消费候选 ID、不接受任意世界坐标的理想 `INSPECT`。`ORBIT / FOLLOW_PATH / RETURN_HOME` 仍未作为独立 Skill 加入。
+Phase 5 最初建立的 TAKEOFF、GOTO、SEARCH、TRACK、REACQUIRE 与 LAND 六个类型合同现在均已有 ideal-kinematic 实现；另外已有受信运行时使用的监督性 `HOVER`、只消费候选 ID 的理想 `INSPECT`，以及只通过 `RouteRegistry.route_ref` 消费已接受多航点路线的 `FOLLOW_ROUTE`。`ORBIT / FOLLOW_PATH / RETURN_HOME` 仍未作为独立 Skill 加入。
 
 MotionPolicy 支持：
 

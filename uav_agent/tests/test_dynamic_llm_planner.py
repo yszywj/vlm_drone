@@ -312,6 +312,21 @@ class DynamicLLMPlannerTest(unittest.TestCase):
             [message.role for message in client.calls[1][0]],
             ["system", "user", "user"],
         )
+        self.assertLess(len(str(client.calls[1][0][0].content)), 800)
+        self.assertIn(
+            "response schema",
+            str(client.calls[1][0][0].content),
+        )
+        compact_context = json.loads(str(client.calls[1][0][1].content))
+        self.assertEqual(
+            compact_context["user_instruction"],
+            _request().instruction,
+        )
+        self.assertEqual(
+            compact_context["trusted_routing"]["mission_id"],
+            MISSION_ID,
+        )
+        self.assertNotIn("skill_catalog", compact_context)
         repair_payload = json.loads(str(client.calls[1][0][-1].content))
         self.assertEqual(repair_payload["original_output"], invalid)
         self.assertEqual(
@@ -532,7 +547,7 @@ class DynamicLLMPlannerTest(unittest.TestCase):
             self.assertEqual(options.temperature, 0.0)
         self.assertEqual(
             [options.max_tokens for _, options in client.calls],
-            [768, 512],
+            [1024, 1536],
         )
 
     def test_runtime_messages_equal_shared_builder_byte_for_byte(self) -> None:

@@ -120,6 +120,12 @@ class FrameStore:
         self._max_frame_age_s = age
 
         self._frames: dict[tuple[str, str], _StoredFrame] = {}
+        # In-flight model requests may outlive the count/byte retention
+        # window when simulation time advances faster than wall-clock HTTP.
+        # Pins protect only explicitly referenced frames; hard count and byte
+        # bounds remain in force because newly inserted, unpinned frames are
+        # still eligible for eviction.
+        self._pins: dict[tuple[str, str], int] = {}
         self._total_bytes = 0
         self._sequence = 0
         self._latest_timestamp_by_uav: dict[str, float] = {}
@@ -247,6 +253,36 @@ class FrameStore:
     def contains(self, ref: FrameRef) -> bool:
         return self.get_frame(ref, copy=False) is not None
 
+    def pin(self, ref: FrameRef) -> None:
+        """Retain an existing frame until the matching request is resolved."""
+
+        if not isinstance(ref, FrameRef):
+            raise TypeError("ref must be a FrameRef")
+        key = (ref.uav_id, ref.frame_id)
+        with self._lock:
+            stored = self._frames.get(key)
+            if stored is None or stored.ref != ref:
+                raise ValueError("cannot pin an absent or mismatched frame")
+            self._pins[key] = self._pins.get(key, 0) + 1
+
+    def unpin(self, ref: FrameRef) -> None:
+        """Release one matching in-flight retention claim."""
+
+        if not isinstance(ref, FrameRef):
+            raise TypeError("ref must be a FrameRef")
+        key = (ref.uav_id, ref.frame_id)
+        with self._lock:
+            count = self._pins.get(key)
+            if count is None:
+                raise ValueError("frame is not pinned")
+            if count == 1:
+                self._pins.pop(key, None)
+            else:
+                self._pins[key] = count - 1
+            newest = self._latest_timestamp_by_uav.get(ref.uav_id)
+            if newest is not None:
+                self._evict_locked(ref.uav_id, newest)
+
     def refs(self, *, uav_id: str | None = None) -> tuple[FrameRef, ...]:
         normalized_uav_id = None if uav_id is None else validate_uav_id(uav_id)
         with self._lock:
@@ -308,6 +344,7 @@ class FrameStore:
             if normalized_uav_id is None:
                 removed = len(self._frames)
                 self._frames.clear()
+                self._pins.clear()
                 self._total_bytes = 0
                 self._latest_timestamp_by_uav.clear()
                 return removed
@@ -325,7 +362,11 @@ class FrameStore:
             (
                 item
                 for item in self._frames.values()
-                if item.ref.uav_id == uav_id and item.ref.timestamp_s < cutoff
+                if (
+                    item.ref.uav_id == uav_id
+                    and item.ref.timestamp_s < cutoff
+                    and (item.ref.uav_id, item.ref.frame_id) not in self._pins
+                )
             ),
             key=lambda item: (item.ref.timestamp_s, item.sequence),
         )
@@ -336,14 +377,25 @@ class FrameStore:
             len(self._frames) > self._max_frames
             or self._total_bytes > self._max_total_bytes
         ):
+            candidates = tuple(
+                item
+                for item in self._frames.values()
+                if (item.ref.uav_id, item.ref.frame_id) not in self._pins
+            )
+            if not candidates:
+                # Pinning never adds bytes or entries, so this can only occur
+                # when every retained frame already fits the configured hard
+                # bounds.  Keep the guard defensive for future callers.
+                break
             oldest = min(
-                self._frames.values(),
+                candidates,
                 key=lambda item: item.sequence,
             )
             self._remove_locked((oldest.ref.uav_id, oldest.ref.frame_id))
 
     def _remove_locked(self, key: tuple[str, str]) -> None:
         item = self._frames.pop(key)
+        self._pins.pop(key, None)
         self._total_bytes -= item.byte_count
 
 

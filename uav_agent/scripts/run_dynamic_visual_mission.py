@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Sequence
 
 
@@ -39,6 +40,9 @@ from common.ids import (  # noqa: E402
     validate_uav_id,
 )
 from configs.loader import ConfigError, load_config  # noqa: E402
+
+
+_DEFAULT_UAV_SAFETY_RADIUS_M = 0.5
 
 
 def _build_oracle_evaluation_backend(uav_id: str) -> object:
@@ -131,6 +135,49 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="dynamic_llm",
         help="high-level planner (default: %(default)s)",
     )
+    parser.add_argument(
+        "--experiment-mode",
+        choices=(
+            "scripted_baseline",
+            "classical_baseline",
+            "qwen_open_sim",
+            "qwen_critic_sim",
+            "qwen_strict",
+        ),
+        default=None,
+        help=(
+            "closed benchmark condition; implies planner, planning contract, "
+            "route backend and validation policy"
+        ),
+    )
+    parser.add_argument(
+        "--planning-contract",
+        choices=("v2", "v3"),
+        default="v2",
+        help="initial structured planner contract (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--route-validation-mode",
+        choices=("open_sim", "critic_sim", "strict"),
+        default="strict",
+        help="Qwen route validation policy (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--obstacle-perception",
+        choices=("disabled", "ideal_camera"),
+        default=None,
+        help="override obstacle_perception.mode from config",
+    )
+    parser.add_argument(
+        "--runtime-program",
+        choices=("linear", "graph"),
+        default="linear",
+        help=(
+            "mission control-flow representation; graph uses the validated "
+            "linear TaskPlan adapter and owns SkillManager advancement "
+            "(default: %(default)s)"
+        ),
+    )
     parser.add_argument("--instruction", required=True)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--model", default=None)
@@ -162,6 +209,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="enable asynchronous RGB review; disabled regardless of YAML without this flag",
     )
     parser.add_argument(
+        "--enable-qwen-next-best-view",
+        action="store_true",
+        help=(
+            "advertise and run asynchronous ADAPTIVE_NEXT_BEST_VIEW for "
+            "Spatial V3; disabled by default"
+        ),
+    )
+    parser.add_argument(
+        "--debug-model-responses",
+        action="store_true",
+        help="persist only response length and a sanitized final 500 characters",
+    )
+    parser.add_argument(
         "--vision-review-mode",
         choices=("shadow", "gate"),
         default=None,
@@ -187,6 +247,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--output-dir",
         default="logs/dynamic_visual_missions",
         help="parent directory for bounded image-free run logs",
+    )
+    parser.add_argument(
+        "--unseen-spatial-instruction",
+        action="store_true",
+        help="mark this episode as held-out spatial-language evaluation",
     )
 
     parser.add_argument(
@@ -214,7 +279,88 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    return build_argument_parser().parse_args(argv)
+    raw_argv = tuple(sys.argv[1:] if argv is None else argv)
+    args = build_argument_parser().parse_args(raw_argv)
+    for destination in (
+        "experiment_mode",
+        "planner",
+        "planning_contract",
+        "route_validation_mode",
+    ):
+        flag = "--" + destination.replace("_", "-")
+        setattr(
+            args,
+            f"_explicit_{destination}",
+            any(item == flag or item.startswith(flag + "=") for item in raw_argv),
+        )
+    return resolve_experiment_launch_args(args)
+
+
+def resolve_experiment_launch_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply one experiment profile or annotate a legacy launch deterministically."""
+
+    from experiments.spatial_benchmark import (
+        SpatialBenchmarkError,
+        experiment_mode_profile,
+        infer_experiment_mode,
+        resolve_experiment_profile,
+    )
+
+    requested = getattr(args, "experiment_mode", None)
+    args.experiment_mode_explicit = bool(
+        getattr(args, "_explicit_experiment_mode", requested is not None)
+    )
+    try:
+        if requested is None:
+            mode = infer_experiment_mode(
+                planner=args.planner,
+                route_validation_mode=args.route_validation_mode,
+            )
+            profile = experiment_mode_profile(mode)
+            exact_profile = (
+                args.planner == profile.planner
+                and args.planning_contract == profile.planning_contract
+                and args.route_validation_mode == profile.route_validation_mode
+                and not (
+                    profile.mode.value
+                    in {"scripted_baseline", "classical_baseline"}
+                    and bool(
+                        args.enable_qwen_vision
+                        or args.enable_qwen_next_best_view
+                    )
+                )
+                and not bool(args.enable_qwen_next_best_view)
+            )
+            # Preserve all legacy defaults, but never label a non-comparable
+            # legacy combination as one of the five benchmark conditions.
+            args.experiment_mode = mode.value if exact_profile else "unspecified"
+            args.inferred_experiment_mode = mode.value
+        else:
+            profile = resolve_experiment_profile(
+                requested,
+                planner=(
+                    args.planner
+                    if getattr(args, "_explicit_planner", False)
+                    else None
+                ),
+                planning_contract=(
+                    args.planning_contract
+                    if getattr(args, "_explicit_planning_contract", False)
+                    else None
+                ),
+                route_validation_mode=(
+                    args.route_validation_mode
+                    if getattr(args, "_explicit_route_validation_mode", False)
+                    else None
+                ),
+            )
+            args.planner = profile.planner
+            args.planning_contract = profile.planning_contract
+            args.route_validation_mode = profile.route_validation_mode
+        args.route_planner_backend = profile.route_planner_backend
+    except SpatialBenchmarkError as exc:
+        raise LaunchConfigurationError(str(exc)) from None
+    return args
 
 
 def build_test_injection_specs(
@@ -253,6 +399,28 @@ def validate_launch_args(
 
     if not isinstance(args.instruction, str) or not args.instruction.strip():
         raise LaunchConfigurationError("--instruction must not be empty")
+    if not hasattr(args, "route_planner_backend"):
+        resolve_experiment_launch_args(args)
+    if (
+        args.experiment_mode in {"scripted_baseline", "classical_baseline"}
+        and bool(getattr(args, "experiment_mode_explicit", False))
+        and (args.enable_qwen_vision or args.enable_qwen_next_best_view)
+    ):
+        raise LaunchConfigurationError(
+            f"--experiment-mode {args.experiment_mode} forbids "
+            "Qwen visual capabilities so the non-Qwen baseline remains isolated"
+        )
+    if args.enable_qwen_next_best_view and (
+        args.planner != "dynamic_llm" or args.planning_contract != "v3"
+    ):
+        raise LaunchConfigurationError(
+            "--enable-qwen-next-best-view requires --planner dynamic_llm "
+            "and --planning-contract v3"
+        )
+    if args.planning_contract == "v3" and args.planner != "dynamic_llm":
+        raise LaunchConfigurationError(
+            "--planning-contract v3 currently requires --planner dynamic_llm"
+        )
     mode = args.vision_review_mode or configured_review_mode
     if mode not in {"shadow", "gate"}:
         raise LaunchConfigurationError("visual review mode must be shadow or gate")
@@ -266,6 +434,23 @@ def validate_launch_args(
         raise LaunchConfigurationError(
             "gate mode requires --acknowledge-vision-gate"
         )
+    if getattr(args, "runtime_program", "linear") == "graph":
+        obstacle_mode = getattr(
+            args,
+            "effective_obstacle_perception_mode",
+            args.obstacle_perception or "disabled",
+        )
+        if mode == "gate":
+            raise LaunchConfigurationError(
+                "--runtime-program graph does not accept TaskPlan gate "
+                "revisions; a ProgramPatch coordinator is required"
+            )
+        if obstacle_mode != "disabled":
+            raise LaunchConfigurationError(
+                "--runtime-program graph does not accept obstacle TaskPlan "
+                "replanning; use --obstacle-perception disabled until the "
+                "route coordinator emits ProgramPatch"
+            )
 
     oracle_selected = args.perception_runtime_profile == "oracle_evaluation"
     if oracle_selected != bool(args.acknowledge_privileged_oracle):
@@ -378,6 +563,179 @@ def _read_git_commit() -> str | None:
     return value if completed.returncode == 0 and len(value) == 40 else None
 
 
+def _active_flight_corridor(
+    manager: object,
+    observation: object,
+    *,
+    safety_radius_m: float = _DEFAULT_UAV_SAFETY_RADIUS_M,
+) -> object | None:
+    """Build a short trusted corridor without consulting target ground truth."""
+
+    from common.obstacle_types import FlightCorridor
+    from skills.follow_route import FollowRouteGoal
+    from skills.goto import GotoGoal
+    from skills.search import SearchGoal, SearchGoalV3
+    from skills.search_geometry import region_center
+
+    invocation = getattr(manager, "active_invocation", None)
+    if invocation is None:
+        return None
+    pose = observation.uav_pose
+    start = (float(pose.x), float(pose.y), float(pose.z))
+    goal = invocation.goal
+    end: tuple[float, float, float] | None = None
+    if isinstance(goal, GotoGoal):
+        end = tuple(float(item) for item in goal.position)
+    elif isinstance(goal, FollowRouteGoal):
+        try:
+            index = int(manager.get_feedback().data.get("waypoint_index", 0))
+        except Exception:
+            index = 0
+        if 0 <= index < len(goal.waypoints):
+            end = tuple(float(item) for item in goal.waypoints[index])
+    elif isinstance(goal, (SearchGoal, SearchGoalV3)):
+        try:
+            feedback = manager.get_feedback().data
+            active_waypoint = feedback.get("active_waypoint_xyz_m")
+            if (
+                isinstance(active_waypoint, (tuple, list))
+                and len(active_waypoint) == 3
+            ):
+                end = tuple(float(item) for item in active_waypoint)
+        except Exception:
+            end = None
+        if end is None and isinstance(goal, SearchGoal):
+            end = (
+                float(goal.center[0]),
+                float(goal.center[1]),
+                float(goal.search_altitude),
+            )
+        elif end is None:
+            center = region_center(goal.region)
+            end = (
+                float(center[0]),
+                float(center[1]),
+                float(goal.search_altitude_m),
+            )
+    if end is None:
+        velocity = observation.uav_velocity
+        speed_sq = float(sum(float(item) ** 2 for item in velocity))
+        if speed_sq > 1e-12:
+            end = tuple(start[index] + 5.0 * float(velocity[index]) for index in range(3))
+    if end is None or sum((right - left) ** 2 for left, right in zip(start, end)) <= 1e-12:
+        return None
+    return FlightCorridor(start, end, safety_radius_m)
+
+
+def _route_debug_records(
+    manager: object,
+    visual_runtime: object | None,
+) -> tuple[object, ...]:
+    """Return rejected raw proposals before registered route lifecycles."""
+
+    registry = getattr(manager, "route_registry", None)
+    coordinator = (
+        None
+        if visual_runtime is None
+        else getattr(visual_runtime, "obstacle_revision_coordinator", None)
+    )
+    proposal_records = () if coordinator is None else tuple(coordinator.records)
+    registry_records = () if registry is None else tuple(registry.records)
+    return (*proposal_records, *registry_records)
+
+
+def _camera_geometry_from_observation(
+    observation: object,
+    *,
+    uav_id: str,
+    camera_config: object,
+    far_clip_m: float,
+) -> object | None:
+    """Project one routed Observation onto the pure-Python camera contract."""
+
+    from common.obstacle_types import CameraGeometry
+
+    if (
+        observation.camera_position_m is None
+        or observation.camera_orientation_wxyz is None
+    ):
+        return None
+    return CameraGeometry(
+        frame_id=generate_routing_id("camera_frame"),
+        uav_id=uav_id,
+        timestamp_s=float(observation.timestamp),
+        position_world_m=tuple(float(item) for item in observation.camera_position_m),
+        orientation_world_from_camera_wxyz=tuple(
+            float(item) for item in observation.camera_orientation_wxyz
+        ),
+        resolution_wh_px=tuple(camera_config.resolution_wh_px),
+        horizontal_fov_deg=float(camera_config.horizontal_fov_deg),
+        near_clip_m=0.1,
+        far_clip_m=max(0.11, float(far_clip_m)),
+    )
+
+
+def _build_initial_spatial_resolver(
+    world_context: object,
+    uav_pose: object,
+) -> object:
+    """Bind Spatial V3 relative frames to trusted post-reset geometry.
+
+    The pose is sampled from the controller after environment setup, so
+    ``UAV_START_FLU`` never relies on an assumed yaw.  ``UAV_HOLD_FLU`` and
+    ``CAMERA_FLU`` deliberately remain unavailable during initial planning.
+    """
+
+    from planner.spatial_resolver import FramePose, SpatialResolver
+
+    landing_zones = getattr(world_context, "landing_zones", None)
+    if not isinstance(landing_zones, dict) and not hasattr(
+        landing_zones, "__getitem__"
+    ):
+        raise LaunchConfigurationError(
+            "Spatial V3 requires trusted landing-zone geometry"
+        )
+    try:
+        home = landing_zones["home"]
+    except (KeyError, TypeError):
+        raise LaunchConfigurationError(
+            "Spatial V3 HOME_ENU requires a trusted 'home' landing zone"
+        ) from None
+
+    named_locations: dict[str, tuple[float, float, float]] = {
+        str(name): (
+            float(zone.position_xy_m[0]),
+            float(zone.position_xy_m[1]),
+            float(zone.ground_altitude_m),
+        )
+        for name, zone in landing_zones.items()
+    }
+    for name, point in getattr(world_context, "navigation_points", {}).items():
+        named_locations[str(name)] = tuple(
+            float(item) for item in point.position_xyz_m
+        )
+
+    start = FramePose(
+        (
+            float(uav_pose.x),
+            float(uav_pose.y),
+            float(uav_pose.z),
+        ),
+        yaw_rad=float(uav_pose.yaw),
+    )
+    return SpatialResolver(
+        home_pose=FramePose(
+            (
+                float(home.position_xy_m[0]),
+                float(home.position_xy_m[1]),
+                float(home.ground_altitude_m),
+            )
+        ),
+        uav_start_pose=start,
+        named_locations=named_locations,
+    )
+
+
 def visual_manifest_context(
     *,
     args: argparse.Namespace,
@@ -398,6 +756,11 @@ def visual_manifest_context(
             "debug_images",
         )
     }
+    obstacle_mode = getattr(
+        args,
+        "effective_obstacle_perception_mode",
+        args.obstacle_perception or config.obstacle_perception.mode,
+    )
     return {
         "mission_id": validate_mission_id(mission_id),
         "uav_id": validate_uav_id(args.uav_id),
@@ -407,22 +770,57 @@ def visual_manifest_context(
         "perception_runtime_profile": args.perception_runtime_profile,
         "oracle_acknowledged": bool(args.acknowledge_privileged_oracle),
         "qwen_visual_review_mode": review_mode,
+        "qwen_next_best_view_enabled": bool(
+            args.enable_qwen_next_best_view
+        ),
+        "experiment_mode": args.experiment_mode,
+        "route_planner_backend": args.route_planner_backend,
+        "unseen_spatial_instruction": bool(args.unseen_spatial_instruction),
+        "planning_contract": args.planning_contract,
+        "runtime_program": args.runtime_program,
+        "route_validation_mode": args.route_validation_mode,
+        "obstacle_perception_mode": obstacle_mode,
+        "obstacle_perception_source": (
+            "ideal_camera_obstacle_perception"
+            if obstacle_mode == "ideal_camera"
+            else "disabled"
+        ),
+        "obstacle_perception_privileged": obstacle_mode == "ideal_camera",
+        "obstacle_coordinate_frame": (
+            "CAMERA_FLU" if obstacle_mode == "ideal_camera" else None
+        ),
+        "prompt_schema_versions": {
+            "initial_planner": 3 if args.planning_contract == "v3" else 2,
+            "visual_review": 1,
+            "runtime_visual_assessment": 2,
+            "obstacle_route_revision": 3,
+            "mission_program": 1,
+            "next_best_view": 1,
+        },
         "configuration": _json_compatible(blocks),
     }
 
 
 @dataclass(slots=True)
 class _VisualRuntime:
-    coordinator: object
-    worker: object
+    coordinator: object | None
+    worker: object | None
     event_bus: object
     output_parent: Path
     model_name: str
     revision_coordinator: object | None = None
+    obstacle_revision_coordinator: object | None = None
+    runtime_visual_assessment_coordinator: object | None = None
+    next_best_view_provider: object | None = None
+    extra_workers: list[object] = field(default_factory=list)
     seen_review_ids: frozenset[str] = frozenset()
     seen_event_ids: frozenset[str] = frozenset()
     seen_revision_keys: frozenset[str] = frozenset()
+    seen_obstacle_revision_keys: frozenset[str] = frozenset()
+    seen_runtime_assessment_request_ids: frozenset[str] = frozenset()
+    seen_next_best_view_request_ids: frozenset[str] = frozenset()
     transition_cursor: int = 0
+    search_report_cursor: int = 0
     logger: object | None = None
     run_dir: Path | None = None
     hover_started_at_s: float | None = None
@@ -435,13 +833,48 @@ class _VisualRuntime:
         *,
         manifest_context: dict[str, object] | None = None,
     ) -> None:
-        from experiments.sparse_mission_logger import SparseMissionLogger
+        from experiments.sparse_mission_logger import (
+            RunManifestMetadata,
+            SparseMissionLogger,
+        )
 
         self.run_dir = self.output_parent.expanduser() / validate_mission_id(mission_id)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_context = dict(manifest_context or {})
         try:
-            self.logger = SparseMissionLogger(self.run_dir)
+            self.logger = SparseMissionLogger(
+                self.run_dir,
+                manifest_metadata=RunManifestMetadata(
+                    experiment_mode=str(
+                        self.manifest_context.get("experiment_mode", "unspecified")
+                    ),
+                    route_planner_backend=str(
+                        self.manifest_context.get(
+                            "route_planner_backend", "unspecified"
+                        )
+                    ),
+                    planning_contract=str(
+                        self.manifest_context.get("planning_contract", "unspecified")
+                    ),
+                    runtime_program=str(
+                        self.manifest_context.get("runtime_program", "linear")
+                    ),
+                    route_validation_mode=str(
+                        self.manifest_context.get(
+                            "route_validation_mode", "unspecified"
+                        )
+                    ),
+                    obstacle_perception_mode=str(
+                        self.manifest_context.get(
+                            "obstacle_perception_mode", "unspecified"
+                        )
+                    ),
+                    prompt_schema_versions=dict(
+                        self.manifest_context.get("prompt_schema_versions", {})
+                    ),
+                    git_commit=self.manifest_context.get("git_commit"),
+                ),
+            )
         except Exception as exc:
             # Persistent logging is observational.  A filesystem failure after
             # takeoff must never stop the control loop or strand the vehicle.
@@ -473,6 +906,8 @@ class _VisualRuntime:
     ) -> None:
         from experiments.sparse_mission_logger import QwenReviewLogRecord
 
+        if self.coordinator is None:
+            return
         records = self.coordinator.records
         for record in records:
             if record.review_id in self.seen_review_ids:
@@ -511,11 +946,135 @@ class _VisualRuntime:
                             stale=record.stale,
                             accepted=record.accepted_for_control,
                             timeout=record.error_code == "TIMEOUT",
+                            semantic_source=record.semantic_source,
+                            geometry_source=record.geometry_source,
+                            error_code=record.error_code,
+                            stale_reasons=record.stale_reasons,
+                            response_text_length=record.response_text_length,
+                            response_text_tail=record.response_text_tail,
                         )
                     )
                 except Exception as exc:
                     self._disable_failed_logger(exc)
         self.seen_review_ids = frozenset(record.review_id for record in records)
+
+    def emit_new_runtime_assessments(self, *, step_id: str | None) -> None:
+        coordinator = self.runtime_visual_assessment_coordinator
+        if coordinator is None:
+            return
+        from experiments.sparse_mission_logger import QwenReviewLogRecord
+
+        seen = set(self.seen_runtime_assessment_request_ids)
+        for record in tuple(coordinator.records):
+            if record.request_id in seen:
+                continue
+            assessment = record.assessment
+            decision = (
+                record.error_code or "UNKNOWN"
+                if assessment is None
+                else assessment.decision.value
+            )
+            grounded = bool(
+                assessment is not None
+                and any(item.geometry_grounded for item in assessment.hazards)
+            )
+            bbox = (
+                None
+                if assessment is None
+                else assessment.target_assessment.bbox_xyxy_normalized
+            )
+            print(
+                "[RuntimeVisualAssessmentV2] "
+                f"mission_id={record.mission_id} uav_id={record.uav_id} "
+                f"plan_version={record.plan_version} "
+                f"step_id={step_id or 'none'} decision={decision} "
+                f"stale={record.stale} applied={record.applied_to_control}"
+            )
+            if self.logger is not None:
+                try:
+                    self.logger.log_qwen_review(
+                        QwenReviewLogRecord(
+                            review_id=record.review_id,
+                            request_id=record.request_id,
+                            mission_id=record.mission_id,
+                            uav_id=record.uav_id,
+                            plan_version=record.plan_version,
+                            step_id=step_id,
+                            frame_id=record.frame_id,
+                            observation_timestamp_s=(
+                                record.observation_timestamp_s
+                            ),
+                            decision=decision,
+                            bbox_xyxy_normalized=bbox,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            total_tokens=0,
+                            latency_s=max(
+                                0.0,
+                                (record.completed_timestamp_s or record.submitted_timestamp_s)
+                                - record.submitted_timestamp_s,
+                            ),
+                            stale=record.stale,
+                            accepted=record.applied_to_control,
+                            timeout=record.error_code == "TIMEOUT",
+                            geometry_source=(
+                                "ideal_camera_obstacle_perception"
+                                if grounded
+                                else "none"
+                            ),
+                            error_code=record.error_code,
+                        )
+                    )
+                except Exception as exc:
+                    self._disable_failed_logger(exc)
+            seen.add(record.request_id)
+        self.seen_runtime_assessment_request_ids = frozenset(seen)
+
+    def emit_new_next_best_view_proposals(self) -> None:
+        """Persist completed macro-view proposals without retaining RGB data."""
+
+        provider = self.next_best_view_provider
+        if provider is None:
+            return
+        from experiments.sparse_mission_logger import (
+            ModelCallKind,
+            ModelProposalLogRecord,
+        )
+
+        seen = set(self.seen_next_best_view_request_ids)
+        for record in tuple(getattr(provider, "records", ())):
+            if record.request_id in seen:
+                continue
+            payload = record.to_dict()
+            # The provider audit contract contains only structured text and
+            # coordinates. SparseMissionLogger independently rejects image or
+            # base64 keys if that invariant ever regresses.
+            print(
+                "[QwenNextBestView] "
+                f"mission_id={record.mission_id} uav_id={record.uav_id} "
+                f"plan_version={record.plan_version} "
+                f"request_id={record.request_id} "
+                f"decision={record.decision or record.error_code}"
+            )
+            if self.logger is not None:
+                try:
+                    self.logger.log_model_proposal(
+                        ModelProposalLogRecord(
+                            proposal_id=generate_routing_id("proposal_nbv"),
+                            mission_id=record.mission_id,
+                            uav_id=record.uav_id,
+                            plan_version=record.plan_version,
+                            timestamp_s=record.observation_timestamp_s,
+                            call_kind=ModelCallKind.NEXT_BEST_VIEW,
+                            proposal_index=record.proposal_index,
+                            proposal=payload,
+                            final_proposal=record.error_code is None,
+                        )
+                    )
+                except Exception as exc:
+                    self._disable_failed_logger(exc)
+            seen.add(record.request_id)
+        self.seen_next_best_view_request_ids = frozenset(seen)
 
     def log_injection(self, event: object, *, skill: str, step_id: str) -> None:
         payload = event.to_dict()
@@ -618,6 +1177,77 @@ class _VisualRuntime:
                     self._disable_failed_logger(exc)
             self.transition_cursor += 1
 
+    def emit_new_search_metrics(self, manager: object) -> None:
+        """Record terminal SEARCH coverage from routed execution reports."""
+
+        from skills.types import SkillName
+
+        reports = manager.execution_reports
+        plan = manager.task_plan
+        steps_by_id = (
+            {} if plan is None else {step.step_id: step for step in plan.steps}
+        )
+        for report in reports[self.search_report_cursor :]:
+            self.search_report_cursor += 1
+            if report.skill_name is not SkillName.SEARCH:
+                continue
+            result = report.feedback_or_result
+            data = result.get("data", result)
+            if not isinstance(data, dict):
+                data = {}
+            coverage = data.get("coverage_ratio", 0.0)
+            visited = data.get("visited_viewpoints", ())
+            elapsed = data.get("elapsed_time")
+            step = steps_by_id.get(report.step_id)
+            params = {} if step is None else step.params
+            region = params.get("region")
+            raw_shape = getattr(region, "shape", None)
+            region_shape = (
+                str(getattr(raw_shape, "value", raw_shape))
+                if raw_shape is not None
+                else str(region or "UNKNOWN")
+            )
+            strategy = params.get("strategy")
+            raw_strategy = getattr(strategy, "kind", None)
+            search_strategy = (
+                str(getattr(raw_strategy, "value", raw_strategy))
+                if raw_strategy is not None
+                else "PERIMETER_V1"
+            )
+            visited_count = (
+                len(visited)
+                if isinstance(visited, (tuple, list))
+                else int(data.get("visited_viewpoint_count", 0))
+            )
+            target_detection_time_s = (
+                float(elapsed)
+                if report.result_code is not None
+                and report.result_code.value == "TARGET_FOUND"
+                and isinstance(elapsed, (int, float))
+                and not isinstance(elapsed, bool)
+                else None
+            )
+            print(
+                "[SearchMetrics] "
+                f"mission_id={report.mission_id} uav_id={report.uav_id} "
+                f"plan_version={report.plan_version} step_id={report.step_id} "
+                f"region_shape={region_shape} strategy={search_strategy} "
+                f"coverage_ratio={float(coverage):.3f} "
+                f"visited_viewpoint_count={visited_count}"
+            )
+            if self.logger is not None:
+                try:
+                    self.logger.record_search_metrics(
+                        region_shape=region_shape,
+                        search_strategy=search_strategy,
+                        coverage_ratio=float(coverage),
+                        visited_viewpoint_count=visited_count,
+                        target_detection_time_s=target_detection_time_s,
+                    )
+                except Exception as exc:
+                    self._disable_failed_logger(exc)
+                    return
+
     def emit_new_revisions(self, *, skill: str, step_id: str) -> None:
         coordinator = self.revision_coordinator
         if coordinator is None:
@@ -635,13 +1265,184 @@ class _VisualRuntime:
                 f"step_id={record.new_step_id or step_id} skill={skill} "
                 f"outcome={record.outcome} request_id={record.request_id}"
             )
-            if self.logger is not None and record.outcome == "ACCEPTED":
+            if self.logger is not None:
                 try:
-                    self.logger.record_plan_revision()
+                    self.logger.record_plan_revision_model_call()
+                    if record.outcome == "ACCEPTED":
+                        self.logger.record_plan_revision()
                 except Exception as exc:
                     self._disable_failed_logger(exc)
             seen.add(key)
         self.seen_revision_keys = frozenset(seen)
+
+    def emit_new_obstacle_revisions(
+        self,
+        *,
+        mission_id: str,
+        uav_id: str,
+        plan_version: int,
+    ) -> None:
+        """Persist every route proposal/Critic pair without retaining RGB."""
+
+        coordinator = self.obstacle_revision_coordinator
+        if coordinator is None:
+            return
+        from experiments.sparse_mission_logger import (
+            ModelCallKind,
+            ModelProposalLogRecord,
+        )
+
+        seen = set(self.seen_obstacle_revision_keys)
+        records = tuple(coordinator.records)
+        first_index_by_round: dict[int, int] = {}
+        for item in records:
+            round_index = int(getattr(item, "round_index", 0))
+            first_index_by_round.setdefault(round_index, item.proposal_index)
+        for record in records:
+            round_index = int(getattr(record, "round_index", 0))
+            key = (
+                f"{round_index}:{record.request_id}:{record.proposal_index}:"
+                f"{record.submitted_timestamp_s}"
+            )
+            if key in seen:
+                continue
+            proposal = (
+                {"error_code": record.error_code or record.outcome}
+                if record.proposal is None
+                else dict(record.proposal)
+            )
+            critique = (
+                None if record.critique is None else dict(record.critique)
+            )
+            shadow_strict_critique = getattr(
+                record,
+                "shadow_strict_critique",
+                None,
+            )
+            if shadow_strict_critique is not None:
+                raw_shadow = dict(shadow_strict_critique)
+                raw_violations = raw_shadow.get("violations", ())
+                violation_types = sorted(
+                    {
+                        str(item.get("type"))
+                        for item in raw_violations
+                        if isinstance(item, dict) and item.get("type") is not None
+                    }
+                )
+                shadow_strict_critique = {
+                    "status": raw_shadow.get("status"),
+                    "route_id": raw_shadow.get("route_id"),
+                    "violation_count": (
+                        len(raw_violations)
+                        if isinstance(raw_violations, (tuple, list))
+                        else 0
+                    ),
+                    "violation_types": violation_types[:16],
+                    "route_length_m": raw_shadow.get("route_length_m"),
+                    "minimum_clearance_m": raw_shadow.get(
+                        "minimum_clearance_m"
+                    ),
+                }
+            raw_version = proposal.get("new_plan_version", plan_version)
+            proposal_version = (
+                raw_version
+                if isinstance(raw_version, int) and not isinstance(raw_version, bool)
+                else plan_version
+            )
+            route_data = proposal.get("route_draft")
+            route_id = (
+                route_data.get("route_id")
+                if isinstance(route_data, dict)
+                and isinstance(route_data.get("route_id"), str)
+                else None
+            )
+            if self.manifest_context.get("route_planner_backend") == "classical":
+                call_kind = ModelCallKind.CLASSICAL_ROUTE_PLANNER
+            else:
+                call_kind = (
+                    ModelCallKind.ROUTE_PLANNER
+                    if record.proposal_index == first_index_by_round[round_index]
+                    else ModelCallKind.ROUTE_REPAIR
+                )
+            completed = record.completed_timestamp_s
+            latency_s = (
+                None
+                if completed is None
+                else max(0.0, completed - record.submitted_timestamp_s)
+            )
+            print(
+                "[ObstacleRouteRevision] "
+                f"mission_id={mission_id} uav_id={uav_id} "
+                f"plan_version={proposal_version} route_id={route_id or 'none'} "
+                f"proposal_index={record.proposal_index} outcome={record.outcome}"
+            )
+            if self.logger is not None:
+                try:
+                    self.logger.log_model_proposal(
+                        ModelProposalLogRecord(
+                            proposal_id=generate_routing_id("proposal_route"),
+                            mission_id=mission_id,
+                            uav_id=uav_id,
+                            plan_version=proposal_version,
+                            timestamp_s=(
+                                record.submitted_timestamp_s
+                                if completed is None
+                                else completed
+                            ),
+                            call_kind=call_kind,
+                            proposal_index=record.proposal_index,
+                            proposal=proposal,
+                            critique=critique,
+                            shadow_strict_critique=shadow_strict_critique,
+                            route_id=route_id,
+                            final_proposal=record.outcome == "ACCEPTED",
+                            latency_s=latency_s,
+                        )
+                    )
+                    if record.outcome == "ACCEPTED":
+                        self.logger.record_plan_revision()
+                    if critique is not None:
+                        invalid = sum(
+                            1
+                            for violation in critique.get("violations", ())
+                            if isinstance(violation, dict)
+                            and violation.get("type")
+                            in {
+                                "OUTSIDE_SCENE",
+                                "ALTITUDE_OUT_OF_BOUNDS",
+                                "TOO_MANY_WAYPOINTS",
+                            }
+                        )
+                        if invalid:
+                            self.logger.record_invalid_waypoints(invalid)
+                except Exception as exc:
+                    self._disable_failed_logger(exc)
+            seen.add(key)
+        if self.logger is not None and records:
+            try:
+                state = getattr(coordinator.snapshot().state, "value", "")
+                terminal = records[-1]
+                shadow = getattr(terminal, "shadow_strict_critique", None)
+                if state in {"ACCEPTED", "EXHAUSTED"} and isinstance(
+                    shadow, dict
+                ):
+                    status = shadow.get("status")
+                    if status in {"ACCEPT", "REVISE"}:
+                        self.logger.record_shadow_strict_route_validity(
+                            status == "ACCEPT"
+                        )
+                elif state == "EXHAUSTED":
+                    # Repeated schema/contract-invalid outputs do not produce
+                    # evaluable geometry, but are still invalid route plans.
+                    self.logger.record_shadow_strict_route_validity(False)
+            except Exception as exc:
+                self._disable_failed_logger(exc)
+        self.seen_obstacle_revision_keys = frozenset(seen)
+
+    def add_worker(self, worker: object) -> None:
+        if not callable(getattr(worker, "close", None)):
+            raise TypeError("worker must provide close")
+        self.extra_workers.append(worker)
 
     def set_terminal_manifest(
         self,
@@ -650,14 +1451,124 @@ class _VisualRuntime:
         task_status: str,
         plan_version: int,
         guard_error: str | None,
+        mission_success: bool | None = None,
     ) -> None:
+        if mission_success is None:
+            mission_success = (
+                agent_status == "SUCCEEDED"
+                and task_status == "SUCCEEDED"
+                and guard_error is None
+            )
+        if not isinstance(mission_success, bool):
+            raise TypeError("mission_success must be a boolean or None")
         self.terminal_manifest = {
             "agent_status": str(agent_status),
             "task_status": str(task_status),
             "final_plan_version": int(plan_version),
             "guard_error": guard_error,
+            "mission_success": mission_success,
         }
+        if self.logger is not None:
+            try:
+                self.logger.set_final_plan_version(int(plan_version))
+            except Exception as exc:
+                self._disable_failed_logger(exc)
         self._write_manifest()
+
+    def record_initial_planner_calls(self, count: int) -> None:
+        if self.logger is None or count <= 0:
+            return
+        try:
+            self.logger.record_initial_planner_model_call(count=count)
+        except Exception as exc:
+            self._disable_failed_logger(exc)
+
+    def log_initial_planner_proposals(
+        self,
+        planner: object,
+        compiled_mission: object,
+        *,
+        timestamp_s: float,
+        fallback_call_count: int,
+    ) -> None:
+        """Persist raw structured drafts and the exact compiled execution plan."""
+
+        if self.logger is None:
+            return
+        proposals = tuple(getattr(planner, "model_proposals", ()))
+        if not proposals:
+            self.record_initial_planner_calls(fallback_call_count)
+            return
+        from experiments.sparse_mission_logger import (
+            ModelCallKind,
+            ModelProposalLogRecord,
+        )
+
+        plan = compiled_mission.task_plan
+        for index, raw_record in enumerate(proposals):
+            final = bool(raw_record.get("accepted", False)) and index == len(proposals) - 1
+            payload: dict[str, object] = {
+                "raw_model_proposal": raw_record,
+            }
+            if final:
+                payload["final_executed_task_plan"] = plan.to_dict()
+            try:
+                self.logger.log_model_proposal(
+                    ModelProposalLogRecord(
+                        proposal_id=generate_routing_id("proposal_initial"),
+                        mission_id=plan.mission_id,
+                        uav_id=plan.uav_id,
+                        plan_version=plan.plan_version,
+                        timestamp_s=float(timestamp_s),
+                        call_kind=ModelCallKind.INITIAL_PLANNER,
+                        proposal_index=index,
+                        proposal=payload,
+                        final_proposal=final,
+                    )
+                )
+            except Exception as exc:
+                self._disable_failed_logger(exc)
+                return
+
+    def record_obstacle_hold_metrics(self, snapshot: object) -> None:
+        if self.logger is None:
+            return
+        requested = getattr(snapshot, "hold_requested_timestamp_s", None)
+        established = getattr(snapshot, "hold_established_timestamp_s", None)
+        sources = tuple(getattr(snapshot, "hold_trigger_sources", ()))
+        if requested is None or not sources:
+            return
+        try:
+            self.logger.record_hold_metrics(
+                trigger_source="+".join(str(item) for item in sources),
+                hazard_detection_latency_s=0.0,
+                hold_establishment_latency_s=(
+                    None
+                    if established is None
+                    else max(0.0, float(established) - float(requested))
+                ),
+            )
+        except Exception as exc:
+            self._disable_failed_logger(exc)
+
+    def record_route_collision(self) -> None:
+        """Increment the sparse metric without putting I/O in safety control."""
+
+        if self.logger is None:
+            return
+        try:
+            self.logger.record_collision()
+        except Exception as exc:
+            self._disable_failed_logger(exc)
+            return
+
+    def record_path_position(self, position_xyz_m: tuple[float, float, float]) -> None:
+        if self.logger is None:
+            return
+        try:
+            self.logger.record_path_position(position_xyz_m)
+        except Exception as exc:
+            self._disable_failed_logger(exc)
 
     def _write_manifest(self) -> None:
         run_dir = self.run_dir
@@ -673,6 +1584,9 @@ class _VisualRuntime:
                     "timeout": 0,
                 },
                 "plan_revisions": 0,
+                "next_best_view_model_calls": 0,
+                "shadow_strict_route_valid": None,
+                "route_validity_source": "shadow_strict_route_valid",
                 "supervisory_hover": {"count": 0, "total_time_s": 0.0},
                 "debug_images": {"count": 0, "bytes": 0},
                 "dropped_log_records": 0,
@@ -683,10 +1597,10 @@ class _VisualRuntime:
             except Exception:
                 return
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             **self.manifest_context,
-            **self.terminal_manifest,
             **stats,
+            **self.terminal_manifest,
         }
         temporary = run_dir / ".run_manifest.json.tmp"
         destination = run_dir / "run_manifest.json"
@@ -715,10 +1629,14 @@ class _VisualRuntime:
 
     def close(self, *, timeout_s: float) -> None:
         close_error: Exception | None = None
-        try:
-            self.worker.close(timeout_s=timeout_s)
-        except Exception as exc:  # pragma: no cover - integration shutdown path
-            close_error = exc
+        for worker in (self.worker, *tuple(self.extra_workers)):
+            if worker is None:
+                continue
+            try:
+                worker.close(timeout_s=timeout_s)
+            except Exception as exc:  # pragma: no cover - integration shutdown path
+                if close_error is None:
+                    close_error = exc
         try:
             if self.logger is not None:
                 self._write_manifest()
@@ -789,6 +1707,7 @@ def _create_visual_runtime(
         ),
         max_result_age_s=config.frame_store.max_age_s,
         await_revision_completion=await_revision_completion,
+        debug_model_responses=args.debug_model_responses,
     )
     return _VisualRuntime(
         coordinator=coordinator,
@@ -796,6 +1715,34 @@ def _create_visual_runtime(
         event_bus=event_bus,
         output_parent=Path(args.output_dir),
         model_name=visual_client.model,
+    )
+
+
+def _create_logging_runtime(*, args: argparse.Namespace) -> _VisualRuntime:
+    """Create image-free experiment logging without starting any Qwen worker."""
+
+    from runtime import MissionEventBus
+
+    uses_model = (
+        getattr(args, "planner", None) in {"llm", "dynamic_llm"}
+        or getattr(args, "route_planner_backend", None) == "qwen"
+        or bool(getattr(args, "enable_qwen_next_best_view", False))
+    )
+    configured_model = getattr(args, "model", None)
+    model_name = (
+        configured_model.strip()
+        if uses_model
+        and isinstance(configured_model, str)
+        and configured_model.strip()
+        else "none"
+    )
+
+    return _VisualRuntime(
+        coordinator=None,
+        worker=None,
+        event_bus=MissionEventBus(max_events=256),
+        output_parent=Path(args.output_dir),
+        model_name=model_name,
     )
 
 
@@ -814,6 +1761,9 @@ def _run_until_terminal(
     debug_ground_truth: bool,
     injections: tuple[TestInjectionSpec, ...],
     visual_runtime: _VisualRuntime | None,
+    obstacle_runtime: object | None = None,
+    obstacle_route_runtime: object | None = None,
+    route_collision_monitor: object | None = None,
 ) -> object:
     """Advance on fresh Camera samples; all HTTP work stays in the worker."""
 
@@ -824,6 +1774,9 @@ def _run_until_terminal(
     cancel_requested = False
     landing_deadline_s: float | None = None
     next_debug_time_s = task_start_s
+    obstacle_route_failed = False
+    route_collision_failed = False
+    route_collision_terminal = False
 
     while simulation_app.is_running() and snapshot.status.value == "RUNNING":
         now = clock.now()
@@ -849,12 +1802,116 @@ def _run_until_terminal(
             continue
         frame = environment.get_evaluator_frame()
         observation = perception.observe(frame)
+        if visual_runtime is not None:
+            visual_runtime.record_path_position(
+                (
+                    float(observation.uav_pose.x),
+                    float(observation.uav_pose.y),
+                    float(observation.uav_pose.z),
+                )
+            )
         if debug_ground_truth and observation.timestamp >= next_debug_time_s:
             _print_ground_truth(frame, observation.timestamp)
             next_debug_time_s = observation.timestamp + 1.0
 
+        if (
+            route_collision_monitor is not None
+            and not route_collision_failed
+            and not route_collision_terminal
+        ):
+            try:
+                collision = route_collision_monitor.observe(
+                    (
+                        float(observation.uav_pose.x),
+                        float(observation.uav_pose.y),
+                        float(observation.uav_pose.z),
+                    ),
+                    timestamp_s=float(observation.timestamp),
+                )
+                if collision is not None:
+                    route_collision_terminal = True
+            except Exception as exc:
+                # Registry/geometry/callback inconsistencies are trusted
+                # runtime failures.  Never keep flying a route after the
+                # collision closure itself becomes unavailable.
+                route_collision_failed = True
+                route_collision_terminal = True
+                print(
+                    "[RouteCollision] monitor failed closed: "
+                    f"{type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                try:
+                    manager.cancel_task()
+                except Exception:
+                    pass
+
         elapsed_s = max(0.0, clock.now() - task_start_s)
-        if visual_runtime is not None:
+        flight_corridor = _active_flight_corridor(manager, observation)
+        camera_geometry = None
+        if obstacle_runtime is not None and not route_collision_terminal:
+            if obstacle_route_runtime is not None:
+                obstacle_route_runtime.observe_active_corridor(
+                    flight_corridor,
+                    collision_state=obstacle_runtime.state,
+                )
+            current = agent.snapshot()
+            camera_geometry = _camera_geometry_from_observation(
+                observation,
+                uav_id=current.uav_id,
+                camera_config=environment.config.camera,
+                far_clip_m=environment.config.obstacle_perception.max_distance_m,
+            )
+            if camera_geometry is not None:
+                assert current.mission_id is not None
+                assert current.plan_version is not None
+                obstacle_runtime.process_camera_frame(
+                    camera_geometry,
+                    mission_id=current.mission_id,
+                    uav_id=current.uav_id,
+                    plan_version=current.plan_version,
+                    active_corridor=flight_corridor,
+                    uav_velocity_world_mps=tuple(
+                        float(item) for item in observation.uav_velocity
+                    ),
+                )
+            runtime_assessment = (
+                None
+                if visual_runtime is None
+                else visual_runtime.runtime_visual_assessment_coordinator
+            )
+            if runtime_assessment is not None and camera_geometry is not None:
+                try:
+                    runtime_assessment.tick(
+                        manager=manager,
+                        obstacle_runtime=obstacle_runtime,
+                        rgb=observation.camera_rgb,
+                        frame_id=camera_geometry.frame_id,
+                        timestamp_s=observation.timestamp,
+                        mission_elapsed_s=elapsed_s,
+                        obstacle_observation=(
+                            obstacle_runtime.latest_observation
+                        ),
+                        safety_state=obstacle_runtime.state,
+                        uav_speed_mps=float(
+                            sum(
+                                float(item) ** 2
+                                for item in observation.uav_velocity
+                            )
+                            ** 0.5
+                        ),
+                    )
+                except Exception as exc:
+                    # V2 periodic assessment is auxiliary; trusted low-level
+                    # collision supervision remains active if its worker or
+                    # schema fails.
+                    print(
+                        "[RuntimeVisualAssessmentV2] disabled: "
+                        f"{type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+                    visual_runtime.runtime_visual_assessment_coordinator = None
+        if visual_runtime is not None and not route_collision_terminal:
             for spec in injections:
                 if spec.flag_name in fired or elapsed_s < spec.trigger_at_s:
                     continue
@@ -880,6 +1937,96 @@ def _run_until_terminal(
         # MissionAgent feeds the same fresh frame to the non-blocking visual
         # coordinator only after hard Safety permits it, then advances Manager.
         snapshot = agent.tick(observation)
+        if (
+            route_collision_monitor is not None
+            and not route_collision_failed
+            and not route_collision_terminal
+        ):
+            try:
+                # Seed a FOLLOW_ROUTE that became active during this Agent
+                # tick, so its first movement interval is swept next frame.
+                collision = route_collision_monitor.observe(
+                    (
+                        float(observation.uav_pose.x),
+                        float(observation.uav_pose.y),
+                        float(observation.uav_pose.z),
+                    ),
+                    timestamp_s=float(observation.timestamp),
+                )
+                if collision is not None:
+                    route_collision_terminal = True
+            except Exception as exc:
+                route_collision_failed = True
+                route_collision_terminal = True
+                print(
+                    "[RouteCollision] monitor failed closed: "
+                    f"{type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                try:
+                    manager.cancel_task()
+                except Exception:
+                    pass
+        manager_plan = manager.task_plan
+        if (
+            not route_collision_terminal
+            and manager_plan is not None
+            and snapshot.plan_version is not None
+            and manager_plan.plan_version == snapshot.plan_version + 1
+        ):
+            try:
+                snapshot = agent.adopt_runtime_task_plan(manager_plan)
+            except Exception as exc:
+                print(
+                    "[ObstacleRouteRevision] Agent adoption failed closed: "
+                    f"{type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                manager.cancel_task()
+                snapshot = agent.snapshot()
+        obstacle_snapshot = None
+        if obstacle_runtime is not None and not route_collision_terminal:
+            obstacle_snapshot = obstacle_runtime.observe_skill_transitions(
+                manager.transition_log
+            )
+            if visual_runtime is not None:
+                visual_runtime.record_obstacle_hold_metrics(obstacle_snapshot)
+        if (
+            obstacle_route_runtime is not None
+            and obstacle_snapshot is not None
+            and camera_geometry is not None
+            and not obstacle_route_failed
+        ):
+            from planner.spatial_resolver import FramePose
+
+            try:
+                obstacle_route_runtime.tick(
+                    obstacle_snapshot=obstacle_snapshot,
+                    manager=manager,
+                    rgb=observation.camera_rgb,
+                    frame_id=camera_geometry.frame_id,
+                    timestamp_s=observation.timestamp,
+                    mission_elapsed_s=elapsed_s,
+                    hold_pose=FramePose(
+                        (
+                            float(observation.uav_pose.x),
+                            float(observation.uav_pose.y),
+                            float(observation.uav_pose.z),
+                        ),
+                        yaw_rad=float(observation.uav_pose.yaw),
+                    ),
+                )
+            except Exception as exc:
+                # A malformed/unavailable route context is a trusted-runtime
+                # failure.  Never continue the interrupted flight or expose
+                # request/image contents in this boundary log.
+                obstacle_route_failed = True
+                print(
+                    "[ObstacleRouteRevision] failed closed: "
+                    f"{type(exc).__name__}",
+                    file=sys.stderr,
+                )
+                manager.cancel_task()
         if debug_visualizer is not None:
             # 如果运行时计划修订成功，更新灰色计划路线和目标点。
             revision_coordinator = (
@@ -900,7 +2047,41 @@ def _run_until_terminal(
                 debug_visualizer.set_plan(
                     accepted_revision.compiled_mission
                 )
+            active_task_plan = manager.task_plan
+            if (
+                active_task_plan is not None
+                and active_task_plan.plan_version != debug_visualizer.plan_version
+            ):
+                debug_visualizer.set_plan(
+                    SimpleNamespace(task_plan=active_task_plan)
+                )
 
+            debug_visualizer.set_safety_corridor(flight_corridor)
+            debug_visualizer.set_hold_point(
+                (
+                    getattr(
+                        getattr(obstacle_route_runtime, "active_hold_pose", None),
+                        "xyz_m",
+                        (
+                            float(observation.uav_pose.x),
+                            float(observation.uav_pose.y),
+                            float(observation.uav_pose.z),
+                        ),
+                    )
+                    if bool(getattr(manager, "is_supervisory_paused", False))
+                    else None
+                )
+            )
+            debug_visualizer.set_route_records(
+                _route_debug_records(manager, visual_runtime)
+            )
+            obstacle_state = (
+                None if obstacle_runtime is None else obstacle_runtime.state
+            )
+            hazard_active = (
+                obstacle_state is not None
+                and getattr(obstacle_state, "value", str(obstacle_state)) != "CLEAR"
+            )
             debug_visualizer.update(
                 uav_pose=observation.uav_pose,
                 camera_position_m=observation.camera_position_m,
@@ -910,21 +2091,36 @@ def _run_until_terminal(
                 active_skill=snapshot.active_skill,
                 active_step_id=manager.active_planned_step_id,
                 target_lifecycle=snapshot.target.lifecycle,
+                hazard_active=hazard_active,
+                hold_active=bool(
+                    getattr(manager, "is_supervisory_paused", False)
+                ),
             )
         if visual_runtime is not None:
             visual_runtime.emit_new_reviews(
                 step_id=manager.active_planned_step_id,
                 skill=snapshot.active_skill or "NONE",
             )
+            visual_runtime.emit_new_runtime_assessments(
+                step_id=manager.active_planned_step_id,
+            )
+            visual_runtime.emit_new_next_best_view_proposals()
             visual_runtime.emit_new_events(
                 skill=snapshot.active_skill or "NONE",
                 step_id=manager.active_planned_step_id or "none",
             )
             visual_runtime.emit_new_transitions(manager)
+            visual_runtime.emit_new_search_metrics(manager)
             visual_runtime.emit_new_revisions(
                 skill=snapshot.active_skill or "NONE",
                 step_id=manager.active_planned_step_id or "none",
             )
+            if snapshot.mission_id is not None and snapshot.plan_version is not None:
+                visual_runtime.emit_new_obstacle_revisions(
+                    mission_id=snapshot.mission_id,
+                    uav_id=snapshot.uav_id,
+                    plan_version=snapshot.plan_version,
+                )
 
     if snapshot.status.value == "RUNNING":
         return _LoopResult(
@@ -935,7 +2131,11 @@ def _run_until_terminal(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
+    try:
+        args = parse_args(argv)
+    except LaunchConfigurationError as exc:
+        print(f"launch configuration error: {exc}", file=sys.stderr)
+        return 2
     if Path(sys.prefix).resolve() != EXPECTED_ENV.resolve():
         print(
             "error: run this standalone demo through "
@@ -947,6 +2147,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         config = replace(config, uav=replace(config.uav, id=args.uav_id))
+        args.effective_obstacle_perception_mode = (
+            args.obstacle_perception or config.obstacle_perception.mode
+        )
         review_mode, injections = validate_launch_args(
             args,
             configured_review_mode=config.qwen_visual_review.mode,
@@ -984,6 +2187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         WorldContextBuildError,
         build_planner_world_context,
     )
+    from skills.search_strategy import SearchRuntimeCapabilities
     from scripts.run_llm_oracle_pipeline import (
         IsaacSimulationClock,
         _CountingModelClient,
@@ -1010,6 +2214,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     planner_limits = PlannerLimits.from_config(config.planner)
     planner_policy = PlannerPolicy.from_config(config.planner, planner_limits)
+    search_runtime_capabilities = SearchRuntimeCapabilities(
+        adaptive_next_best_view=bool(args.enable_qwen_next_best_view)
+    )
     counting_client: _CountingModelClient | None = None
     selected_model: str | None = None
     if args.planner == "scripted":
@@ -1042,12 +2249,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             planner = DynamicLLMPlanner(
                 counting_client,
-                PROJECT_ROOT / "prompts" / "dynamic_skill_planner_system.txt",
+                (
+                    PROJECT_ROOT / "prompts" / "dynamic_skill_planner_v3_system.txt"
+                    if args.planning_contract == "v3"
+                    else PROJECT_ROOT / "prompts" / "dynamic_skill_planner_system.txt"
+                ),
                 planner_limits=planner_limits,
                 planner_policy=planner_policy,
+                planning_contract=args.planning_contract,
+                search_runtime_capabilities=search_runtime_capabilities,
             )
 
-    validator = PlanValidator(planner_limits, planner_policy)
     shutdown_guard_s = _shutdown_guard_s(
         max(args.takeoff_altitude, config.scene.size_xyz_m[2]),
         args.start_altitude,
@@ -1059,6 +2271,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         position_margin_m=0.25,
         max_safe_altitude_m=world_context.scene_max_xyz_m[2],
         planner_limits=planner_limits,
+        search_runtime_capabilities=search_runtime_capabilities,
     )
 
     # Standalone ordering boundary: this is the first Isaac import.  All
@@ -1088,10 +2301,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         simulation_app.update()
     environment = None
     agent = None
+    manager = None
     perception = None
     clock = None
     visual_runtime: _VisualRuntime | None = None
     debug_visualizer = None
+    obstacle_runtime = None
+    obstacle_route_runtime = None
+    route_collision_monitor = None
+    initial_spatial_resolver = None
+    next_best_view_worker = None
+    next_best_view_provider = None
+    next_best_view_worker_registered = False
     interrupted = False
     try:
         from agents.mission_agent import MissionAgent
@@ -1102,7 +2323,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             OracleEvaluationCandidateResolver,
             PerceptionRuntimeProfile,
         )
-        from runtime import FrameStore
+        from runtime import (
+            CollisionSupervisor,
+            FrameStore,
+            HazardFusion,
+            ObstacleHazardRuntime,
+            RouteCollisionMonitor,
+            RouteRegistry,
+        )
         from skills.inspect import InspectSkill
         from skills.manager import SkillManager, create_default_skill_registry
         from target.target_manager import TargetManager
@@ -1114,6 +2342,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         configured_start = config.uav.initial_position_xyz_m
         environment.set_uav_pose(
             (configured_start[0], configured_start[1], args.start_altitude)
+        )
+        initial_spatial_resolver = _build_initial_spatial_resolver(
+            world_context,
+            environment.uav_controller.get_pose(),
+        )
+        validator = PlanValidator(
+            planner_limits,
+            planner_policy,
+            spatial_resolver=initial_spatial_resolver,
+            search_runtime_capabilities=search_runtime_capabilities,
         )
         target_spawn = _random_target_spawn(config)
         environment.set_target_pose(target_spawn)
@@ -1158,12 +2396,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidate_resolver=candidate_resolver,
             frame_store=frame_store,
         )
+        route_registry = RouteRegistry()
+        if args.enable_qwen_next_best_view:
+            from models import AsyncModelWorker
+            from planner.qwen_next_best_view import (
+                NextBestViewRouting,
+                QwenNextBestViewProvider,
+            )
+
+            next_best_view_client = OpenAICompatibleClient(
+                base_url=args.base_url,
+                model=args.model,
+                api_key=args.api_key,
+                timeout_s=config.model_worker.request_timeout_s,
+                max_images_per_request=1,
+            )
+            next_best_view_worker = AsyncModelWorker(
+                next_best_view_client,
+                uav_id=args.uav_id,
+            )
+
+            def current_next_best_view_routing() -> NextBestViewRouting:
+                if manager is None or manager.task_plan is None:
+                    raise RuntimeError(
+                        "next-best-view routing is unavailable before task start"
+                    )
+                return NextBestViewRouting(
+                    manager.task_plan.mission_id,
+                    manager.task_plan.plan_version,
+                )
+
+            next_best_view_provider = QwenNextBestViewProvider(
+                worker=next_best_view_worker,
+                uav_id=args.uav_id,
+                routing_context=current_next_best_view_routing,
+                max_image_side_px=(
+                    config.qwen_visual_review.max_image_side_px
+                ),
+                jpeg_quality=config.qwen_visual_review.jpeg_quality,
+            )
         manager = SkillManager(
             context,
             registry=create_default_skill_registry(
                 transit_yaw_mode=config.search.transit_yaw_mode,
                 inspect_skill=inspect_skill,
+                next_best_view_provider=next_best_view_provider,
             ),
+            route_registry=route_registry,
         )
         target_manager = TargetManager()
         revision_enabled = bool(
@@ -1183,9 +2462,111 @@ def main(argv: Sequence[str] | None = None) -> int:
                 review_mode=review_mode,
                 await_revision_completion=revision_enabled,
             )
+        else:
+            # Metrics, transitions and manifests are experiment outputs, not
+            # a side effect of enabling the periodic Qwen vision reviewer.
+            visual_runtime = _create_logging_runtime(args=args)
+        if next_best_view_worker is not None:
+            assert visual_runtime is not None
+            visual_runtime.add_worker(next_best_view_worker)
+            next_best_view_worker_registered = True
+            visual_runtime.next_best_view_provider = next_best_view_provider
+            visual_runtime.model_name = next_best_view_client.model
+        if args.effective_obstacle_perception_mode == "ideal_camera":
+            from perception import IdealObstaclePerception
+
+            assert environment.scene is not None
+            ideal_obstacles = IdealObstaclePerception.from_config(
+                environment.scene.obstacle_registry,
+                config.obstacle_perception,
+            )
+            collision_supervisor = CollisionSupervisor()
+            obstacle_runtime = ObstacleHazardRuntime(
+                perception=ideal_obstacles,
+                hazard_fusion=HazardFusion(),
+                collision_supervisor=collision_supervisor,
+                skill_manager=manager,
+                event_sink=(
+                    None
+                    if visual_runtime is None
+                    else visual_runtime.event_bus.publish
+                ),
+                hover_timeout_s=config.qwen_visual_review.blocking_hover_timeout_s,
+                hover_position_tolerance_m=(
+                    config.qwen_visual_review.hover_position_tolerance_m
+                ),
+                hover_max_correction_speed_mps=(
+                    config.qwen_visual_review.hover_max_correction_speed_mps
+                ),
+                hover_timeout_fallback=(
+                    config.qwen_visual_review.blocking_timeout_fallback
+                ),
+            )
+            if (
+                visual_runtime is not None
+                and args.route_planner_backend == "qwen"
+            ):
+                from agents.obstacle_revision_coordinator import (
+                    ObstacleRevisionCoordinator,
+                )
+                from models import AsyncModelWorker
+                from planner.obstacle_revision import ObstacleAwareRevisionPlanner
+
+                route_client = OpenAICompatibleClient(
+                    base_url=args.base_url,
+                    model=args.model,
+                    api_key=args.api_key,
+                    timeout_s=config.model_worker.request_timeout_s,
+                    max_images_per_request=3,
+                )
+                route_worker = AsyncModelWorker(
+                    route_client,
+                    uav_id=args.uav_id,
+                )
+                visual_runtime.add_worker(route_worker)
+                obstacle_revision_coordinator = ObstacleRevisionCoordinator(
+                    uav_id=args.uav_id,
+                    planner=ObstacleAwareRevisionPlanner(
+                        max_image_side_px=(
+                            config.qwen_visual_review.max_image_side_px
+                        ),
+                        jpeg_quality=config.qwen_visual_review.jpeg_quality,
+                    ),
+                    worker=route_worker,
+                    route_registry=route_registry,
+                    collision_supervisor=collision_supervisor,
+                    skill_manager=manager,
+                    safety_preflight=safety.preflight,
+                    route_validation_mode=args.route_validation_mode,
+                    max_proposals=3,
+                    event_sink=visual_runtime.event_bus.publish,
+                )
+                visual_runtime.obstacle_revision_coordinator = (
+                    obstacle_revision_coordinator
+                )
+            elif (
+                visual_runtime is not None
+                and args.route_planner_backend == "classical"
+            ):
+                from agents.classical_obstacle_revision_coordinator import (
+                    ClassicalObstacleRevisionCoordinator,
+                )
+                from planner.classical_route_planner import ClassicalRoutePlanner
+
+                visual_runtime.obstacle_revision_coordinator = (
+                    ClassicalObstacleRevisionCoordinator(
+                        uav_id=args.uav_id,
+                        planner=ClassicalRoutePlanner(),
+                        route_registry=route_registry,
+                        collision_supervisor=collision_supervisor,
+                        skill_manager=manager,
+                        safety_preflight=safety.preflight,
+                        event_sink=visual_runtime.event_bus.publish,
+                    )
+                )
 
         agent_kwargs: dict[str, object] = {}
-        if visual_runtime is not None:
+        if visual_runtime is not None and visual_runtime.coordinator is not None:
             agent_kwargs["visual_review_coordinator"] = visual_runtime.coordinator
         if revision_enabled:
             assert visual_runtime is not None
@@ -1230,19 +2611,107 @@ def main(argv: Sequence[str] | None = None) -> int:
             clock,
             perception_runtime_profile=profile,
             acknowledge_privileged_oracle=True,
+            runtime_program=args.runtime_program,
             **agent_kwargs,
         )
 
         task_start_s = clock.now()
         compiled = agent.start(args.instruction, world_context)
+        assert environment.scene is not None
+
+        def on_route_collision(collision: object) -> None:
+            impact = getattr(collision, "impact_position_world_m", None)
+            print(
+                "[RouteCollision] "
+                f"mission_id={getattr(collision, 'mission_id', 'unknown')} "
+                f"uav_id={getattr(collision, 'uav_id', 'unknown')} "
+                f"plan_version={getattr(collision, 'plan_version', 'unknown')} "
+                f"route_id={getattr(collision, 'route_id', 'unknown')} "
+                f"obstacle_id={getattr(collision, 'obstacle_id', 'unknown')} "
+                f"impact_world_m={impact} action=CANCEL_AND_LAND",
+                file=sys.stderr,
+            )
+            if visual_runtime is not None:
+                visual_runtime.record_route_collision()
+
+        if (
+            obstacle_runtime is not None
+            and visual_runtime is not None
+            and visual_runtime.obstacle_revision_coordinator is not None
+        ):
+            from runtime.obstacle_route_runtime import (
+                ObstacleRouteReplanRuntime,
+            )
+
+            assert environment.scene is not None
+            assert initial_spatial_resolver is not None
+            obstacle_route_runtime = ObstacleRouteReplanRuntime(
+                coordinator=visual_runtime.obstacle_revision_coordinator,
+                initial_resolver=initial_spatial_resolver,
+                obstacles=environment.scene.obstacle_registry,
+                scene_min_xyz_m=world_context.scene_min_xyz_m,
+                scene_max_xyz_m=world_context.scene_max_xyz_m,
+                original_instruction=args.instruction,
+                original_plan_summary=compiled.task_plan.to_dict(),
+            )
+            if args.route_planner_backend == "qwen":
+                from agents.runtime_visual_assessment_coordinator import (
+                    RuntimeVisualAssessmentCoordinator,
+                )
+                from models import AsyncModelWorker
+                from perception.runtime_visual_assessment import (
+                    QwenRuntimeVisualVerifierV2,
+                )
+
+                assessment_client = OpenAICompatibleClient(
+                    base_url=args.base_url,
+                    model=args.model,
+                    api_key=args.api_key,
+                    timeout_s=config.model_worker.request_timeout_s,
+                    max_images_per_request=3,
+                )
+                assessment_worker = AsyncModelWorker(
+                    assessment_client,
+                    uav_id=args.uav_id,
+                )
+                visual_runtime.add_worker(assessment_worker)
+                visual_runtime.runtime_visual_assessment_coordinator = (
+                    RuntimeVisualAssessmentCoordinator(
+                        uav_id=args.uav_id,
+                        worker=assessment_worker,
+                        verifier=QwenRuntimeVisualVerifierV2(
+                            max_image_side_px=(
+                                config.qwen_visual_review.max_image_side_px
+                            ),
+                            jpeg_quality=config.qwen_visual_review.jpeg_quality,
+                        ),
+                        original_instruction=args.instruction,
+                        target_spec=compiled.target_spec,
+                        intervals_s={
+                            "GOTO": config.qwen_visual_review.goto_interval_s,
+                            "SEARCH": config.qwen_visual_review.search_interval_s,
+                            "INSPECT": config.qwen_visual_review.inspect_interval_s,
+                            "TRACK": config.qwen_visual_review.track_interval_s,
+                        },
+                        max_result_age_s=config.frame_store.max_age_s,
+                        apply_to_control=review_mode == "gate",
+                    )
+                )
         if args.debug_visualization:
-            from visualization import MissionDebugDraw
+            from visualization import MissionDebugDraw, MissionStatusOverlay
 
             debug_visualizer = MissionDebugDraw(
                 world_context=world_context,
                 camera_config=config.camera,
+                status_overlay=(
+                    None if headless else MissionStatusOverlay()
+                ),
             )
             debug_visualizer.set_plan(compiled)
+            assert environment.scene is not None
+            debug_visualizer.set_obstacles(
+                environment.scene.obstacle_registry.specs
+            )
         launch_snapshot = agent.snapshot()
         assert launch_snapshot.mission_id is not None
         for key, value in startup_fields(
@@ -1255,6 +2724,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             oracle_acknowledged=args.acknowledge_privileged_oracle,
         ):
             print(f"[Launch] {key}={value}")
+        print(
+            "[Launch] qwen_next_best_view="
+            + (
+                "enabled:async_macro_only"
+                if args.enable_qwen_next_best_view
+                else "disabled"
+            )
+        )
         _print_plan(compiled)
         if visual_runtime is not None:
             visual_runtime.begin_logging(
@@ -1267,7 +2744,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                     model_name=visual_runtime.model_name,
                 ),
             )
+            visual_runtime.log_initial_planner_proposals(
+                planner,
+                compiled,
+                timestamp_s=task_start_s,
+                fallback_call_count=(
+                    0 if counting_client is None else counting_client.chat_calls
+                ),
+            )
             visual_runtime.emit_new_transitions(manager)
+
+        # Construct this for every planner/perception mode. In particular,
+        # open_sim deliberately executes unchecked model geometry and relies
+        # on this runtime closure to measure and terminate real collisions.
+        route_collision_monitor = RouteCollisionMonitor(
+            obstacle_registry=environment.scene.obstacle_registry,
+            route_registry=route_registry,
+            skill_manager=manager,
+            uav_radius_m=_DEFAULT_UAV_SAFETY_RADIUS_M,
+            event_sink=(
+                None
+                if visual_runtime is None
+                else visual_runtime.event_bus.publish
+            ),
+            collision_sink=on_route_collision,
+        )
+        initial_pose = environment.uav_controller.get_pose()
+        route_collision_monitor.observe(
+            (initial_pose.x, initial_pose.y, initial_pose.z),
+            timestamp_s=task_start_s,
+        )
 
         try:
             loop_result = _run_until_terminal(
@@ -1284,6 +2790,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 debug_ground_truth=args.debug_ground_truth,
                 injections=injections,
                 visual_runtime=visual_runtime,
+                obstacle_runtime=obstacle_runtime,
+                obstacle_route_runtime=obstacle_route_runtime,
+                route_collision_monitor=route_collision_monitor,
             )
         except KeyboardInterrupt:
             interrupted = True
@@ -1320,15 +2829,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         if visual_runtime is not None:
             terminal_snapshot = loop_result.snapshot
             visual_runtime.emit_new_transitions(manager)
+            visual_runtime.emit_new_search_metrics(manager)
+            visual_runtime.emit_new_runtime_assessments(
+                step_id=manager.active_planned_step_id,
+            )
+            visual_runtime.emit_new_next_best_view_proposals()
             visual_runtime.emit_new_revisions(
                 skill=terminal_snapshot.active_skill or "NONE",
                 step_id=manager.active_planned_step_id or "none",
             )
+            if (
+                terminal_snapshot.mission_id is not None
+                and terminal_snapshot.plan_version is not None
+            ):
+                visual_runtime.emit_new_obstacle_revisions(
+                    mission_id=terminal_snapshot.mission_id,
+                    uav_id=terminal_snapshot.uav_id,
+                    plan_version=terminal_snapshot.plan_version,
+                )
             visual_runtime.set_terminal_manifest(
                 agent_status=terminal_snapshot.status.value,
                 task_status=terminal_snapshot.task_status,
                 plan_version=terminal_snapshot.plan_version or 1,
                 guard_error=loop_result.guard_error,
+                mission_success=bool(checks_passed),
             )
         if interrupted:
             return 130
@@ -1351,6 +2875,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     finally:
         try:
+            if (
+                next_best_view_worker is not None
+                and not next_best_view_worker_registered
+            ):
+                try:
+                    next_best_view_worker.close(
+                        timeout_s=config.model_worker.request_timeout_s + 1.0
+                    )
+                except Exception as exc:
+                    print(
+                        "next-best-view worker shutdown failed: "
+                        f"{type(exc).__name__}",
+                        file=sys.stderr,
+                    )
             if visual_runtime is not None:
                 try:
                     visual_runtime.close(

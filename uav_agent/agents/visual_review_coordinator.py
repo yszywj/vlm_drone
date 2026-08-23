@@ -13,8 +13,11 @@ from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+import json
 from math import isfinite
 from numbers import Real
+import os
+import re
 from typing import Protocol
 from types import MappingProxyType
 
@@ -24,7 +27,7 @@ from common.ids import (
     validate_routing_id,
     validate_uav_id,
 )
-from models import AsyncModelRequest, AsyncModelResult
+from models import AsyncModelRequest, AsyncModelResult, ModelProtocolError
 from perception.qwen_vlm_verifier import (
     QwenVLMVerifier,
     VisualReviewFrame,
@@ -44,7 +47,9 @@ from perception.visual_review import (
     VisualReviewExpectation,
     VisualReviewGate,
     VisualReviewMode,
+    VisualReviewParseErrorCode,
     VisualReviewProtocolError,
+    VisualReviewStaleReason,
 )
 from runtime.events import (
     EventSeverity,
@@ -60,7 +65,7 @@ from runtime.review_scheduler import (
 )
 from runtime.safety_supervisor import SafetyAction, SafetyDecision
 from skills.hover import HoverTimeoutFallback
-from skills.manager import ExecutionKind, SkillManager, TaskStatus
+from skills.manager import ExecutionKind, SkillManager, TaskStatus, TransitionRecord
 from skills.plan import TaskPlan
 from skills.types import Observation, SkillName, SkillStatus
 from target.target_manager import TargetManager, TargetStateError
@@ -139,6 +144,7 @@ class VisualReviewRecord:
     completed_timestamp_s: float
     blocking: bool
     stale: bool
+    stale_reasons: tuple[str, ...]
     decision: str | None
     disposition: str | None
     accepted_for_control: bool
@@ -149,8 +155,22 @@ class VisualReviewRecord:
     semantic_source: str = "qwen_vl"
     geometry_source: str = "none"
     candidate_id: str | None = None
+    response_text_length: int | None = None
+    response_text_tail: str | None = None
 
     def __post_init__(self) -> None:
+        reasons = tuple(self.stale_reasons)
+        allowed_reasons = {item.value for item in VisualReviewStaleReason}
+        if any(
+            not isinstance(reason, str) or reason not in allowed_reasons
+            for reason in reasons
+        ):
+            raise ValueError("stale_reasons contains an unsupported reason")
+        if len(set(reasons)) != len(reasons):
+            raise ValueError("stale_reasons must not contain duplicates")
+        if self.stale != bool(reasons):
+            raise ValueError("stale must equal bool(stale_reasons)")
+        object.__setattr__(self, "stale_reasons", reasons)
         if self.candidate_id is not None:
             object.__setattr__(
                 self,
@@ -165,6 +185,25 @@ class VisualReviewRecord:
                 raise ValueError("token_usage values must be non-negative integers")
             copied_usage[key] = value
         object.__setattr__(self, "token_usage", MappingProxyType(copied_usage))
+        debug_pair = (self.response_text_length, self.response_text_tail)
+        if (debug_pair[0] is None) != (debug_pair[1] is None):
+            raise ValueError(
+                "response_text_length and response_text_tail must be set together"
+            )
+        if self.response_text_length is not None:
+            if (
+                isinstance(self.response_text_length, bool)
+                or not isinstance(self.response_text_length, int)
+                or self.response_text_length < 0
+            ):
+                raise ValueError("response_text_length must be non-negative")
+            if not isinstance(self.response_text_tail, str):
+                raise TypeError("response_text_tail must be a string")
+            if len(self.response_text_tail) > 500:
+                raise ValueError("response_text_tail must contain at most 500 characters")
+            lowered = self.response_text_tail.casefold()
+            if "base64," in lowered or "api_key" in lowered or "authorization" in lowered:
+                raise ValueError("response_text_tail contains forbidden secret/image data")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -178,6 +217,7 @@ class VisualReviewRecord:
             "completed_timestamp_s": self.completed_timestamp_s,
             "blocking": self.blocking,
             "stale": self.stale,
+            "stale_reasons": list(self.stale_reasons),
             "decision": self.decision,
             "disposition": self.disposition,
             "accepted_for_control": self.accepted_for_control,
@@ -192,6 +232,8 @@ class VisualReviewRecord:
             "semantic_source": self.semantic_source,
             "geometry_source": self.geometry_source,
             "candidate_id": self.candidate_id,
+            "response_text_length": self.response_text_length,
+            "response_text_tail": self.response_text_tail,
         }
 
 
@@ -285,6 +327,7 @@ class VisualReviewCoordinator:
         await_revision_completion: bool = False,
         max_recent_frames: int = 3,
         candidate_association_iou_threshold: float = 0.5,
+        debug_model_responses: bool | None = None,
     ) -> None:
         self._uav_id = validate_uav_id(uav_id)
         if not isinstance(scheduler, ReviewScheduler):
@@ -321,6 +364,10 @@ class VisualReviewCoordinator:
             raise TypeError("event_bus must be a MissionEventBus or None")
         if not isinstance(await_revision_completion, bool):
             raise TypeError("await_revision_completion must be bool")
+        if debug_model_responses is not None and not isinstance(
+            debug_model_responses, bool
+        ):
+            raise TypeError("debug_model_responses must be bool or None")
 
         self._review_timeout_s = _positive_finite(review_timeout_s, "review_timeout_s")
         self._max_result_age_s = _positive_finite(max_result_age_s, "max_result_age_s")
@@ -352,6 +399,11 @@ class VisualReviewCoordinator:
         self._candidate_association_iou_threshold = _unit_interval(
             candidate_association_iou_threshold,
             "candidate_association_iou_threshold",
+        )
+        self._debug_model_responses = (
+            _debug_visual_review_from_environment()
+            if debug_model_responses is None
+            else debug_model_responses
         )
 
         self._scheduler = scheduler
@@ -427,6 +479,56 @@ class VisualReviewCoordinator:
         self._pending_events.append(event)
         if self._event_bus is not None:
             self._event_bus.publish(event)
+
+    def observe_skill_transition(
+        self,
+        record: TransitionRecord,
+    ) -> MissionEvent | None:
+        """Publish the routed HOLD-established handshake exactly once.
+
+        MissionAgent calls this while consuming each Manager transition, so a
+        hold established while the revision worker owns model polling is not
+        delayed until visual-review polling resumes.
+        """
+
+        if not isinstance(record, TransitionRecord):
+            raise TypeError("record must be a TransitionRecord")
+        if record.uav_id != self._uav_id:
+            raise VisualReviewCoordinatorError("transition uav_id mismatch")
+        if record.reason != "HOLD_ESTABLISHED":
+            return None
+        if (
+            record.old_skill is not SkillName.HOVER
+            or record.new_skill is not SkillName.HOVER
+            or record.old_status is not SkillStatus.RUNNING
+        ):
+            raise VisualReviewCoordinatorError(
+                "HOLD_ESTABLISHED transition has invalid HOVER lifecycle"
+            )
+        if self._route is not None and self._route != (
+            record.mission_id,
+            record.plan_version,
+        ):
+            raise VisualReviewCoordinatorError(
+                "HOLD_ESTABLISHED transition route is stale"
+            )
+        event = MissionEvent(
+            event_id=generate_routing_id("event"),
+            mission_id=record.mission_id,
+            uav_id=record.uav_id,
+            plan_version=record.plan_version,
+            timestamp_s=record.timestamp,
+            event_type=MissionEventType.HOLD_ESTABLISHED,
+            severity=EventSeverity.INFO,
+            payload={
+                "source": "skill_manager",
+                "step_id": record.new_step_id,
+                "invocation_id": record.invocation_id,
+            },
+        )
+        if self._event_bus is not None:
+            self._event_bus.publish(event)
+        return event
 
     def complete_revision(
         self,
@@ -545,7 +647,11 @@ class VisualReviewCoordinator:
             timestamp_s=now,
             rgb=observation.camera_rgb,
         )
-        self._latest_frame_ref = frame_ref
+        self._latest_frame_ref = (
+            frame_ref
+            if self._frame_store.contains(frame_ref)
+            else self._frame_store.latest_ref(uav_id=self._uav_id)
+        )
         self._last_frame_timestamp_s = now
         if (
             self._pending_revision is not None
@@ -559,15 +665,23 @@ class VisualReviewCoordinator:
         # Hard safety always wins. Reviews are not submitted, and especially
         # cannot start HOVER, until the trusted supervisor allows CONTINUE.
         if safety_decision.action is not SafetyAction.CONTINUE:
+            self.abort_pending(
+                reason_code="SAFETY_SUPERSEDED",
+                timestamp_s=now,
+            )
             return self.snapshot()
-        self._poll_result(
+        poll_failed = self._poll_result(
             now=now,
             mission_id=mission,
             plan_version=version,
             current_target_id=target_snapshot.target_id,
             current_step_id=active_step_id,
         )
-        self._handle_timeout(now)
+        timed_out = self._handle_timeout(now)
+        if poll_failed or timed_out:
+            # Transport/timeout failures must not immediately create another
+            # request on the same frame, especially with zero test cooldown.
+            return self.snapshot()
 
         # Polling may have promoted repeated ordinary SEARCH evidence into a
         # trusted supervisory HOVER. Do not schedule from the caller's now-
@@ -607,22 +721,29 @@ class VisualReviewCoordinator:
             return self.snapshot()
         ticket = decision.ticket
         assert ticket is not None
-        review_input = self._build_input(
-            ticket=ticket,
-            latest=frame_ref,
-            target_spec=target_spec,
-            target_snapshot=_prompt_safe_target_snapshot(target_snapshot),
-            active_step_id=active_step_id,
-            skill_feedback=skill_feedback,
-            mission_elapsed_s=elapsed,
-            trigger_event_type=(None if event is None else event.event_type),
-        )
         blocking_hover_started = False
+        frame_pinned = False
         try:
+            # Building the multimodal input is part of the scheduler
+            # reservation transaction.  A tiny store or explicit eviction
+            # may reject the latest frame; that failure must still release
+            # the reserved per-UAV ticket.
+            review_input = self._build_input(
+                ticket=ticket,
+                latest=frame_ref,
+                target_spec=target_spec,
+                target_snapshot=_prompt_safe_target_snapshot(target_snapshot),
+                active_step_id=active_step_id,
+                skill_feedback=skill_feedback,
+                mission_elapsed_s=elapsed,
+                trigger_event_type=(None if event is None else event.event_type),
+            )
             request = self._verifier.build_async_request(
                 review_input,
                 request_id=ticket.request_id,
             )
+            self._frame_store.pin(frame_ref)
+            frame_pinned = True
             self._worker.submit(request)
             if ticket.blocking and self._gate.mode is VisualReviewMode.GATE:
                 if self._skill_manager is None:
@@ -635,9 +756,12 @@ class VisualReviewCoordinator:
                     position_tolerance_m=self._hover_position_tolerance_m,
                     max_correction_speed_mps=self._hover_max_correction_speed_mps,
                     timeout_fallback=self._blocking_timeout_fallback,
+                    defer_observation_timestamp_s=now,
                 )
                 blocking_hover_started = True
         except Exception:
+            if frame_pinned:
+                self._frame_store.unpin(frame_ref)
             self._scheduler.mark_timed_out(
                 uav_id=self._uav_id,
                 request_id=ticket.request_id,
@@ -661,6 +785,36 @@ class VisualReviewCoordinator:
             ticket,
             now,
             {"blocking": ticket.blocking, "frame_id": frame_ref.frame_id},
+        )
+        return self.snapshot()
+
+    def abort_pending(
+        self,
+        *,
+        reason_code: str = "MISSION_SHUTDOWN",
+        timestamp_s: float | None = None,
+    ) -> VisualReviewCoordinatorSnapshot:
+        """Release an in-flight review when trusted mission control supersedes it."""
+
+        if reason_code not in {"MISSION_SHUTDOWN", "SAFETY_SUPERSEDED"}:
+            raise ValueError("unsupported visual-review abort reason")
+        pending = self._pending
+        if pending is None:
+            return self.snapshot()
+        selected_time = (
+            self._last_frame_timestamp_s
+            if timestamp_s is None
+            else _nonnegative_finite(timestamp_s, "timestamp_s")
+        )
+        now = max(
+            pending.ticket.submitted_timestamp_s,
+            0.0 if selected_time is None else selected_time,
+        )
+        self._finish_pending_with_error(
+            pending,
+            now=now,
+            error_code=reason_code,
+            event_type=MissionEventType.MODEL_REVIEW_COMPLETED,
         )
         return self.snapshot()
 
@@ -774,35 +928,74 @@ class VisualReviewCoordinator:
         plan_version: int,
         current_target_id: str | None,
         current_step_id: str | None,
-    ) -> None:
+    ) -> bool:
         pending = self._pending
         if pending is None:
-            return
-        result = self._worker.poll(
-            expected_request_id=pending.ticket.request_id,
-            expected_review_id=pending.ticket.review_id,
-            minimum_observation_timestamp_s=pending.expectation.observation_timestamp_s,
-            include_stale=True,
-        )
+            return False
+        try:
+            result = self._worker.poll(
+                expected_request_id=pending.ticket.request_id,
+                expected_review_id=pending.ticket.review_id,
+                minimum_observation_timestamp_s=pending.expectation.observation_timestamp_s,
+                include_stale=True,
+            )
+        except Exception:
+            # Worker transport failures are data-plane failures, not a reason
+            # to strand the scheduler reservation or its pinned image.
+            self._finish_pending_with_error(
+                pending,
+                now=now,
+                error_code=VisualReviewParseErrorCode.MODEL_REQUEST_FAILED.value,
+                event_type=MissionEventType.MODEL_REVIEW_COMPLETED,
+            )
+            return True
         if result is None:
-            return
+            return False
 
-        route_stale = (
-            result.stale
-            or mission_id != pending.ticket.mission_id
-            or plan_version != pending.ticket.plan_version
-            or current_step_id != pending.step_id
-            or current_target_id != pending.target_id
-            or now - pending.expectation.observation_timestamp_s > self._max_result_age_s
-            or not self._frame_store.contains(pending.frame_ref)
+        orphan_reasons: list[str] = []
+        if result.stale:
+            orphan_reasons.append(
+                VisualReviewStaleReason.WORKER_MARKED_STALE.value
+            )
+        if result.request_id != pending.ticket.request_id:
+            orphan_reasons.append(
+                VisualReviewStaleReason.REQUEST_ID_MISMATCH.value
+            )
+        if result.review_id != pending.ticket.review_id:
+            orphan_reasons.append(
+                VisualReviewStaleReason.REVIEW_ID_MISMATCH.value
+            )
+        if orphan_reasons:
+            # A timed-out/aborted HTTP call can finish after a new request has
+            # acquired coordinator ownership.  Record that old result as an
+            # orphan, but never let it complete or unpin the new request.
+            self._record_orphan_result(
+                result,
+                now=now,
+                stale_reasons=tuple(dict.fromkeys(orphan_reasons)),
+            )
+            return False
+
+        stale_reasons = _collect_stale_reasons(
+            result=result,
+            pending=pending,
+            mission_id=mission_id,
+            plan_version=plan_version,
+            current_step_id=current_step_id,
+            current_target_id=current_target_id,
+            now=now,
+            max_result_age_s=self._max_result_age_s,
+            frame_present=self._frame_store.contains(pending.frame_ref),
         )
         review: QwenVisualReview | None = None
         acceptance: VisualReviewAcceptance | None = None
         candidate_id: str | None = None
         candidate_suppressed = False
         error_code: str | None = None
-        if route_stale:
+        if stale_reasons:
             error_code = "STALE"
+        elif result.error_code is not None:
+            error_code = VisualReviewParseErrorCode.MODEL_REQUEST_FAILED.value
         else:
             try:
                 review = self._verifier.parse_async_result(
@@ -827,12 +1020,18 @@ class VisualReviewCoordinator:
                 )
                 if acceptance.disposition is ReviewDisposition.STALE:
                     error_code = "STALE"
+                    # parse_async_result already enforces this route. Retain a
+                    # specific fail-closed reason if a custom gate violates
+                    # that invariant rather than emitting an unexplained bool.
+                    stale_reasons = (
+                        VisualReviewStaleReason.WORKER_MARKED_STALE.value,
+                    )
             except VisualReviewProtocolError:
-                error_code = "PROTOCOL_ERROR"
-            except Exception:
-                error_code = "MODEL_OR_PARSE_ERROR"
+                error_code = VisualReviewParseErrorCode.ROUTING_MISMATCH.value
+            except Exception as exc:
+                error_code = _classify_model_or_parse_error(result, exc)
 
-        stale = error_code in {"STALE", "PROTOCOL_ERROR"}
+        stale = bool(stale_reasons)
         if stale:
             self._stale_count += 1
         self._scheduler.mark_completed(
@@ -841,6 +1040,11 @@ class VisualReviewCoordinator:
             review_id=pending.ticket.review_id,
             timestamp_s=now,
         )
+        # An explicit store clear is itself a legitimate staleness signal;
+        # it also removes the pin, so release only while the exact frame is
+        # still present.
+        if self._frame_store.contains(pending.frame_ref):
+            self._frame_store.unpin(pending.frame_ref)
         self._pending = None
         candidate_id = self._record_candidate(
             review=review,
@@ -867,6 +1071,7 @@ class VisualReviewCoordinator:
             now=now,
             stale=stale,
             error_code=error_code,
+            stale_reasons=stale_reasons,
             candidate_id=candidate_id,
         )
         self._publish_status_event(
@@ -875,7 +1080,11 @@ class VisualReviewCoordinator:
             else MissionEventType.MODEL_REVIEW_COMPLETED,
             pending.ticket,
             now,
-            {"stale": stale, "error_code": error_code},
+            {
+                "stale": stale,
+                "stale_reasons": list(stale_reasons),
+                "error_code": error_code,
+            },
         )
         revision_action: str | None = None
         authorization_source: str | None = None
@@ -958,17 +1167,40 @@ class VisualReviewCoordinator:
                 # Goal immediately so a model recommendation cannot starve the
                 # mission in HOVER.
                 self._skill_manager.resume_interrupted_step()
+        return False
 
-    def _handle_timeout(self, now: float) -> None:
+    def _handle_timeout(self, now: float) -> bool:
         pending = self._pending
         if pending is None or now - pending.ticket.submitted_timestamp_s < self._review_timeout_s:
-            return
+            return False
+        self._finish_pending_with_error(
+            pending,
+            now=now,
+            error_code="TIMEOUT",
+            event_type=MissionEventType.MODEL_REVIEW_TIMEOUT,
+        )
+        return True
+
+    def _finish_pending_with_error(
+        self,
+        pending: _PendingReview,
+        *,
+        now: float,
+        error_code: str,
+        event_type: MissionEventType,
+    ) -> None:
+        """Atomically release scheduler/frame ownership and record the failure."""
+
+        if self._pending is not pending:
+            raise VisualReviewCoordinatorError("pending review ownership changed")
         self._scheduler.mark_timed_out(
             uav_id=self._uav_id,
             request_id=pending.ticket.request_id,
             review_id=pending.ticket.review_id,
             timestamp_s=now,
         )
+        if self._frame_store.contains(pending.frame_ref):
+            self._frame_store.unpin(pending.frame_ref)
         self._pending = None
         self._records.append(
             VisualReviewRecord(
@@ -982,20 +1214,24 @@ class VisualReviewCoordinator:
                 completed_timestamp_s=now,
                 blocking=pending.ticket.blocking,
                 stale=False,
+                stale_reasons=(),
                 decision=None,
                 disposition=None,
                 accepted_for_control=False,
                 bbox_xyxy_normalized=None,
                 token_usage={},
                 latency_s=now - pending.ticket.submitted_timestamp_s,
-                error_code="TIMEOUT",
+                error_code=error_code,
             )
         )
         self._publish_status_event(
-            MissionEventType.MODEL_REVIEW_TIMEOUT,
+            event_type,
             pending.ticket,
             now,
-            {"blocking": pending.ticket.blocking},
+            {
+                "blocking": pending.ticket.blocking,
+                "error_code": error_code,
+            },
         )
         # For blocking reviews, the Manager's trusted HOVER goal owns timeout
         # fallback. Its next tick chooses RESUME_PREVIOUS or CANCEL_AND_LAND.
@@ -1146,6 +1382,7 @@ class VisualReviewCoordinator:
             position_tolerance_m=self._hover_position_tolerance_m,
             max_correction_speed_mps=self._hover_max_correction_speed_mps,
             timeout_fallback=self._blocking_timeout_fallback,
+            defer_observation_timestamp_s=self._last_frame_timestamp_s,
         )
         return True
 
@@ -1232,6 +1469,7 @@ class VisualReviewCoordinator:
         now: float,
         stale: bool,
         error_code: str | None,
+        stale_reasons: tuple[str, ...],
         candidate_id: str | None,
     ) -> None:
         response = result.response
@@ -1247,6 +1485,7 @@ class VisualReviewCoordinator:
                 completed_timestamp_s=now,
                 blocking=pending.ticket.blocking,
                 stale=stale,
+                stale_reasons=stale_reasons,
                 decision=None if review is None else review.decision.value,
                 disposition=(
                     None if acceptance is None else acceptance.disposition.value
@@ -1261,6 +1500,10 @@ class VisualReviewCoordinator:
                 latency_s=now - pending.ticket.submitted_timestamp_s,
                 error_code=error_code or result.error_code,
                 candidate_id=candidate_id,
+                **_response_debug_fields(
+                    response.content if response is not None else None,
+                    enabled=self._debug_model_responses,
+                ),
             )
         )
 
@@ -1288,6 +1531,25 @@ class VisualReviewCoordinator:
         result = self._worker.poll(include_stale=True)
         if result is None:
             return
+        self._record_orphan_result(
+            result,
+            now=now,
+            stale_reasons=(
+                VisualReviewStaleReason.WORKER_MARKED_STALE.value
+                if result.stale
+                else VisualReviewStaleReason.REQUEST_ID_MISMATCH.value,
+            ),
+        )
+
+    def _record_orphan_result(
+        self,
+        result: AsyncModelResult,
+        *,
+        now: float,
+        stale_reasons: tuple[str, ...],
+    ) -> None:
+        """Log a result that has no ownership claim on the current request."""
+
         self._stale_count += 1
         # Results from timed-out/superseded requests are deliberately not
         # parsed: no trusted expectation remains against which to accept them.
@@ -1303,6 +1565,7 @@ class VisualReviewCoordinator:
                 completed_timestamp_s=now,
                 blocking=False,
                 stale=True,
+                stale_reasons=stale_reasons,
                 decision=None,
                 disposition=ReviewDisposition.STALE.value,
                 accepted_for_control=False,
@@ -1312,6 +1575,14 @@ class VisualReviewCoordinator:
                 ),
                 latency_s=max(0.0, now - result.observation_timestamp_s),
                 error_code="ORPHAN_STALE",
+                **_response_debug_fields(
+                    (
+                        None
+                        if result.response is None
+                        else result.response.content
+                    ),
+                    enabled=self._debug_model_responses,
+                ),
             )
         )
 
@@ -1411,6 +1682,170 @@ def _feedback_summary(value: Mapping[str, object] | None) -> dict[str, object]:
         elif isinstance(item, float) and isfinite(item):
             result[key] = item
     return result
+
+
+def _collect_stale_reasons(
+    *,
+    result: AsyncModelResult,
+    pending: _PendingReview,
+    mission_id: str,
+    plan_version: int,
+    current_step_id: str | None,
+    current_target_id: str | None,
+    now: float,
+    max_result_age_s: float,
+    frame_present: bool,
+) -> tuple[str, ...]:
+    """Evaluate every staleness invariant independently in stable order."""
+
+    reasons: list[str] = []
+
+    def add(reason: VisualReviewStaleReason, condition: bool) -> None:
+        if condition:
+            reasons.append(reason.value)
+
+    add(VisualReviewStaleReason.WORKER_MARKED_STALE, result.stale)
+    add(
+        VisualReviewStaleReason.MISSION_ID_CHANGED,
+        mission_id != pending.ticket.mission_id
+        or result.mission_id != pending.ticket.mission_id,
+    )
+    add(
+        VisualReviewStaleReason.PLAN_VERSION_CHANGED,
+        plan_version != pending.ticket.plan_version
+        or result.plan_version != pending.ticket.plan_version,
+    )
+    add(
+        VisualReviewStaleReason.STEP_ID_CHANGED,
+        current_step_id != pending.step_id,
+    )
+    add(
+        VisualReviewStaleReason.TARGET_ID_CHANGED,
+        current_target_id != pending.target_id,
+    )
+    add(
+        VisualReviewStaleReason.RESULT_TOO_OLD,
+        now - pending.expectation.observation_timestamp_s > max_result_age_s,
+    )
+    add(VisualReviewStaleReason.FRAME_EVICTED, not frame_present)
+    add(
+        VisualReviewStaleReason.REQUEST_ID_MISMATCH,
+        result.request_id != pending.ticket.request_id,
+    )
+    add(
+        VisualReviewStaleReason.REVIEW_ID_MISMATCH,
+        result.review_id != pending.ticket.review_id,
+    )
+    return tuple(reasons)
+
+
+class _DuplicateJSONField(ValueError):
+    pass
+
+
+def _diagnostic_json_object(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJSONField(key)
+        result[key] = value
+    return result
+
+
+def _reject_diagnostic_constant(value: str) -> object:
+    raise ValueError(f"unsupported JSON constant: {value}")
+
+
+def _classify_model_or_parse_error(
+    result: AsyncModelResult,
+    error: Exception,
+) -> str:
+    """Classify without retaining exception text or the full model response."""
+
+    response = result.response
+    if response is None:
+        return VisualReviewParseErrorCode.MODEL_REQUEST_FAILED.value
+    try:
+        parsed = json.loads(
+            response.content,
+            parse_constant=_reject_diagnostic_constant,
+            object_pairs_hook=_diagnostic_json_object,
+        )
+    except _DuplicateJSONField:
+        return VisualReviewParseErrorCode.DUPLICATE_FIELD.value
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return VisualReviewParseErrorCode.INVALID_JSON.value
+    if isinstance(parsed, Mapping):
+        decision = parsed.get("decision")
+        action = parsed.get("recommended_action")
+        if (
+            isinstance(decision, str)
+            and decision not in {item.value for item in VisualReviewDecision}
+        ) or (
+            isinstance(action, str)
+            and action not in {item.value for item in VisualReviewAction}
+        ):
+            return VisualReviewParseErrorCode.UNSUPPORTED_ENUM.value
+    if isinstance(error, ModelProtocolError):
+        return VisualReviewParseErrorCode.SCHEMA_INVALID.value
+    return VisualReviewParseErrorCode.UNKNOWN_PARSE_ERROR.value
+
+
+_IMAGE_DATA_PATTERN = re.compile(
+    r"data:image/[^;,\s\"']+;base64,[^\s\"']+",
+    flags=re.IGNORECASE,
+)
+_CREDENTIAL_LABEL_PATTERN = re.compile(
+    r"api[\s_-]*key|authorization",
+    flags=re.IGNORECASE,
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r'''(["']?(?:api[\s_-]*key|authorization)["']?\s*[:=]\s*)'''
+    r'''(?:"[^"]*"|'[^']*'|[^,\s}]+)''',
+    flags=re.IGNORECASE,
+)
+_BEARER_PATTERN = re.compile(r"bearer\s+[^\s\"']+", flags=re.IGNORECASE)
+
+
+def _response_debug_fields(
+    content: str | None,
+    *,
+    enabled: bool,
+) -> dict[str, object]:
+    if not enabled or content is None:
+        return {
+            "response_text_length": None,
+            "response_text_tail": None,
+        }
+    # Redact before slicing: otherwise a long data URL whose prefix lies
+    # outside the tail could leak an unlabelled base64 suffix.
+    redacted = _IMAGE_DATA_PATTERN.sub("[REDACTED_IMAGE_DATA]", content)
+    redacted = _CREDENTIAL_ASSIGNMENT_PATTERN.sub(
+        '"credential":"[REDACTED_CREDENTIAL]"',
+        redacted,
+    )
+    redacted = _BEARER_PATTERN.sub("[REDACTED_CREDENTIAL]", redacted)
+    redacted = _CREDENTIAL_LABEL_PATTERN.sub("credential", redacted)
+    return {
+        "response_text_length": len(content),
+        "response_text_tail": redacted[-500:],
+    }
+
+
+def _debug_visual_review_from_environment() -> bool:
+    raw = os.environ.get("UAV_AGENT_DEBUG_VISUAL_REVIEW")
+    if raw is None:
+        return False
+    normalized = raw.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "UAV_AGENT_DEBUG_VISUAL_REVIEW must be one of 0/1/false/true/no/yes/off/on"
+    )
 
 
 def _prompt_safe_target_snapshot(snapshot: TargetSnapshot) -> TargetSnapshot:

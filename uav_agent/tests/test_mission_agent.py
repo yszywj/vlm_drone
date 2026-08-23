@@ -383,6 +383,7 @@ def make_harness(
         PerceptionRuntimeProfile.ORACLE_EVALUATION
     ),
     acknowledge_privileged_oracle: bool = True,
+    runtime_program: str = "linear",
 ) -> Harness:
     clock = FakeClock()
     context = SkillContext(
@@ -427,6 +428,7 @@ def make_harness(
         logger=logger,  # type: ignore[arg-type]
         perception_runtime_profile=perception_runtime_profile,
         acknowledge_privileged_oracle=acknowledge_privileged_oracle,
+        runtime_program=runtime_program,
     )
     return Harness(
         agent=agent,
@@ -474,6 +476,24 @@ class MissionAgentStartTests(unittest.TestCase):
         self.assertIs(snapshot.target.lifecycle, TargetLifecycle.UNINITIALIZED)
         request = harness.planner.requests[0]
         self.assertIs(request.world_context, harness.context)
+
+    def test_graph_start_binds_real_manager_program_executor(self) -> None:
+        harness = make_harness(runtime_program="graph")
+
+        harness.start()
+
+        self.assertTrue(harness.manager.is_graph_runtime)
+        program = harness.manager.program_snapshot
+        assert program is not None
+        assert harness.manager.task_plan is not None
+        self.assertEqual(
+            program.current_node_id,
+            harness.manager.task_plan.steps[0].step_id,
+        )
+        terminal = run_to_terminal(harness)
+        self.assertIs(terminal.status, AgentStatus.SUCCEEDED)
+        assert harness.manager.program_snapshot is not None
+        self.assertTrue(harness.manager.program_snapshot.terminal)
 
     def test_planner_failure_sets_failed_and_does_not_start_manager(self) -> None:
         planner = FakePlanner(mission_intent(), error=RuntimeError("planner offline"))

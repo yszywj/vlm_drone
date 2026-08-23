@@ -53,7 +53,11 @@ from agents.plan_revision_coordinator import (
     PlanRevisionCoordinator,
     PlanRevisionState,
 )
-from runtime.events import MissionEvent
+from agents.program_patch_coordinator import (
+    ProgramPatchCoordinator,
+    ProgramPatchCoordinatorState,
+)
+from runtime.events import MissionEvent, MissionEventType
 from runtime.world_belief import (
     CandidateSummary,
     QwenRequestState,
@@ -88,6 +92,7 @@ class MissionAgentSnapshot:
     skill_report: dict[str, object] | None = None
     visual_review: dict[str, object] | None = None
     plan_revision: dict[str, object] | None = None
+    program_patch: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, AgentStatus):
@@ -127,6 +132,10 @@ class MissionAgentSnapshot:
             if not isinstance(self.plan_revision, dict):
                 raise TypeError("plan_revision must be a dict or None")
             object.__setattr__(self, "plan_revision", deepcopy(self.plan_revision))
+        if self.program_patch is not None:
+            if not isinstance(self.program_patch, dict):
+                raise TypeError("program_patch must be a dict or None")
+            object.__setattr__(self, "program_patch", deepcopy(self.program_patch))
 
     def to_dict(self) -> dict[str, object]:
         """Return a fresh JSON-compatible view with stable enum strings."""
@@ -151,6 +160,9 @@ class MissionAgentSnapshot:
             ),
             "plan_revision": (
                 None if self.plan_revision is None else deepcopy(self.plan_revision)
+            ),
+            "program_patch": (
+                None if self.program_patch is None else deepcopy(self.program_patch)
             ),
         }
 
@@ -197,6 +209,8 @@ class MissionAgent:
         uav_id: str | None = None,
         visual_review_coordinator: VisualReviewCoordinator | None = None,
         plan_revision_coordinator: PlanRevisionCoordinator | None = None,
+        runtime_program: str = "linear",
+        program_patch_coordinator: ProgramPatchCoordinator | None = None,
     ) -> None:
         if not isinstance(planner, MissionPlanner):
             raise TypeError("planner must be a MissionPlanner")
@@ -212,6 +226,8 @@ class MissionAgent:
             raise TypeError("clock must satisfy SkillClock")
         if logger is not None and not callable(logger):
             raise TypeError("logger must be callable or None")
+        if runtime_program not in {"linear", "graph"}:
+            raise ValueError("runtime_program must be linear or graph")
         if not isinstance(perception_runtime_profile, PerceptionRuntimeProfile):
             raise TypeError(
                 "perception_runtime_profile must be a PerceptionRuntimeProfile"
@@ -281,6 +297,27 @@ class MissionAgent:
                 raise MissionAgentError(
                     "runtime plan revision requires a VisualReviewCoordinator"
                 )
+            if runtime_program == "graph":
+                raise MissionAgentError(
+                    "graph runtime requires ProgramPatch revisions; the "
+                    "TaskPlan PlanRevisionCoordinator is unsupported"
+                )
+        if program_patch_coordinator is not None:
+            if not isinstance(
+                program_patch_coordinator, ProgramPatchCoordinator
+            ):
+                raise TypeError(
+                    "program_patch_coordinator must be a "
+                    "ProgramPatchCoordinator or None"
+                )
+            if program_patch_coordinator.uav_id != bound_uav_id:
+                raise MissionAgentError(
+                    "ProgramPatchCoordinator.uav_id must match MissionAgent.uav_id"
+                )
+            if runtime_program != "graph":
+                raise MissionAgentError(
+                    "ProgramPatchCoordinator requires runtime_program=graph"
+                )
 
         self._planner = planner
         self._validator = validator
@@ -293,6 +330,8 @@ class MissionAgent:
         self._uav_id = bound_uav_id
         self._visual_review_coordinator = visual_review_coordinator
         self._plan_revision_coordinator = plan_revision_coordinator
+        self._program_patch_coordinator = program_patch_coordinator
+        self._runtime_program = runtime_program
 
         self._status = AgentStatus.IDLE
         self._compiled_mission: CompiledMission | None = None
@@ -417,7 +456,41 @@ class MissionAgent:
 
         try:
             mission_start_time = self._read_clock()
-            task_status = self._skill_manager.start_task(owned_compiled.task_plan)
+            if self._runtime_program == "graph":
+                from planner.mission_program import (
+                    ProgramAction,
+                    ProgramActionOp,
+                    ProgramEvent,
+                    ProgramEventHandler,
+                    linear_plan_to_mission_program,
+                )
+
+                handlers = ()
+                if self._program_patch_coordinator is not None:
+                    handlers = (
+                        ProgramEventHandler(
+                            ProgramEvent.PATH_BLOCKED,
+                            (
+                                ProgramAction(ProgramActionOp.HOLD),
+                                ProgramAction(
+                                    ProgramActionOp.REPLAN_CURRENT_ROUTE,
+                                    planner="QWEN_VL",
+                                    allow_model_waypoints=True,
+                                ),
+                            ),
+                        ),
+                    )
+
+                task_status = self._skill_manager.start_program(
+                    linear_plan_to_mission_program(
+                        owned_compiled.task_plan,
+                        event_handlers=handlers,
+                    )
+                )
+            else:
+                task_status = self._skill_manager.start_task(
+                    owned_compiled.task_plan
+                )
         except Exception as exc:
             self._raise_start_failure("SkillManager start failed", exc)
         if task_status is not TaskStatus.RUNNING:
@@ -465,6 +538,38 @@ class MissionAgent:
             raise MissionAgentError(
                 "Observation.uav_id does not match this MissionAgent"
             )
+
+        if self._runtime_program == "graph" and self._shutdown_outcome is None:
+            try:
+                published = self._skill_manager.graph_task_plan_for_adoption()
+                synchronized = (
+                    self._mission_id is not None
+                    and self._plan_version is not None
+                    and published.mission_id == self._mission_id
+                    and published.uav_id == self._uav_id
+                    and published.plan_version == self._plan_version
+                )
+            except Exception as exc:
+                synchronized = False
+                sync_error = self._error_text(
+                    "graph runtime publication is inconsistent",
+                    exc,
+                )
+            else:
+                sync_error = (
+                    "graph runtime plan version changed without "
+                    "MissionAgent adoption"
+                )
+            if not synchronized:
+                # A ProgramPatch successor is started but never ticked on its
+                # publication frame.  This check therefore gives a trusted
+                # coordinator exactly one inter-frame adoption window and
+                # cancels before an unadopted plan can command motion.
+                self._last_error = sync_error
+                self._begin_shutdown(AgentStatus.FAILED, sync_error)
+                self._consume_transitions()
+                self._sync_status()
+                return self.snapshot()
 
         # Enforce the information boundary before timestamp de-duplication,
         # SafetySupervisor, SkillManager, or transition handling sees the
@@ -531,8 +636,18 @@ class MissionAgent:
             decision = self._runtime_safety_decision(observation)
             self._log_safety(decision, phase="runtime")
             if decision.action is SafetyAction.CONTINUE:
+                patch_owned_tick = (
+                    self._program_patch_coordinator is not None
+                    and self._program_patch_coordinator.is_inflight
+                )
+                if patch_owned_tick:
+                    self._tick_program_patch(timestamp)
                 revision = self._plan_revision_coordinator
-                if revision is not None and revision.is_inflight:
+                if patch_owned_tick:
+                    # ProgramPatch owns supervisory HOVER and its own routed
+                    # worker result for this frame.
+                    pass
+                elif revision is not None and revision.is_inflight:
                     # The visual and revision planners intentionally share one
                     # per-UAV AsyncModelWorker. While revision owns it, do not
                     # let the visual coordinator drain that routed result as
@@ -544,6 +659,7 @@ class MissionAgent:
                     if revision is not None and revision.is_inflight:
                         self._tick_plan_revision()
                 self._tick_manager_or_abort(observation)
+                self._adopt_published_program_patch()
             else:
                 forced_outcome = (
                     AgentStatus.FAILED
@@ -622,6 +738,8 @@ class MissionAgent:
             self._plan_revision_coordinator.reset()
         if self._visual_review_coordinator is not None:
             self._visual_review_coordinator.reset()
+        if self._program_patch_coordinator is not None:
+            self._program_patch_coordinator.reset()
         self._compiled_mission = None
         self._transition_cursor = 0
         self._last_observation_timestamp = None
@@ -645,6 +763,7 @@ class MissionAgent:
         skill_report: dict[str, object] | None = None
         visual_review: dict[str, object] | None = None
         plan_revision: dict[str, object] | None = None
+        program_patch: dict[str, object] | None = None
         if active_name is not None:
             try:
                 feedback = self._skill_manager.get_feedback().to_dict()
@@ -668,6 +787,13 @@ class MissionAgent:
                 )
             except Exception:
                 plan_revision = None
+        if self._program_patch_coordinator is not None:
+            try:
+                program_patch = (
+                    self._program_patch_coordinator.snapshot().to_dict()
+                )
+            except Exception:
+                program_patch = None
         return MissionAgentSnapshot(
             status=self._status,
             task_status=_enum_text(task_status),
@@ -683,6 +809,7 @@ class MissionAgent:
             skill_report=skill_report,
             visual_review=visual_review,
             plan_revision=plan_revision,
+            program_patch=program_patch,
         )
 
     def submit_review_event(self, event: MissionEvent) -> None:
@@ -712,6 +839,45 @@ class MissionAgent:
         except Exception as exc:
             raise MissionAgentError(
                 self._error_text("review event rejected", exc)
+            ) from exc
+
+    def submit_program_event(
+        self,
+        event: MissionEvent,
+        *,
+        frame_id: str,
+    ) -> None:
+        """Start the graph ``PATH_BLOCKED`` ProgramPatch chain.
+
+        This is a trusted runtime boundary for collision/obstacle integration;
+        arbitrary review events cannot enter graph control flow.
+        """
+
+        coordinator = self._program_patch_coordinator
+        if self._status is not AgentStatus.RUNNING or self._shutdown_outcome is not None:
+            raise MissionAgentError("program event requires a RUNNING mission")
+        if coordinator is None:
+            raise MissionAgentError("ProgramPatch runtime is not configured")
+        if not isinstance(event, MissionEvent):
+            raise TypeError("event must be a MissionEvent")
+        if event.event_type is not MissionEventType.PATH_BLOCKED:
+            raise MissionAgentError("only PATH_BLOCKED is a graph program event")
+        if (
+            event.mission_id != self._mission_id
+            or event.uav_id != self._uav_id
+            or event.plan_version != self._plan_version
+        ):
+            raise MissionAgentError("program event routing/version mismatch")
+        try:
+            coordinator.begin(
+                expected_plan_version=event.plan_version,
+                observation_timestamp_s=event.timestamp_s,
+                frame_id=frame_id,
+                defer_observation_timestamp_s=event.timestamp_s,
+            )
+        except Exception as exc:
+            raise MissionAgentError(
+                self._error_text("program event rejected", exc)
             ) from exc
 
     def complete_visual_plan_revision(
@@ -798,6 +964,71 @@ class MissionAgent:
         self._safe_log(
             "[MissionAgent] visual_revision_completed "
             f"action={selected.value} plan_version={self._plan_version}"
+        )
+        return self.snapshot()
+
+    def adopt_runtime_task_plan(self, task_plan: TaskPlan) -> MissionAgentSnapshot:
+        """Synchronize Agent routing after a trusted Manager-side replacement.
+
+        Obstacle route publication and experimental ProgramPatch publication
+        are intentionally owned by their trusted coordinators.  Once
+        ``SkillManager`` has atomically installed either replacement, this
+        method advances the Agent's public plan version and compiled-plan view.
+        It never dispatches a plan itself and repeats Safety preflight before
+        accepting the metadata hand-off.  Graph callers must invoke it in the
+        one-tick window after HOVER publishes the replacement and before the
+        newly started successor consumes an observation.
+        """
+
+        if self._status is not AgentStatus.RUNNING:
+            raise MissionAgentError(
+                "adopt_runtime_task_plan requires a RUNNING MissionAgent"
+            )
+        compiled = self._compiled_mission
+        if compiled is None or self._mission_id is None or self._plan_version is None:
+            raise MissionAgentError("there is no active compiled mission")
+        if not isinstance(task_plan, TaskPlan):
+            raise TypeError("task_plan must be a TaskPlan")
+        if (
+            task_plan.mission_id != self._mission_id
+            or task_plan.uav_id != self._uav_id
+            or task_plan.plan_version != self._plan_version + 1
+        ):
+            raise MissionAgentError("runtime TaskPlan routing/version mismatch")
+        manager_plan = (
+            self._skill_manager.graph_task_plan_for_adoption()
+            if self._runtime_program == "graph"
+            else self._skill_manager.task_plan
+        )
+        if manager_plan is None or manager_plan.to_dict() != task_plan.to_dict():
+            raise MissionAgentError(
+                "SkillManager has not atomically installed this runtime TaskPlan"
+            )
+        replacement = CompiledMission(
+            planner_output=compiled.planner_output,
+            task_plan=task_plan,
+            source=compiled.source,
+            compiler_notes=(
+                *compiled.compiler_notes,
+                "runtime replacement adopted after trusted publication",
+            ),
+        )
+        decision = self._safety.preflight(replacement)
+        if not isinstance(decision, SafetyDecision):
+            raise MissionAgentError(
+                "runtime replacement safety preflight returned an invalid decision"
+            )
+        self._log_safety(decision, phase="runtime_replacement_preflight")
+        if decision.action is not SafetyAction.CONTINUE:
+            raise MissionAgentError(
+                "runtime replacement safety preflight rejected TaskPlan: "
+                f"{decision.action.value}: {decision.reason}"
+            )
+        self._compiled_mission = _copy_compiled_mission(replacement)
+        self._plan_version = task_plan.plan_version
+        self._safe_log(
+            "[MissionAgent] runtime_replacement_adopted "
+            f"plan_version={self._plan_version}"
         )
         return self.snapshot()
 
@@ -1016,6 +1247,39 @@ class MissionAgent:
                 + self._error_text("revision tick failed", exc)
             )
 
+    def _tick_program_patch(self, timestamp_s: float | None) -> None:
+        coordinator = self._program_patch_coordinator
+        if coordinator is None or not coordinator.is_inflight:
+            return
+        now = self._read_clock() if timestamp_s is None else timestamp_s
+        try:
+            coordinator.tick(timestamp_s=now)
+        except Exception as exc:
+            self._safe_log(
+                "[MissionAgent] program_patch_error "
+                + self._error_text("ProgramPatch tick failed", exc)
+            )
+
+    def _adopt_published_program_patch(self) -> None:
+        coordinator = self._program_patch_coordinator
+        if (
+            coordinator is None
+            or coordinator.snapshot().state
+            is not ProgramPatchCoordinatorState.ACCEPTED
+            or self._plan_version is None
+        ):
+            return
+        try:
+            published = self._skill_manager.graph_task_plan_for_adoption()
+            if published.plan_version == self._plan_version:
+                return
+            self.adopt_runtime_task_plan(published)
+            coordinator.reset()
+        except Exception as exc:
+            message = self._error_text("ProgramPatch adoption failed", exc)
+            self._last_error = message
+            self._begin_shutdown(AgentStatus.FAILED, message)
+
     def _build_revision_world_belief(
         self,
         semantic_plan: SkillPlanDraftV2,
@@ -1132,6 +1396,18 @@ class MissionAgent:
             f"[MissionAgent] shutdown_requested outcome={outcome.value} "
             f"reason={reason}"
         )
+        if self._visual_review_coordinator is not None:
+            try:
+                self._visual_review_coordinator.abort_pending(
+                    reason_code="MISSION_SHUTDOWN"
+                )
+            except Exception as exc:
+                # Releasing auxiliary model work must never prevent the
+                # trusted cancel-and-land path.
+                self._safe_log(
+                    "[MissionAgent] visual_review_abort_error "
+                    + self._error_text("could not abort visual review", exc)
+                )
         try:
             self._skill_manager.cancel_task()
         except Exception as exc:
@@ -1150,6 +1426,19 @@ class MissionAgent:
             # second time after a partial TargetManager transition.
             self._transition_cursor += 1
             self._log_skill_transition(record)
+            if self._visual_review_coordinator is not None:
+                try:
+                    self._visual_review_coordinator.observe_skill_transition(record)
+                except Exception as exc:
+                    # Event publication is diagnostic and may never turn an
+                    # otherwise stable supervisory HOVER into a failed flight.
+                    self._safe_log(
+                        "[MissionAgent] hold_event_error "
+                        + self._error_text(
+                            "could not publish Skill transition event",
+                            exc,
+                        )
+                    )
             event_count = len(self._target_manager.events())
             try:
                 self._apply_target_transition(record)
@@ -1168,6 +1457,14 @@ class MissionAgent:
             raise MissionAgentError("compiled mission is missing")
 
         if record.new_skill is SkillName.SEARCH:
+            if (
+                record.old_skill is SkillName.SEARCH
+                and self._target_manager.lifecycle is TargetLifecycle.SEARCHING
+            ):
+                # Consecutive SEARCH steps are one bounded fallback chain for
+                # the same immutable TargetSpec.  Exhausting a region does not
+                # create a second target lifecycle.
+                return
             if (
                 record.old_skill is SkillName.INSPECT
                 and self._target_manager.lifecycle

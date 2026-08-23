@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from common.ids import validate_uav_id
+from common.obstacle_types import ObstacleSpec
 from planner.policy import PlannerLimits, PlannerPolicy
 
 
@@ -25,6 +26,7 @@ class SimulationConfig:
 @dataclass(frozen=True)
 class SceneConfig:
     size_xyz_m: tuple[float, float, float]
+    obstacles: tuple[ObstacleSpec, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,16 @@ class CameraConfig:
     horizontal_fov_deg: float
     focal_length_m: float | None
     pitch_deg: float
+
+
+@dataclass(frozen=True, slots=True)
+class ObstaclePerceptionConfig:
+    """Trusted visibility limits for the privileged ideal-camera backend."""
+
+    mode: str = "disabled"
+    max_distance_m: float = 40.0
+    min_bbox_area_px: int = 64
+    max_occlusion_ratio: float = 0.95
 
 
 @dataclass(frozen=True)
@@ -100,7 +112,7 @@ class QwenVisualReviewConfig:
     jpeg_quality: int = 80
     hover_position_tolerance_m: float = 0.25
     hover_max_correction_speed_mps: float = 0.5
-    blocking_hover_timeout_s: float = 20.0
+    blocking_hover_timeout_s: float = 75.0
     blocking_timeout_fallback: str = "CANCEL_AND_LAND"
 
 
@@ -275,6 +287,9 @@ class AppConfig:
     plan_revision: PlanRevisionConfig = field(default_factory=PlanRevisionConfig)
     frame_store: FrameStoreConfig = field(default_factory=FrameStoreConfig)
     debug_images: DebugImagesConfig = field(default_factory=DebugImagesConfig)
+    obstacle_perception: ObstaclePerceptionConfig = field(
+        default_factory=ObstaclePerceptionConfig
+    )
 
 
 __all__ = [
@@ -289,6 +304,7 @@ __all__ = [
     "DebugImagesConfig",
     "LoggingConfig",
     "ModelWorkerConfig",
+    "ObstaclePerceptionConfig",
     "PlanRevisionConfig",
     "PlannerConfig",
     "SceneConfig",

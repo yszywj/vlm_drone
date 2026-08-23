@@ -5,7 +5,12 @@ import time
 import unittest
 
 from models.async_worker import AsyncModelRequest, AsyncModelWorker
-from models.base import ChatMessage, GenerationOptions, ModelResponse
+from models.base import (
+    ChatMessage,
+    GenerationOptions,
+    ModelHTTPError,
+    ModelResponse,
+)
 
 
 def request(
@@ -65,6 +70,21 @@ class ControlledModelClient:
         finally:
             with self._lock:
                 self.active -= 1
+
+
+class FailingModelClient:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+
+    def healthcheck(self) -> None:
+        return None
+
+    def chat(self, messages, *, options=None) -> ModelResponse:
+        del messages, options
+        self.started.set()
+        raise ModelHTTPError(
+            "Authorization: Bearer TOP_SECRET api_key=TOP_SECRET"
+        )
 
 
 class AsyncModelRequestTest(unittest.TestCase):
@@ -204,6 +224,20 @@ class AsyncModelWorkerTest(unittest.TestCase):
 
         self.assertIsNone(worker.poll(minimum_observation_timestamp_s=2.0))
         self.assertEqual(worker.discarded_result_count, 1)
+
+    def test_model_failure_uses_stable_non_secret_error_category(self) -> None:
+        client = FailingModelClient()
+        worker = AsyncModelWorker(client, uav_id="uav_1")
+        worker.submit(request("request_1"))
+        self.assertTrue(client.started.wait(1.0))
+        worker.close(timeout_s=2.0)
+
+        result = worker.poll()
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.error_code, "MODEL_REQUEST_FAILED")
+        self.assertEqual(result.error_message, "ModelHTTPError")
+        self.assertNotIn("TOP_SECRET", result.error_message)
 
 
 if __name__ == "__main__":

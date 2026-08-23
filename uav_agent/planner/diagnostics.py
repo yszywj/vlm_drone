@@ -10,6 +10,7 @@ from planner.schemas import (
     SkillPlanDraft,
     SkillPlanDraftV2,
 )
+from planner.schemas_v3 import SkillPlanDraftV3
 
 
 def _optional_text(value: object, field_name: str) -> str | None:
@@ -89,17 +90,17 @@ class PlannerDiagnostics:
 class PlannerExecution:
     """A successful Planner output paired with sanitized diagnostics."""
 
-    output: PlannerOutput
+    output: PlannerOutput | SkillPlanDraftV3
     diagnostics: PlannerDiagnostics
 
     def __post_init__(self) -> None:
         if not isinstance(
             self.output,
-            (MissionIntent, SkillPlanDraft, SkillPlanDraftV2),
+            (MissionIntent, SkillPlanDraft, SkillPlanDraftV2, SkillPlanDraftV3),
         ):
             raise TypeError(
                 "output must be a MissionIntent, SkillPlanDraft, or "
-                "SkillPlanDraftV2"
+                "SkillPlanDraftV2, or SkillPlanDraftV3"
             )
         if not isinstance(self.diagnostics, PlannerDiagnostics):
             raise TypeError("diagnostics must be PlannerDiagnostics")

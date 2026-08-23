@@ -22,6 +22,7 @@ from skills.motion_types import (
     MotionPolicyValidationError,
     YawMode,
 )
+from skills.search_strategy import SearchRuntimeCapabilities
 from skills.types import Observation, SkillName
 
 
@@ -52,6 +53,25 @@ _ALLOWED_COMPILED_PARAMS: Mapping[SkillName, frozenset[str]] = {
             "transit_speed",
             "scan_yaw_rate",
             "timeout",
+            "region",
+            "strategy",
+            "entry_policy",
+            "search_altitude_m",
+            "timeout_s",
+            "transit_speed_mps",
+            "scan_yaw_rate_rad_s",
+            "user_anchor_xyz_m",
+            "model_selected_entry_xyz_m",
+        }
+    ),
+    SkillName.FOLLOW_ROUTE: frozenset(
+        {
+            "route_ref",
+            "route_id",
+            "waypoints",
+            "tolerance_m",
+            "timeout_s",
+            "motion_policy",
         }
     ),
     SkillName.TRACK: frozenset(
@@ -131,6 +151,7 @@ class SafetySupervisor:
         position_margin_m: float = 0.0,
         max_safe_altitude_m: float | None = None,
         planner_limits: PlannerLimits | None = None,
+        search_runtime_capabilities: SearchRuntimeCapabilities | None = None,
     ) -> None:
         self._scene_min = _finite_vector3(scene_min_xyz_m, "scene_min_xyz_m")
         self._scene_max = _finite_vector3(scene_max_xyz_m, "scene_max_xyz_m")
@@ -171,7 +192,15 @@ class SafetySupervisor:
             planner_limits = PlannerLimits()
         if not isinstance(planner_limits, PlannerLimits):
             raise TypeError("planner_limits must be a PlannerLimits")
+        if search_runtime_capabilities is None:
+            search_runtime_capabilities = SearchRuntimeCapabilities()
+        if not isinstance(search_runtime_capabilities, SearchRuntimeCapabilities):
+            raise TypeError(
+                "search_runtime_capabilities must be a "
+                "SearchRuntimeCapabilities or None"
+            )
         self._planner_limits = planner_limits
+        self._search_runtime_capabilities = search_runtime_capabilities
         self._last_observation_timestamp: float | None = None
         self._last_mission_elapsed_s: float | None = None
 
@@ -362,7 +391,14 @@ class SafetySupervisor:
             return _abort("TaskPlan must contain exactly one LAND")
         if counts[SkillName.GOTO] > limits.max_goto_calls:
             return _abort("TaskPlan GOTO call count exceeds planner limit")
-        if counts[SkillName.SEARCH] > limits.max_search_calls:
+        spatial_v3 = any(
+            step.skill is SkillName.SEARCH and "region" in step.params
+            for step in steps
+        )
+        if (
+            not spatial_v3
+            and counts[SkillName.SEARCH] > limits.max_search_calls
+        ):
             return _abort("TaskPlan SEARCH call count exceeds planner limit")
         if counts[SkillName.TRACK] > limits.max_track_calls:
             return _abort("TaskPlan TRACK call count exceeds planner limit")
@@ -558,6 +594,9 @@ class SafetySupervisor:
             return
 
         if step.skill is SkillName.SEARCH:
+            if "region" in params:
+                self._validate_search_v3(params, prefix)
+                return
             center = _finite_vector3(
                 _required(params, "center", prefix),
                 f"{prefix} center",
@@ -587,6 +626,10 @@ class SafetySupervisor:
             description = _required(params, "target_description", prefix)
             if not isinstance(description, str) or not description.strip():
                 raise ValueError(f"{prefix} target_description must be non-empty")
+            return
+
+        if step.skill is SkillName.FOLLOW_ROUTE:
+            self._validate_follow_route(params, prefix)
             return
 
         if step.skill is SkillName.INSPECT:
@@ -722,6 +765,124 @@ class SafetySupervisor:
                         f"{prefix} expected_position_xy is outside scene XY bounds"
                     )
             _validate_vertical_yaw(params, prefix)
+
+    def _validate_search_v3(
+        self,
+        params: Mapping[str, object],
+        prefix: str,
+    ) -> None:
+        from planner.region_compiler import RegionCompiler
+        from planner.spatial import RelationalRegion
+        from skills.search_geometry import region_center
+        from skills.search_strategy import SearchEntryPolicy, SearchStrategySpec
+
+        region = _required(params, "region", prefix)
+        if isinstance(region, RelationalRegion):
+            raise ValueError(f"{prefix} RELATIONAL region was not grounded")
+        try:
+            center = region_center(region)  # type: ignore[arg-type]
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{prefix} region is invalid: {exc}") from exc
+        strategy = _required(params, "strategy", prefix)
+        if not isinstance(strategy, SearchStrategySpec):
+            raise TypeError(f"{prefix} strategy must be a SearchStrategySpec")
+        entry_policy = _required(params, "entry_policy", prefix)
+        if not isinstance(entry_policy, SearchEntryPolicy):
+            raise TypeError(f"{prefix} entry_policy must be a SearchEntryPolicy")
+        altitude = _positive_finite(
+            _required(params, "search_altitude_m", prefix),
+            f"{prefix} search_altitude_m",
+        )
+        self._require_flight_altitude(altitude, f"{prefix} search_altitude_m")
+        timeout = _positive_finite(
+            _required(params, "timeout_s", prefix),
+            f"{prefix} timeout_s",
+        )
+        if timeout > self._max_mission_time_s:
+            raise ValueError(f"{prefix} timeout_s exceeds mission time budget")
+        _validate_optional_positive_fields(
+            params,
+            prefix,
+            ("transit_speed_mps", "scan_yaw_rate_rad_s"),
+        )
+        description = _required(params, "target_description", prefix)
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(f"{prefix} target_description must be non-empty")
+        try:
+            geometry = RegionCompiler(
+                search_runtime_capabilities=self._search_runtime_capabilities
+            ).compile(
+                region=region,  # type: ignore[arg-type]
+                strategy=strategy,
+                entry_policy=entry_policy,
+                current_uav_xyz_m=center,
+                search_altitude_m=altitude,
+                user_anchor_xyz_m=params.get("user_anchor_xyz_m"),  # type: ignore[arg-type]
+                model_selected_entry_xyz_m=params.get(
+                    "model_selected_entry_xyz_m"
+                ),  # type: ignore[arg-type]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{prefix} geometry is unsafe: {exc}") from exc
+        for index, point in enumerate(geometry.route_waypoints_xyz_m):
+            self._require_point_in_plan_bounds(
+                point,
+                f"{prefix} route_waypoints_xyz_m[{index}]",
+            )
+
+    def _validate_follow_route(
+        self,
+        params: Mapping[str, object],
+        prefix: str,
+    ) -> None:
+        route_ref = params.get("route_ref")
+        resolved_route = "route_id" in params or "waypoints" in params
+        if route_ref is not None and resolved_route:
+            raise ValueError(
+                f"{prefix} must use route_ref or resolved route fields, not both"
+            )
+        if route_ref is not None:
+            try:
+                validate_routing_id(route_ref, f"{prefix} route_ref")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from None
+        else:
+            route_id = _required(params, "route_id", prefix)
+            try:
+                validate_routing_id(route_id, f"{prefix} route_id")
+            except (TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from None
+            raw_waypoints = _required(params, "waypoints", prefix)
+            if (
+                isinstance(raw_waypoints, (str, bytes, bytearray, Mapping))
+                or not isinstance(raw_waypoints, Sequence)
+                or not 2 <= len(raw_waypoints) <= 16
+            ):
+                raise ValueError(f"{prefix} waypoints must contain 2-16 points")
+            previous: tuple[float, float, float] | None = None
+            for index, raw_point in enumerate(raw_waypoints):
+                point = _finite_vector3(
+                    raw_point,
+                    f"{prefix} waypoints[{index}]",
+                )
+                self._require_point_in_plan_bounds(
+                    point,
+                    f"{prefix} waypoints[{index}]",
+                )
+                if previous is not None and point == previous:
+                    raise ValueError(
+                        f"{prefix} adjacent route waypoints must be distinct"
+                    )
+                previous = point
+        _validate_optional_positive_fields(
+            params,
+            prefix,
+            ("tolerance_m", "timeout_s"),
+        )
+        if "timeout_s" in params and float(params["timeout_s"]) > self._max_mission_time_s:
+            raise ValueError(f"{prefix} timeout_s exceeds mission time budget")
+        if "motion_policy" in params:
+            _validate_motion_policy(params["motion_policy"], prefix)
 
     def _require_flight_altitude(self, altitude: float, name: str) -> None:
         if not self._scene_min[2] < altitude <= self._scene_max[2]:

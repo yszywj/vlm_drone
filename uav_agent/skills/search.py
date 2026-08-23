@@ -10,6 +10,16 @@ from numbers import Real
 import numpy as np
 
 from env.moving_target import TargetState
+from planner.region_compiler import CompiledSearchGeometry, RegionCompiler
+from planner.spatial import (
+    CircleRegion,
+    CorridorRegion,
+    PolygonRegion,
+    RectangleRegion,
+    RegionSpec,
+    RelationalRegion,
+    SectorRegion,
+)
 from skills.base import (
     Skill,
     SkillExecutionStateError,
@@ -18,6 +28,17 @@ from skills.base import (
     require_vector3,
 )
 from skills.motion_types import MotionPolicy, YawMode, move_toward_with_policy
+from skills.search_geometry import region_center
+from skills.search_strategy import (
+    AsyncNextBestViewProvider,
+    NextBestViewProvider,
+    NextBestViewPollResult,
+    NextBestViewRequest,
+    SearchEntryPolicy,
+    SearchRuntimeCapabilities,
+    SearchStrategySpec,
+    SearchStrategyType,
+)
 from skills.types import (
     Observation,
     SkillContext,
@@ -69,11 +90,49 @@ class SearchGoal(SkillGoal):
     timeout: float = 60.0
 
 
+@dataclass(frozen=True, slots=True)
+class SearchGoalV3(SkillGoal):
+    """Spatial Contract V3 SEARCH request.
+
+    Region resolution/geometry is performed once at Skill start. Strategies
+    select macro observation points and never expose controller-rate outputs.
+    """
+
+    region: RegionSpec
+    strategy: SearchStrategySpec
+    entry_policy: SearchEntryPolicy
+    target_description: str
+    search_altitude_m: float
+    timeout_s: float
+    transit_speed_mps: float = 1.5
+    scan_yaw_rate_rad_s: float = 0.5
+    user_anchor_xyz_m: tuple[float, float, float] | None = None
+    model_selected_entry_xyz_m: tuple[float, float, float] | None = None
+
+    # Runtime compatibility spellings used by the shared SEARCH state machine.
+    @property
+    def search_altitude(self) -> float:
+        return self.search_altitude_m
+
+    @property
+    def timeout(self) -> float:
+        return self.timeout_s
+
+    @property
+    def transit_speed(self) -> float:
+        return self.transit_speed_mps
+
+    @property
+    def scan_yaw_rate(self) -> float:
+        return self.scan_yaw_rate_rad_s
+
+
 class SearchPhase(str, Enum):
     """Observable SEARCH phase without embedding another Skill lifecycle."""
 
     TRANSIT = "TRANSIT"
     SCANNING = "SCANNING"
+    WAITING_FOR_NEXT_VIEW = "WAITING_FOR_NEXT_VIEW"
     CANDIDATE_PENDING = "CANDIDATE_PENDING"
     WAITING_FOR_REVIEW = "WAITING_FOR_REVIEW"
     TARGET_LOCKED = "TARGET_LOCKED"
@@ -82,16 +141,36 @@ class SearchPhase(str, Enum):
 class SearchSkill(Skill):
     """Search six fixed perimeter points without reading hidden target position."""
 
-    goal_type = SearchGoal
+    goal_type = (SearchGoal, SearchGoalV3)
     WAYPOINT_COUNT = len(_SEARCH_WAYPOINT_ANGLES_DEG)
     FULL_SCAN_RAD = 2.0 * pi
 
     def __init__(
         self,
         transit_yaw_mode: YawMode | str = YawMode.FACE_POINT,
+        *,
+        next_best_view_provider: (
+            NextBestViewProvider | AsyncNextBestViewProvider | None
+        ) = None,
     ) -> None:
         super().__init__()
+        synchronous = callable(
+            getattr(next_best_view_provider, "next_best_view", None)
+        )
+        asynchronous = callable(
+            getattr(next_best_view_provider, "submit_next_best_view", None)
+        ) and callable(
+            getattr(next_best_view_provider, "poll_next_best_view", None)
+        )
+        if next_best_view_provider is not None and not (
+            synchronous or asynchronous
+        ):
+            raise TypeError(
+                "next_best_view_provider must provide next_best_view() or the "
+                "submit_next_best_view()/poll_next_best_view() pair"
+            )
         self._transit_yaw_mode = _transit_mode(transit_yaw_mode)
+        self._next_best_view_provider = next_best_view_provider
         self._center: np.ndarray | None = None
         self._waypoints: tuple[np.ndarray, ...] = ()
         self._waypoint_index = 0
@@ -109,10 +188,18 @@ class SearchSkill(Skill):
         self._scan_last_timestamp: float | None = None
         self._effective_scan_rate_rad_s: float | None = None
         self._completed_scan_angles_rad: list[float] = []
+        self._compiled_v3: CompiledSearchGeometry | None = None
+        self._visited_viewpoints: list[tuple[float, float, float]] = []
 
     @property
     def transit_yaw_mode(self) -> YawMode:
         return self._transit_yaw_mode
+
+    @property
+    def next_best_view_provider(
+        self,
+    ) -> NextBestViewProvider | AsyncNextBestViewProvider | None:
+        return self._next_best_view_provider
 
     @property
     def phase(self) -> SearchPhase | None:
@@ -179,10 +266,35 @@ class SearchSkill(Skill):
 
     def _validate_goal(self, goal: SkillGoal) -> None:
         typed_goal = goal
-        if not isinstance(typed_goal, SearchGoal):
+        if not isinstance(typed_goal, (SearchGoal, SearchGoalV3)):
             return
-        require_vector3(typed_goal.center, "center")
-        require_positive(typed_goal.radius, "radius")
+        if isinstance(typed_goal, SearchGoal):
+            require_vector3(typed_goal.center, "center")
+            require_positive(typed_goal.radius, "radius")
+        else:
+            if not isinstance(
+                typed_goal.region,
+                (
+                    CircleRegion,
+                    RectangleRegion,
+                    SectorRegion,
+                    PolygonRegion,
+                    CorridorRegion,
+                    RelationalRegion,
+                ),
+            ):
+                raise SkillGoalValidationError("region must be a RegionSpec")
+            if not isinstance(typed_goal.strategy, SearchStrategySpec):
+                raise SkillGoalValidationError("strategy must be a SearchStrategySpec")
+            if not isinstance(typed_goal.entry_policy, SearchEntryPolicy):
+                raise SkillGoalValidationError("entry_policy must be a SearchEntryPolicy")
+            if typed_goal.user_anchor_xyz_m is not None:
+                require_vector3(typed_goal.user_anchor_xyz_m, "user_anchor_xyz_m")
+            if typed_goal.model_selected_entry_xyz_m is not None:
+                require_vector3(
+                    typed_goal.model_selected_entry_xyz_m,
+                    "model_selected_entry_xyz_m",
+                )
         if (
             not isinstance(typed_goal.target_description, str)
             or not typed_goal.target_description.strip()
@@ -197,18 +309,49 @@ class SearchSkill(Skill):
 
     def _on_start(self, goal: SkillGoal, context: SkillContext) -> None:
         typed_goal = self._search_goal(goal)
-        center = np.asarray(
-            require_vector3(typed_goal.center, "center"),
-            dtype=np.float64,
-        )
         start_time = self._read_clock(context)
-        waypoints = tuple(
-            np.asarray(point, dtype=np.float64)
-            for point in build_search_waypoints(
-                tuple(float(value) for value in center),
+        compiled_v3: CompiledSearchGeometry | None = None
+        if isinstance(typed_goal, SearchGoalV3):
+            pose = context.uav.get_pose()
+            try:
+                compiled_v3 = RegionCompiler(
+                    search_runtime_capabilities=SearchRuntimeCapabilities(
+                        adaptive_next_best_view=(
+                            self._next_best_view_provider is not None
+                        )
+                    )
+                ).compile(
+                    region=typed_goal.region,
+                    strategy=typed_goal.strategy,
+                    entry_policy=typed_goal.entry_policy,
+                    current_uav_xyz_m=(pose.x, pose.y, pose.z),
+                    search_altitude_m=typed_goal.search_altitude_m,
+                    user_anchor_xyz_m=typed_goal.user_anchor_xyz_m,
+                    model_selected_entry_xyz_m=(
+                        typed_goal.model_selected_entry_xyz_m
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise SkillExecutionStateError(
+                    f"could not compile SEARCH V3 geometry: {exc}"
+                ) from exc
+            center_tuple = region_center(
+                compiled_v3.region,
+                typed_goal.search_altitude_m,
+            )
+            waypoint_values = compiled_v3.route_waypoints_xyz_m
+            tolerance_scale = typed_goal.strategy.spacing_m
+        else:
+            center_tuple = require_vector3(typed_goal.center, "center")
+            waypoint_values = build_search_waypoints(
+                tuple(float(value) for value in center_tuple),
                 typed_goal.radius,
                 typed_goal.search_altitude,
             )
+            tolerance_scale = typed_goal.radius
+        center = np.asarray(center_tuple, dtype=np.float64)
+        waypoints = tuple(
+            np.asarray(point, dtype=np.float64) for point in waypoint_values
         )
         look_at_point = (
             tuple(float(value) for value in center)
@@ -224,7 +367,7 @@ class SearchSkill(Skill):
         self._waypoint_index = 0
         self._waypoint_tolerance_m = min(
             0.5,
-            max(0.05, 0.1 * float(typed_goal.radius)),
+            max(0.05, 0.1 * float(tolerance_scale)),
         )
         self._phase = SearchPhase.TRANSIT
         self._reported_phase = SearchPhase.TRANSIT
@@ -239,6 +382,8 @@ class SearchSkill(Skill):
         self._last_clock_time = start_time
         self._last_observation_timestamp = None
         self._completed_scan_angles_rad = []
+        self._compiled_v3 = compiled_v3
+        self._visited_viewpoints = []
         self._clear_scan_state()
         self._set_feedback(
             0.0,
@@ -247,9 +392,14 @@ class SearchSkill(Skill):
                 "phase": self._phase.name,
                 "waypoint_index": 1,
                 "waypoint_count": len(self._waypoints),
-                "target_visible": False,
-            },
-        )
+                "active_waypoint_xyz_m": tuple(
+                    float(value) for value in self._current_waypoint()
+                ),
+                    "target_visible": False,
+                    "coverage_ratio": 0.0,
+                    "visited_viewpoints": (),
+                },
+            )
 
     def _on_tick(self, observation: Observation) -> None:
         goal = self._search_goal(self._active_goal)
@@ -308,6 +458,9 @@ class SearchSkill(Skill):
                     "target_description": goal.target_description.strip(),
                     "completed_scans": len(self._completed_scan_angles_rad),
                     "elapsed_time": elapsed,
+                    "coverage_ratio": self._coverage_ratio(),
+                    "visited_viewpoints": tuple(self._visited_viewpoints),
+                    "search_exhausted_reason": "TIMEOUT",
                 },
             )
             return
@@ -316,6 +469,8 @@ class SearchSkill(Skill):
             self._tick_transit(observation, goal, elapsed)
         elif self._phase is SearchPhase.SCANNING:
             self._tick_scan(observation, goal, elapsed)
+        elif self._phase is SearchPhase.WAITING_FOR_NEXT_VIEW:
+            self._tick_waiting_for_next_view(goal, elapsed)
         else:
             raise SkillExecutionStateError("SEARCH has an invalid internal phase")
 
@@ -417,31 +572,46 @@ class SearchSkill(Skill):
         if self._scan_accumulated_rad + 1e-9 >= self.FULL_SCAN_RAD:
             self._active_context.uav.stop()
             self._completed_scan_angles_rad.append(self._scan_accumulated_rad)
+            self._visited_viewpoints.append(
+                tuple(float(value) for value in self._current_waypoint())
+            )
             self._waypoint_index += 1
             if self._waypoint_index >= len(self._waypoints):
-                self._set_feedback(
-                    1.0,
-                    "All search waypoints exhausted",
-                    {
-                        "phase": SearchPhase.SCANNING.value,
-                        "waypoint_index": len(self._waypoints),
-                        "waypoint_count": len(self._waypoints),
-                        "scan_angle_rad": self._scan_accumulated_rad,
-                        "target_visible": False,
-                        "elapsed_time": elapsed,
-                    },
-                )
-                self._fail(
-                    SkillResultCode.SEARCH_EXHAUSTED,
-                    "SEARCH completed every waypoint without finding the target",
-                    {
-                        "target_description": goal.target_description.strip(),
-                        "completed_scans": len(self._completed_scan_angles_rad),
-                        "scan_angles_rad": tuple(self._completed_scan_angles_rad),
-                        "elapsed_time": elapsed,
-                    },
-                )
-                return
+                exhausted_reason = "WAYPOINTS_EXHAUSTED"
+                if self._is_adaptive_search(goal):
+                    assert isinstance(goal, SearchGoalV3)
+                    if len(self._visited_viewpoints) < goal.strategy.max_viewpoints:
+                        if self._has_async_next_best_view_provider():
+                            self._submit_next_best_view(goal, observation)
+                            self._clear_scan_state()
+                            self._set_feedback(
+                                self._overall_progress(),
+                                "Waiting for next macro observation point",
+                                self._feedback_data(
+                                    target_visible=False,
+                                    elapsed=elapsed,
+                                ),
+                            )
+                            return
+                        else:
+                            next_waypoint = self._request_next_best_view(
+                                goal,
+                                observation,
+                            )
+                            if next_waypoint is not None:
+                                self._append_adaptive_waypoint(next_waypoint)
+                                exhausted_reason = ""
+                            else:
+                                exhausted_reason = "ADAPTIVE_PROVIDER_EXHAUSTED"
+                    else:
+                        exhausted_reason = "MAX_VIEWPOINTS_REACHED"
+                if exhausted_reason:
+                    self._finish_search_exhausted(
+                        goal,
+                        elapsed=elapsed,
+                        reason=exhausted_reason,
+                    )
+                    return
 
             self._phase = SearchPhase.TRANSIT
             if self._reported_phase not in {
@@ -462,6 +632,238 @@ class SearchSkill(Skill):
             self._overall_progress(),
             "Scanning current waypoint",
             self._feedback_data(target_visible=False, elapsed=elapsed),
+        )
+
+    def _tick_waiting_for_next_view(
+        self,
+        goal: SearchGoal | SearchGoalV3,
+        elapsed: float,
+    ) -> None:
+        if not isinstance(goal, SearchGoalV3) or not self._is_adaptive_search(goal):
+            raise SkillExecutionStateError(
+                "only adaptive SEARCH may wait for a next-best-view proposal"
+            )
+        provider = self._next_best_view_provider
+        if provider is None or not isinstance(provider, AsyncNextBestViewProvider):
+            raise SkillExecutionStateError(
+                "adaptive SEARCH lost its asynchronous next-best-view provider"
+            )
+        self._active_context.uav.stop()
+        try:
+            result = provider.poll_next_best_view()
+        except Exception as exc:
+            raise SkillExecutionStateError(
+                "next-best-view provider failed: " + type(exc).__name__
+            ) from exc
+        if not isinstance(result, NextBestViewPollResult):
+            raise SkillExecutionStateError(
+                "next-best-view provider returned an invalid poll result"
+            )
+        if not result.completed:
+            self._set_feedback(
+                self._overall_progress(),
+                "Waiting for next macro observation point",
+                self._feedback_data(target_visible=False, elapsed=elapsed),
+            )
+            return
+        if result.viewpoint_xyz_m is None:
+            self._finish_search_exhausted(
+                goal,
+                elapsed=elapsed,
+                reason="ADAPTIVE_PROVIDER_EXHAUSTED",
+            )
+            return
+        waypoint = self._validate_adaptive_waypoint(
+            goal,
+            result.viewpoint_xyz_m,
+        )
+        self._append_adaptive_waypoint(waypoint)
+        self._phase = SearchPhase.TRANSIT
+        if self._reported_phase not in {
+            SearchPhase.CANDIDATE_PENDING,
+            SearchPhase.WAITING_FOR_REVIEW,
+        }:
+            self._reported_phase = SearchPhase.TRANSIT
+        self._set_feedback(
+            self._overall_progress(),
+            "Next macro observation point accepted",
+            self._feedback_data(target_visible=False, elapsed=elapsed),
+        )
+
+    def _submit_next_best_view(
+        self,
+        goal: SearchGoalV3,
+        observation: Observation,
+    ) -> None:
+        provider = self._next_best_view_provider
+        if provider is None or not isinstance(provider, AsyncNextBestViewProvider):
+            raise SkillExecutionStateError(
+                "adaptive SEARCH has no asynchronous next-best-view provider"
+            )
+        request = self._build_next_best_view_request(goal, observation)
+        try:
+            provider.submit_next_best_view(request)
+        except Exception as exc:
+            raise SkillExecutionStateError(
+                "next-best-view provider failed: " + type(exc).__name__
+            ) from exc
+        self._phase = SearchPhase.WAITING_FOR_NEXT_VIEW
+        if self._reported_phase not in {
+            SearchPhase.CANDIDATE_PENDING,
+            SearchPhase.WAITING_FOR_REVIEW,
+        }:
+            self._reported_phase = SearchPhase.WAITING_FOR_NEXT_VIEW
+
+    def _request_next_best_view(
+        self,
+        goal: SearchGoalV3,
+        observation: Observation,
+    ) -> tuple[float, float, float] | None:
+        provider = self._next_best_view_provider
+        compiled = self._compiled_v3
+        if provider is None or compiled is None:
+            raise SkillExecutionStateError(
+                "adaptive SEARCH has no runtime next-best-view provider"
+            )
+        request = self._build_next_best_view_request(goal, observation)
+        try:
+            proposed = provider.next_best_view(request)
+        except Exception as exc:
+            raise SkillExecutionStateError(
+                "next-best-view provider failed: " + type(exc).__name__
+            ) from exc
+        if proposed is None:
+            return None
+        return self._validate_adaptive_waypoint(goal, proposed)
+
+    def _build_next_best_view_request(
+        self,
+        goal: SearchGoalV3,
+        observation: Observation,
+    ) -> NextBestViewRequest:
+        compiled = self._compiled_v3
+        if compiled is None:
+            raise SkillExecutionStateError(
+                "adaptive SEARCH has no compiled region"
+            )
+        return NextBestViewRequest(
+            region=compiled.region,
+            target_description=goal.target_description,
+            observation_timestamp_s=float(observation.timestamp),
+            uav_position_xyz_m=(
+                float(observation.uav_pose.x),
+                float(observation.uav_pose.y),
+                float(observation.uav_pose.z),
+            ),
+            uav_yaw_rad=float(observation.uav_pose.yaw),
+            camera_rgb=observation.camera_rgb,
+            camera_position_m=(
+                None
+                if observation.camera_position_m is None
+                else tuple(
+                    float(value) for value in observation.camera_position_m
+                )
+            ),
+            camera_orientation_wxyz=(
+                None
+                if observation.camera_orientation_wxyz is None
+                else tuple(
+                    float(value)
+                    for value in observation.camera_orientation_wxyz
+                )
+            ),
+            visited_viewpoints_xyz_m=tuple(self._visited_viewpoints),
+            coverage_ratio=self._coverage_ratio(),
+            max_viewpoints=goal.strategy.max_viewpoints,
+            search_altitude_m=goal.search_altitude_m,
+        )
+
+    def _validate_adaptive_waypoint(
+        self,
+        goal: SearchGoalV3,
+        proposed: object,
+    ) -> tuple[float, float, float]:
+        compiled = self._compiled_v3
+        if compiled is None:
+            raise SkillExecutionStateError(
+                "adaptive SEARCH has no compiled region"
+            )
+        try:
+            waypoint = RegionCompiler.validate_adaptive_waypoint(
+                compiled.region,
+                proposed,  # type: ignore[arg-type]
+                search_altitude_m=goal.search_altitude_m,
+            )
+        except (TypeError, ValueError) as exc:
+            raise SkillExecutionStateError(
+                f"next-best-view provider returned an invalid waypoint: {exc}"
+            ) from exc
+        prior = (
+            *self._visited_viewpoints,
+            *(
+                tuple(float(value) for value in point)
+                for point in self._waypoints
+            ),
+        )
+        if any(
+            float(np.linalg.norm(np.asarray(waypoint) - np.asarray(point))) <= 1e-6
+            for point in prior
+        ):
+            raise SkillExecutionStateError(
+                "next-best-view provider returned a duplicate waypoint"
+            )
+        return waypoint
+
+    def _append_adaptive_waypoint(
+        self,
+        waypoint: tuple[float, float, float],
+    ) -> None:
+        self._waypoints = (
+            *self._waypoints,
+            np.asarray(waypoint, dtype=np.float64),
+        )
+
+    def _has_async_next_best_view_provider(self) -> bool:
+        provider = self._next_best_view_provider
+        return provider is not None and isinstance(
+            provider,
+            AsyncNextBestViewProvider,
+        )
+
+    def _finish_search_exhausted(
+        self,
+        goal: SearchGoal | SearchGoalV3,
+        *,
+        elapsed: float,
+        reason: str,
+    ) -> None:
+        self._set_feedback(
+            1.0,
+            "All search waypoints exhausted",
+            {
+                "phase": SearchPhase.SCANNING.value,
+                "waypoint_index": len(self._waypoints),
+                "waypoint_count": len(self._waypoints),
+                "scan_angle_rad": self._scan_accumulated_rad,
+                "target_visible": False,
+                "elapsed_time": elapsed,
+                "coverage_ratio": self._coverage_ratio(),
+                "visited_viewpoints": tuple(self._visited_viewpoints),
+                "search_exhausted_reason": reason,
+            },
+        )
+        self._fail(
+            SkillResultCode.SEARCH_EXHAUSTED,
+            "SEARCH completed every available viewpoint without finding the target",
+            {
+                "target_description": goal.target_description.strip(),
+                "completed_scans": len(self._completed_scan_angles_rad),
+                "scan_angles_rad": tuple(self._completed_scan_angles_rad),
+                "elapsed_time": elapsed,
+                "coverage_ratio": self._coverage_ratio(),
+                "visited_viewpoints": tuple(self._visited_viewpoints),
+                "search_exhausted_reason": reason,
+            },
         )
 
     def _command_scan(self, goal: SearchGoal) -> None:
@@ -511,6 +913,9 @@ class SearchSkill(Skill):
             },
             "oracle_target_pose": _target_pose_dict(target_pose),
             "elapsed_time": elapsed,
+            "coverage_ratio": self._coverage_ratio(),
+            "visited_viewpoints": tuple(self._visited_viewpoints),
+            "search_exhausted_reason": None,
         }
         if observation.oracle_target_velocity is not None:
             data["oracle_target_velocity_mps"] = tuple(
@@ -545,7 +950,13 @@ class SearchSkill(Skill):
             "waypoint_count": len(self._waypoints),
             "target_visible": target_visible,
             "elapsed_time": elapsed,
+            "coverage_ratio": self._coverage_ratio(),
+            "visited_viewpoints": tuple(self._visited_viewpoints),
         }
+        if 0 <= self._waypoint_index < len(self._waypoints):
+            data["active_waypoint_xyz_m"] = tuple(
+                float(value) for value in self._current_waypoint()
+            )
         if distance_to_waypoint is not None:
             data["distance_to_waypoint"] = float(distance_to_waypoint)
         if self._candidate_id is not None:
@@ -564,12 +975,35 @@ class SearchSkill(Skill):
             if self._phase is SearchPhase.SCANNING
             else 0.0
         )
+        denominator = len(self._waypoints)
+        goal = self._active_goal
+        if self._is_adaptive_search(goal):
+            assert isinstance(goal, SearchGoalV3)
+            denominator = goal.strategy.max_viewpoints
         return min(
             1.0,
             max(
                 0.0,
-                (self._waypoint_index + scan_fraction) / len(self._waypoints),
+                (self._waypoint_index + scan_fraction) / denominator,
             ),
+        )
+
+    def _coverage_ratio(self) -> float:
+        if not self._waypoints:
+            return 0.0
+        denominator = len(self._waypoints)
+        goal = self._active_goal
+        if self._is_adaptive_search(goal):
+            assert isinstance(goal, SearchGoalV3)
+            denominator = goal.strategy.max_viewpoints
+        return min(1.0, len(self._visited_viewpoints) / denominator)
+
+    @staticmethod
+    def _is_adaptive_search(goal: object) -> bool:
+        return (
+            isinstance(goal, SearchGoalV3)
+            and goal.strategy.kind
+            is SearchStrategyType.ADAPTIVE_NEXT_BEST_VIEW
         )
 
     def _current_waypoint(self) -> np.ndarray:
@@ -584,6 +1018,14 @@ class SearchSkill(Skill):
         self._effective_scan_rate_rad_s = None
 
     def _on_reset(self) -> None:
+        provider = self._next_best_view_provider
+        cancel_pending = getattr(
+            provider,
+            "cancel_pending_next_best_view",
+            None,
+        )
+        if callable(cancel_pending):
+            cancel_pending()
         self._center = None
         self._waypoints = ()
         self._waypoint_index = 0
@@ -597,11 +1039,13 @@ class SearchSkill(Skill):
         self._last_clock_time = None
         self._last_observation_timestamp = None
         self._completed_scan_angles_rad = []
+        self._compiled_v3 = None
+        self._visited_viewpoints = []
         self._clear_scan_state()
 
     @staticmethod
-    def _search_goal(goal: SkillGoal) -> SearchGoal:
-        if not isinstance(goal, SearchGoal):
+    def _search_goal(goal: SkillGoal) -> SearchGoal | SearchGoalV3:
+        if not isinstance(goal, (SearchGoal, SearchGoalV3)):
             raise SkillExecutionStateError("active SEARCH goal has an invalid type")
         return goal
 

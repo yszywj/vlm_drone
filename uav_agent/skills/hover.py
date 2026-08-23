@@ -57,7 +57,35 @@ class HoverSkill(Skill):
         self._start_time: float | None = None
         self._last_clock_time: float | None = None
         self._last_observation_timestamp: float | None = None
+        self._hold_established = False
         self._release_requested = Event()
+
+    @property
+    def start_time_s(self) -> float | None:
+        """Clock boundary after which an Observation may drive this HOVER."""
+
+        return self._start_time
+
+    @property
+    def hold_established(self) -> bool:
+        """Whether at least one post-start hold setpoint has been issued."""
+
+        return self._hold_established
+
+    def observation_precedes_start(self, timestamp_s: float) -> bool:
+        """Return whether a sampled frame predates the captured hold pose.
+
+        SkillManager uses this narrow query to defer a HOVER created midway
+        through a runtime tick without weakening the timestamp checks in the
+        Skill itself.
+        """
+
+        if isinstance(timestamp_s, bool) or not isinstance(timestamp_s, Real):
+            raise TypeError("timestamp_s must be a finite number")
+        normalized = float(timestamp_s)
+        if not isfinite(normalized):
+            raise ValueError("timestamp_s must be a finite number")
+        return self._start_time is not None and normalized < self._start_time - 1e-12
 
     def request_release(self) -> None:
         """Thread-safe signal; lifecycle transition happens on the next tick."""
@@ -117,6 +145,7 @@ class HoverSkill(Skill):
         self._start_time = now
         self._last_clock_time = now
         self._last_observation_timestamp = None
+        self._hold_established = False
         context.uav.stop()
         self._set_feedback(
             0.0,
@@ -177,6 +206,7 @@ class HoverSkill(Skill):
             goal.motion_policy,
             initial_yaw=self.initial_yaw,
         )
+        self._hold_established = True
         progress = (
             min(1.0, elapsed / float(goal.duration_s))
             if goal.mode is HoverMode.TIMED and goal.duration_s is not None
@@ -222,6 +252,7 @@ class HoverSkill(Skill):
             ),
             "mode": goal.mode.value,
             "reason_code": goal.reason_code,
+            "hold_established": self._hold_established,
         }
 
     def _on_reset(self) -> None:
@@ -229,6 +260,7 @@ class HoverSkill(Skill):
         self._start_time = None
         self._last_clock_time = None
         self._last_observation_timestamp = None
+        self._hold_established = False
         self._release_requested.clear()
 
     @staticmethod

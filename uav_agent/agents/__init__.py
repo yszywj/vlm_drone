@@ -6,6 +6,12 @@ from agents.mission_agent import (
     MissionAgentError,
     MissionAgentSnapshot,
 )
+from agents.obstacle_revision_coordinator import (
+    ObstacleRevisionCoordinator,
+    ObstacleRevisionCoordinatorRecord,
+    ObstacleRevisionCoordinatorSnapshot,
+    ObstacleRevisionCoordinatorState,
+)
 from agents.plan_revision_coordinator import (
     PlanRevisionCoordinator,
     PlanRevisionCoordinatorError,
@@ -13,6 +19,12 @@ from agents.plan_revision_coordinator import (
     PlanRevisionFallback,
     PlanRevisionRecord,
     PlanRevisionState,
+)
+from agents.program_patch_coordinator import (
+    ProgramPatchCoordinator,
+    ProgramPatchCoordinatorRecord,
+    ProgramPatchCoordinatorSnapshot,
+    ProgramPatchCoordinatorState,
 )
 from agents.visual_review_coordinator import (
     PendingPlanRevision,
@@ -28,12 +40,20 @@ __all__ = [
     "MissionAgent",
     "MissionAgentError",
     "MissionAgentSnapshot",
+    "ObstacleRevisionCoordinator",
+    "ObstacleRevisionCoordinatorRecord",
+    "ObstacleRevisionCoordinatorSnapshot",
+    "ObstacleRevisionCoordinatorState",
     "PlanRevisionCoordinator",
     "PlanRevisionCoordinatorError",
     "PlanRevisionCoordinatorSnapshot",
     "PlanRevisionFallback",
     "PlanRevisionRecord",
     "PlanRevisionState",
+    "ProgramPatchCoordinator",
+    "ProgramPatchCoordinatorRecord",
+    "ProgramPatchCoordinatorSnapshot",
+    "ProgramPatchCoordinatorState",
     "PendingPlanRevision",
     "RevisionCompletionAction",
     "VisualReviewCoordinator",

@@ -182,6 +182,7 @@ class SimpleUavSearchEnv:
             seed=motion.seed,
             initial_heading_rad=radians(motion.initial_heading_deg),
             pose_writer=self.scene.set_target_pose,
+            obstacle_registry=self.scene.obstacle_registry,
         )
         self._invalidate_camera_observation()
 

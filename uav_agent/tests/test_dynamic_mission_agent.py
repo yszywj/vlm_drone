@@ -20,7 +20,10 @@ from agents.mission_agent import AgentStatus, MissionAgent
 from env.kinematic_uav import KinematicUAV, UAVState
 from perception.runtime import PerceptionRuntimeProfile
 from planner.base import MissionPlanner
+from planner.mission_program import MissionEdge, MissionNode, ProgramEvent
+from planner.program_patch import ProgramPatch
 from planner.schemas import (
+    CompiledMission,
     LandingZoneSpec,
     MissionIntent,
     PlannerOutput,
@@ -29,10 +32,18 @@ from planner.schemas import (
     SearchRegionSpec,
     SkillPlanDraft,
 )
+from planner.spatial import CircleRegion, CoordinateFrame
 from runtime.plan_validator import PlanValidator
 from runtime.safety_supervisor import SafetySupervisor
 from skills.base import Skill
+from skills.hover import HoverSkill
 from skills.manager import SkillManager
+from skills.plan import TaskPlan
+from skills.search_strategy import (
+    SearchEntryPolicy,
+    SearchStrategySpec,
+    SearchStrategyType,
+)
 from skills.types import (
     Observation,
     SkillContext,
@@ -253,6 +264,8 @@ def make_harness(
     *,
     source: str,
     outcome_overrides: dict[SkillName, list[ScriptedOutcome]] | None = None,
+    validator: PlanValidator | None = None,
+    runtime_program: str = "linear",
 ) -> Harness:
     configured = default_outcomes()
     if outcome_overrides is not None:
@@ -261,6 +274,10 @@ def make_harness(
         name: ScriptedSkill(*outcomes)
         for name, outcomes in configured.items()
     }
+    # Supervisory HOVER is an internal runtime transition rather than a
+    # planner step, so keep the real continuously-commanded implementation in
+    # this otherwise deterministic registry.
+    registry[SkillName.HOVER] = HoverSkill()
     clock = ManualClock()
     manager = SkillManager(
         SkillContext(
@@ -281,7 +298,7 @@ def make_harness(
     context = world_context()
     agent = MissionAgent(
         planner=planner,
-        validator=PlanValidator(),
+        validator=PlanValidator() if validator is None else validator,
         safety=SafetySupervisor(
             context.scene_min_xyz_m,
             context.scene_max_xyz_m,
@@ -295,6 +312,7 @@ def make_harness(
             PerceptionRuntimeProfile.ORACLE_EVALUATION
         ),
         acknowledge_privileged_oracle=True,
+        runtime_program=runtime_program,
     )
     return Harness(agent, planner, manager, target, clock, context)
 
@@ -313,6 +331,260 @@ def run_to_terminal(harness: Harness, *, start_at: int = 1):
 
 
 class DynamicMissionAgentTests(unittest.TestCase):
+    def test_agent_adopts_only_the_manager_installed_next_plan_version(self) -> None:
+        plan = draft(
+            step("takeoff", "TAKEOFF", {}),
+            step("return_home", "GOTO", {"destination": "home"}),
+            step("land", "LAND", {"zone": "home"}),
+        )
+        harness = make_harness(plan, source="dynamic_scripted")
+        harness.start()
+        harness.tick(1.0)  # TAKEOFF -> GOTO
+        current = harness.manager.task_plan
+        assert current is not None
+        replacement = TaskPlan(
+            current.steps,
+            mission_id=current.mission_id,
+            uav_id=current.uav_id,
+            plan_version=2,
+        )
+
+        with self.assertRaisesRegex(Exception, "atomically installed"):
+            harness.agent.adopt_runtime_task_plan(replacement)
+
+        harness.clock.set(1.1)
+        harness.manager.interrupt_with_hover("PATH_BLOCKED")
+        harness.tick(2.0)  # establish the hold on a fresh Observation
+        harness.manager.replace_interrupted_step_and_suffix(replacement)
+        harness.tick(3.0)  # release HOVER and atomically install replacement
+
+        adopted = harness.agent.adopt_runtime_task_plan(replacement)
+
+        self.assertEqual(adopted.plan_version, 2)
+        self.assertEqual(harness.manager.task_plan.plan_version, 2)
+
+    def test_agent_adopts_atomically_published_graph_program_plan(self) -> None:
+        plan = draft(
+            step("takeoff", "TAKEOFF", {}),
+            step("return_home", "GOTO", {"destination": "home"}),
+            step("land", "LAND", {"zone": "home"}),
+        )
+        harness = make_harness(
+            plan,
+            source="dynamic_scripted",
+            runtime_program="graph",
+        )
+        harness.start()
+        harness.tick(1.0)  # TAKEOFF -> GOTO
+        current = harness.manager.task_plan
+        assert current is not None
+        current_step, land_step = current.steps[1:]
+        patch = ProgramPatch(
+            mission_id=current.mission_id,
+            uav_id=current.uav_id,
+            base_plan_version=1,
+            new_plan_version=2,
+            replace_from_node_id=current_step.step_id,
+            replacement_nodes=(
+                MissionNode(current_step.step_id, current_step),
+                MissionNode(land_step.step_id, land_step),
+            ),
+            replacement_edges=(
+                MissionEdge(
+                    current_step.step_id,
+                    land_step.step_id,
+                    ProgramEvent.SUCCESS,
+                ),
+            ),
+            reason_codes=("PATH_BLOCKED",),
+        )
+
+        harness.clock.set(1.1)
+        harness.manager.interrupt_with_hover("PATH_BLOCKED")
+        harness.tick(2.0)  # establish HOVER
+        harness.manager.replace_interrupted_program_suffix(patch)
+        self.assertEqual(
+            harness.manager.graph_task_plan_for_adoption().plan_version,
+            1,
+        )
+
+        before_adoption = harness.tick(3.0)  # publish v2; successor is not ticked
+        self.assertEqual(before_adoption.plan_version, 1)
+        published = harness.manager.graph_task_plan_for_adoption()
+        self.assertEqual(published.plan_version, 2)
+
+        adopted = harness.agent.adopt_runtime_task_plan(published)
+
+        self.assertEqual(adopted.plan_version, 2)
+        self.assertEqual(harness.manager.program_snapshot.plan_version, 2)
+
+    def test_unadopted_graph_program_version_fails_closed_before_motion_tick(self) -> None:
+        plan = draft(
+            step("takeoff", "TAKEOFF", {}),
+            step("return_home", "GOTO", {"destination": "home"}),
+            step("land", "LAND", {"zone": "home"}),
+        )
+        harness = make_harness(
+            plan,
+            source="dynamic_scripted",
+            runtime_program="graph",
+        )
+        harness.start()
+        harness.tick(1.0)
+        current = harness.manager.task_plan
+        assert current is not None
+        current_step, land_step = current.steps[1:]
+        patch = ProgramPatch(
+            mission_id=current.mission_id,
+            uav_id=current.uav_id,
+            base_plan_version=1,
+            new_plan_version=2,
+            replace_from_node_id=current_step.step_id,
+            replacement_nodes=(
+                MissionNode(current_step.step_id, current_step),
+                MissionNode(land_step.step_id, land_step),
+            ),
+            replacement_edges=(
+                MissionEdge(
+                    current_step.step_id,
+                    land_step.step_id,
+                    ProgramEvent.SUCCESS,
+                ),
+            ),
+            reason_codes=("PATH_BLOCKED",),
+        )
+        harness.clock.set(1.1)
+        harness.manager.interrupt_with_hover("PATH_BLOCKED")
+        harness.tick(2.0)
+        harness.manager.replace_interrupted_program_suffix(patch)
+        harness.tick(3.0)  # publish v2, intentionally do not adopt it
+
+        failed_closed = harness.tick(4.0)
+
+        self.assertIs(failed_closed.status, AgentStatus.RUNNING)
+        self.assertEqual(failed_closed.active_skill, "LAND")
+        self.assertIn(
+            "without MissionAgent adoption",
+            failed_closed.last_error or "",
+        )
+
+    def test_consecutive_search_fallback_preserves_one_target_lifecycle(self) -> None:
+        class FallbackValidator(PlanValidator):
+            def validate_and_compile(
+                self,
+                planner_output,
+                context,
+                *,
+                source,
+                mission_id=None,
+                uav_id=None,
+                plan_version=None,
+                **kwargs,
+            ):
+                del context, kwargs
+                plan = TaskPlan.from_dicts(
+                    [
+                        {
+                            "id": "takeoff",
+                            "skill": "TAKEOFF",
+                            "target_altitude": 10.0,
+                        },
+                        {
+                            "id": "search_near",
+                            "skill": "SEARCH",
+                            "region": CircleRegion(
+                                CoordinateFrame.WORLD_ENU,
+                                (10.0, 0.0, 0.0),
+                                5.0,
+                            ),
+                            "strategy": SearchStrategySpec(
+                                SearchStrategyType.PERIMETER_V1
+                            ),
+                            "entry_policy": SearchEntryPolicy.NEAREST_POINT,
+                            "search_altitude_m": 10.0,
+                            "timeout_s": 20.0,
+                            "target_description": "moving red target",
+                        },
+                        {
+                            "id": "search_far",
+                            "skill": "SEARCH",
+                            "region": CircleRegion(
+                                CoordinateFrame.WORLD_ENU,
+                                (20.0, 0.0, 0.0),
+                                5.0,
+                            ),
+                            "strategy": SearchStrategySpec(
+                                SearchStrategyType.PERIMETER_V1
+                            ),
+                            "entry_policy": SearchEntryPolicy.NEAREST_POINT,
+                            "search_altitude_m": 10.0,
+                            "timeout_s": 20.0,
+                            "target_description": "moving red target",
+                        },
+                        {
+                            "id": "track",
+                            "skill": "TRACK",
+                            "target_id": "$search_far.target_id",
+                            "track_duration": 5.0,
+                        },
+                        {"id": "land", "skill": "LAND"},
+                    ],
+                    mission_id=mission_id,
+                    uav_id=uav_id,
+                    plan_version=plan_version,
+                )
+                return CompiledMission(planner_output, plan, source)
+
+        for runtime_program in ("linear", "graph"):
+            with self.subTest(runtime_program=runtime_program):
+                harness = make_harness(
+                    legacy_intent(),
+                    source="scripted",
+                    validator=FallbackValidator(),
+                    runtime_program=runtime_program,
+                    outcome_overrides={
+                        SkillName.SEARCH: [
+                            failed(
+                                SkillResultCode.SEARCH_EXHAUSTED,
+                                {"coverage_ratio": 1.0},
+                            ),
+                            succeeded(
+                                SkillResultCode.TARGET_FOUND,
+                                {"target_id": "target_0"},
+                            ),
+                        ]
+                    },
+                )
+                harness.start()
+                searching = harness.tick(1.0)
+                self.assertIs(
+                    searching.target.lifecycle,
+                    TargetLifecycle.SEARCHING,
+                )
+                second_region = harness.tick(2.0)
+                self.assertIs(
+                    second_region.target.lifecycle,
+                    TargetLifecycle.SEARCHING,
+                )
+                self.assertEqual(
+                    harness.manager.active_planned_step_id,
+                    "search_far",
+                )
+                tracking = harness.tick(3.0)
+                self.assertIs(
+                    tracking.target.lifecycle,
+                    TargetLifecycle.TRACKING,
+                )
+                self.assertEqual(tracking.target.target_id, "target_0")
+                self.assertEqual(
+                    [event.reason for event in harness.target.events()],
+                    [
+                        "search_started",
+                        "target_locked_by_oracle_evaluation",
+                        "tracking_started",
+                    ],
+                )
+
     def test_navigation_without_search_never_fabricates_target_process(self) -> None:
         plan = draft(
             step("takeoff", "TAKEOFF", {}),

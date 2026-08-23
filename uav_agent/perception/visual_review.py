@@ -48,6 +48,32 @@ class ReviewDisposition(str, Enum):
     STALE = "STALE"
 
 
+class VisualReviewStaleReason(str, Enum):
+    """Independent trusted-runtime reasons for rejecting a late result."""
+
+    WORKER_MARKED_STALE = "worker_marked_stale"
+    MISSION_ID_CHANGED = "mission_id_changed"
+    PLAN_VERSION_CHANGED = "plan_version_changed"
+    STEP_ID_CHANGED = "step_id_changed"
+    TARGET_ID_CHANGED = "target_id_changed"
+    RESULT_TOO_OLD = "result_too_old"
+    FRAME_EVICTED = "frame_evicted"
+    REQUEST_ID_MISMATCH = "request_id_mismatch"
+    REVIEW_ID_MISMATCH = "review_id_mismatch"
+
+
+class VisualReviewParseErrorCode(str, Enum):
+    """Stable, non-secret failure categories for model/parse diagnostics."""
+
+    MODEL_REQUEST_FAILED = "MODEL_REQUEST_FAILED"
+    INVALID_JSON = "INVALID_JSON"
+    SCHEMA_INVALID = "SCHEMA_INVALID"
+    ROUTING_MISMATCH = "ROUTING_MISMATCH"
+    UNSUPPORTED_ENUM = "UNSUPPORTED_ENUM"
+    DUPLICATE_FIELD = "DUPLICATE_FIELD"
+    UNKNOWN_PARSE_ERROR = "UNKNOWN_PARSE_ERROR"
+
+
 class VisualReviewProtocolError(RuntimeError):
     """Raised when a model review violates trusted routing metadata."""
 
@@ -643,6 +669,8 @@ __all__ = [
     "VisualReviewExpectation",
     "VisualReviewGate",
     "VisualReviewMode",
+    "VisualReviewParseErrorCode",
     "VisualReviewProtocolError",
+    "VisualReviewStaleReason",
     "build_qwen_visual_review_json_schema",
 ]

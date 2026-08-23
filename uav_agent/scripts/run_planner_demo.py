@@ -27,6 +27,7 @@ from planner.schemas import (  # noqa: E402
     SkillPlanDraft,
     SkillPlanDraftV2,
 )
+from planner.schemas_v3 import SkillPlanDraftV3  # noqa: E402
 from common.ids import generate_routing_id, validate_uav_id  # noqa: E402
 from planner.diagnostics import PlannerDiagnostics  # noqa: E402
 from planner.scripted_planner import ScriptedPlanner  # noqa: E402
@@ -41,6 +42,9 @@ DEFAULT_TRACK_DURATION_S = 30.0
 _SYSTEM_PROMPT_PATH = _PROJECT_ROOT / "prompts" / "mission_planner_system.txt"
 _DYNAMIC_SYSTEM_PROMPT_PATH = (
     _PROJECT_ROOT / "prompts" / "dynamic_skill_planner_system.txt"
+)
+_DYNAMIC_V3_SYSTEM_PROMPT_PATH = (
+    _PROJECT_ROOT / "prompts" / "dynamic_skill_planner_v3_system.txt"
 )
 
 
@@ -75,6 +79,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="uav_1",
         type=validate_uav_id,
         help="trusted UAV routing ID (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--planning-contract",
+        choices=("v2", "v3"),
+        default="v2",
+        help=(
+            "dynamic_llm output contract; v3 enables explicit framed spatial "
+            "geometry while v2 remains the default (default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--instruction",
@@ -114,6 +127,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json-output",
         action="store_true",
         help="write exactly one JSON object to stdout",
+    )
+    parser.add_argument(
+        "--debug-model-responses",
+        action="store_true",
+        help=(
+            "on failure, print bounded image-free proposal diagnostics "
+            "(parsed JSON or response length and final 500 characters)"
+        ),
     )
     return parser
 
@@ -217,10 +238,12 @@ class _PlannerDemoFailure(RuntimeError):
         self,
         cause: Exception,
         diagnostics: PlannerDiagnostics | None,
+        model_proposals: tuple[dict[str, object], ...] = (),
     ) -> None:
         super().__init__(str(cause))
         self.cause_type = type(cause).__name__
         self.diagnostics = diagnostics
+        self.model_proposals = model_proposals
 
 
 def _scripted_diagnostics() -> PlannerDiagnostics:
@@ -238,7 +261,16 @@ def _scripted_diagnostics() -> PlannerDiagnostics:
 
 def _plan(
     args: argparse.Namespace,
-) -> tuple[PlannerOutput, CompiledMission, PlannerDiagnostics]:
+) -> tuple[
+    PlannerOutput | SkillPlanDraftV3,
+    CompiledMission | None,
+    PlannerDiagnostics,
+]:
+    planning_contract = getattr(args, "planning_contract", "v2")
+    if planning_contract == "v3" and args.planner != "dynamic_llm":
+        raise ValueError(
+            "planning_contract v3 is currently supported only by dynamic_llm"
+        )
     context = _build_world_context(
         takeoff_altitude_m=args.takeoff_altitude,
         track_duration_s=args.track_duration,
@@ -281,7 +313,12 @@ def _plan(
         else:
             planner = DynamicLLMPlanner(
                 client,
-                system_prompt_path=_DYNAMIC_SYSTEM_PROMPT_PATH,
+                system_prompt_path=(
+                    _DYNAMIC_V3_SYSTEM_PROMPT_PATH
+                    if planning_contract == "v3"
+                    else _DYNAMIC_SYSTEM_PROMPT_PATH
+                ),
+                planning_contract=planning_contract,
             )
 
     diagnostics: PlannerDiagnostics | None = None
@@ -294,47 +331,73 @@ def _plan(
         else:
             planner_output = planner.plan(request)
             diagnostics = _scripted_diagnostics()
-        compiled = PlanValidator().validate_and_compile(
-            planner_output,
-            context,
-            source=args.planner,
-            mission_id=request.mission_id,
-            uav_id=request.uav_id,
-            plan_version=request.plan_version,
-        )
+        if isinstance(planner_output, SkillPlanDraftV3):
+            # This command exposes the opt-in initial V3 model contract.  V3
+            # execution compilation remains a separate trusted runtime stage;
+            # never coerce framed geometry through the V2 compiler.
+            compiled = None
+        else:
+            compiled = PlanValidator().validate_and_compile(
+                planner_output,
+                context,
+                source=args.planner,
+                mission_id=request.mission_id,
+                uav_id=request.uav_id,
+                plan_version=request.plan_version,
+            )
     except Exception as exc:
         observed = getattr(planner, "last_diagnostics", None)
         if isinstance(observed, PlannerDiagnostics):
             diagnostics = observed
-        raise _PlannerDemoFailure(exc, diagnostics) from None
+        proposals = getattr(planner, "model_proposals", ())
+        if not isinstance(proposals, tuple) or any(
+            not isinstance(item, dict) for item in proposals
+        ):
+            proposals = ()
+        raise _PlannerDemoFailure(exc, diagnostics, proposals) from None
     return planner_output, compiled, diagnostics
 
 
 def _render(
-    planner_output: PlannerOutput,
-    compiled: CompiledMission,
+    planner_output: PlannerOutput | SkillPlanDraftV3,
+    compiled: CompiledMission | None,
     diagnostics: PlannerDiagnostics,
     *,
     json_output: bool,
 ) -> None:
-    dynamic = isinstance(planner_output, (SkillPlanDraft, SkillPlanDraftV2))
+    dynamic = isinstance(
+        planner_output,
+        (SkillPlanDraft, SkillPlanDraftV2, SkillPlanDraftV3),
+    )
     output_key = "skill_plan_draft" if dynamic else "mission_intent"
     payload = {
         output_key: planner_output.to_dict(),
-        "compiled_task_plan": compiled.task_plan.to_dicts(),
+        "compiled_task_plan": (
+            None if compiled is None else compiled.task_plan.to_dicts()
+        ),
         "planner_diagnostics": diagnostics.to_dict(),
     }
     if dynamic:
         payload["planner_output_type"] = type(planner_output).__name__
-        payload["compiler_notes"] = list(compiled.compiler_notes)
+        payload["compiler_notes"] = (
+            [
+                "Spatial V3 initial draft only; trusted V3 runtime compilation "
+                "is not performed by this pure planner demo."
+            ]
+            if compiled is None
+            else list(compiled.compiler_notes)
+        )
     if json_output:
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return
 
     print("SkillPlanDraft (planner-selected)" if dynamic else "MissionIntent")
     print(json.dumps(payload[output_key], ensure_ascii=False, indent=2))
-    print("\nCompiled TaskPlan (trusted coordinates, policies, and timeouts)")
-    print(json.dumps(payload["compiled_task_plan"], ensure_ascii=False, indent=2))
+    if compiled is None:
+        print("\nCompiled TaskPlan: not produced for the opt-in V3 draft")
+    else:
+        print("\nCompiled TaskPlan (trusted coordinates, policies, and timeouts)")
+        print(json.dumps(payload["compiled_task_plan"], ensure_ascii=False, indent=2))
     if dynamic:
         print("\nCompiler Notes")
         print(json.dumps(payload["compiler_notes"], ensure_ascii=False, indent=2))
@@ -359,9 +422,11 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(exc, _PlannerDemoFailure):
             error_type = exc.cause_type
             diagnostics = exc.diagnostics
+            model_proposals = exc.model_proposals
         else:
             error_type = type(exc).__name__
             diagnostics = None
+            model_proposals = ()
         failure = {
             "status": "FAILED",
             "error": {"type": error_type, "message": str(exc)},
@@ -369,6 +434,8 @@ def main(argv: list[str] | None = None) -> int:
                 None if diagnostics is None else diagnostics.to_dict()
             ),
         }
+        if args.debug_model_responses:
+            failure["model_proposals"] = list(model_proposals)
         if args.json_output:
             print(json.dumps(failure, ensure_ascii=False, separators=(",", ":")))
         else:
@@ -380,6 +447,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     "Planner Diagnostics: "
                     + json.dumps(diagnostics.to_dict(), ensure_ascii=False),
+                    file=sys.stderr,
+                )
+            if args.debug_model_responses and model_proposals:
+                print(
+                    "Bounded Model Proposal Diagnostics: "
+                    + json.dumps(model_proposals, ensure_ascii=False),
                     file=sys.stderr,
                 )
         return 1

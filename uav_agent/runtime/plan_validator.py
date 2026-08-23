@@ -19,10 +19,21 @@ from planner.schemas import (
     SkillPlanDraftV2,
     migrate_plan_v1_to_v2,
 )
+from planner.schemas_v3 import SkillPlanDraftV3
+from planner.spatial import (
+    CoordinateFrame,
+    NamedLocationTarget,
+    PointTarget,
+    RelationalPointTarget,
+    RouteTarget,
+)
+from planner.spatial_resolver import SpatialResolver
+from planner.region_compiler import RegionCompilationError, RegionCompiler
 from planner.policy import PlannerLimits, PlannerPolicy, TargetLostAction
 from planner.symbolic_checker import SymbolicPlanChecker
 from skills.motion_types import MotionPolicy, YawMode
 from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskPlanError, TaskStep
+from skills.search_strategy import SearchRuntimeCapabilities
 from skills.types import SkillName
 
 
@@ -140,11 +151,14 @@ class PlanValidator:
     MAX_INSPECT_VIEWPOINT_CHANGE_DEG = 90.0
     DEFAULT_INSPECT_MAX_DURATION_S = 15.0
     MAX_INSPECT_MAX_DURATION_S = 60.0
+    MAX_V3_PLANNED_DURATION_S = 900.0
 
     def __init__(
         self,
         limits: PlannerLimits | None = None,
         policy: PlannerPolicy | None = None,
+        spatial_resolver: SpatialResolver | None = None,
+        search_runtime_capabilities: SearchRuntimeCapabilities | None = None,
     ) -> None:
         if limits is None:
             limits = PlannerLimits()
@@ -155,9 +169,23 @@ class PlanValidator:
         if not isinstance(policy, PlannerPolicy):
             raise TypeError("policy must be a PlannerPolicy")
         policy.validate_against(limits)
+        if spatial_resolver is not None and not isinstance(
+            spatial_resolver,
+            SpatialResolver,
+        ):
+            raise TypeError("spatial_resolver must be a SpatialResolver or None")
+        if search_runtime_capabilities is None:
+            search_runtime_capabilities = SearchRuntimeCapabilities()
+        if not isinstance(search_runtime_capabilities, SearchRuntimeCapabilities):
+            raise TypeError(
+                "search_runtime_capabilities must be a "
+                "SearchRuntimeCapabilities or None"
+            )
         self._limits = limits
         self._policy = policy
         self._symbolic_checker = SymbolicPlanChecker()
+        self._spatial_resolver = spatial_resolver
+        self._search_runtime_capabilities = search_runtime_capabilities
 
     @property
     def limits(self) -> PlannerLimits:
@@ -175,9 +203,20 @@ class PlanValidator:
         policy.validate_against(self.limits)
         return policy
 
+    @property
+    def search_runtime_capabilities(self) -> SearchRuntimeCapabilities:
+        capabilities = getattr(self, "_search_runtime_capabilities", None)
+        return (
+            SearchRuntimeCapabilities()
+            if capabilities is None
+            else capabilities
+        )
+
     def validate_and_compile(
         self,
-        planner_output: MissionIntent | SkillPlanDraft | SkillPlanDraftV2,
+        planner_output: (
+            MissionIntent | SkillPlanDraft | SkillPlanDraftV2 | SkillPlanDraftV3
+        ),
         context: PlannerWorldContext,
         *,
         source: str,
@@ -185,6 +224,7 @@ class PlanValidator:
         uav_id: str | None = None,
         plan_version: int | None = None,
         trusted_inspect_candidate_ids: Sequence[str] = (),
+        spatial_resolver: SpatialResolver | None = None,
     ) -> CompiledMission:
         """Dispatch to the legacy or dynamic compiler based on output type.
 
@@ -196,6 +236,13 @@ class PlanValidator:
 
         if not isinstance(context, PlannerWorldContext):
             raise TypeError("context must be a PlannerWorldContext")
+        resolver = (
+            getattr(self, "_spatial_resolver", None)
+            if spatial_resolver is None
+            else spatial_resolver
+        )
+        if resolver is not None and not isinstance(resolver, SpatialResolver):
+            raise TypeError("spatial_resolver must be a SpatialResolver or None")
         if not isinstance(source, str) or source not in _ALL_SOURCES:
             raise PlanValidationError(
                 "source must be scripted, llm, dynamic_scripted, or dynamic_llm"
@@ -239,6 +286,52 @@ class PlanValidator:
                 mission_id=trusted_mission_id,
                 uav_id=trusted_uav_id,
                 plan_version=trusted_plan_version,
+            )
+        if isinstance(planner_output, SkillPlanDraftV3):
+            if source not in _DYNAMIC_SOURCES:
+                raise PlanValidationError(
+                    "SkillPlanDraftV3 requires source 'dynamic_scripted' or "
+                    "'dynamic_llm'"
+                )
+            if mission_id is None:
+                raise PlanValidationError(
+                    "SkillPlanDraftV3 requires trusted mission_id, uav_id, and "
+                    "plan_version values"
+                )
+            if (
+                planner_output.mission_id != trusted_mission_id
+                or planner_output.uav_id != trusted_uav_id
+                or planner_output.plan_version != trusted_plan_version
+            ):
+                raise PlanValidationError(
+                    "schema-v3 routing IDs do not match trusted runtime values"
+                )
+            if trusted_inspect_ids:
+                raise PlanValidationError(
+                    "initial SkillPlanDraftV3 cannot consume INSPECT candidates"
+                )
+            result = getattr(
+                self,
+                "_symbolic_checker",
+                SymbolicPlanChecker(),
+            ).check(
+                planner_output,
+                world_context=context,
+                limits=self.limits,
+                policy=self.policy,
+            )
+            if not result.valid:
+                issue = result.issues[0]
+                location = "" if issue.step_id is None else f" at {issue.step_id}"
+                raise PlanValidationError(
+                    f"symbolic plan invalid [{issue.code.value}]{location}: "
+                    f"{issue.message}"
+                )
+            return self._compile_spatial_v3(
+                planner_output,
+                context,
+                source,
+                spatial_resolver=resolver,
             )
         if isinstance(planner_output, SkillPlanDraftV2):
             if source not in _DYNAMIC_SOURCES:
@@ -338,7 +431,505 @@ class PlanValidator:
             )
         raise TypeError(
             "planner_output must be MissionIntent, SkillPlanDraft, or "
-            "SkillPlanDraftV2"
+            "SkillPlanDraftV2/SkillPlanDraftV3"
+        )
+
+    def _compile_spatial_v3(
+        self,
+        draft: SkillPlanDraftV3,
+        context: PlannerWorldContext,
+        source: str,
+        *,
+        spatial_resolver: SpatialResolver | None,
+    ) -> CompiledMission:
+        """Compile V3 without applying V2 named-location/order assumptions."""
+
+        world = self._trusted_world(context)
+        self._require_unambiguous_named_locations(context)
+        steps = tuple(draft.steps)
+        compiled_steps: list[TaskStep] = []
+        compiler_notes = [
+            (
+                "spatial assumption retained: "
+                f"{item.interpretation} (confidence={item.confidence:.3f})"
+            )
+            for item in draft.assumptions
+        ]
+        airborne = False
+        landed = False
+        current_altitude = world.initial_uav[2]
+        guaranteed_position: tuple[float, float, float] | None = world.initial_uav
+        search_step_ids: set[str] = set()
+        total_recovery_attempts = 0
+        planned_duration_s = 0.0
+
+        for index, draft_step in enumerate(steps):
+            step_id = draft_step.id
+            skill = _skill_name(draft_step.skill)
+            args = draft_step.args
+            recovery = draft_step.recovery
+            params: dict[str, object]
+            compiled_recovery: RecoveryPolicy | None = None
+
+            if landed:
+                raise PlanValidationError("no V3 step is allowed after LAND")
+            if skill is SkillName.TAKEOFF:
+                if airborne:
+                    raise PlanValidationError("V3 TAKEOFF requires the UAV on ground")
+                altitude = self._dynamic_altitude(
+                    args.get("altitude_m", world.default_altitude),
+                    world,
+                    f"step {step_id} TAKEOFF altitude_m",
+                )
+                if altitude < world.initial_uav[2]:
+                    raise PlanValidationError(
+                        "TAKEOFF altitude_m must not be below initial UAV altitude"
+                    )
+                yaw_mode, yaw_value = _vertical_yaw_args(
+                    args,
+                    default=YawMode.KEEP_CURRENT,
+                    prefix=f"step {step_id} TAKEOFF",
+                )
+                params = {
+                    "target_altitude": altitude,
+                    "yaw_mode": yaw_mode,
+                    "yaw_value": yaw_value,
+                    "timeout": world.goto_timeout,
+                }
+                airborne = True
+                current_altitude = altitude
+                guaranteed_position = (
+                    world.initial_uav[0],
+                    world.initial_uav[1],
+                    altitude,
+                )
+                planned_duration_s += world.goto_timeout
+
+            elif skill is SkillName.GOTO:
+                if not airborne:
+                    raise PlanValidationError("V3 GOTO requires an airborne UAV")
+                target = args.get("target")
+                position, face_point, target_note = self._resolve_v3_goto_target(
+                    target,
+                    args=args,
+                    current_altitude=current_altitude,
+                    context=context,
+                    world=world,
+                    spatial_resolver=spatial_resolver,
+                )
+                motion_policy = _goto_motion_policy(
+                    args,
+                    look_at_point=face_point,
+                    max_speed=self.TRUSTED_GOTO_MAX_SPEED_MPS,
+                    prefix=f"step {step_id} GOTO",
+                )
+                params = {
+                    "position": position,
+                    "motion_policy": motion_policy,
+                    "timeout": world.goto_timeout,
+                }
+                landing_zone_name = _v3_land_after_hovers(steps, index)
+                if landing_zone_name is not None:
+                    zone = _landing_zone(context, landing_zone_name)
+                    landing_xy, _ground, tolerance = (
+                        self._trusted_landing_geometry(zone, world)
+                    )
+                    if _same_xy(position, landing_xy, tolerance):
+                        params["tolerance"] = tolerance
+                guaranteed_position = position
+                current_altitude = position[2]
+                planned_duration_s += world.goto_timeout
+                compiler_notes.append(f"{step_id}: {target_note}")
+
+            elif skill is SkillName.HOVER:
+                if not airborne:
+                    raise PlanValidationError("V3 HOVER requires an airborne UAV")
+                duration = _bounded_finite_number(
+                    _required_value(args, "duration_s", f"step {step_id} HOVER"),
+                    f"step {step_id} HOVER duration_s",
+                    minimum=self.MIN_PLANNED_HOVER_DURATION_S,
+                    maximum=self.MAX_PLANNED_HOVER_DURATION_S,
+                )
+                yaw_mode, yaw_value = _vertical_yaw_args(
+                    args,
+                    default=YawMode.KEEP_CURRENT,
+                    prefix=f"step {step_id} HOVER",
+                )
+                motion_policy = MotionPolicy(
+                    max_speed=self.TRUSTED_HOVER_MAX_CORRECTION_SPEED_MPS,
+                    max_yaw_rate=self.TRUSTED_HOVER_MAX_YAW_RATE_RAD_S,
+                    yaw_mode=yaw_mode,
+                    yaw_value=yaw_value,
+                )
+                motion_policy.validate()
+                from skills.hover import HoverMode
+
+                params = {
+                    "mode": HoverMode.TIMED,
+                    "duration_s": duration,
+                    "max_wait_s": duration,
+                    "position_tolerance_m": self.TRUSTED_HOVER_POSITION_TOLERANCE_M,
+                    "max_correction_speed_mps": self.TRUSTED_HOVER_MAX_CORRECTION_SPEED_MPS,
+                    "reason_code": "PLANNED_HOVER",
+                    "motion_policy": motion_policy,
+                }
+                # A successful HOVER preserves the last guaranteed position.
+                planned_duration_s += duration
+
+            elif skill is SkillName.SEARCH:
+                if not airborne:
+                    raise PlanValidationError("V3 SEARCH requires an airborne UAV")
+                altitude = self._dynamic_altitude(
+                    _required_value(
+                        args,
+                        "search_altitude_m",
+                        f"step {step_id} SEARCH",
+                    ),
+                    world,
+                    f"step {step_id} SEARCH search_altitude_m",
+                )
+                timeout = _bounded_finite_number(
+                    _required_value(args, "timeout_s", f"step {step_id} SEARCH"),
+                    f"step {step_id} SEARCH timeout_s",
+                    minimum=1.0,
+                    maximum=world.search_timeout,
+                )
+                transit_speed = _bounded_finite_number(
+                    args.get("transit_speed_mps", 1.5),
+                    f"step {step_id} SEARCH transit_speed_mps",
+                    minimum=0.1,
+                    maximum=self.TRUSTED_GOTO_MAX_SPEED_MPS,
+                )
+                scan_rate = _bounded_finite_number(
+                    args.get("scan_yaw_rate_rad_s", 0.5),
+                    f"step {step_id} SEARCH scan_yaw_rate_rad_s",
+                    minimum=0.05,
+                    maximum=self.TRUSTED_HOVER_MAX_YAW_RATE_RAD_S,
+                )
+                region = _required_value(args, "region", f"step {step_id} SEARCH")
+                strategy = _required_value(args, "strategy", f"step {step_id} SEARCH")
+                entry_policy = _required_value(
+                    args,
+                    "entry_policy",
+                    f"step {step_id} SEARCH",
+                )
+                validation_position = (
+                    guaranteed_position
+                    if guaranteed_position is not None
+                    else (world.initial_uav[0], world.initial_uav[1], altitude)
+                )
+                try:
+                    geometry = RegionCompiler(
+                        spatial_resolver,
+                        search_runtime_capabilities=(
+                            self.search_runtime_capabilities
+                        ),
+                    ).compile(
+                        region=region,  # type: ignore[arg-type]
+                        strategy=strategy,  # type: ignore[arg-type]
+                        entry_policy=entry_policy,  # type: ignore[arg-type]
+                        current_uav_xyz_m=validation_position,
+                        search_altitude_m=altitude,
+                        user_anchor_xyz_m=args.get("user_anchor_xyz_m"),  # type: ignore[arg-type]
+                        model_selected_entry_xyz_m=args.get(
+                            "model_selected_entry_xyz_m"
+                        ),  # type: ignore[arg-type]
+                    )
+                except (TypeError, ValueError, RegionCompilationError) as exc:
+                    raise PlanValidationError(
+                        f"step {step_id} SEARCH geometry is not executable: {exc}"
+                    ) from exc
+                for waypoint_index, point in enumerate(
+                    geometry.route_waypoints_xyz_m
+                ):
+                    _require_point_in_bounds(
+                        point,
+                        world.scene_min,
+                        world.scene_max,
+                        f"step {step_id} SEARCH waypoint[{waypoint_index}]",
+                    )
+                description = _target_description(
+                    _required_non_empty_string(
+                        args,
+                        "target_description",
+                        f"step {step_id} SEARCH",
+                    )
+                )
+                params = {
+                    "region": geometry.region,
+                    "strategy": geometry.strategy,
+                    "entry_policy": geometry.entry_policy,
+                    "target_description": description,
+                    "search_altitude_m": altitude,
+                    "timeout_s": timeout,
+                    "transit_speed_mps": transit_speed,
+                    "scan_yaw_rate_rad_s": scan_rate,
+                }
+                if "user_anchor_xyz_m" in args:
+                    params["user_anchor_xyz_m"] = geometry.entry_point_xyz_m
+                if "model_selected_entry_xyz_m" in args:
+                    params["model_selected_entry_xyz_m"] = (
+                        geometry.entry_point_xyz_m
+                    )
+                search_step_ids.add(step_id)
+                current_altitude = altitude
+                # SEARCH may succeed at any observation point; its exact final
+                # XY is deliberately not guessed during compilation.
+                guaranteed_position = None
+                planned_duration_s += timeout
+                compiler_notes.append(
+                    f"{step_id}: V3 {geometry.region.shape} / "
+                    f"{geometry.strategy.kind.value} geometry validated"
+                )
+
+            elif skill is SkillName.TRACK:
+                if not airborne:
+                    raise PlanValidationError("V3 TRACK requires an airborne UAV")
+                target_ref = _parse_target_ref(
+                    _required_value(args, "target_ref", f"step {step_id} TRACK"),
+                    prefix=f"step {step_id} TRACK",
+                )
+                if target_ref.step_id not in search_step_ids:
+                    raise PlanValidationError(
+                        f"step {step_id} TRACK must reference a prior SEARCH"
+                    )
+                duration = self._track_duration(
+                    args.get("duration_s", world.default_track_duration)
+                )
+                desired_altitude = self._dynamic_altitude(
+                    args.get("desired_altitude_m", current_altitude),
+                    world,
+                    f"step {step_id} TRACK desired_altitude_m",
+                )
+                desired_distance = _positive_finite_number(
+                    args.get(
+                        "desired_distance_m",
+                        self.DEFAULT_DESIRED_DISTANCE_M,
+                    ),
+                    f"step {step_id} TRACK desired_distance_m",
+                )
+                if desired_distance > hypot(
+                    world.scene_max[0] - world.scene_min[0],
+                    world.scene_max[1] - world.scene_min[1],
+                ):
+                    raise PlanValidationError(
+                        f"step {step_id} TRACK desired_distance_m exceeds scene scale"
+                    )
+                params = {
+                    "target_id": target_ref,
+                    "desired_distance": desired_distance,
+                    "desired_altitude": desired_altitude,
+                    "max_speed": self.TRUSTED_TRACK_MAX_SPEED_MPS,
+                    "max_target_lost_time": self.TRUSTED_TARGET_LOST_TIME_S,
+                    "track_duration": duration,
+                    "timeout": duration + self.TRUSTED_TRACK_TIMEOUT_GRACE_S,
+                }
+                compiled_recovery, recovery_note = self._compile_track_recovery(
+                    args=args,
+                    recovery=recovery,
+                    step_id=step_id,
+                )
+                if compiled_recovery is not None:
+                    total_recovery_attempts += compiled_recovery.max_attempts
+                    if total_recovery_attempts > self.limits.max_total_reacquire_attempts:
+                        raise PlanValidationError(
+                            "total REACQUIRE attempt budget exceeds planner limit"
+                        )
+                compiler_notes.append(f"{step_id}: {recovery_note}")
+                current_altitude = desired_altitude
+                guaranteed_position = None
+                planned_duration_s += duration
+
+            elif skill is SkillName.LAND:
+                if not airborne:
+                    raise PlanValidationError("V3 LAND requires an airborne UAV")
+                zone_name = _required_non_empty_string(
+                    args,
+                    "zone",
+                    f"step {step_id} LAND",
+                )
+                zone = _landing_zone(context, zone_name)
+                landing_xy, ground_altitude, landing_tolerance = (
+                    self._trusted_landing_geometry(zone, world)
+                )
+                if guaranteed_position is None or not _same_xy(
+                    guaranteed_position,
+                    landing_xy,
+                    landing_tolerance,
+                ):
+                    raise PlanValidationError(
+                        f"step {step_id} LAND position is not guaranteed inside "
+                        f"landing zone {zone_name!r}"
+                    )
+                if ground_altitude > current_altitude:
+                    raise PlanValidationError(
+                        "landing ground altitude must not exceed current flight altitude"
+                    )
+                yaw_mode, yaw_value = _vertical_yaw_args(
+                    args,
+                    default=YawMode.KEEP_CURRENT,
+                    prefix=f"step {step_id} LAND",
+                )
+                params = {
+                    "ground_altitude": ground_altitude,
+                    "expected_position_xy": landing_xy,
+                    "zone_tolerance_m": landing_tolerance,
+                    "yaw_mode": yaw_mode,
+                    "yaw_value": yaw_value,
+                    "timeout": world.land_timeout,
+                }
+                airborne = False
+                landed = True
+                planned_duration_s += world.land_timeout
+                compiler_notes.append(
+                    f"{step_id}: LAND accepted from guaranteed zone geometry"
+                )
+
+            else:
+                raise PlanValidationError(
+                    f"unsupported V3 top-level Skill: {skill.value}"
+                )
+
+            compiled_steps.append(
+                TaskStep(step_id, skill, params, compiled_recovery)
+            )
+
+        if not landed:
+            raise PlanValidationError("V3 plan has no terminal LAND path")
+        if planned_duration_s > self.MAX_V3_PLANNED_DURATION_S:
+            raise PlanValidationError(
+                "V3 planned duration exceeds trusted 900 second budget"
+            )
+        try:
+            task_plan = TaskPlan(
+                tuple(compiled_steps),
+                mission_id=draft.mission_id,
+                uav_id=draft.uav_id,
+                plan_version=draft.plan_version,
+            )
+        except TaskPlanError as exc:
+            raise PlanValidationError(f"compiled V3 TaskPlan is invalid: {exc}") from exc
+        compiler_notes.append(
+            f"V3 bounded planned duration={planned_duration_s:.3f}s"
+        )
+        return CompiledMission(
+            planner_output=draft,
+            task_plan=task_plan,
+            source=source,
+            compiler_notes=tuple(compiler_notes),
+        )
+
+    def _resolve_v3_goto_target(
+        self,
+        target: object,
+        *,
+        args: Mapping[str, object],
+        current_altitude: float,
+        context: PlannerWorldContext,
+        world: _TrustedWorld,
+        spatial_resolver: SpatialResolver | None,
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        str,
+    ]:
+        if isinstance(target, RouteTarget):
+            raise PlanValidationError(
+                "GOTO RouteTarget is forbidden; use FOLLOW_ROUTE for multi-waypoint routes"
+            )
+        if isinstance(target, NamedLocationTarget):
+            altitude = self._dynamic_altitude(
+                args.get("altitude_m", current_altitude),
+                world,
+                "V3 GOTO altitude_m",
+            )
+            position, face_point = self._resolve_destination(
+                target.name,
+                altitude,
+                context,
+                world,
+            )
+            return position, face_point, f"named target {target.name!r} resolved"
+        if isinstance(target, PointTarget):
+            if target.frame is CoordinateFrame.WORLD_ENU:
+                resolved = target
+            else:
+                if spatial_resolver is None:
+                    raise PlanValidationError(
+                        f"GOTO {target.frame.value} point requires an injected SpatialResolver"
+                    )
+                try:
+                    resolved = spatial_resolver.resolve_target(target)
+                except (TypeError, ValueError) as exc:
+                    raise PlanValidationError(
+                        f"GOTO point frame could not be resolved: {exc}"
+                    ) from exc
+            assert isinstance(resolved, PointTarget)
+            if "altitude_m" in args:
+                altitude = self._dynamic_altitude(
+                    args["altitude_m"],
+                    world,
+                    "V3 GOTO altitude_m",
+                )
+                if abs(altitude - resolved.xyz_m[2]) > 1e-6:
+                    raise PlanValidationError(
+                        "POINT target z and GOTO altitude_m disagree"
+                    )
+            else:
+                altitude = self._dynamic_altitude(
+                    resolved.xyz_m[2],
+                    world,
+                    "V3 POINT target z",
+                )
+            position = (resolved.xyz_m[0], resolved.xyz_m[1], altitude)
+            _require_point_in_bounds(
+                position,
+                world.scene_min,
+                world.scene_max,
+                "V3 POINT target",
+            )
+            return position, position, "explicit POINT target resolved to WORLD_ENU"
+        if isinstance(target, RelationalPointTarget):
+            if spatial_resolver is None:
+                raise PlanValidationError(
+                    "RELATIONAL_POINT requires an injected trusted SpatialResolver"
+                )
+            try:
+                resolved = spatial_resolver.resolve_target(target)
+            except (TypeError, ValueError) as exc:
+                raise PlanValidationError(
+                    f"RELATIONAL_POINT is unresolved: {exc}"
+                ) from exc
+            assert isinstance(resolved, PointTarget)
+            altitude_value = args.get("altitude_m")
+            if altitude_value is None:
+                altitude_value = (
+                    resolved.xyz_m[2]
+                    if resolved.xyz_m[2] > world.scene_min[2]
+                    else current_altitude
+                )
+            altitude = self._dynamic_altitude(
+                altitude_value,
+                world,
+                "V3 RELATIONAL_POINT altitude",
+            )
+            position = (resolved.xyz_m[0], resolved.xyz_m[1], altitude)
+            _require_point_in_bounds(
+                position,
+                world.scene_min,
+                world.scene_max,
+                "V3 RELATIONAL_POINT target",
+            )
+            face_point = resolved.xyz_m
+            _require_point_in_bounds(
+                face_point,
+                world.scene_min,
+                world.scene_max,
+                "V3 RELATIONAL_POINT reference altitude",
+            )
+            return position, face_point, "trusted grounded RELATIONAL_POINT resolved"
+        raise PlanValidationError(
+            "V3 GOTO target must be NAMED_LOCATION, POINT, or RELATIONAL_POINT"
         )
 
     def _compile_legacy(
@@ -1432,6 +2023,23 @@ def _same_xy(
     tolerance: float = 1e-6,
 ) -> bool:
     return abs(point[0] - xy[0]) <= tolerance and abs(point[1] - xy[1]) <= tolerance
+
+
+def _v3_land_after_hovers(
+    steps: Sequence[object],
+    goto_index: int,
+) -> str | None:
+    """Return a LAND zone when only position-preserving HOVERs intervene."""
+
+    for step in steps[goto_index + 1 :]:
+        skill = getattr(step, "skill", None)
+        if skill == "HOVER":
+            continue
+        if skill != "LAND":
+            return None
+        zone = getattr(step, "args", {}).get("zone")
+        return zone if isinstance(zone, str) and zone.strip() else None
+    return None
 
 
 def _nonnegative_integer(value: object, name: str) -> int:

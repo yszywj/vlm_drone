@@ -1143,10 +1143,17 @@ class CompiledMission:
         if planner_output is not None and intent is not None:
             raise TypeError("provide planner_output or intent, not both")
         output = intent if planner_output is None else planner_output
-        if not isinstance(output, (MissionIntent, SkillPlanDraft, SkillPlanDraftV2)):
+        # Import lazily: schemas_v3 builds on the foundational V2 step types
+        # in this module, so a top-level reverse import would create a cycle.
+        from planner.schemas_v3 import SkillPlanDraftV3
+
+        if not isinstance(
+            output,
+            (MissionIntent, SkillPlanDraft, SkillPlanDraftV2, SkillPlanDraftV3),
+        ):
             raise TypeError(
                 "planner_output must be a MissionIntent, SkillPlanDraft, or "
-                "SkillPlanDraftV2"
+                "SkillPlanDraftV2/SkillPlanDraftV3"
             )
         if not isinstance(task_plan, TaskPlan):
             raise TypeError("task_plan must be a skills.plan.TaskPlan")
@@ -1176,14 +1183,27 @@ class CompiledMission:
         return None
 
     @property
-    def skill_plan_draft(self) -> SkillPlanDraft | SkillPlanDraftV2 | None:
-        if isinstance(self.planner_output, (SkillPlanDraft, SkillPlanDraftV2)):
+    def skill_plan_draft(self) -> object | None:
+        from planner.schemas_v3 import SkillPlanDraftV3
+
+        if isinstance(
+            self.planner_output,
+            (SkillPlanDraft, SkillPlanDraftV2, SkillPlanDraftV3),
+        ):
             return self.planner_output
         return None
 
     @property
     def skill_plan_draft_v2(self) -> SkillPlanDraftV2 | None:
         if isinstance(self.planner_output, SkillPlanDraftV2):
+            return self.planner_output
+        return None
+
+    @property
+    def skill_plan_draft_v3(self) -> object | None:
+        from planner.schemas_v3 import SkillPlanDraftV3
+
+        if isinstance(self.planner_output, SkillPlanDraftV3):
             return self.planner_output
         return None
 
@@ -1197,7 +1217,21 @@ class CompiledMission:
         """
 
         output = self.planner_output
-        if isinstance(output, SkillPlanDraftV2):
+        from planner.schemas_v3 import SkillPlanDraftV3
+
+        if isinstance(output, (SkillPlanDraftV2, SkillPlanDraftV3)):
+            if output.target_spec is None:
+                description = next(
+                    (
+                        str(step.args["target_description"]).strip()
+                        for step in output.steps
+                        if step.skill == "SEARCH"
+                        and isinstance(step.args.get("target_description"), str)
+                        and str(step.args["target_description"]).strip()
+                    ),
+                    "unspecified mission target",
+                )
+                return TargetSpec(description)
             assert output.target_spec is not None
             return output.target_spec
         if isinstance(output, MissionIntent):

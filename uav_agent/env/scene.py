@@ -23,10 +23,11 @@ from isaacsim.core.api.objects import FixedCuboid, VisualCuboid
 from isaacsim.core.prims import SingleXFormPrim
 from isaacsim.core.utils.stage import get_current_stage
 from isaacsim.core.utils.viewports import set_camera_view
-from pxr import Gf, UsdGeom, UsdLux
+from pxr import Gf, Tf, UsdGeom, UsdLux
 
 from configs.schema import AppConfig
 from env.camera_sensor import ImageProjection, RGBCameraSensor
+from env.obstacle_registry import ObstacleRegistry, obstacle_scene_prim_key
 
 
 @dataclass(frozen=True)
@@ -47,9 +48,22 @@ class UavSearchScene:
     CAMERA_PRIM_PATH = "/World/UAV/Camera"
     TARGET_PRIM_PATH = "/World/Target"
 
-    def __init__(self, world: World, config: AppConfig) -> None:
+    def __init__(
+        self,
+        world: World,
+        config: AppConfig,
+        *,
+        obstacle_registry: ObstacleRegistry | None = None,
+    ) -> None:
         self.world = world
         self.config = config
+        self.obstacle_registry = (
+            ObstacleRegistry.from_scene_config(config.scene)
+            if obstacle_registry is None
+            else obstacle_registry
+        )
+        if not isinstance(self.obstacle_registry, ObstacleRegistry):
+            raise TypeError("obstacle_registry must be an ObstacleRegistry")
         self.ground = None
         self.uav: SingleXFormPrim | None = None
         self.camera_sensor: RGBCameraSensor | None = None
@@ -92,31 +106,21 @@ class UavSearchScene:
         )
 
     def _add_obstacles(self) -> None:
-        size_x, size_y, size_z = self.config.scene.size_xyz_m
         stage = get_current_stage()
         UsdGeom.Xform.Define(stage, "/World/Obstacles")
-
-        footprint = max(0.5, min(3.0, min(size_x, size_y) * 0.06))
-        heights = (
-            max(0.5, min(2.0, size_z * 0.20)),
-            max(0.5, min(3.0, size_z * 0.25)),
-            max(0.5, min(4.0, size_z * 0.30)),
-        )
-        obstacle_specs = (
-            ("Box_00", [0.12 * size_x, 0.08 * size_y], [footprint, footprint, heights[0]], [0.75, 0.25, 0.20]),
-            ("Box_01", [-0.15 * size_x, 0.10 * size_y], [footprint, 0.7 * footprint, heights[1]], [0.25, 0.60, 0.85]),
-            ("Box_02", [0.10 * size_x, -0.14 * size_y], [0.7 * footprint, footprint, heights[2]], [0.55, 0.35, 0.75]),
-        )
-        for name, xy, scale, color in obstacle_specs:
-            position = np.asarray([xy[0], xy[1], scale[2] / 2.0])
+        for index, spec in enumerate(self.obstacle_registry):
+            prim_name = Tf.MakeValidIdentifier(
+                obstacle_scene_prim_key(index, spec.obstacle_id)
+            )
+            obstacle_type = FixedCuboid if spec.collidable else VisualCuboid
             self.world.scene.add(
-                FixedCuboid(
-                    prim_path=f"/World/Obstacles/{name}",
-                    name=f"obstacle_{name.lower()}",
-                    position=position,
-                    scale=np.asarray(scale),
+                obstacle_type(
+                    prim_path=f"/World/Obstacles/{prim_name}",
+                    name=prim_name,
+                    position=np.asarray(spec.center_xyz_m, dtype=np.float64),
+                    scale=np.asarray(spec.size_xyz_m, dtype=np.float64),
                     size=1.0,
-                    color=np.asarray(color),
+                    color=np.asarray(spec.color_rgb, dtype=np.float64),
                 )
             )
 

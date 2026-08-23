@@ -12,6 +12,21 @@ simulation:
 scene:
   # [x, y, z]; x/y are centered on the world origin and z starts at 0.
   size_xyz_m: [100.0, 100.0, 30.0]
+  # This is the single geometry source used by Isaac scene construction,
+  # ideal-camera perception, collision monitoring, visualisation, and critics.
+  obstacles:
+    - obstacle_id: box_red
+      center_xyz_m: [12.0, 4.0, 1.0]
+      size_xyz_m: [3.0, 3.0, 2.0]
+      color_rgb: [0.75, 0.25, 0.20]
+      collidable: true
+      motion_state: STATIC
+    - obstacle_id: box_blue
+      center_xyz_m: [-15.0, 5.0, 1.5]
+      size_xyz_m: [3.0, 2.1, 3.0]
+      color_rgb: [0.20, 0.35, 0.80]
+      collidable: true
+      motion_state: STATIC
 
 uav:
   id: uav_1
@@ -31,6 +46,14 @@ camera:
   focal_length_m: null
   # Negative pitch points the camera downward relative to the UAV body.
   pitch_deg: -45.0
+
+# Privileged geometry is filtered through the rendered camera frustum before
+# it is exposed.  The feature remains disabled unless explicitly requested.
+obstacle_perception:
+  mode: disabled  # disabled | ideal_camera
+  max_distance_m: 40.0
+  min_bbox_area_px: 64
+  max_occlusion_ratio: 0.95
 
 target:
   # Closed axis-aligned bounds; setup uses their center as the spawn position.
@@ -90,7 +113,11 @@ qwen_visual_review:
   jpeg_quality: 80
   hover_position_tolerance_m: 0.25
   hover_max_correction_speed_mps: 0.5
-  blocking_hover_timeout_s: 20.0
+  # Allows the bounded obstacle-route repair sequence to remain in HOLD during
+  # normal model latency. HTTP retries use wall time, so this remains an
+  # independent trusted simulation-time safety deadline rather than a sum of
+  # transport timeouts.
+  blocking_hover_timeout_s: 75.0
   blocking_timeout_fallback: CANCEL_AND_LAND  # RESUME_PREVIOUS | CANCEL_AND_LAND
 
 plan_revision:

@@ -12,6 +12,29 @@ def _rgb(value: int, *, height: int = 2, width: int = 2) -> np.ndarray:
 
 
 class FrameStoreTest(unittest.TestCase):
+    def test_pinned_inflight_frame_survives_ring_pressure_until_release(self) -> None:
+        store = FrameStore(max_frames=2, max_total_bytes=24, max_frame_age_s=5)
+        pending = store.add_frame(
+            uav_id="uav_1", frame_id="frame_pending", timestamp_s=1, rgb=_rgb(1)
+        )
+        store.pin(pending)
+        store.add_frame(
+            uav_id="uav_1", frame_id="frame_2", timestamp_s=7, rgb=_rgb(2)
+        )
+        latest = store.add_frame(
+            uav_id="uav_1", frame_id="frame_3", timestamp_s=8, rgb=_rgb(3)
+        )
+
+        self.assertTrue(store.contains(pending))
+        self.assertTrue(store.contains(latest))
+        self.assertLessEqual(len(store), 2)
+        self.assertLessEqual(store.total_bytes, 24)
+
+        store.unpin(pending)
+        self.assertFalse(store.contains(pending))
+        with self.assertRaisesRegex(ValueError, "not pinned"):
+            store.unpin(pending)
+
     def test_frame_count_limit_evicts_oldest(self) -> None:
         store = FrameStore(max_frames=2, max_total_bytes=100, max_frame_age_s=20)
         first = store.add_frame(

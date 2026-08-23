@@ -368,12 +368,16 @@ class AsyncModelWorker:
                     )
                 response = candidate
             except ModelClientError as exc:
-                error_code = type(exc).__name__
-                error_message = str(exc)
+                # Keep the worker/model boundary stable and non-secret.  The
+                # concrete exception text may contain response bodies, URLs,
+                # or transport headers and therefore must not enter runtime
+                # review logs.
+                error_code = "MODEL_REQUEST_FAILED"
+                error_message = type(exc).__name__
             except Exception:
                 # Never retain an arbitrary exception, whose text or traceback
                 # may include a request payload, base64 image, or API key.
-                error_code = "MODEL_WORKER_ERROR"
+                error_code = "MODEL_REQUEST_FAILED"
                 error_message = "unexpected model worker failure"
 
             with self._condition:

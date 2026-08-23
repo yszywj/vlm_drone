@@ -23,6 +23,7 @@ from configs.schema import (
     FrameStoreConfig,
     LoggingConfig,
     ModelWorkerConfig,
+    ObstaclePerceptionConfig,
     PlanRevisionConfig,
     PlannerConfig,
     SceneConfig,
@@ -36,6 +37,7 @@ from configs.schema import (
     TensorboardConfig,
     UavConfig,
 )
+from common.obstacle_types import ObstacleMotionState, ObstacleSpec
 
 
 class ConfigError(ValueError):
@@ -50,6 +52,7 @@ _DEFAULT_QWEN_VISUAL_REVIEW_CONFIG = QwenVisualReviewConfig()
 _DEFAULT_PLAN_REVISION_CONFIG = PlanRevisionConfig()
 _DEFAULT_FRAME_STORE_CONFIG = FrameStoreConfig()
 _DEFAULT_DEBUG_IMAGES_CONFIG = DebugImagesConfig()
+_DEFAULT_OBSTACLE_PERCEPTION_CONFIG = ObstaclePerceptionConfig()
 
 _MAX_REQUEST_TIMEOUT_S = 300.0
 _MAX_REVIEW_INTERVAL_S = 3_600.0
@@ -64,6 +67,8 @@ _MAX_FRAME_STORE_FRAMES = 4_096
 _MAX_FRAME_STORE_BYTES = 1_073_741_824
 _MAX_FRAME_STORE_AGE_S = 3_600.0
 _MAX_DEBUG_IMAGES_PER_RUN = 10_000
+_MAX_OBSTACLE_PERCEPTION_DISTANCE_M = 10_000.0
+_MAX_OBSTACLE_BBOX_AREA_PX = 100_000_000
 
 
 def _mapping(value: Any, path: str) -> Mapping[str, Any]:
@@ -224,6 +229,16 @@ def _validate_spatial_bounds(config: AppConfig) -> None:
     if not initial_inside_motion:
         raise ConfigError("target.initial_region must be contained in target.motion.region")
 
+    for spec in config.scene.obstacles:
+        minimum = spec.aabb.min_xyz_m
+        maximum = spec.aabb.max_xyz_m
+        if minimum[0] < -size_x / 2.0 or maximum[0] > size_x / 2.0:
+            raise ConfigError(f"scene obstacle {spec.obstacle_id!r} x bounds are outside the scene")
+        if minimum[1] < -size_y / 2.0 or maximum[1] > size_y / 2.0:
+            raise ConfigError(f"scene obstacle {spec.obstacle_id!r} y bounds are outside the scene")
+        if minimum[2] < 0.0 or maximum[2] > size_z:
+            raise ConfigError(f"scene obstacle {spec.obstacle_id!r} z bounds are outside the scene")
+
 
 def load_config(path: str | Path) -> AppConfig:
     """Read ``path`` once and return an immutable, validated configuration."""
@@ -291,8 +306,62 @@ def load_config(path: str | Path) -> AppConfig:
     )
 
     scene_raw = _mapping(_required(root, "scene", "config"), "scene")
+    obstacles_raw = scene_raw.get("obstacles", ())
+    if isinstance(obstacles_raw, (str, bytes)) or not isinstance(obstacles_raw, Sequence):
+        raise ConfigError("scene.obstacles must be a sequence")
+    obstacle_specs: list[ObstacleSpec] = []
+    obstacle_keys = frozenset(
+        {
+            "obstacle_id",
+            "center_xyz_m",
+            "size_xyz_m",
+            "color_rgb",
+            "collidable",
+            "motion_state",
+        }
+    )
+    for index, raw_obstacle in enumerate(obstacles_raw):
+        path = f"scene.obstacles[{index}]"
+        obstacle = _mapping(raw_obstacle, path)
+        missing = sorted(obstacle_keys - set(obstacle))
+        unknown = sorted(set(obstacle) - obstacle_keys)
+        if missing:
+            raise ConfigError(f"{path} is missing required keys: " + ", ".join(missing))
+        if unknown:
+            raise ConfigError(f"{path} contains unknown keys: " + ", ".join(unknown))
+        obstacle_id = obstacle["obstacle_id"]
+        if not isinstance(obstacle_id, str):
+            raise ConfigError(f"{path}.obstacle_id must be a string")
+        motion_state = obstacle["motion_state"]
+        if not isinstance(motion_state, str):
+            raise ConfigError(f"{path}.motion_state must be a string")
+        try:
+            obstacle_specs.append(
+                ObstacleSpec(
+                    obstacle_id=obstacle_id,
+                    center_xyz_m=_float_vector(
+                        obstacle["center_xyz_m"], f"{path}.center_xyz_m", 3
+                    ),
+                    size_xyz_m=_float_vector(
+                        obstacle["size_xyz_m"], f"{path}.size_xyz_m", 3
+                    ),
+                    color_rgb=_float_vector(
+                        obstacle["color_rgb"], f"{path}.color_rgb", 3
+                    ),
+                    collidable=_boolean(
+                        obstacle["collidable"], f"{path}.collidable"
+                    ),
+                    motion_state=ObstacleMotionState(motion_state),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"invalid {path}: {exc}") from exc
+    obstacle_ids = tuple(spec.obstacle_id for spec in obstacle_specs)
+    if len(obstacle_ids) != len(set(obstacle_ids)):
+        raise ConfigError("invalid scene.obstacles: duplicate obstacle_id")
     scene = SceneConfig(
-        size_xyz_m=_float_vector(_required(scene_raw, "size_xyz_m", "scene"), "scene.size_xyz_m", 3)
+        size_xyz_m=_float_vector(_required(scene_raw, "size_xyz_m", "scene"), "scene.size_xyz_m", 3),
+        obstacles=tuple(obstacle_specs),
     )
     if any(value <= 0.0 for value in scene.size_xyz_m):
         raise ConfigError("scene.size_xyz_m values must be greater than 0")
@@ -335,6 +404,49 @@ def load_config(path: str | Path) -> AppConfig:
         raise ConfigError("camera.pitch_deg must be between -90 and 90")
     if rendering_hz % camera.frequency_hz != 0:
         raise ConfigError("camera.frequency_hz must be an integer divisor of the rendering frequency")
+
+    obstacle_perception_raw = _strict_optional_block(
+        root,
+        "obstacle_perception",
+        frozenset(
+            {
+                "mode",
+                "max_distance_m",
+                "min_bbox_area_px",
+                "max_occlusion_ratio",
+            }
+        ),
+    )
+    if obstacle_perception_raw is None:
+        obstacle_perception = _DEFAULT_OBSTACLE_PERCEPTION_CONFIG
+    else:
+        mode = obstacle_perception_raw["mode"]
+        if not isinstance(mode, str) or mode not in {"disabled", "ideal_camera"}:
+            raise ConfigError(
+                "obstacle_perception.mode must be disabled or ideal_camera"
+            )
+        max_occlusion = _finite_number(
+            obstacle_perception_raw["max_occlusion_ratio"],
+            "obstacle_perception.max_occlusion_ratio",
+        )
+        if not 0.0 <= max_occlusion < 1.0:
+            raise ConfigError(
+                "obstacle_perception.max_occlusion_ratio must be in [0, 1)"
+            )
+        obstacle_perception = ObstaclePerceptionConfig(
+            mode=mode,
+            max_distance_m=_bounded_positive_number(
+                obstacle_perception_raw["max_distance_m"],
+                "obstacle_perception.max_distance_m",
+                _MAX_OBSTACLE_PERCEPTION_DISTANCE_M,
+            ),
+            min_bbox_area_px=_bounded_positive_integer(
+                obstacle_perception_raw["min_bbox_area_px"],
+                "obstacle_perception.min_bbox_area_px",
+                _MAX_OBSTACLE_BBOX_AREA_PX,
+            ),
+            max_occlusion_ratio=max_occlusion,
+        )
 
     target_raw = _mapping(_required(root, "target", "config"), "target")
     region_raw = _mapping(_required(target_raw, "initial_region", "target"), "target.initial_region")
@@ -921,6 +1033,7 @@ def load_config(path: str | Path) -> AppConfig:
         plan_revision=plan_revision,
         frame_store=frame_store,
         debug_images=debug_images,
+        obstacle_perception=obstacle_perception,
     )
     _validate_spatial_bounds(config)
     return config

@@ -105,8 +105,12 @@ class SparseMissionLoggerTest(unittest.TestCase):
                     "token_usage",
                     "latency_s",
                     "stale",
+                    "stale_reasons",
                     "accepted",
                     "timeout",
+                    "error_code",
+                    "response_text_length",
+                    "response_text_tail",
                 },
             )
             serialized = review_path.read_text(encoding="utf-8").casefold()
@@ -186,6 +190,42 @@ class SparseMissionLoggerTest(unittest.TestCase):
             self._review(semantic_source="oracle")
         with self.assertRaises(ValueError):
             self._review(geometry_source="qwen_vl")
+        with self.assertRaises(ValueError):
+            self._review(stale_reasons=("step_id_changed",))
+        with self.assertRaises(ValueError):
+            self._review(
+                stale=True,
+                accepted=False,
+                stale_reasons=("not_a_stale_reason",),
+            )
+        with self.assertRaises(ValueError):
+            self._review(
+                response_text_length=100,
+                response_text_tail="data:image/jpeg;base64,AAAA",
+            )
+
+    def test_specific_stale_reasons_and_safe_debug_tail_are_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with SparseMissionLogger(temporary) as logger:
+                logger.log_qwen_review(
+                    self._review(
+                        stale=True,
+                        accepted=False,
+                        error_code="STALE",
+                        stale_reasons=("step_id_changed",),
+                        response_text_length=640,
+                        response_text_tail='{"decision":"NO_RELEVANT_CHANGE"}',
+                    )
+                )
+            payload = json.loads(
+                (Path(temporary) / "qwen_reviews.jsonl").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(payload["error_code"], "STALE")
+            self.assertEqual(payload["stale_reasons"], ["step_id_changed"])
+            self.assertEqual(payload["response_text_length"], 640)
+            self.assertLessEqual(len(payload["response_text_tail"]), 500)
 
     def test_close_is_idempotent_and_prevents_further_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

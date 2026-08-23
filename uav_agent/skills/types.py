@@ -24,6 +24,7 @@ from common.ids import (
 class SkillName(str, Enum):
     TAKEOFF = "TAKEOFF"
     GOTO = "GOTO"
+    FOLLOW_ROUTE = "FOLLOW_ROUTE"
     HOVER = "HOVER"
     SEARCH = "SEARCH"
     INSPECT = "INSPECT"
@@ -47,6 +48,7 @@ class SkillResultCode(Enum):
     LAND_COMPLETE = auto()
 
     GOAL_REACHED = auto()
+    ROUTE_COMPLETE = auto()
     HOVER_COMPLETE = auto()
     TRACK_COMPLETE = auto()
 
@@ -68,6 +70,7 @@ _SUCCESS_RESULT_CODES = frozenset(
         SkillResultCode.TAKEOFF_COMPLETE,
         SkillResultCode.LAND_COMPLETE,
         SkillResultCode.GOAL_REACHED,
+        SkillResultCode.ROUTE_COMPLETE,
         SkillResultCode.HOVER_COMPLETE,
         SkillResultCode.TRACK_COMPLETE,
         SkillResultCode.TARGET_FOUND,

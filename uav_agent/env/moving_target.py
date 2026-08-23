@@ -10,6 +10,9 @@ from typing import Callable, Sequence
 
 import numpy as np
 
+from env.obstacle_registry import ObstacleRegistry
+from common.obstacle_types import ObstacleAABB
+
 
 PoseWriter = Callable[[np.ndarray, np.ndarray], None]
 
@@ -43,6 +46,8 @@ class MovingTarget:
         seed: int = 0,
         initial_heading_rad: float = 0.0,
         pose_writer: PoseWriter | None = None,
+        obstacle_registry: ObstacleRegistry | None = None,
+        target_half_extent_xyz_m: Sequence[float] = (0.3, 0.3, 0.5),
     ) -> None:
         self.mode = _mode(mode)
         self._initial_position = _vector3(initial_position_xyz_m, "initial_position_xyz_m")
@@ -67,6 +72,22 @@ class MovingTarget:
         self._base_seed = seed
         self._initial_heading_rad = _finite(initial_heading_rad, "initial_heading_rad")
         self._pose_writer = pose_writer
+        if obstacle_registry is not None and not isinstance(
+            obstacle_registry, ObstacleRegistry
+        ):
+            raise TypeError("obstacle_registry must be an ObstacleRegistry or None")
+        self._obstacle_registry = obstacle_registry or ObstacleRegistry()
+        self._target_half_extent = _vector3(
+            target_half_extent_xyz_m,
+            "target_half_extent_xyz_m",
+        )
+        if np.any(self._target_half_extent < 0.0):
+            raise ValueError("target_half_extent_xyz_m values must be non-negative")
+        self._expanded_obstacles = tuple(
+            spec.aabb.expanded(tuple(float(item) for item in self._target_half_extent))
+            for spec in self._obstacle_registry.collidable_specs
+        )
+        self._ensure_obstacle_free(self._initial_position, "initial_position_xyz_m")
         self._position = self._initial_position.copy()
         self._velocity = np.zeros(3, dtype=np.float64)
         self._yaw = self._initial_heading_rad
@@ -101,6 +122,7 @@ class MovingTarget:
         )
         if np.any(candidate_position < self._bounds_min) or np.any(candidate_position > self._bounds_max):
             raise ValueError("position_m must be inside target bounds")
+        self._ensure_obstacle_free(candidate_position, "position_m")
         reset_heading = (
             self._initial_heading_rad if yaw_rad is None else _finite(yaw_rad, "yaw_rad")
         )
@@ -157,31 +179,89 @@ class MovingTarget:
         return self.get_pose()
 
     def _advance(self, dt_s: float) -> None:
-        for axis in (0, 1):
-            low = self._bounds_min[axis]
-            high = self._bounds_max[axis]
-            length = high - low
-            unfolded = (self._position[axis] - low) + self._velocity[axis] * dt_s
-            phase = unfolded % (2.0 * length)
-            if phase <= length:
-                new_position = low + phase
-                new_velocity = self._velocity[axis]
-            else:
-                new_position = low + (2.0 * length - phase)
-                new_velocity = -self._velocity[axis]
-            wall_tolerance = 1e-12 * max(1.0, length)
-            if np.isclose(new_position, low, rtol=0.0, atol=wall_tolerance):
-                new_position = low
-                if new_velocity < 0.0:
-                    new_velocity = -new_velocity
-            elif np.isclose(new_position, high, rtol=0.0, atol=wall_tolerance):
-                new_position = high
-                if new_velocity > 0.0:
-                    new_velocity = -new_velocity
-            self._position[axis] = np.clip(new_position, low, high)
-            self._velocity[axis] = new_velocity
+        remaining = dt_s
+        time_epsilon = 1e-10
+        max_collisions = 256
+        collisions = 0
+        while remaining > time_epsilon:
+            hit_time = remaining
+            hit_axes: set[int] = set()
+            found_hit = False
+
+            # Closed world walls are handled as continuous collision events,
+            # preserving the exact legacy reflection behaviour for large dt.
+            for axis in (0, 1):
+                velocity = self._velocity[axis]
+                if abs(velocity) <= 1e-15:
+                    continue
+                wall = (
+                    self._bounds_max[axis]
+                    if velocity > 0.0
+                    else self._bounds_min[axis]
+                )
+                candidate = (wall - self._position[axis]) / velocity
+                if candidate < -time_epsilon or candidate > remaining + time_epsilon:
+                    continue
+                candidate = max(0.0, candidate)
+                if not found_hit or candidate < hit_time - time_epsilon:
+                    found_hit = True
+                    hit_time = candidate
+                    hit_axes = {axis}
+                elif abs(candidate - hit_time) <= time_epsilon:
+                    hit_axes.add(axis)
+
+            for obstacle in self._expanded_obstacles:
+                hit = _first_aabb_hit(
+                    obstacle,
+                    self._position,
+                    self._velocity,
+                    remaining,
+                )
+                if hit is None:
+                    continue
+                candidate, axes = hit
+                if not found_hit or candidate < hit_time - time_epsilon:
+                    found_hit = True
+                    hit_time = candidate
+                    hit_axes = set(axes)
+                elif abs(candidate - hit_time) <= time_epsilon:
+                    hit_axes.update(axes)
+
+            if not found_hit:
+                self._position += self._velocity * remaining
+                remaining = 0.0
+                break
+
+            self._position += self._velocity * hit_time
+            remaining -= hit_time
+            for axis in hit_axes:
+                if axis in (0, 1):
+                    self._velocity[axis] = -self._velocity[axis]
+            collisions += 1
+            if collisions > max_collisions:
+                raise RuntimeError("target collision integration exceeded its finite event budget")
+
+            # Move an infinitesimal amount along the reflected direction so a
+            # closed AABB boundary is not interpreted as a fresh inward hit.
+            if hit_time <= time_epsilon and remaining > 0.0:
+                nudge_time = min(remaining, time_epsilon)
+                self._position += self._velocity * nudge_time
+                remaining -= nudge_time
+
+        self._position[0] = np.clip(
+            self._position[0], self._bounds_min[0], self._bounds_max[0]
+        )
+        self._position[1] = np.clip(
+            self._position[1], self._bounds_min[1], self._bounds_max[1]
+        )
         self._position[2] = np.clip(self._position[2], self._bounds_min[2], self._bounds_max[2])
         self._velocity[2] = 0.0
+
+    def _ensure_obstacle_free(self, position: np.ndarray, field_name: str) -> None:
+        if any(obstacle.contains(position, strict=True) for obstacle in self._expanded_obstacles):
+            raise ValueError(
+                f"{field_name} intersects a collidable obstacle after target expansion"
+            )
 
     def _sample_random_heading(self) -> None:
         self._set_heading(float(self._rng.uniform(-pi, pi)))
@@ -245,3 +325,61 @@ def _nonnegative(value: float, name: str) -> float:
 
 def _wrap_angle(angle_rad: float) -> float:
     return (angle_rad + pi) % (2.0 * pi) - pi
+
+
+def _first_aabb_hit(
+    obstacle: ObstacleAABB,
+    position: np.ndarray,
+    velocity: np.ndarray,
+    max_time_s: float,
+) -> tuple[float, tuple[int, ...]] | None:
+    """Return first swept-point entry and reflecting axes for one AABB."""
+
+    entry = float("-inf")
+    exit_ = float("inf")
+    entry_axes: list[int] = []
+    tolerance = 1e-10
+    for axis in range(3):
+        low = obstacle.min_xyz_m[axis]
+        high = obstacle.max_xyz_m[axis]
+        speed = float(velocity[axis])
+        value = float(position[axis])
+        if abs(speed) <= 1e-15:
+            if value < low - tolerance or value > high + tolerance:
+                return None
+            continue
+        first = (low - value) / speed
+        second = (high - value) / speed
+        axis_entry = min(first, second)
+        axis_exit = max(first, second)
+        if axis_entry > entry + tolerance:
+            entry = axis_entry
+            entry_axes = [axis]
+        elif abs(axis_entry - entry) <= tolerance:
+            entry_axes.append(axis)
+        exit_ = min(exit_, axis_exit)
+        if entry > exit_ + tolerance:
+            return None
+
+    if exit_ < -tolerance or entry > max_time_s + tolerance:
+        return None
+    hit_time = max(0.0, entry)
+    if hit_time > max_time_s + tolerance:
+        return None
+    reflecting_axes = tuple(axis for axis in entry_axes if axis in (0, 1))
+    if not reflecting_axes:
+        return None
+
+    if hit_time <= tolerance:
+        # A point exactly on a face and travelling away is not a new hit.
+        inward = False
+        for axis in reflecting_axes:
+            value = float(position[axis])
+            speed = float(velocity[axis])
+            if abs(value - obstacle.min_xyz_m[axis]) <= tolerance and speed > 0.0:
+                inward = True
+            if abs(value - obstacle.max_xyz_m[axis]) <= tolerance and speed < 0.0:
+                inward = True
+        if not inward:
+            return None
+    return hit_time, reflecting_axes

@@ -48,7 +48,7 @@ class Skill(ABC):
     to enter a terminal state. A Skill never owns or invokes another Skill.
     """
 
-    goal_type: ClassVar[type[SkillGoal]] = SkillGoal
+    goal_type: ClassVar[type[SkillGoal] | tuple[type[SkillGoal], ...]] = SkillGoal
 
     def __init__(self) -> None:
         self._status = SkillStatus.IDLE
@@ -97,10 +97,15 @@ class Skill(ABC):
         self._context = context
 
         if not isinstance(goal, self.goal_type):
+            expected = (
+                self.goal_type.__name__
+                if isinstance(self.goal_type, type)
+                else " or ".join(item.__name__ for item in self.goal_type)
+            )
             self._complete(
                 SkillStatus.FAILED,
                 SkillResultCode.INVALID_GOAL,
-                f"expected {self.goal_type.__name__}, got {type(goal).__name__}",
+                f"expected {expected}, got {type(goal).__name__}",
             )
             return
         self._goal = goal

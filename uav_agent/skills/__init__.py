@@ -7,6 +7,7 @@ from skills.base import (
     SkillLifecycleError,
 )
 from skills.goto import GotoGoal, GotoSkill
+from skills.follow_route import FollowRouteGoal, FollowRouteSkill
 from skills.hover import HoverGoal, HoverMode, HoverSkill, HoverTimeoutFallback
 from skills.land import LandGoal, LandSkill
 from skills.manager import (
@@ -33,7 +34,26 @@ from skills.plan import (
     TaskPlanError,
     TaskStep,
 )
-from skills.search import SearchGoal, SearchPhase, SearchSkill
+from skills.search import SearchGoal, SearchGoalV3, SearchPhase, SearchSkill
+from skills.search_geometry import (
+    generate_search_waypoints,
+    nearest_boundary_point,
+    point_inside_region,
+    rectangle_anchor_point,
+    region_center,
+)
+from skills.search_strategy import (
+    AsyncNextBestViewProvider,
+    NextBestViewProvider,
+    NextBestViewPollResult,
+    NextBestViewRequest,
+    SearchEntryPolicy,
+    SearchRuntimeCapabilities,
+    SearchStrategy,
+    SearchStrategyError,
+    SearchStrategySpec,
+    SearchStrategyType,
+)
 from skills.takeoff import TakeoffGoal, TakeoffSkill
 from skills.track import TrackGoal, TrackSkill
 from skills.types import (
@@ -55,6 +75,8 @@ from skills.types import (
 __all__ = [
     "CameraSensor",
     "ExecutionKind",
+    "FollowRouteGoal",
+    "FollowRouteSkill",
     "GotoGoal",
     "GotoSkill",
     "HoverGoal",
@@ -71,13 +93,24 @@ __all__ = [
     "LandSkill",
     "MotionPolicy",
     "MotionPolicyValidationError",
+    "NextBestViewProvider",
+    "AsyncNextBestViewProvider",
+    "NextBestViewPollResult",
+    "NextBestViewRequest",
     "Observation",
     "ReacquireGoal",
     "ReacquireSkill",
     "RecoveryPolicy",
     "SearchGoal",
+    "SearchGoalV3",
     "SearchPhase",
+    "SearchRuntimeCapabilities",
     "SearchSkill",
+    "SearchEntryPolicy",
+    "SearchStrategy",
+    "SearchStrategyError",
+    "SearchStrategySpec",
+    "SearchStrategyType",
     "Skill",
     "SkillClock",
     "SkillContext",
@@ -110,6 +143,11 @@ __all__ = [
     "apply_motion_policy",
     "create_default_skill_registry",
     "move_toward_with_policy",
+    "generate_search_waypoints",
+    "nearest_boundary_point",
+    "point_inside_region",
+    "rectangle_anchor_point",
+    "region_center",
 ]
 
 

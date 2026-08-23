@@ -147,6 +147,40 @@ def six_step_plan(*, track_duration: float = 5.0) -> TaskPlan:
     return TaskPlan.from_dicts(entries)
 
 
+def fallback_search_plan() -> TaskPlan:
+    return TaskPlan.from_dicts(
+        [
+            {"id": "takeoff", "skill": "TAKEOFF", "target_altitude": 10.0},
+            {
+                "id": "search_near",
+                "skill": "SEARCH",
+                "center": [10.0, 0.0, 0.0],
+                "radius": 5.0,
+                "search_altitude": 10.0,
+                "target_description": "moving target",
+            },
+            {
+                "id": "search_far",
+                "skill": "SEARCH",
+                "center": [20.0, 0.0, 0.0],
+                "radius": 5.0,
+                "search_altitude": 10.0,
+                "target_description": "moving target",
+            },
+            {
+                "id": "track",
+                "skill": "TRACK",
+                "target_id": "$search_far.target_id",
+                "track_duration": 5.0,
+            },
+            {"id": "land", "skill": "LAND"},
+        ],
+        mission_id="mission_search_chain",
+        uav_id="uav_1",
+        plan_version=1,
+    )
+
+
 def default_outcomes() -> dict[SkillName, list[ScriptedOutcome]]:
     return {
         SkillName.TAKEOFF: [succeeded(SkillResultCode.TAKEOFF_COMPLETE)],
@@ -210,6 +244,93 @@ def tick_once(manager: SkillManager, clock: ManualClock) -> TaskStatus:
 
 
 class SkillManagerTaskTest(unittest.TestCase):
+    def test_search_fallback_chain_continues_after_exhaustion(self) -> None:
+        context, clock = make_context()
+        scripted, registry = make_registry(
+            {
+                SkillName.SEARCH: [
+                    failed(
+                        SkillResultCode.SEARCH_EXHAUSTED,
+                        {
+                            "coverage_ratio": 1.0,
+                            "visited_viewpoints": ((1.0, 0.0, 10.0),),
+                            "search_exhausted_reason": "WAYPOINTS_EXHAUSTED",
+                        },
+                    ),
+                    succeeded(
+                        SkillResultCode.TARGET_FOUND,
+                        {"target_id": "target_0", "elapsed_time": 3.0},
+                    ),
+                ]
+            }
+        )
+        manager = SkillManager(context, registry=registry)
+        manager.start_task(fallback_search_plan())
+
+        self.assertIs(tick_once(manager, clock), TaskStatus.RUNNING)
+        self.assertIs(manager.active_name, SkillName.SEARCH)
+        self.assertIs(tick_once(manager, clock), TaskStatus.RUNNING)
+        self.assertEqual(manager.active_planned_step_id, "search_far")
+        self.assertIs(tick_once(manager, clock), TaskStatus.RUNNING)
+        self.assertIs(manager.active_name, SkillName.TRACK)
+        self.assertEqual(
+            scripted[SkillName.TRACK].started_goals[0].target_id,
+            "target_0",
+        )
+        search_reports = [
+            item
+            for item in manager.execution_reports
+            if item.skill_name is SkillName.SEARCH
+        ]
+        self.assertEqual(len(search_reports), 2)
+        self.assertEqual(
+            search_reports[0].feedback_or_result["data"]["coverage_ratio"],
+            1.0,
+        )
+
+    def test_search_fallback_chain_skips_later_regions_after_success(self) -> None:
+        context, clock = make_context()
+        scripted, registry = make_registry()
+        manager = SkillManager(context, registry=registry)
+        manager.start_task(fallback_search_plan())
+
+        tick_once(manager, clock)  # TAKEOFF -> first SEARCH
+        tick_once(manager, clock)  # first SEARCH -> TRACK, skip second
+        self.assertIs(manager.active_name, SkillName.TRACK)
+        self.assertEqual(len(scripted[SkillName.SEARCH].started_goals), 1)
+        self.assertEqual(
+            scripted[SkillName.TRACK].started_goals[0].target_id,
+            "target_0",
+        )
+        self.assertEqual(
+            manager.transition_log[-1].reason,
+            "search_fallback_chain_satisfied",
+        )
+        self.assertEqual(
+            manager.step_outputs["search_far"]["target_id"],
+            "target_0",
+        )
+
+    def test_search_fallback_chain_all_exhausted_uses_landing_fallback(self) -> None:
+        context, clock = make_context()
+        _, registry = make_registry(
+            {
+                SkillName.SEARCH: [
+                    failed(SkillResultCode.SEARCH_EXHAUSTED),
+                    failed(SkillResultCode.SEARCH_EXHAUSTED),
+                ]
+            }
+        )
+        manager = SkillManager(context, registry=registry)
+        manager.start_task(fallback_search_plan())
+
+        tick_once(manager, clock)
+        tick_once(manager, clock)
+        tick_once(manager, clock)
+        self.assertIs(manager.active_name, SkillName.LAND)
+        self.assertIs(manager.pending_task_result, TaskStatus.FAILED)
+        self.assertIs(tick_once(manager, clock), TaskStatus.FAILED)
+
     def test_task_plan_is_generic_but_enforces_runtime_structure(self) -> None:
         self.assertEqual(len(standard_plan().steps), 5)
         self.assertEqual(len(six_step_plan().steps), 6)

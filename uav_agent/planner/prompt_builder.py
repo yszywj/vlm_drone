@@ -21,6 +21,7 @@ from planner.schemas import PlannerWorldContext
 from planner.policy import PlannerLimits, PlannerPolicy
 from planner.skill_catalog import SkillCatalog, initial_planner_catalog
 from planner.text_safety import reject_forbidden_planner_text
+from skills.search_strategy import SearchRuntimeCapabilities
 
 
 # Planner-visible world metadata is configuration, not user prose.  Reject
@@ -285,6 +286,173 @@ def build_dynamic_skill_planner_messages(
     )
 
 
+def build_spatial_v3_skill_planner_messages(
+    instruction: str,
+    world_context: PlannerWorldContext,
+    skill_catalog: SkillCatalog,
+    planner_limits: object,
+    system_prompt: str,
+    planner_policy: object = None,
+    *,
+    mission_id: str,
+    uav_id: str,
+    plan_version: int,
+    search_runtime_capabilities: SearchRuntimeCapabilities | None = None,
+) -> tuple[ChatMessage, ...]:
+    """Build the independent coordinate-capable Spatial Contract V3 prompt.
+
+    This intentionally does not call the V2 prompt builder: in V3, explicit
+    framed geometry is model output rather than trusted-compiler-only state.
+    Hidden target truth and media are still excluded from the public context.
+    """
+
+    normalized_instruction = _non_empty_text(instruction, "instruction")
+    normalized_system_prompt = _non_empty_text(system_prompt, "system_prompt")
+    if not isinstance(world_context, PlannerWorldContext):
+        raise TypeError("world_context must be a PlannerWorldContext")
+    if not isinstance(skill_catalog, SkillCatalog):
+        raise TypeError("skill_catalog must be a SkillCatalog")
+    capabilities = (
+        SearchRuntimeCapabilities()
+        if search_runtime_capabilities is None
+        else search_runtime_capabilities
+    )
+    if not isinstance(capabilities, SearchRuntimeCapabilities):
+        raise TypeError(
+            "search_runtime_capabilities must be a SearchRuntimeCapabilities or None"
+        )
+    trusted_mission_id = validate_mission_id(mission_id)
+    trusted_uav_id = validate_uav_id(uav_id)
+    if (
+        isinstance(plan_version, bool)
+        or not isinstance(plan_version, int)
+        or plan_version <= 0
+    ):
+        raise ValueError("plan_version must be a positive integer")
+
+    _validate_v3_planner_visible_world_text(world_context)
+    projected_limits = _project_dynamic_limits(planner_limits)
+    trusted_limits = PlannerLimits(**projected_limits)
+    # V2 keeps its single-SEARCH baseline. Spatial V3 bounds repeated SEARCH
+    # with the total step budget, reserving TAKEOFF and LAND slots.
+    projected_limits["max_search_calls"] = max(
+        1,
+        int(projected_limits["max_plan_steps"]) - 2,
+    )
+    model_catalog = initial_planner_catalog(skill_catalog)
+    safe_context = {
+        "scene_bounds_world_enu_m": {
+            "minimum": list(world_context.scene_min_xyz_m),
+            "maximum": list(world_context.scene_max_xyz_m),
+        },
+        "named_search_regions": [
+            {"name": name, "description": spec.description}
+            for name, spec in sorted(world_context.search_regions.items())
+        ],
+        "named_landing_zones": [
+            {"name": name, "description": spec.description}
+            for name, spec in sorted(world_context.landing_zones.items())
+        ],
+        "named_navigation_points": [
+            {"name": name, "description": spec.description}
+            for name, spec in sorted(world_context.navigation_points.items())
+        ],
+        "default_takeoff_altitude_m": world_context.default_takeoff_altitude_m,
+        "default_track_duration_s": world_context.default_track_duration_s,
+        # V2 historically allowed exactly one SEARCH.  V3 reuses the same
+        # trusted budget as an aggregate across every SEARCH timeout so
+        # repeated searches do not silently multiply mission time.
+        "total_search_time_budget_s": world_context.search_timeout_s,
+    }
+    payload = {
+        "task": (
+            "Create one routed Spatial Contract schema-v3 SkillPlanDraft JSON "
+            "object with explicit frames and recorded spatial assumptions."
+        ),
+        "trusted_routing": {
+            "schema_version": 3,
+            "mission_id": trusted_mission_id,
+            "uav_id": trusted_uav_id,
+            "plan_version": plan_version,
+            "step_uav_id_must_equal": trusted_uav_id,
+        },
+        "coordinate_frames": {
+            "WORLD_ENU": "world origin; +x east, +y north, +z up",
+            "HOME_ENU": "home origin; +x east, +y north, +z up",
+            "UAV_START_FLU": "mission-start UAV origin; +x forward, +y left, +z up",
+            "UAV_HOLD_FLU": "supervisory-hold UAV origin; +x forward, +y left, +z up",
+            "CAMERA_FLU": "current camera origin; +x forward, +y left, +z up",
+        },
+        "spatial_output_policy": {
+            "framed_coordinates_allowed": True,
+            "bare_spatial_objects_forbidden": True,
+            "ambiguous_reference_requires_assumption": True,
+            "compiler_must_not_silently_choose_reference_frame": True,
+        },
+        "mission_completeness_contract": {
+            "emit_the_complete_mission_not_a_prefix": True,
+            "represent_every_action_requested_after_search": True,
+            "preserve_requested_track_duration": True,
+            "when_return_and_land_are_requested": (
+                "emit GOTO NAMED_LOCATION to the landing zone followed by "
+                "exactly one final LAND for the same zone"
+            ),
+        },
+        "runtime_search_capabilities": capabilities.to_prompt_dict(),
+        "trusted_world_context": safe_context,
+        # The response JSON Schema already carries exact field types, bounds,
+        # and enum values.  Repeating every argument paragraph here consumed
+        # most of the 4096-token local Qwen context and truncated otherwise
+        # valid plans before their final LAND.  Keep the semantic Skill tags,
+        # argument names, required flags, concise descriptions, and outputs;
+        # trusted Python/schema validation remains authoritative.
+        "skill_catalog": _compact_v3_skill_catalog(model_catalog),
+        "planner_limits": projected_limits,
+        "trusted_planner_policy": _project_dynamic_policy(
+            planner_policy,
+            limits=trusted_limits,
+        ),
+        "user_instruction": normalized_instruction,
+    }
+    return (
+        ChatMessage(role="system", content=normalized_system_prompt),
+        ChatMessage(
+            role="user",
+            content=json.dumps(
+                payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ),
+    )
+
+
+def _compact_v3_skill_catalog(skill_catalog: SkillCatalog) -> dict[str, object]:
+    """Project V3 semantic affordances without duplicating JSON Schema prose."""
+
+    if not isinstance(skill_catalog, SkillCatalog):
+        raise TypeError("skill_catalog must be a SkillCatalog")
+    return {
+        "skills": [
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "arguments": [
+                    {
+                        "name": argument.name,
+                        "required": argument.required,
+                    }
+                    for argument in skill.arguments
+                ],
+                "outputs": list(skill.outputs),
+            }
+            for skill in skill_catalog.skills
+        ]
+    }
+
+
 def _project_dynamic_limits(value: object) -> dict[str, int | float]:
     if value is None:
         raw: dict[str, object] = dict(_DYNAMIC_LIMIT_DEFAULTS)
@@ -443,6 +611,49 @@ def _validate_planner_visible_world_text(
         )
 
 
+def _validate_v3_planner_visible_world_text(
+    world_context: PlannerWorldContext,
+) -> None:
+    """Reject hidden/media provenance without applying V2's geometry ban."""
+
+    collections = (
+        ("search_regions", world_context.search_regions),
+        ("landing_zones", world_context.landing_zones),
+        ("navigation_points", world_context.navigation_points),
+    )
+    for collection_name, values in collections:
+        for index, (mapping_name, spec) in enumerate(sorted(values.items())):
+            for field_name, value in (
+                ("key", mapping_name),
+                ("name", spec.name),
+                ("description", spec.description),
+            ):
+                _reject_v3_forbidden_context_text(
+                    value,
+                    f"{collection_name} {field_name} at index {index}",
+                )
+
+
+def _reject_v3_forbidden_context_text(value: str, field_name: str) -> None:
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string")
+    nfkc = unicodedata.normalize("NFKC", value)
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", nfkc).casefold()
+    words = tuple(_ASCII_WORD.findall(normalized))
+    compact = "".join(words)
+    unicode_compact = "".join(
+        character for character in normalized if character.isalnum()
+    )
+    if (
+        any(word in _FORBIDDEN_CONTEXT_ASCII_TOKENS for word in words)
+        or any(marker in compact for marker in _FORBIDDEN_CONTEXT_ASCII_COMPACT)
+        or any(marker in unicode_compact for marker in _FORBIDDEN_CONTEXT_UNICODE)
+    ):
+        raise ValueError(
+            f"{field_name} contains a forbidden hidden-state or media marker"
+        )
+
+
 def _reject_forbidden_context_text(value: str, field_name: str) -> None:
     # Shared semantic boundary additionally rejects raw coordinate triples,
     # XYZ assignments, PID/motor/waypoint text, and similar low-level data.
@@ -476,4 +687,5 @@ def _reject_forbidden_context_text(value: str, field_name: str) -> None:
 __all__ = [
     "build_dynamic_skill_planner_messages",
     "build_mission_planner_messages",
+    "build_spatial_v3_skill_planner_messages",
 ]

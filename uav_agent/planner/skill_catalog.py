@@ -14,14 +14,31 @@ from numbers import Real
 
 from common.ids import validate_routing_id
 from planner.text_safety import reject_forbidden_planner_text
+from skills.search_strategy import SearchRuntimeCapabilities
 
 
-_ARGUMENT_TYPES = frozenset({"string", "number", "integer"})
+_ARGUMENT_TYPES = frozenset({"string", "number", "integer", "object", "array"})
 _MODEL_VISIBLE_ARGUMENTS: dict[str, frozenset[str]] = {
     "TAKEOFF": frozenset({"altitude_m", "yaw_mode", "yaw_deg"}),
-    "GOTO": frozenset({"destination", "altitude_m", "yaw_mode", "yaw_deg"}),
+    "GOTO": frozenset(
+        {"destination", "target", "altitude_m", "yaw_mode", "yaw_deg"}
+    ),
     "HOVER": frozenset({"duration_s", "yaw_mode", "yaw_deg"}),
-    "SEARCH": frozenset({"region", "target_description", "altitude_m"}),
+    "SEARCH": frozenset(
+        {
+            "region",
+            "strategy",
+            "entry_policy",
+            "target_description",
+            "altitude_m",
+            "search_altitude_m",
+            "timeout_s",
+            "transit_speed_mps",
+            "scan_yaw_rate_rad_s",
+            "user_anchor_xyz_m",
+            "model_selected_entry_xyz_m",
+        }
+    ),
     "INSPECT": frozenset(
         {
             "candidate_id",
@@ -605,6 +622,116 @@ def build_default_skill_catalog() -> SkillCatalog:
     )
 
 
+def build_spatial_v3_skill_catalog(
+    search_runtime_capabilities: SearchRuntimeCapabilities | None = None,
+) -> SkillCatalog:
+    """Build the opt-in V3 catalog without changing the V2 default.
+
+    Exact nested object grammar remains owned by ``json_schema_v3``; this
+    catalog is the compact semantic description supplied to a planner prompt.
+    """
+
+    capabilities = (
+        SearchRuntimeCapabilities()
+        if search_runtime_capabilities is None
+        else search_runtime_capabilities
+    )
+    if not isinstance(capabilities, SearchRuntimeCapabilities):
+        raise TypeError(
+            "search_runtime_capabilities must be a SearchRuntimeCapabilities or None"
+        )
+    supported_strategy_names = ", ".join(
+        strategy.value for strategy in capabilities.supported_strategies
+    )
+    base = build_default_skill_catalog()
+    projected: list[SkillContract] = []
+    for contract in base:
+        if contract.name == "GOTO":
+            projected.append(
+                replace(
+                    contract,
+                    description=(
+                        "飞往 V3 空间目标；目标可为具名位置、带坐标系的点、"
+                        "或已落地关系点。复数点序列不得交给单点导航，"
+                        "必须由持有可信 route_ref 的 FOLLOW_ROUTE 执行。"
+                    ),
+                    arguments=(
+                        _argument("target", "V3 空间目标对象。", "object"),
+                        *tuple(
+                            argument
+                            for argument in contract.arguments
+                            if argument.name != "destination"
+                        ),
+                    ),
+                    preconditions=(
+                        "UAV is airborne",
+                        "the spatial reference is resolvable",
+                        "multi-point routes require FOLLOW_ROUTE with a trusted route_ref",
+                    ),
+                )
+            )
+            continue
+        if contract.name == "SEARCH":
+            projected.append(
+                replace(
+                    contract,
+                    description=(
+                        "在 V3 几何区域内按宏观观察策略寻找任务目标；"
+                        "SEARCH 可自行进入区域。"
+                    ),
+                    arguments=(
+                        _argument("region", "带显式坐标系的 V3 区域对象。", "object"),
+                        _argument(
+                            "strategy",
+                            "搜索覆盖策略对象；本次运行允许的 kind 为: "
+                            + supported_strategy_names,
+                            "object",
+                        ),
+                        _argument(
+                            "entry_policy",
+                            "进入区域的显式策略。",
+                            "string",
+                            allowed_values=(
+                                "START_IN_PLACE_IF_INSIDE",
+                                "NEAREST_POINT",
+                                "NEAREST_BOUNDARY",
+                                "CENTER",
+                                "USER_ANCHOR",
+                                "MODEL_SELECTED",
+                            ),
+                        ),
+                        _argument("target_description", "需要寻找的目标语义描述。", "string"),
+                        _argument("search_altitude_m", "搜索飞行高度。", "number"),
+                        _argument("timeout_s", "搜索时间上限。", "number"),
+                        _argument("transit_speed_mps", "区域内转场速度。", "number", required=False),
+                        _argument("scan_yaw_rate_rad_s", "观察点扫描角速度。", "number", required=False),
+                        _argument("user_anchor_xyz_m", "用户指定的区域内进入点。", "array", required=False),
+                        _argument("model_selected_entry_xyz_m", "模型选择的区域内进入点。", "array", required=False),
+                    ),
+                    preconditions=("UAV is airborne", "region frame is resolvable"),
+                    outputs=(
+                        "target_id", "coverage_ratio", "visited_viewpoints",
+                        "elapsed_time", "search_exhausted_reason",
+                    ),
+                )
+            )
+            continue
+        if contract.name == "LAND":
+            projected.append(
+                replace(
+                    contract,
+                    preconditions=(
+                        "UAV is airborne",
+                        "must be the final step",
+                        "the latest position-changing step must place the UAV in this zone",
+                    ),
+                )
+            )
+            continue
+        projected.append(contract)
+    return SkillCatalog(tuple(projected))
+
+
 def initial_planner_catalog(catalog: SkillCatalog) -> SkillCatalog:
     """Project the catalog to skills safe for an initial mission plan.
 
@@ -666,6 +793,7 @@ __all__ = [
     "SkillCatalog",
     "SkillContract",
     "build_default_skill_catalog",
+    "build_spatial_v3_skill_catalog",
     "initial_planner_catalog",
     "revision_planner_catalog",
 ]

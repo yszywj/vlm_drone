@@ -367,6 +367,147 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
         self.assertIs(manager.active_name, SkillName.GOTO)
         self.assertEqual(coordinator.revision_events, ())
 
+    def test_worker_poll_failure_releases_scheduler_and_pinned_frame(self) -> None:
+        manager, clock, uav = make_runtime()
+        worker = FakeAsyncWorker()
+        coordinator = self.make_coordinator(
+            manager,
+            worker,
+            mode=VisualReviewMode.GATE,
+            timeout=1.0,
+        )
+        tick_coordinator(coordinator, manager, clock, uav)
+        clock.time_s = 1.0
+        tick_coordinator(coordinator, manager, clock, uav)
+        pending_ref = coordinator.snapshot().latest_frame_ref
+        assert pending_ref is not None
+
+        def fail_poll(**kwargs: object) -> None:
+            del kwargs
+            raise RuntimeError("poll failed")
+
+        worker.poll = fail_poll  # type: ignore[method-assign]
+        clock.time_s = 2.0
+        tick_coordinator(coordinator, manager, clock, uav)
+
+        self.assertIsNone(coordinator.snapshot().inflight_request_id)
+        self.assertIsNone(coordinator._scheduler.inflight(uav_id="uav_1"))
+        self.assertEqual(
+            coordinator.records[-1].error_code,
+            "MODEL_REQUEST_FAILED",
+        )
+        coordinator._frame_store.evict_expired(timestamp_s=100.0)
+        self.assertFalse(coordinator._frame_store.contains(pending_ref))
+
+    def test_one_frame_store_rolls_back_failed_reservation_and_recovers(self) -> None:
+        manager, clock, uav = make_runtime()
+        worker = FakeAsyncWorker()
+        coordinator = self.make_coordinator(
+            manager,
+            worker,
+            mode=VisualReviewMode.GATE,
+            timeout=10.0,
+        )
+        coordinator._frame_store = FrameStore(
+            max_frames=1,
+            max_bytes=100_000,
+            max_age_s=10.0,
+        )
+        tick_coordinator(coordinator, manager, clock, uav)
+        clock.time_s = 1.0
+        tick_coordinator(coordinator, manager, clock, uav)
+        self.assertIsNotNone(coordinator.snapshot().inflight_request_id)
+
+        worker.complete_latest()
+        clock.time_s = 2.0
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "latest frame was evicted before submission",
+        ):
+            tick_coordinator(coordinator, manager, clock, uav)
+        self.assertIsNone(coordinator.snapshot().inflight_request_id)
+        self.assertIsNone(coordinator._scheduler.inflight(uav_id="uav_1"))
+        latest = coordinator.snapshot().latest_frame_ref
+        assert latest is not None
+        self.assertTrue(coordinator._frame_store.contains(latest))
+
+        clock.time_s = 3.0
+        tick_coordinator(coordinator, manager, clock, uav)
+        self.assertIsNotNone(coordinator.snapshot().inflight_request_id)
+        self.assertIsNotNone(coordinator._scheduler.inflight(uav_id="uav_1"))
+        self.assertLessEqual(len(coordinator._frame_store), 1)
+
+    def test_safety_abort_releases_inflight_review_ownership(self) -> None:
+        manager, clock, uav = make_runtime()
+        worker = FakeAsyncWorker()
+        coordinator = self.make_coordinator(
+            manager,
+            worker,
+            mode=VisualReviewMode.GATE,
+        )
+        tick_coordinator(coordinator, manager, clock, uav)
+        clock.time_s = 1.0
+        tick_coordinator(coordinator, manager, clock, uav)
+        pending_ref = coordinator.snapshot().latest_frame_ref
+        assert pending_ref is not None
+
+        clock.time_s = 2.0
+        tick_coordinator(
+            coordinator,
+            manager,
+            clock,
+            uav,
+            safety_action=SafetyAction.CANCEL_AND_LAND,
+        )
+
+        self.assertIsNone(coordinator.snapshot().inflight_request_id)
+        self.assertIsNone(coordinator._scheduler.inflight(uav_id="uav_1"))
+        self.assertEqual(coordinator.records[-1].error_code, "SAFETY_SUPERSEDED")
+        coordinator._frame_store.evict_expired(timestamp_s=100.0)
+        self.assertFalse(coordinator._frame_store.contains(pending_ref))
+
+    def test_late_aborted_result_cannot_complete_newer_request(self) -> None:
+        manager, clock, uav = make_runtime()
+        worker = FakeAsyncWorker()
+        coordinator = self.make_coordinator(
+            manager,
+            worker,
+            mode=VisualReviewMode.SHADOW,
+        )
+        coordinator.submit_event(event(MissionEventType.LOW_VISIBILITY, 0.0))
+        tick_coordinator(coordinator, manager, clock, uav)
+        first_request = worker.requests[-1]
+        coordinator.abort_pending(
+            reason_code="SAFETY_SUPERSEDED",
+            timestamp_s=0.1,
+        )
+        worker.complete_latest()
+
+        coordinator.submit_event(event(MissionEventType.LOW_VISIBILITY, 0.2))
+        clock.time_s = 0.2
+        tick_coordinator(coordinator, manager, clock, uav)
+        second_request = worker.requests[-1]
+        self.assertNotEqual(second_request.request_id, first_request.request_id)
+
+        clock.time_s = 0.3
+        tick_coordinator(coordinator, manager, clock, uav)
+        snapshot = coordinator.snapshot()
+        self.assertEqual(snapshot.inflight_request_id, second_request.request_id)
+        inflight = coordinator._scheduler.inflight(uav_id="uav_1")
+        assert inflight is not None
+        self.assertEqual(inflight.request_id, second_request.request_id)
+        self.assertEqual(coordinator.records[-1].error_code, "ORPHAN_STALE")
+        self.assertIn(
+            "request_id_mismatch",
+            coordinator.records[-1].stale_reasons,
+        )
+
+        worker.complete_latest()
+        clock.time_s = 0.4
+        tick_coordinator(coordinator, manager, clock, uav)
+        self.assertIsNone(coordinator.snapshot().inflight_request_id)
+        self.assertIsNone(coordinator._scheduler.inflight(uav_id="uav_1"))
+
     def test_blocking_gate_event_starts_hover_only_after_safety_continue(self) -> None:
         manager, clock, uav = make_runtime()
         worker = FakeAsyncWorker()

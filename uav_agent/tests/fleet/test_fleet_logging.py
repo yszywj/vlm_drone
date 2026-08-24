@@ -113,6 +113,64 @@ def test_existing_mission_directory_is_rejected_without_touching_old_logs(
     assert (event_path.read_bytes(), assignment_path.read_bytes()) == before
 
 
+def test_attach_run_dir_preserves_run_manager_and_existing_fleet_artifacts(
+    tmp_path,
+) -> None:
+    run_dir = tmp_path / "runs/mission/20260824-120000"
+    (run_dir / "logs").mkdir(parents=True)
+    (run_dir / "metrics").mkdir()
+    preserved = {
+        run_dir / "manifest.yaml": b"status: running\n",
+        run_dir / "logs/terminal.log": b"interpreter starting\n",
+        run_dir / "metrics/episode_metrics.csv": b"episode_id,status\n1,ok\n",
+        run_dir / "fleet_events.jsonl": b'{"event_type":"INTERPRETER_STARTED"}\n',
+    }
+    for path, payload in preserved.items():
+        path.write_bytes(payload)
+
+    logger = FleetMissionLogger.attach_run_dir(
+        run_dir,
+        "fleet_mission_attached",
+        uav_ids=("uav_a",),
+    )
+
+    assert logger.run_dir == run_dir.resolve()
+    assert logger.fleet_mission_id == "fleet_mission_attached"
+    for path, payload in preserved.items():
+        assert path.read_bytes() == payload
+    assert (run_dir / "agents/uav_a/transitions.jsonl").is_file()
+    with (run_dir / "assignments.csv").open(newline="") as stream:
+        assert tuple(next(csv.reader(stream))) == logger.ASSIGNMENT_FIELDS
+    logger.log_fleet_event({"event_type": "INTERPRETER_SUCCEEDED"})
+    assert "INTERPRETER_STARTED" in (run_dir / "fleet_events.jsonl").read_text()
+
+
+def test_attach_run_dir_keeps_existing_compatible_csv_and_rejects_bad_header(
+    tmp_path,
+) -> None:
+    run_dir = tmp_path / "existing"
+    run_dir.mkdir()
+    assignments = run_dir / "assignments.csv"
+    original = (
+        ",".join(FleetMissionLogger.ASSIGNMENT_FIELDS)
+        + "\nassignment_old,uav_a,target_old,1,RUNNING,1\n"
+    ).encode()
+    assignments.write_bytes(original)
+
+    FleetMissionLogger.attach_run_dir(run_dir, "fleet_mission_existing")
+    assert assignments.read_bytes() == original
+
+    bad_run_dir = tmp_path / "bad"
+    bad_run_dir.mkdir()
+    bad_csv = bad_run_dir / "model_calls.csv"
+    bad_csv.write_text("wrong,header\nold,data\n", encoding="utf-8")
+    before = bad_csv.read_bytes()
+    with pytest.raises(ValueError, match="incompatible header"):
+        FleetMissionLogger.attach_run_dir(bad_run_dir, "fleet_mission_bad")
+    assert bad_csv.read_bytes() == before
+    assert not (bad_run_dir / "agents").exists()
+
+
 def test_assignment_csv_overwrite_is_atomic_on_validation_failure(tmp_path) -> None:
     logger = FleetMissionLogger(tmp_path, "fleet_mission_atomic")
     original = {

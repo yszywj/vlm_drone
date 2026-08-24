@@ -381,6 +381,71 @@ class StorageConfig:
     max_run_size_gb: float
 
 
+@dataclass(frozen=True, slots=True)
+class ResultsConfig:
+    """Hard-bounded, image-free Fleet mission result policy."""
+
+    detail_level: str = "standard"
+    state_sample_hz: float = 1.0
+    save_summary_figures: bool = True
+    save_camera_images: bool = False
+    save_videos: bool = False
+    save_raw_frames: bool = False
+    save_observations: bool = False
+    retain_model_proposals: bool = True
+    retain_prompts: bool = False
+    max_record_bytes: int = 32_768
+    max_stream_bytes: int = 8_388_608
+    max_run_bytes: int = 33_554_432
+
+    def __post_init__(self) -> None:
+        if self.detail_level not in {"minimal", "standard"}:
+            raise ValueError("results.detail_level must be minimal or standard")
+        if (
+            isinstance(self.state_sample_hz, bool)
+            or not isinstance(self.state_sample_hz, (int, float))
+            or not isfinite(float(self.state_sample_hz))
+            or not 0.0 < float(self.state_sample_hz) <= 10.0
+        ):
+            raise ValueError("results.state_sample_hz must be within (0, 10]")
+        for name in (
+            "save_summary_figures",
+            "save_camera_images",
+            "save_videos",
+            "save_raw_frames",
+            "save_observations",
+            "retain_model_proposals",
+            "retain_prompts",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"results.{name} must be a boolean")
+        if any(
+            (
+                self.save_camera_images,
+                self.save_videos,
+                self.save_raw_frames,
+                self.save_observations,
+                self.retain_prompts,
+            )
+        ):
+            raise ValueError(
+                "camera images, videos, raw frames, observations, and prompts "
+                "must not be persisted"
+            )
+        for name in ("max_record_bytes", "max_stream_bytes", "max_run_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"results.{name} must be a positive integer")
+        if self.max_record_bytes > 32_768:
+            raise ValueError("results.max_record_bytes must not exceed 32768")
+        if self.max_stream_bytes > 8_388_608:
+            raise ValueError("results.max_stream_bytes must not exceed 8388608")
+        if self.max_run_bytes > 33_554_432:
+            raise ValueError("results.max_run_bytes must not exceed 33554432")
+        if not self.max_record_bytes <= self.max_stream_bytes <= self.max_run_bytes:
+            raise ValueError("results byte limits must satisfy record <= stream <= run")
+
+
 @dataclass(frozen=True)
 class FleetConfig:
     minimum_uav_separation_m: float = 5.0
@@ -460,6 +525,7 @@ class AppConfig:
     # default factory keeps construction of older trusted AppConfig fixtures
     # backward compatible while the loader validates any explicit YAML block.
     model_worker: ModelWorkerConfig = field(default_factory=ModelWorkerConfig)
+    results: ResultsConfig = field(default_factory=ResultsConfig)
     qwen_visual_review: QwenVisualReviewConfig = field(
         default_factory=QwenVisualReviewConfig
     )
@@ -578,6 +644,7 @@ __all__ = [
     "SceneConfig",
     "SearchConfig",
     "QwenVisualReviewConfig",
+    "ResultsConfig",
     "StorageConfig",
     "SimulationConfig",
     "TargetConfig",

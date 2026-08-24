@@ -18,6 +18,8 @@ from fleet.types import (
     RouteConflictPolicy,
     TargetClaimPolicy,
 )
+from fleet.task_spec import FleetTaskSpecV1, validate_task_spec_trust
+from fleet.types_v2 import FleetMissionRequestV2, TrustedFleetStateEvidence
 from planner.schemas import LandingZoneSpec, PlannerWorldContext
 from planner.spatial import CircleRegion, CoordinateFrame, RegionSpec
 from target.types import TargetSpec
@@ -25,6 +27,7 @@ from target.types import TargetSpec
 if TYPE_CHECKING:
     from configs.schema import AppConfig, TargetConfig, UavConfig
     from fleet.types import FleetMissionPlan
+    from fleet.types_v2 import FleetMissionPlanV2
 
 
 class FleetRequestBuildError(ValueError):
@@ -223,6 +226,48 @@ def build_fleet_mission_request(
     )
 
 
+def build_fleet_mission_request_v2(
+    config: "AppConfig",
+    task_spec: FleetTaskSpecV1,
+    *,
+    trusted_fleet_state: tuple[TrustedFleetStateEvidence, ...] = (),
+    fleet_mission_id: str | None = None,
+    fleet_plan_version: int = 1,
+    supported_coordinate_frames: tuple[CoordinateFrame | str, ...] = (
+        CoordinateFrame.WORLD_ENU,
+        CoordinateFrame.HOME_ENU,
+        CoordinateFrame.UAV_START_FLU,
+    ),
+) -> FleetMissionRequestV2:
+    """Build a V2 request from a trusted TaskSpec without fixed grammar parsing."""
+
+    if not isinstance(task_spec, FleetTaskSpecV1):
+        raise TypeError("task_spec must be a FleetTaskSpecV1")
+    inventory = build_fleet_inventory(config)
+    validate_task_spec_trust(
+        task_spec,
+        trusted_uav_ids=tuple(item.uav_id for item in inventory),
+        trusted_target_aliases=tuple(build_target_catalog(config)),
+        supported_coordinate_frames=supported_coordinate_frames,
+    )
+    policy = FleetCoordinationPolicy(
+        target_claim_policy=TargetClaimPolicy(config.fleet.target_claim_policy),
+        minimum_uav_separation_m=config.fleet.minimum_uav_separation_m,
+        route_conflict_policy=RouteConflictPolicy(config.fleet.route_conflict_policy),
+        assignment_failure_policy=AssignmentFailurePolicy(
+            config.fleet.assignment_failure_policy
+        ),
+    )
+    return FleetMissionRequestV2(
+        fleet_mission_id=fleet_mission_id or generate_routing_id("fleet_mission"),
+        fleet_plan_version=fleet_plan_version,
+        task_spec=task_spec,
+        uav_inventory=inventory,
+        trusted_fleet_state=trusted_fleet_state,
+        coordination_policy=policy,
+    )
+
+
 def build_agent_world_contexts(
     config: "AppConfig",
     plan: "FleetMissionPlan",
@@ -260,6 +305,77 @@ def build_agent_world_contexts(
             },
             default_takeoff_altitude_m=min(10.0, size_z),
             default_track_duration_s=assignment.track_duration_s,
+            search_timeout_s=config.search.timeout_s,
+            goto_timeout_s=120.0,
+            land_timeout_s=60.0,
+        )
+    return contexts
+
+
+def build_agent_world_contexts_v2(
+    config: "AppConfig",
+    request: FleetMissionRequestV2,
+    plan: "FleetMissionPlanV2",
+) -> dict[str, PlannerWorldContext]:
+    """Build one trusted, target-GT-free context for each V2 Assignment.
+
+    Unlike the v1 helper, this projection does not assume that every
+    Assignment contains SEARCH and TRACK.  A small positive default tracking
+    duration is retained only because :class:`PlannerWorldContext` has a
+    backwards-compatible required field; the focused V2 prompt carries the
+    actual Goal durations and never presents that default as a user Goal.
+    """
+
+    from fleet.schemas_v2 import validate_fleet_mission_plan_v2
+    from fleet.task_spec import GoalType, MissionGoal
+
+    validate_fleet_mission_plan_v2(plan, request)
+    size_x, size_y, size_z = config.scene.size_xyz_m
+    uavs = {uav.id: uav for uav in config.uavs}
+    landing_tolerances = derive_safe_home_landing_tolerances(config, plan)
+    contexts: dict[str, PlannerWorldContext] = {}
+    for assignment in plan.assignments:
+        try:
+            uav = uavs[assignment.uav_id]
+        except KeyError:
+            raise FleetRequestBuildError(
+                f"plan references unknown configured UAV: {assignment.uav_id}"
+            ) from None
+        home_name = uav.home_name or f"home_{uav.id}"
+        assigned_goals = tuple(request.task_spec.goal(item) for item in assignment.goal_ids)
+        track_durations = tuple(
+            float(goal.duration_s)
+            for goal in assigned_goals
+            if (
+                isinstance(goal, MissionGoal)
+                and goal.goal_type is GoalType.TRACK_TARGET
+                and goal.duration_s is not None
+            )
+        )
+        default_track_duration_s = (
+            max(track_durations)
+            if track_durations
+            else max(1.0, float(config.planner.min_track_duration_s))
+        )
+        contexts[uav.id] = PlannerWorldContext(
+            scene_min_xyz_m=(-size_x / 2.0, -size_y / 2.0, 0.0),
+            scene_max_xyz_m=(size_x / 2.0, size_y / 2.0, size_z),
+            initial_uav_xyz_m=uav.initial_position_xyz_m,
+            search_regions={},
+            landing_zones={
+                home_name: LandingZoneSpec(
+                    name=home_name,
+                    position_xy_m=(
+                        uav.initial_position_xyz_m[0],
+                        uav.initial_position_xyz_m[1],
+                    ),
+                    ground_altitude_m=uav.initial_position_xyz_m[2],
+                    description=f"trusted launch/recovery zone for {uav.id}",
+                    horizontal_tolerance_m=landing_tolerances[uav.id],
+                )
+            },
+            default_takeoff_altitude_m=min(10.0, size_z),
+            default_track_duration_s=default_track_duration_s,
             search_timeout_s=config.search.timeout_s,
             goto_timeout_s=120.0,
             land_timeout_s=60.0,
@@ -458,8 +574,10 @@ __all__ = [
     "ExplicitAssignmentDirective",
     "FleetRequestBuildError",
     "build_agent_world_contexts",
+    "build_agent_world_contexts_v2",
     "build_fleet_inventory",
     "build_fleet_mission_request",
+    "build_fleet_mission_request_v2",
     "build_target_catalog",
     "derive_safe_home_landing_tolerances",
     "parse_explicit_assignment_instruction",

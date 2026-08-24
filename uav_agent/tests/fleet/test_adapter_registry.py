@@ -26,9 +26,10 @@ def _write(tmp_path: Path, payload: dict[str, object]) -> Path:
     return path
 
 
-def test_committed_four_placeholders_fall_back_and_fleet_roles_share_slot() -> None:
+def test_committed_five_placeholders_fall_back_and_fleet_roles_share_slot() -> None:
     registry = AdapterRegistry(PROJECT_ROOT / "configs/adapters.json")
     assert set(registry.adapters) == {
+        "mission_interpreter",
         "fleet_planner",
         "spatial_mission",
         "runtime_visual",
@@ -37,9 +38,13 @@ def test_committed_four_placeholders_fall_back_and_fleet_roles_share_slot() -> N
     assert all(spec.status is AdapterStatus.PLACEHOLDER for spec in registry.adapters.values())
     plan = registry.resolve(ModelCallRole.FLEET_PLAN)
     replan = registry.resolve(ModelCallRole.FLEET_REPLAN)
+    interpretation = registry.resolve(ModelCallRole.MISSION_INTERPRETATION)
     assert plan.requested_adapter == replan.requested_adapter == "fleet_planner"
     assert plan.effective_model == "Qwen3-VL-4B-Instruct"
     assert plan.fallback_used
+    assert interpretation.requested_adapter == "mission_interpreter"
+    assert interpretation.effective_model == "Qwen3-VL-4B-Instruct"
+    assert interpretation.fallback_used
     assert plan.to_dict()["adapter_status"] == "placeholder"
 
 

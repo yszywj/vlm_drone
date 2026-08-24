@@ -712,6 +712,25 @@ class RunManager:
         self._manifest = _read_yaml_mapping(self.paths.manifest)
         return self.manifest
 
+    def update_resolved_config(self, resolved_config: Any) -> None:
+        """Atomically replace the persisted, credential-free run config.
+
+        Run directories may be allocated before mission interpretation so that
+        early failures are still bounded artifacts.  The caller can use this
+        method once interpretation has produced the complete resolved config.
+        It deliberately applies the same recursive type and sensitive-field
+        checks as :meth:`create` before touching the existing file.
+        """
+
+        if self.status is not RunStatus.RUNNING:
+            raise InvalidRunStateError(
+                "resolved_config can only be updated while the run is running"
+            )
+        plain_config = _to_plain_data(resolved_config, "resolved_config")
+        if not isinstance(plain_config, Mapping):
+            raise TypeError("resolved_config must be a mapping or dataclass configuration")
+        _atomic_write_yaml(self.paths.resolved_config, plain_config)
+
     def record_exit_code(self, exit_code: int) -> None:
         if isinstance(exit_code, bool) or not isinstance(exit_code, int):
             raise TypeError("exit_code must be an integer")

@@ -53,6 +53,13 @@ from runtime.review_scheduler import (
     ReviewTrigger,
 )
 from runtime.safety_supervisor import SafetyAction, SafetyDecision, SafetySupervisor
+from runtime.validation_codes import ValidationCode
+from runtime.validation_report import (
+    RecoveryRecommendation,
+    ValidationFinding,
+    ValidationReport,
+    ValidationSeverity,
+)
 from runtime.world_belief import (
     CandidateSummary,
     is_privileged_oracle_source,
@@ -125,6 +132,11 @@ __all__ = [
     "SafetyAction",
     "SafetyDecision",
     "SafetySupervisor",
+    "RecoveryRecommendation",
+    "ValidationCode",
+    "ValidationFinding",
+    "ValidationReport",
+    "ValidationSeverity",
     "WorldBelief",
     "WorldBeliefSnapshot",
     "WorldBeliefStore",

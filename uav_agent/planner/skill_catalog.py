@@ -445,7 +445,10 @@ def build_default_skill_catalog() -> SkillCatalog:
             ),
             SkillContract(
                 name="SEARCH",
-                description="在一个具名搜索区域内寻找单个任务目标；最多一次。",
+                description=(
+                    "在一个具名搜索区域内寻找任务目标；仅在分配 Goal 需要发现"
+                    "目标时调用，次数由可信 planner_limits 约束。"
+                ),
                 top_level_allowed=True,
                 recovery_only=False,
                 arguments=(
@@ -462,7 +465,7 @@ def build_default_skill_catalog() -> SkillCatalog:
                         required=False,
                     ),
                 ),
-                preconditions=("UAV is airborne", "no prior SEARCH in this plan"),
+                preconditions=("UAV is airborne",),
                 outputs=("target_id",),
             ),
             SkillContract(
@@ -518,7 +521,8 @@ def build_default_skill_catalog() -> SkillCatalog:
             SkillContract(
                 name="TRACK",
                 description=(
-                    "跟踪先前 SEARCH 输出的目标。目标丢失时，省略 "
+                    "跟踪经可信运行时确认的目标。目标来源可以是本计划先前 "
+                    "SEARCH 的确认结果，或协调器明确提供的可信锁定。目标丢失时，省略 "
                     "on_target_lost 将继承 trusted_planner_policy 的默认动作；"
                     "用户明确要求不重新搜索、丢失即失败时使用 FAIL。"
                 ),
@@ -527,7 +531,8 @@ def build_default_skill_catalog() -> SkillCatalog:
                 arguments=(
                     _argument(
                         "target_ref",
-                        "格式为 $<先前SEARCH步骤id>.target_id。",
+                        "使用 $<先前SEARCH步骤id>.target_id；只有可信上下文明确"
+                        "声明已锁定目标时才可使用 $trusted_target.target_id。",
                         "string",
                     ),
                     _argument("duration_s", "跟踪持续时间。", "number"),
@@ -551,7 +556,9 @@ def build_default_skill_catalog() -> SkillCatalog:
                         allowed_values=("REACQUIRE", "FAIL"),
                     ),
                 ),
-                preconditions=("a prior SEARCH target reference is available",),
+                preconditions=(
+                    "a confirmed target is available from trusted runtime state",
+                ),
                 outputs=("track_complete", "last_seen_state_on_loss"),
             ),
             SkillContract(

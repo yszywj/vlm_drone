@@ -303,6 +303,82 @@ def aggregate_episode_metrics(
     }
 
 
+def _fleet_rate(
+    episodes: Sequence[Mapping[str, object]], name: str
+) -> float | None:
+    values = [parse_metric_bool(episode.get(name)) for episode in episodes]
+    measured = [value for value in values if value is not None]
+    return sum(value is True for value in measured) / len(measured) if measured else None
+
+
+def aggregate_fleet_episode_metrics(
+    episodes: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Aggregate dynamic Fleet episodes without assuming a fixed Skill chain."""
+
+    def count_sum(field: str) -> int:
+        total = 0
+        for episode in episodes:
+            value = episode.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if math.isfinite(float(value)) and value >= 0:
+                total += int(value)
+        return total
+
+    goal_count = count_sum("goal_count")
+    goals_completed = count_sum("goals_completed")
+    repairs = count_sum("repair_count")
+    repairs_succeeded = count_sum("repairs_succeeded")
+    reassignments = count_sum("reassignment_count")
+    reassignments_succeeded = count_sum("reassignments_succeeded")
+    failure_breakdown: dict[str, int] = {}
+    for episode in episodes:
+        if parse_metric_bool(episode.get("strict_success")) is True:
+            continue
+        reason = str(episode.get("failure_reason") or "UNKNOWN_ERROR")
+        failure_breakdown[reason] = failure_breakdown.get(reason, 0) + 1
+    model_latencies = [
+        value
+        for episode in episodes
+        if (value := _finite_number(episode.get("model_latency_s"))) is not None
+    ]
+    return {
+        "schema_version": 1,
+        "num_episodes": len(episodes),
+        "strict_success_rate": _fleet_rate(episodes, "strict_success"),
+        "semantic_success_rate": _fleet_rate(episodes, "semantic_success"),
+        "execution_success_rate": _fleet_rate(episodes, "execution_success"),
+        "safety_success_rate": _fleet_rate(episodes, "safety_success"),
+        "partial_success_rate": _fleet_rate(episodes, "partial_success"),
+        "interpreter_schema_success_rate": _fleet_rate(
+            episodes, "interpreter_schema_success"
+        ),
+        "fleet_plan_success_rate": _fleet_rate(episodes, "fleet_plan_success"),
+        "local_plan_success_rate": _fleet_rate(episodes, "local_plan_success"),
+        "repair_success_rate": repairs_succeeded / repairs if repairs else None,
+        "reassignment_success_rate": (
+            reassignments_succeeded / reassignments if reassignments else None
+        ),
+        "goal_completion_rate": goals_completed / goal_count if goal_count else None,
+        "goal_count": goal_count,
+        "goals_completed": goals_completed,
+        "stage_success_rate": {
+            "mission_interpretation": _fleet_rate(
+                episodes, "interpreter_schema_success"
+            ),
+            "fleet_planning": _fleet_rate(episodes, "fleet_plan_success"),
+            "local_planning": _fleet_rate(episodes, "local_plan_success"),
+            "execution": _fleet_rate(episodes, "execution_success"),
+            "safety": _fleet_rate(episodes, "safety_success"),
+        },
+        "failure_breakdown": dict(sorted(failure_breakdown.items())),
+        "total_prompt_tokens": count_sum("prompt_tokens"),
+        "total_completion_tokens": count_sum("completion_tokens"),
+        "mean_model_latency_s": fmean(model_latencies) if model_latencies else None,
+    }
+
+
 class Evaluator:
     """Run fixed-seed validation and best-checkpoint final testing.
 
@@ -560,6 +636,7 @@ __all__ = [
     "STRICT_FAILURE_FIELDS",
     "STRICT_SUCCESS_FIELDS",
     "aggregate_episode_metrics",
+    "aggregate_fleet_episode_metrics",
     "compute_instruction_grounded_success",
     "compute_mission_success_strict",
     "parse_metric_bool",

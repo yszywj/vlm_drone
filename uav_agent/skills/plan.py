@@ -16,7 +16,7 @@ from math import isfinite
 from numbers import Real
 import re
 
-from common.ids import validate_mission_id, validate_uav_id
+from common.ids import validate_mission_id, validate_routing_id, validate_uav_id
 from skills.types import SkillName
 
 
@@ -87,6 +87,25 @@ class StepOutputRef:
 
     def __str__(self) -> str:
         return self.to_string()
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedTargetRef:
+    """Typed proof that Python bound TRACK to an existing trusted lock.
+
+    Model JSON cannot construct this runtime value directly.  The trusted
+    compiler creates it only after comparing ``$trusted_target.target_id``
+    with coordinator-owned state.
+    """
+
+    target_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "target_id",
+            validate_routing_id(self.target_id, "TrustedTargetRef.target_id"),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -332,6 +351,8 @@ class TaskPlan:
 def _to_json_compatible(value: object) -> object:
     if isinstance(value, StepOutputRef):
         return value.to_string()
+    if isinstance(value, TrustedTargetRef):
+        return {"kind": "TRUSTED_TARGET", "target_id": value.target_id}
     if isinstance(value, Enum):
         # Names are stable across both string-valued SkillName and auto-valued
         # control enums such as YawMode.  Numeric ``auto()`` values are an
@@ -357,6 +378,7 @@ def _to_json_compatible(value: object) -> object:
 __all__ = [
     "RecoveryPolicy",
     "StepOutputRef",
+    "TrustedTargetRef",
     "TaskPlan",
     "TaskPlanError",
     "TaskStep",

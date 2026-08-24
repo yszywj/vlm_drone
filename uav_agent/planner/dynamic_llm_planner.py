@@ -28,7 +28,12 @@ from planner.prompt_builder import (
     build_dynamic_skill_planner_messages,
     build_spatial_v3_skill_planner_messages,
 )
-from planner.schemas import PlannerRequest, SkillPlanDraft, SkillPlanDraftV2
+from planner.schemas import (
+    PlannerRequest,
+    PlannerWorldContext,
+    SkillPlanDraft,
+    SkillPlanDraftV2,
+)
 from planner.schemas_v3 import SkillPlanDraftV3
 from planner.skill_catalog import (
     SkillArgumentSpec,
@@ -47,6 +52,9 @@ from planner.spatial import (
     SectorRegion,
 )
 from planner.symbolic_checker import PlanIssue, SymbolicPlanChecker
+from planner.trusted_safety_completion import (
+    analyze_trusted_safety_completion,
+)
 from skills.search_strategy import (
     SearchRuntimeCapabilities,
     SearchStrategySpec,
@@ -191,8 +199,9 @@ class DynamicLLMPlanner(MissionPlanner):
     """Use a text model to select a finite high-level linear Skill plan.
 
     The result is intentionally unresolved: named places remain names and a
-    TRACK target remains a reference to a prior SEARCH output.  Trusted Python
-    code performs all geometry resolution and safety completion later.
+    TRACK target references either a prior SEARCH output or an explicitly
+    advertised trusted runtime lock.  Trusted Python code performs all
+    geometry resolution and safety completion later.
     """
 
     source = "dynamic_llm"
@@ -208,6 +217,7 @@ class DynamicLLMPlanner(MissionPlanner):
         *,
         planning_contract: PlanningContract | str = PlanningContract.V2,
         search_runtime_capabilities: SearchRuntimeCapabilities | None = None,
+        repair_budget: int = 1,
     ) -> None:
         if not callable(getattr(model_client, "chat", None)):
             raise TypeError("model_client must provide a callable chat() method")
@@ -242,6 +252,12 @@ class DynamicLLMPlanner(MissionPlanner):
                 "search_runtime_capabilities must be a "
                 "SearchRuntimeCapabilities or None"
             )
+        if (
+            isinstance(repair_budget, bool)
+            or not isinstance(repair_budget, int)
+            or repair_budget not in {0, 1}
+        ):
+            raise ValueError("repair_budget must be integer 0 or 1")
         if skill_catalog is None:
             skill_catalog = (
                 build_default_skill_catalog()
@@ -297,6 +313,7 @@ class DynamicLLMPlanner(MissionPlanner):
         self._planner_policy = policy
         self._symbolic_checker = SymbolicPlanChecker()
         self._logger = logger
+        self._repair_budget = repair_budget
         self._last_diagnostics: PlannerDiagnostics | None = None
         self._model_proposals: list[dict[str, object]] = []
 
@@ -321,6 +338,12 @@ class DynamicLLMPlanner(MissionPlanner):
         """Return bounded image-free raw structured proposal records."""
 
         return tuple(deepcopy(item) for item in self._model_proposals)
+
+    @property
+    def repair_budget(self) -> int:
+        """Return the bounded number of planner-internal repair calls."""
+
+        return self._repair_budget
 
     def plan(
         self,
@@ -388,6 +411,10 @@ class DynamicLLMPlanner(MissionPlanner):
                 uav_id=request.uav_id,
                 plan_version=request.plan_version,
                 search_runtime_capabilities=self._search_runtime_capabilities,
+                trusted_target_locked=request.trusted_target_id is not None,
+                allow_trusted_safety_completion=(
+                    request.allow_trusted_safety_completion
+                ),
             )
             schema = build_skill_plan_v3_json_schema(
                 mission_id=request.mission_id,
@@ -398,6 +425,7 @@ class DynamicLLMPlanner(MissionPlanner):
                 require_empty_assumptions=(
                     request.require_empty_spatial_assumptions
                 ),
+                trusted_target_locked=request.trusted_target_id is not None,
             )
             response_format_name = "skill_plan_draft_v3"
         response_format = JsonSchemaResponseFormat(
@@ -446,7 +474,12 @@ class DynamicLLMPlanner(MissionPlanner):
             )
             self._safe_log(
                 "warning",
-                "dynamic Skill plan output was invalid; requesting one repair",
+                (
+                    "dynamic Skill plan output was invalid; requesting one repair"
+                    if self._repair_budget
+                    else "dynamic Skill plan output was invalid; internal repair "
+                    "is disabled"
+                ),
             )
         else:
             self._record_model_proposal(
@@ -471,6 +504,23 @@ class DynamicLLMPlanner(MissionPlanner):
             return PlannerExecution(output=draft, diagnostics=diagnostics)
 
         assert first_failure is not None
+
+        if self._repair_budget == 0:
+            self._safe_log(
+                "error",
+                "dynamic Skill plan output was invalid; internal repair is disabled",
+            )
+            self._last_diagnostics = self._failure_diagnostics(
+                model_calls=1,
+                repair_used=False,
+                initial_error_code=first_failure.code,
+                initial_error_message=first_failure.message,
+            )
+            raise PlannerOutputError(
+                "model failed to produce a valid SkillPlanDraft and internal "
+                f"repair is disabled: {first_failure.code}: "
+                f"{first_failure.message}"
+            ) from None
 
         # The response schema already carries the authoritative Skill shape.
         # Re-sending the full catalog alongside the prior JSON can overflow
@@ -695,8 +745,13 @@ class DynamicLLMPlanner(MissionPlanner):
                 )
                 self._validate_v3_plan_semantics(
                     draft,
+                    world_context=request.world_context,
                     total_search_time_budget_s=(
                         request.world_context.search_timeout_s
+                    ),
+                    trusted_target_locked=request.trusted_target_id is not None,
+                    allow_trusted_safety_completion=(
+                        request.allow_trusted_safety_completion
                     ),
                 )
             except (OverflowError, RecursionError, TypeError, ValueError) as exc:
@@ -928,7 +983,10 @@ class DynamicLLMPlanner(MissionPlanner):
         self,
         draft: SkillPlanDraftV3,
         *,
+        world_context: PlannerWorldContext,
         total_search_time_budget_s: float,
+        trusted_target_locked: bool = False,
+        allow_trusted_safety_completion: bool = False,
     ) -> None:
         """Apply bounded initial-plan invariants without compiling geometry."""
 
@@ -937,7 +995,26 @@ class DynamicLLMPlanner(MissionPlanner):
         skills = tuple(step.skill for step in draft.steps)
         if skills[0] != "TAKEOFF" or skills.count("TAKEOFF") != 1:
             raise ValueError("V3 plan must begin with exactly one TAKEOFF")
-        if skills[-1] != "LAND" or skills.count("LAND") != 1:
+        if not isinstance(allow_trusted_safety_completion, bool):
+            raise TypeError("allow_trusted_safety_completion must be bool")
+        if allow_trusted_safety_completion:
+            if skills.count("LAND") > 1:
+                raise ValueError("V3 plan may contain at most one LAND")
+            if skills.count("LAND") == 1 and skills[-1] != "LAND":
+                raise ValueError("V3 LAND must be the final model step")
+            completion = analyze_trusted_safety_completion(
+                draft,
+                world_context,
+            )
+            if (
+                len(draft.steps) + completion.additional_steps
+                > self._planner_limits.max_plan_steps
+            ):
+                raise ValueError(
+                    "V3 model plan leaves no step budget for trusted safety "
+                    "completion"
+                )
+        elif skills[-1] != "LAND" or skills.count("LAND") != 1:
             raise ValueError("V3 plan must end with exactly one LAND")
         for skill, maximum in (
             ("GOTO", self._planner_limits.max_goto_calls),
@@ -946,6 +1023,15 @@ class DynamicLLMPlanner(MissionPlanner):
         ):
             if skills.count(skill) > maximum:
                 raise ValueError(f"V3 plan exceeds {skill} call limit")
+        if (
+            allow_trusted_safety_completion
+            and skills.count("GOTO") + completion.additional_gotos
+            > self._planner_limits.max_goto_calls
+        ):
+            raise ValueError(
+                "V3 model plan leaves no GOTO budget for trusted safety "
+                "completion"
+            )
 
         search_ids: set[str] = set()
         total_search_time_s = 0.0
@@ -990,9 +1076,12 @@ class DynamicLLMPlanner(MissionPlanner):
                 continue
             reference = step.args.get("target_ref")
             expected_refs = {f"${step_id}.target_id" for step_id in search_ids}
+            if trusted_target_locked:
+                expected_refs.add("$trusted_target.target_id")
             if reference not in expected_refs:
                 raise ValueError(
-                    f"TRACK step {step.id} must reference a prior SEARCH target_id"
+                    f"TRACK step {step.id} must reference a prior SEARCH "
+                    "target_id or an advertised trusted target lock"
                 )
             duration_s = step.args.get("duration_s")
             if isinstance(duration_s, bool) or not isinstance(duration_s, Real):
@@ -1025,6 +1114,9 @@ class DynamicLLMPlanner(MissionPlanner):
                 "V3 plan exceeds total SEARCH time budget: "
                 f"{total_search_time_s:g} > {float(total_search_time_budget_s):g}"
             )
+
+        if allow_trusted_safety_completion and "LAND" not in skills:
+            return
 
         return_index = len(draft.steps) - 2
         while return_index >= 0 and draft.steps[return_index].skill == "HOVER":
@@ -1204,9 +1296,10 @@ class DynamicLLMPlanner(MissionPlanner):
                 "explanation; emit compact JSON without indentation or unnecessary "
                 "whitespace. Framed V3 coordinates and region geometry are allowed; "
                 "preserve explicit coordinate frames and spatial assumptions. Do not "
-                "add low-level controls or hidden truth. Every TRACK target_ref must "
-                "be '$' plus the exact id of an earlier SEARCH plus '.target_id'; do "
-                "not invent a search_ prefix."
+                "add low-level controls or hidden truth. A TRACK target_ref must "
+                "use the exact id of an earlier SEARCH as '$<id>.target_id', or "
+                "the exact '$trusted_target.target_id' token only when the trusted "
+                "context advertises a confirmed target lock."
             )
         payload = {
             "task": (
@@ -1327,8 +1420,9 @@ class DynamicLLMPlanner(MissionPlanner):
                 "LAND. Before that LAND, return with "
                 "a GOTO NAMED_LOCATION target whose name equals LAND.args.zone; "
                 "only position-preserving HOVER steps may appear between them. For "
-                "every TRACK, copy the exact earlier SEARCH id into target_ref as "
-                "'$<id>.target_id' without adding another prefix."
+                "For TRACK, use an earlier SEARCH '$<id>.target_id' reference, or "
+                "'$trusted_target.target_id' only when the trusted context explicitly "
+                "advertises a confirmed target lock."
             )
         return None
 

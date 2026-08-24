@@ -155,6 +155,8 @@ def _validate_served_models(
         raise AdapterRegistryError(
             "--model does not match the base model lineage in adapters.json"
         )
+    # Every active slot is checked, including MISSION_INTERPRETATION.  A
+    # placeholder intentionally resolves to the already-required base model.
     required = {requested_base_model}
     required.update(adapter.served_model_name for adapter in registry.active_adapters)
     missing = sorted(required - model_ids)

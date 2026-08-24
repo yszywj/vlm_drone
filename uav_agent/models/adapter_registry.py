@@ -18,6 +18,7 @@ class AdapterRegistryError(ValueError):
 
 
 class ModelCallRole(str, Enum):
+    MISSION_INTERPRETATION = "MISSION_INTERPRETATION"
     FLEET_PLAN = "FLEET_PLAN"
     FLEET_REPLAN = "FLEET_REPLAN"
     AGENT_SPATIAL_PLAN = "AGENT_SPATIAL_PLAN"

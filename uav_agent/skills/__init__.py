@@ -33,6 +33,7 @@ from skills.plan import (
     TaskPlan,
     TaskPlanError,
     TaskStep,
+    TrustedTargetRef,
 )
 from skills.search import SearchGoal, SearchGoalV3, SearchPhase, SearchSkill
 from skills.search_geometry import (
@@ -129,6 +130,7 @@ __all__ = [
     "SkillResultCode",
     "SkillStatus",
     "StepOutputRef",
+    "TrustedTargetRef",
     "TakeoffGoal",
     "TakeoffSkill",
     "TaskPlan",

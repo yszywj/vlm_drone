@@ -1069,7 +1069,9 @@ class PlannerRequest:
     uav_id: str | None
     plan_version: int | None
     trusted_target_spec: TargetSpec | None
+    trusted_target_id: str | None
     require_empty_spatial_assumptions: bool
+    allow_trusted_safety_completion: bool
 
     def __init__(
         self,
@@ -1080,7 +1082,9 @@ class PlannerRequest:
         uav_id: str | None = None,
         plan_version: int | None = None,
         trusted_target_spec: TargetSpec | None = None,
+        trusted_target_id: str | None = None,
         require_empty_spatial_assumptions: bool = False,
+        allow_trusted_safety_completion: bool = False,
     ) -> None:
         supplied = (mission_id is not None, uav_id is not None, plan_version is not None)
         if any(supplied) and not all(supplied):
@@ -1093,10 +1097,16 @@ class PlannerRequest:
         object.__setattr__(self, "uav_id", uav_id)
         object.__setattr__(self, "plan_version", plan_version)
         object.__setattr__(self, "trusted_target_spec", trusted_target_spec)
+        object.__setattr__(self, "trusted_target_id", trusted_target_id)
         object.__setattr__(
             self,
             "require_empty_spatial_assumptions",
             require_empty_spatial_assumptions,
+        )
+        object.__setattr__(
+            self,
+            "allow_trusted_safety_completion",
+            allow_trusted_safety_completion,
         )
         self.__post_init__()
 
@@ -1116,8 +1126,16 @@ class PlannerRequest:
                     "trusted_target_spec.mutable_appearance_notes must be empty "
                     "for initial planning"
                 )
+        if self.trusted_target_id is not None:
+            object.__setattr__(
+                self,
+                "trusted_target_id",
+                validate_routing_id(self.trusted_target_id, "trusted_target_id"),
+            )
         if not isinstance(self.require_empty_spatial_assumptions, bool):
             raise TypeError("require_empty_spatial_assumptions must be bool")
+        if not isinstance(self.allow_trusted_safety_completion, bool):
+            raise TypeError("allow_trusted_safety_completion must be bool")
         if self.mission_id is not None:
             object.__setattr__(
                 self,

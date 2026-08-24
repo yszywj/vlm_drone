@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from hashlib import sha256
 from math import hypot, isfinite, radians
 from numbers import Real
 
@@ -19,7 +20,7 @@ from planner.schemas import (
     SkillPlanDraftV2,
     migrate_plan_v1_to_v2,
 )
-from planner.schemas_v3 import SkillPlanDraftV3
+from planner.schemas_v3 import PlanStepDraftV3, SkillPlanDraftV3
 from planner.spatial import (
     CoordinateFrame,
     NamedLocationTarget,
@@ -31,8 +32,18 @@ from planner.spatial_resolver import SpatialResolver
 from planner.region_compiler import RegionCompilationError, RegionCompiler
 from planner.policy import PlannerLimits, PlannerPolicy, TargetLostAction
 from planner.symbolic_checker import SymbolicPlanChecker
+from planner.trusted_safety_completion import (
+    analyze_trusted_safety_completion,
+)
 from skills.motion_types import MotionPolicy, YawMode
-from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskPlanError, TaskStep
+from skills.plan import (
+    RecoveryPolicy,
+    StepOutputRef,
+    TaskPlan,
+    TaskPlanError,
+    TaskStep,
+    TrustedTargetRef,
+)
 from skills.search_strategy import SearchRuntimeCapabilities
 from skills.types import SkillName
 
@@ -224,7 +235,9 @@ class PlanValidator:
         uav_id: str | None = None,
         plan_version: int | None = None,
         trusted_inspect_candidate_ids: Sequence[str] = (),
+        trusted_target_id: str | None = None,
         spatial_resolver: SpatialResolver | None = None,
+        allow_trusted_safety_completion: bool = False,
     ) -> CompiledMission:
         """Dispatch to the legacy or dynamic compiler based on output type.
 
@@ -236,6 +249,8 @@ class PlanValidator:
 
         if not isinstance(context, PlannerWorldContext):
             raise TypeError("context must be a PlannerWorldContext")
+        if not isinstance(allow_trusted_safety_completion, bool):
+            raise TypeError("allow_trusted_safety_completion must be bool")
         resolver = (
             getattr(self, "_spatial_resolver", None)
             if spatial_resolver is None
@@ -249,6 +264,11 @@ class PlanValidator:
             )
         trusted_inspect_ids = _trusted_inspect_candidate_ids(
             trusted_inspect_candidate_ids
+        )
+        trusted_track_target_id = (
+            None
+            if trusted_target_id is None
+            else validate_routing_id(trusted_target_id, "trusted_target_id")
         )
         supplied = (
             mission_id is not None,
@@ -319,6 +339,10 @@ class PlanValidator:
                 world_context=context,
                 limits=self.limits,
                 policy=self.policy,
+                trusted_target_locked=trusted_track_target_id is not None,
+                allow_trusted_safety_completion=(
+                    allow_trusted_safety_completion
+                ),
             )
             if not result.valid:
                 issue = result.issues[0]
@@ -332,6 +356,10 @@ class PlanValidator:
                 context,
                 source,
                 spatial_resolver=resolver,
+                trusted_target_id=trusted_track_target_id,
+                allow_trusted_safety_completion=(
+                    allow_trusted_safety_completion
+                ),
             )
         if isinstance(planner_output, SkillPlanDraftV2):
             if source not in _DYNAMIC_SOURCES:
@@ -434,6 +462,116 @@ class PlanValidator:
             "SkillPlanDraftV2/SkillPlanDraftV3"
         )
 
+    def validate_and_compile_with_report(
+        self,
+        planner_output: object,
+        context: PlannerWorldContext,
+        *,
+        source: str,
+        mission_id: str | None = None,
+        uav_id: str | None = None,
+        plan_version: int | None = None,
+        assignment_id: str | None = None,
+        proposal_id: str | None = None,
+        timestamp: float = 0.0,
+        goals: Sequence[object] = (),
+        trusted_inspect_candidate_ids: Sequence[str] = (),
+        trusted_target_id: str | None = None,
+        spatial_resolver: SpatialResolver | None = None,
+        allow_trusted_safety_completion: bool = False,
+    ) -> tuple[CompiledMission | None, object]:
+        """Compile one proposal and always return a structured validation report.
+
+        Recoverable Goal findings retain the compiled safe subset.  A hard
+        action or fatal finding returns ``None`` so callers cannot accidentally
+        dispatch the blocked proposal to ``SkillManager``.
+        """
+
+        from planner.goal_checker import GoalSatisfactionChecker
+        from runtime.validation_codes import ValidationCode
+        from runtime.validation_report import (
+            RecoveryRecommendation,
+            ValidationFinding,
+            ValidationReport,
+            ValidationSeverity,
+        )
+
+        trusted_mission = validate_mission_id(mission_id or "mission_validation")
+        trusted_uav = None if uav_id is None else validate_uav_id(uav_id)
+        if assignment_id is not None:
+            assignment_id = validate_routing_id(assignment_id, "assignment_id")
+        if proposal_id is not None:
+            proposal_id = validate_routing_id(proposal_id, "proposal_id")
+        normalized_timestamp = _nonnegative_finite_number(
+            timestamp,
+            "timestamp",
+        )
+        try:
+            compiled = self.validate_and_compile(
+                planner_output,  # type: ignore[arg-type]
+                context,
+                source=source,
+                mission_id=mission_id,
+                uav_id=uav_id,
+                plan_version=plan_version,
+                trusted_inspect_candidate_ids=trusted_inspect_candidate_ids,
+                trusted_target_id=trusted_target_id,
+                spatial_resolver=spatial_resolver,
+                allow_trusted_safety_completion=(
+                    allow_trusted_safety_completion
+                ),
+            )
+        except (PlanValidationError, TypeError, ValueError) as exc:
+            code = _validation_code_for_error(exc)
+            digest = sha256(
+                f"{trusted_mission}|{assignment_id}|{proposal_id}|{code.value}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()[:24]
+            finding = ValidationFinding(
+                schema_version=1,
+                finding_id=f"finding_{digest}",
+                timestamp=normalized_timestamp,
+                stage="LOCAL_ACTION_VALIDATION",
+                scope="ASSIGNMENT" if assignment_id else "AGENT",
+                severity=ValidationSeverity.HARD_ACTION_BLOCK,
+                code=code,
+                message=(str(exc) or type(exc).__name__)[:2048],
+                mission_id=trusted_mission,
+                assignment_id=assignment_id,
+                uav_id=trusted_uav,
+                goal_id=None,
+                step_id=None,
+                proposal_id=proposal_id,
+                evidence_refs=(),
+                recommended_action=RecoveryRecommendation.REPAIR_LOCAL_PLAN,
+            )
+            report = ValidationReport(
+                schema_version=1,
+                report_id=f"report_{digest}",
+                timestamp=normalized_timestamp,
+                stage="LOCAL_ACTION_VALIDATION",
+                mission_id=trusted_mission,
+                assignment_id=assignment_id,
+                uav_id=trusted_uav,
+                findings=(finding,),
+            )
+            return None, report
+
+        coverage = GoalSatisfactionChecker().check(
+            goals,
+            planner_output,
+            mission_id=trusted_mission,
+            assignment_id=assignment_id,
+            uav_id=trusted_uav,
+            timestamp=normalized_timestamp,
+            proposal_id=proposal_id,
+            trusted_target_locked=trusted_target_id is not None,
+            valid_landing_zone=bool(context.landing_zones),
+        )
+        report = coverage.validation_report
+        return (None if report.hard_blocked else compiled), report
+
     def _compile_spatial_v3(
         self,
         draft: SkillPlanDraftV3,
@@ -441,6 +579,8 @@ class PlanValidator:
         source: str,
         *,
         spatial_resolver: SpatialResolver | None,
+        trusted_target_id: str | None = None,
+        allow_trusted_safety_completion: bool = False,
     ) -> CompiledMission:
         """Compile V3 without applying V2 named-location/order assumptions."""
 
@@ -455,6 +595,52 @@ class PlanValidator:
             )
             for item in draft.assumptions
         ]
+        if allow_trusted_safety_completion:
+            try:
+                completion = analyze_trusted_safety_completion(draft, context)
+            except (TypeError, ValueError) as exc:
+                raise PlanValidationError(str(exc)) from None
+            used_ids = {step.id for step in steps}
+            appended: list[PlanStepDraftV3] = []
+            if completion.append_goto:
+                assert completion.zone_name is not None
+                goto_id = _trusted_completion_step_id(
+                    "trusted_return_home",
+                    used_ids,
+                )
+                used_ids.add(goto_id)
+                appended.append(
+                    PlanStepDraftV3(
+                        id=goto_id,
+                        uav_id=draft.uav_id,
+                        skill="GOTO",
+                        args={
+                            "target": NamedLocationTarget(
+                                completion.zone_name
+                            ).to_dict()
+                        },
+                    )
+                )
+            if completion.append_land:
+                assert completion.zone_name is not None
+                land_id = _trusted_completion_step_id(
+                    "trusted_land",
+                    used_ids,
+                )
+                appended.append(
+                    PlanStepDraftV3(
+                        id=land_id,
+                        uav_id=draft.uav_id,
+                        skill="LAND",
+                        args={"zone": completion.zone_name},
+                    )
+                )
+            if appended:
+                steps = steps + tuple(appended)
+                compiler_notes.append(
+                    "trusted runtime safety completion appended: "
+                    + ", ".join(step.id for step in appended)
+                )
         airborne = False
         landed = False
         current_altitude = world.initial_uav[2]
@@ -685,14 +871,29 @@ class PlanValidator:
             elif skill is SkillName.TRACK:
                 if not airborne:
                     raise PlanValidationError("V3 TRACK requires an airborne UAV")
-                target_ref = _parse_target_ref(
-                    _required_value(args, "target_ref", f"step {step_id} TRACK"),
-                    prefix=f"step {step_id} TRACK",
+                raw_target_ref = _required_value(
+                    args,
+                    "target_ref",
+                    f"step {step_id} TRACK",
                 )
-                if target_ref.step_id not in search_step_ids:
-                    raise PlanValidationError(
-                        f"step {step_id} TRACK must reference a prior SEARCH"
+                if raw_target_ref == "$trusted_target.target_id":
+                    if trusted_target_id is None:
+                        raise PlanValidationError(
+                            f"step {step_id} TRACK requested a trusted lock but "
+                            "the coordinator supplied none"
+                        )
+                    target_ref: StepOutputRef | TrustedTargetRef = TrustedTargetRef(
+                        trusted_target_id
                     )
+                else:
+                    target_ref = _parse_target_ref(
+                        raw_target_ref,
+                        prefix=f"step {step_id} TRACK",
+                    )
+                    if target_ref.step_id not in search_step_ids:
+                        raise PlanValidationError(
+                            f"step {step_id} TRACK must reference a prior SEARCH"
+                        )
                 duration = self._track_duration(
                     args.get("duration_s", world.default_track_duration)
                 )
@@ -1860,6 +2061,43 @@ def _skill_name(value: object) -> SkillName:
     raise PlanValidationError("Skill name must be a string or SkillName")
 
 
+def _nonnegative_finite_number(value: object, name: str) -> float:
+    result = _finite_number(value, name)
+    if result < 0.0:
+        raise PlanValidationError(f"{name} must be non-negative")
+    return result
+
+
+def _validation_code_for_error(error: BaseException) -> object:
+    """Classify action-boundary failures without parsing model prose."""
+
+    from runtime.validation_codes import ValidationCode
+
+    message = str(error).casefold()
+    if "finite" in message or "nan" in message or "infinity" in message:
+        return ValidationCode.NON_FINITE_NUMBER
+    if "unknown skill" in message or "unsupported top-level skill" in message:
+        return ValidationCode.UNKNOWN_SKILL
+    if (
+        "routing" in message
+        or "mission_id" in message
+        or "uav_id" in message
+        or "plan_version" in message
+    ):
+        return ValidationCode.ROUTING_MISMATCH
+    if "reference" in message or "target_ref" in message:
+        return ValidationCode.STEP_REFERENCE_INVALID
+    if "outside" in message or "out of bounds" in message or "scene bounds" in message:
+        return ValidationCode.OUT_OF_BOUNDS_GOTO
+    if "landing" in message or " land" in message:
+        return ValidationCode.INVALID_LANDING_ZONE
+    if "unknown" in message:
+        return ValidationCode.UNKNOWN_ENTITY
+    if isinstance(error, TypeError) or "schema" in message or "field" in message:
+        return ValidationCode.SCHEMA_INVALID
+    return ValidationCode.UNSAFE_ACTION
+
+
 def _search_region(context: PlannerWorldContext, name: object) -> SearchRegionSpec:
     if not isinstance(name, str) or not name.strip():
         raise PlanValidationError("search region name must be a non-empty string")
@@ -2023,6 +2261,18 @@ def _same_xy(
     tolerance: float = 1e-6,
 ) -> bool:
     return abs(point[0] - xy[0]) <= tolerance and abs(point[1] - xy[1]) <= tolerance
+
+
+def _trusted_completion_step_id(prefix: str, used_ids: set[str]) -> str:
+    """Allocate one deterministic, schema-valid trusted epilogue step ID."""
+
+    if prefix not in used_ids:
+        return prefix
+    for suffix in range(2, 1000):
+        candidate = f"{prefix}_{suffix}"
+        if candidate not in used_ids:
+            return candidate
+    raise PlanValidationError("could not allocate trusted safety completion step id")
 
 
 def _v3_land_after_hovers(

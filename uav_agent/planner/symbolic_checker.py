@@ -15,6 +15,9 @@ import re
 
 from planner.policy import PlannerLimits, PlannerPolicy
 from planner.schemas import PlannerWorldContext, SkillPlanDraft, SkillPlanDraftV2
+from planner.trusted_safety_completion import (
+    analyze_trusted_safety_completion,
+)
 
 
 _TARGET_REF_PATTERN = re.compile(
@@ -93,6 +96,8 @@ class SymbolicPlanChecker:
         world_context: PlannerWorldContext,
         limits: PlannerLimits,
         policy: PlannerPolicy,
+        trusted_target_locked: bool = False,
+        allow_trusted_safety_completion: bool = False,
     ) -> SymbolicCheckResult:
         from planner.schemas_v3 import SkillPlanDraftV3
 
@@ -102,6 +107,10 @@ class SymbolicPlanChecker:
                 world_context=world_context,
                 limits=limits,
                 policy=policy,
+                trusted_target_locked=trusted_target_locked,
+                allow_trusted_safety_completion=(
+                    allow_trusted_safety_completion
+                ),
             )
         if isinstance(draft, SkillPlanDraftV2):
             draft = draft.to_v1()
@@ -295,7 +304,7 @@ class SymbolicPlanChecker:
                     "TRACK target_ref must use $<step_id>.target_id",
                     step.id,
                 )
-            else:
+            elif match is not None:
                 source_id = match.group("step_id")
                 source_indexes = indexes_by_id.get(source_id, [])
                 prior_indexes = [item for item in source_indexes if item < index]
@@ -374,6 +383,8 @@ class SymbolicPlanChecker:
         world_context: PlannerWorldContext,
         limits: PlannerLimits,
         policy: PlannerPolicy,
+        trusted_target_locked: bool = False,
+        allow_trusted_safety_completion: bool = False,
     ) -> SymbolicCheckResult:
         """Validate V3 program structure without reapplying V2 location rules."""
 
@@ -389,6 +400,10 @@ class SymbolicPlanChecker:
         if not isinstance(policy, PlannerPolicy):
             raise TypeError("policy must be a PlannerPolicy")
         policy.validate_against(limits)
+        if not isinstance(trusted_target_locked, bool):
+            raise TypeError("trusted_target_locked must be bool")
+        if not isinstance(allow_trusted_safety_completion, bool):
+            raise TypeError("allow_trusted_safety_completion must be bool")
 
         steps = draft.steps
         issues: list[PlanIssue] = []
@@ -420,15 +435,53 @@ class SymbolicPlanChecker:
             add(PlanIssueCode.TAKEOFF_COUNT_INVALID, "TAKEOFF must appear exactly once")
         if steps and steps[0].skill != "TAKEOFF":
             add(PlanIssueCode.TAKEOFF_NOT_FIRST, "TAKEOFF must be the first step", steps[0].id)
-        if counts["LAND"] != 1:
-            add(PlanIssueCode.LAND_COUNT_INVALID, "LAND must appear exactly once")
-        if steps and steps[-1].skill != "LAND":
-            add(PlanIssueCode.LAND_NOT_FINAL, "LAND must be the final step", steps[-1].id)
+        if allow_trusted_safety_completion:
+            if counts["LAND"] > 1:
+                add(
+                    PlanIssueCode.LAND_COUNT_INVALID,
+                    "model plan may contain at most one LAND when trusted "
+                    "runtime safety completion is enabled",
+                )
+            if counts["LAND"] == 1 and steps[-1].skill != "LAND":
+                add(
+                    PlanIssueCode.LAND_NOT_FINAL,
+                    "a model-provided LAND must be the final model step",
+                    next(step.id for step in steps if step.skill == "LAND"),
+                )
+        else:
+            if counts["LAND"] != 1:
+                add(PlanIssueCode.LAND_COUNT_INVALID, "LAND must appear exactly once")
+            if steps and steps[-1].skill != "LAND":
+                add(PlanIssueCode.LAND_NOT_FINAL, "LAND must be the final step", steps[-1].id)
         if counts["GOTO"] > limits.max_goto_calls:
             add(
                 PlanIssueCode.GOTO_LIMIT_EXCEEDED,
                 f"GOTO exceeds the trusted call limit of {limits.max_goto_calls}",
             )
+        if allow_trusted_safety_completion and counts["LAND"] == 0:
+            try:
+                completion = analyze_trusted_safety_completion(
+                    draft,
+                    world_context,
+                )
+            except (TypeError, ValueError) as exc:
+                add(PlanIssueCode.LAND_GOTO_MISSING, str(exc))
+            else:
+                if len(steps) + completion.additional_steps > limits.max_plan_steps:
+                    add(
+                        PlanIssueCode.PLAN_TOO_LONG,
+                        "model plan leaves no step budget for trusted safety "
+                        "completion",
+                    )
+                if (
+                    counts["GOTO"] + completion.additional_gotos
+                    > limits.max_goto_calls
+                ):
+                    add(
+                        PlanIssueCode.GOTO_LIMIT_EXCEEDED,
+                        "model plan leaves no GOTO budget for trusted safety "
+                        "completion",
+                    )
         # V3 intentionally does not reuse PlannerLimits.max_search_calls=1.
         # Multiple searches remain bounded by max_plan_steps and compiler time.
         if counts["TRACK"] > limits.max_track_calls:
@@ -494,18 +547,31 @@ class SymbolicPlanChecker:
                 continue
 
             reference = step.args.get("target_ref")
+            if reference == "$trusted_target.target_id":
+                if not trusted_target_locked:
+                    add(
+                        PlanIssueCode.TARGET_REF_INVALID,
+                        "trusted target_ref requires an explicit trusted runtime lock",
+                        step.id,
+                    )
+                # A trusted lock is an external predecessor, not a fabricated
+                # step in the model-produced plan.
+                match = None
+                direct_trusted_ref = True
+            else:
+                direct_trusted_ref = False
             match = (
                 _TARGET_REF_PATTERN.fullmatch(reference)
-                if isinstance(reference, str)
+                if isinstance(reference, str) and not direct_trusted_ref
                 else None
             )
-            if match is None:
+            if match is None and not direct_trusted_ref:
                 add(
                     PlanIssueCode.TARGET_REF_INVALID,
                     "TRACK target_ref must use $<step_id>.target_id",
                     step.id,
                 )
-            else:
+            elif match is not None:
                 source_id = match.group("step_id")
                 source_index = indexes_by_id.get(source_id)
                 if source_index is None:
@@ -526,7 +592,10 @@ class SymbolicPlanChecker:
                         "TRACK target_ref must point to a SEARCH step",
                         step.id,
                     )
-            if not any(previous.skill == "SEARCH" for previous in steps[:index]):
+            if (
+                not direct_trusted_ref
+                and not any(previous.skill == "SEARCH" for previous in steps[:index])
+            ):
                 add(
                     PlanIssueCode.TRACK_WITHOUT_SEARCH,
                     "TRACK requires a prior SEARCH step",

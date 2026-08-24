@@ -298,6 +298,8 @@ def build_spatial_v3_skill_planner_messages(
     uav_id: str,
     plan_version: int,
     search_runtime_capabilities: SearchRuntimeCapabilities | None = None,
+    trusted_target_locked: bool = False,
+    allow_trusted_safety_completion: bool = False,
 ) -> tuple[ChatMessage, ...]:
     """Build the independent coordinate-capable Spatial Contract V3 prompt.
 
@@ -312,6 +314,10 @@ def build_spatial_v3_skill_planner_messages(
         raise TypeError("world_context must be a PlannerWorldContext")
     if not isinstance(skill_catalog, SkillCatalog):
         raise TypeError("skill_catalog must be a SkillCatalog")
+    if not isinstance(trusted_target_locked, bool):
+        raise TypeError("trusted_target_locked must be bool")
+    if not isinstance(allow_trusted_safety_completion, bool):
+        raise TypeError("allow_trusted_safety_completion must be bool")
     capabilities = (
         SearchRuntimeCapabilities()
         if search_runtime_capabilities is None
@@ -391,11 +397,35 @@ def build_spatial_v3_skill_planner_messages(
         },
         "mission_completeness_contract": {
             "emit_the_complete_mission_not_a_prefix": True,
-            "represent_every_action_requested_after_search": True,
-            "preserve_requested_track_duration": True,
+            "represent_every_assigned_goal": True,
+            "cover_only_goals_assigned_to_this_uav": True,
+            "do_not_invent_search_or_track_goals": True,
+            "trusted_runtime_safety_completion": (
+                allow_trusted_safety_completion
+            ),
+            "omit_unrequested_return_or_land": (
+                allow_trusted_safety_completion
+            ),
             "when_return_and_land_are_requested": (
-                "emit GOTO NAMED_LOCATION to the landing zone followed by "
-                "exactly one final LAND for the same zone"
+                "emit a safe matching return and landing path"
+            ),
+            "runtime_rule": (
+                "When trusted_runtime_safety_completion is true, emit only "
+                "the assigned semantic Goals; trusted Python may append a "
+                "bounded return/LAND epilogue after Goal coverage is checked."
+                if allow_trusted_safety_completion
+                else "The model plan itself must contain the complete safe "
+                "return and terminal LAND path."
+            ),
+        },
+        "trusted_target_state": {
+            "confirmed_target_available": trusted_target_locked,
+            "confirmed_target_ref": (
+                "$trusted_target.target_id" if trusted_target_locked else None
+            ),
+            "rule": (
+                "TRACK may omit SEARCH only when confirmed_target_available "
+                "is true; this flag is trusted runtime state"
             ),
         },
         "runtime_search_capabilities": capabilities.to_prompt_dict(),

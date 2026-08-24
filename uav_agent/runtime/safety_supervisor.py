@@ -10,13 +10,27 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
+from hashlib import sha256
 from math import hypot, isfinite, pi
 from numbers import Real
 
-from common.ids import validate_routing_id
+from common.ids import validate_mission_id, validate_routing_id, validate_uav_id
 from planner.schemas import CompiledMission
 from runtime.plan_validator import PlannerLimits
-from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskStep
+from runtime.validation_codes import ValidationCode
+from runtime.validation_report import (
+    RecoveryRecommendation,
+    ValidationFinding,
+    ValidationReport,
+    ValidationSeverity,
+)
+from skills.plan import (
+    RecoveryPolicy,
+    StepOutputRef,
+    TaskPlan,
+    TaskStep,
+    TrustedTargetRef,
+)
 from skills.motion_types import (
     MotionPolicy,
     MotionPolicyValidationError,
@@ -236,6 +250,35 @@ class SafetySupervisor:
             self._last_mission_elapsed_s = None
         return decision
 
+    def preflight_with_report(
+        self,
+        compiled_mission: CompiledMission | TaskPlan,
+        *,
+        mission_id: str | None = None,
+        uav_id: str | None = None,
+        assignment_id: str | None = None,
+        timestamp: float = 0.0,
+    ) -> tuple[SafetyDecision, ValidationReport]:
+        """Return the legacy decision plus its machine-readable admission report."""
+
+        plan = (
+            compiled_mission.task_plan
+            if isinstance(compiled_mission, CompiledMission)
+            else compiled_mission
+        )
+        resolved_mission = mission_id or getattr(plan, "mission_id", None)
+        resolved_uav = uav_id or getattr(plan, "uav_id", None)
+        decision = self.preflight(compiled_mission)
+        report = _safety_report(
+            decision,
+            mission_id=resolved_mission,
+            uav_id=resolved_uav,
+            assignment_id=assignment_id,
+            timestamp=timestamp,
+            runtime=False,
+        )
+        return decision, report
+
     def evaluate(
         self,
         observation: Observation,
@@ -300,6 +343,32 @@ class SafetySupervisor:
                 f"{elapsed:g} > {self._max_mission_time_s:g}"
             )
         return _continue("safety checks passed")
+
+    def evaluate_with_report(
+        self,
+        observation: Observation,
+        *,
+        mission_elapsed_s: float,
+        mission_id: str,
+        uav_id: str,
+        assignment_id: str | None = None,
+    ) -> tuple[SafetyDecision, ValidationReport]:
+        """Evaluate live safety; every non-CONTINUE result is fatal safety."""
+
+        decision = self.evaluate(
+            observation,
+            mission_elapsed_s=mission_elapsed_s,
+        )
+        timestamp = getattr(observation, "timestamp", 0.0)
+        report = _safety_report(
+            decision,
+            mission_id=mission_id,
+            uav_id=uav_id,
+            assignment_id=assignment_id,
+            timestamp=timestamp,
+            runtime=True,
+        )
+        return decision, report
 
     def reset(self) -> None:
         """Clear the per-mission monotonic timestamp history."""
@@ -413,8 +482,12 @@ class SafetySupervisor:
             if (
                 step.skill is SkillName.TRACK
                 and SkillName.SEARCH not in previous.values()
+                and not isinstance(target, TrustedTargetRef)
             ):
-                return _abort(f"{prefix} TRACK must appear after SEARCH")
+                return _abort(
+                    f"{prefix} TRACK must appear after SEARCH or use a compiler-bound "
+                    "trusted target lock"
+                )
             if (
                 step.skill is SkillName.INSPECT
                 and SkillName.SEARCH not in previous.values()
@@ -730,6 +803,11 @@ class SafetySupervisor:
             if isinstance(target_id, StepOutputRef):
                 if target_id.field != "target_id":
                     raise ValueError(f"{prefix} target reference field is invalid")
+            elif isinstance(target_id, TrustedTargetRef):
+                validate_routing_id(
+                    target_id.target_id,
+                    f"{prefix} trusted target_id",
+                )
             elif target_id != "$SEARCH.result.target_id":
                 raise ValueError(
                     f"{prefix} target_id must be a validated StepOutputRef "
@@ -1146,6 +1224,98 @@ def _nonnegative_finite(value: object, name: str) -> float:
 def _exception_text(exc: BaseException) -> str:
     message = str(exc).strip()
     return message or type(exc).__name__
+
+
+def _safety_report(
+    decision: SafetyDecision,
+    *,
+    mission_id: object,
+    uav_id: object,
+    assignment_id: str | None,
+    timestamp: object,
+    runtime: bool,
+) -> ValidationReport:
+    mission = validate_mission_id(mission_id or "mission_validation")
+    uav = validate_uav_id(uav_id or "uav_1")
+    if assignment_id is not None:
+        assignment_id = validate_routing_id(assignment_id, "assignment_id")
+    try:
+        timestamp_s = _nonnegative_finite(timestamp, "timestamp")
+    except (TypeError, ValueError):
+        timestamp_s = 0.0
+    code = _safety_validation_code(decision.reason, runtime=runtime)
+    digest = sha256(
+        f"{mission}|{uav}|{assignment_id}|{decision.action.value}|{code.value}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:24]
+    findings: tuple[ValidationFinding, ...]
+    if decision.action is SafetyAction.CONTINUE:
+        findings = ()
+    else:
+        severity = (
+            ValidationSeverity.FATAL_SAFETY
+            if runtime
+            else ValidationSeverity.HARD_ACTION_BLOCK
+        )
+        action = (
+            RecoveryRecommendation.CANCEL_AND_LAND
+            if runtime or decision.action is SafetyAction.CANCEL_AND_LAND
+            else RecoveryRecommendation.REPAIR_LOCAL_PLAN
+        )
+        findings = (
+            ValidationFinding(
+                schema_version=1,
+                finding_id=f"finding_{digest}",
+                timestamp=timestamp_s,
+                stage="RUNTIME_SAFETY" if runtime else "PREFLIGHT_SAFETY",
+                scope="ASSIGNMENT" if assignment_id else "AGENT",
+                severity=severity,
+                code=code,
+                message=decision.reason[:2048],
+                mission_id=mission,
+                assignment_id=assignment_id,
+                uav_id=uav,
+                goal_id=None,
+                step_id=None,
+                proposal_id=None,
+                evidence_refs=(),
+                recommended_action=action,
+            ),
+        )
+    return ValidationReport(
+        schema_version=1,
+        report_id=f"report_{digest}",
+        timestamp=timestamp_s,
+        stage="RUNTIME_SAFETY" if runtime else "PREFLIGHT_SAFETY",
+        mission_id=mission,
+        assignment_id=assignment_id,
+        uav_id=uav,
+        findings=findings,
+    )
+
+
+def _safety_validation_code(reason: str, *, runtime: bool) -> ValidationCode:
+    message = reason.casefold()
+    if "unknown skill" in message or "supported top-level skill" in message:
+        return ValidationCode.UNKNOWN_SKILL
+    if "finite" in message or "nan" in message or "infinity" in message:
+        return ValidationCode.NON_FINITE_NUMBER
+    if "outside the scene bounds" in message or "outside scene" in message:
+        return (
+            ValidationCode.GEOFENCE_BREACH
+            if runtime
+            else ValidationCode.OUT_OF_BOUNDS_GOTO
+        )
+    if "altitude exceeds" in message:
+        return ValidationCode.ALTITUDE_LIMIT_BREACH
+    if "mission exceeded" in message:
+        return ValidationCode.MISSION_TIMEOUT
+    if "landing" in message or " land" in message:
+        return ValidationCode.INVALID_LANDING_ZONE
+    if "observation" in message or "timestamp" in message or "timing" in message:
+        return ValidationCode.WORLD_STATE_INVALID
+    return ValidationCode.UNSAFE_ACTION
 
 
 def _continue(reason: str) -> SafetyDecision:

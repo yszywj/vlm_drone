@@ -32,6 +32,7 @@ from configs.schema import (
     SceneConfig,
     SearchConfig,
     QwenVisualReviewConfig,
+    ResultsConfig,
     StorageConfig,
     SimulationConfig,
     TargetDetectorConfig,
@@ -105,6 +106,7 @@ _DEFAULT_FRAME_STORE_CONFIG = FrameStoreConfig()
 _DEFAULT_DEBUG_IMAGES_CONFIG = DebugImagesConfig()
 _DEFAULT_OBSTACLE_PERCEPTION_CONFIG = ObstaclePerceptionConfig()
 _DEFAULT_TARGET_PERCEPTION_CONFIG = TargetPerceptionConfig()
+_DEFAULT_RESULTS_CONFIG = ResultsConfig()
 
 _MAX_REQUEST_TIMEOUT_S = 300.0
 _MAX_REVIEW_INTERVAL_S = 3_600.0
@@ -1746,6 +1748,76 @@ def load_config(path: str | Path) -> AppConfig:
     if storage.warning_run_size_gb >= storage.max_run_size_gb:
         raise ConfigError("storage.warning_run_size_gb must be smaller than storage.max_run_size_gb")
 
+    results_raw = _strict_optional_block(
+        root,
+        "results",
+        frozenset(
+            {
+                "detail_level",
+                "state_sample_hz",
+                "save_summary_figures",
+                "save_camera_images",
+                "save_videos",
+                "save_raw_frames",
+                "save_observations",
+                "retain_model_proposals",
+                "retain_prompts",
+                "max_record_bytes",
+                "max_stream_bytes",
+                "max_run_bytes",
+            }
+        ),
+    )
+    if results_raw is None:
+        results = _DEFAULT_RESULTS_CONFIG
+    else:
+        detail_level = _non_empty_string(
+            results_raw["detail_level"], "results.detail_level"
+        )
+        try:
+            results = ResultsConfig(
+                detail_level=detail_level,
+                state_sample_hz=_positive_number(
+                    results_raw["state_sample_hz"], "results.state_sample_hz"
+                ),
+                save_summary_figures=_boolean(
+                    results_raw["save_summary_figures"],
+                    "results.save_summary_figures",
+                ),
+                save_camera_images=_boolean(
+                    results_raw["save_camera_images"],
+                    "results.save_camera_images",
+                ),
+                save_videos=_boolean(
+                    results_raw["save_videos"], "results.save_videos"
+                ),
+                save_raw_frames=_boolean(
+                    results_raw["save_raw_frames"], "results.save_raw_frames"
+                ),
+                save_observations=_boolean(
+                    results_raw["save_observations"],
+                    "results.save_observations",
+                ),
+                retain_model_proposals=_boolean(
+                    results_raw["retain_model_proposals"],
+                    "results.retain_model_proposals",
+                ),
+                retain_prompts=_boolean(
+                    results_raw["retain_prompts"], "results.retain_prompts"
+                ),
+                max_record_bytes=_positive_integer(
+                    results_raw["max_record_bytes"], "results.max_record_bytes"
+                ),
+                max_stream_bytes=_positive_integer(
+                    results_raw["max_stream_bytes"], "results.max_stream_bytes"
+                ),
+                max_run_bytes=_positive_integer(
+                    results_raw["max_run_bytes"], "results.max_run_bytes"
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(str(exc)) from exc
+
     config = AppConfig(
         schema_version=schema_version,
         simulation=simulation,
@@ -1763,6 +1835,7 @@ def load_config(path: str | Path) -> AppConfig:
         artifacts=artifacts,
         figures=figures,
         storage=storage,
+        results=results,
         model_worker=model_worker,
         model_broker=model_broker,
         qwen_visual_review=qwen_visual_review,

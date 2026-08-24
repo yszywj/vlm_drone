@@ -132,7 +132,12 @@ class FleetUavSearchEnv:
         self._tick_index = 0
         self._last_tick_order: tuple[str, ...] = ()
         self._assignments: dict[str, str] = {}
-        self.set_assignments(assignments or self._default_assignments())
+        # ``None`` means legacy/default routing.  An explicit empty mapping is
+        # materially different: it is used by targetless V2 missions and must
+        # not silently regain target/Oracle authority through truthiness.
+        self.set_assignments(
+            self._default_assignments() if assignments is None else assignments
+        )
 
         self.uav_prim_paths = MappingProxyType(
             {item.id: uav_prim_path(item.id) for item in config.uavs}

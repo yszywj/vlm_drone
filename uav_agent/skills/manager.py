@@ -27,7 +27,14 @@ from skills.hover import (
 )
 from skills.land import LandGoal, LandSkill
 from skills.motion_types import MotionPolicy, YawMode
-from skills.plan import RecoveryPolicy, StepOutputRef, TaskPlan, TaskPlanError, TaskStep
+from skills.plan import (
+    RecoveryPolicy,
+    StepOutputRef,
+    TaskPlan,
+    TaskPlanError,
+    TaskStep,
+    TrustedTargetRef,
+)
 from skills.reacquire import ReacquireGoal, ReacquireSkill
 from skills.search import SearchGoal, SearchGoalV3, SearchSkill
 from skills.search_strategy import AsyncNextBestViewProvider, NextBestViewProvider
@@ -3195,6 +3202,8 @@ class SkillManager:
         validation_only: bool,
     ) -> str:
         reference: StepOutputRef | None = None
+        if isinstance(raw_target, TrustedTargetRef):
+            return raw_target.target_id
         if isinstance(raw_target, StepOutputRef):
             reference = raw_target
         elif raw_target == "$SEARCH.result.target_id":

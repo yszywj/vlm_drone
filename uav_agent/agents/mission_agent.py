@@ -216,6 +216,15 @@ class MissionAgent:
     ) -> None:
         if not isinstance(planner, MissionPlanner):
             raise TypeError("planner must be a MissionPlanner")
+        allow_trusted_safety_completion = getattr(
+            planner,
+            "allow_trusted_safety_completion",
+            False,
+        )
+        if not isinstance(allow_trusted_safety_completion, bool):
+            raise TypeError(
+                "planner.allow_trusted_safety_completion must be bool"
+            )
         if not isinstance(validator, PlanValidator):
             raise TypeError("validator must be a PlanValidator")
         if not isinstance(safety, SafetySupervisor):
@@ -329,6 +338,9 @@ class MissionAgent:
                 )
 
         self._planner = planner
+        self._allow_trusted_safety_completion = (
+            allow_trusted_safety_completion
+        )
         self._validator = validator
         self._safety = safety
         self._skill_manager = skill_manager
@@ -399,6 +411,9 @@ class MissionAgent:
                 mission_id=self._mission_id,
                 uav_id=self._uav_id,
                 plan_version=self._plan_version,
+                allow_trusted_safety_completion=(
+                    self._allow_trusted_safety_completion
+                ),
             )
             planner_output = self._planner.plan(request)
         except Exception as exc:
@@ -412,13 +427,20 @@ class MissionAgent:
             if {"mission_id", "uav_id", "plan_version"}.issubset(
                 validator_parameters
             ):
+                validator_kwargs: dict[str, object] = {
+                    "source": self._planner_source(),
+                    "mission_id": self._mission_id,
+                    "uav_id": self._uav_id,
+                    "plan_version": self._plan_version,
+                }
+                if "allow_trusted_safety_completion" in validator_parameters:
+                    validator_kwargs["allow_trusted_safety_completion"] = (
+                        self._allow_trusted_safety_completion
+                    )
                 compiled = validator_method(
                     planner_output,
                     world_context,
-                    source=self._planner_source(),
-                    mission_id=self._mission_id,
-                    uav_id=self._uav_id,
-                    plan_version=self._plan_version,
+                    **validator_kwargs,
                 )
                 if (
                     compiled.task_plan.mission_id != self._mission_id

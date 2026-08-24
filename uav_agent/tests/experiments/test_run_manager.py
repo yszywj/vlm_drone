@@ -204,6 +204,34 @@ class RunManagerTest(unittest.TestCase):
             )
             self.assertTrue(manager.paths.resolved_config.is_file())
 
+    def test_update_resolved_config_is_validated_and_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = self.create_run(Path(temporary))
+            manager.update_resolved_config(
+                {
+                    "mission": {"interpreter": "llm", "goal_count": 3},
+                    "planner": {"mode": "dynamic_llm"},
+                }
+            )
+            updated = yaml.safe_load(
+                manager.paths.resolved_config.read_text(encoding="utf-8")
+            )
+            self.assertEqual(updated["mission"]["goal_count"], 3)
+            self.assertEqual(updated["planner"]["mode"], "dynamic_llm")
+            before = manager.paths.resolved_config.read_bytes()
+
+            with self.assertRaises(SensitiveDataError):
+                manager.update_resolved_config(
+                    {"mission": {"api_key": "must-not-be-persisted"}}
+                )
+            self.assertEqual(manager.paths.resolved_config.read_bytes(), before)
+            self.assertFalse(list(manager.paths.run_dir.rglob("*.tmp")))
+
+            manager.complete()
+            with self.assertRaises(InvalidRunStateError):
+                manager.update_resolved_config({"mission": {"goal_count": 4}})
+            self.assertEqual(manager.paths.resolved_config.read_bytes(), before)
+
     def test_lifecycle_updates_manifest_and_exit_code_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manager = self.create_run(Path(temporary))

@@ -217,3 +217,17 @@ storage:
   min_free_space_gb_during_run: 10.0
   warning_run_size_gb: 3.0
   max_run_size_gb: 5.0
+
+results:
+  detail_level: standard
+  state_sample_hz: 1.0
+  save_summary_figures: true
+  save_camera_images: false
+  save_videos: false
+  save_raw_frames: false
+  save_observations: false
+  retain_model_proposals: true
+  retain_prompts: false
+  max_record_bytes: 32768
+  max_stream_bytes: 8388608
+  max_run_bytes: 33554432

@@ -74,7 +74,7 @@ printf '%s\n' \
   "Maximum model length: ${QWEN_MAX_MODEL_LEN}" \
   "GPU memory utilization: ${QWEN_GPU_MEMORY_UTILIZATION}"
 if ((${#QWEN_LORA_ARGS[@]} > 0)); then
-  printf 'Static active LoRA adapters: enabled (%s vLLM arguments)\n' "${#QWEN_LORA_ARGS[@]}"
+  printf 'Static active LoRA adapters (including mission interpreter when active): enabled (%s vLLM arguments)\n' "${#QWEN_LORA_ARGS[@]}"
 else
   printf 'Static active LoRA adapters: none; serving base model only\n'
 fi

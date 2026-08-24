@@ -221,6 +221,30 @@ def _multi_search_v3_plan(
     return result
 
 
+def _wait_only_v3_plan() -> dict[str, object]:
+    return {
+        "schema_version": 3,
+        "mission_id": _MISSION_ID,
+        "uav_id": _UAV_ID,
+        "plan_version": 1,
+        "assumptions": [],
+        "steps": [
+            {
+                "id": "takeoff_1",
+                "uav_id": _UAV_ID,
+                "skill": "TAKEOFF",
+                "args": {"altitude_m": 10},
+            },
+            {
+                "id": "wait_1",
+                "uav_id": _UAV_ID,
+                "skill": "HOVER",
+                "args": {"duration_s": 5},
+            },
+        ],
+    }
+
+
 class _FakeModelClient:
     def __init__(self, outcomes: Sequence[dict[str, object] | str]) -> None:
         self._outcomes = list(outcomes)
@@ -337,6 +361,64 @@ class DynamicLLMPlannerV3Test(unittest.TestCase):
             ]
         )
         self.assertNotIn("ADAPTIVE_NEXT_BEST_VIEW", json.dumps(schema))
+
+    def test_fleet_goal_mode_allows_no_track_and_defers_unrequested_land(self) -> None:
+        client = _FakeModelClient([_wait_only_v3_plan()])
+        planner = DynamicLLMPlanner(
+            client,
+            _V3_PROMPT,
+            planning_contract="v3",
+            repair_budget=0,
+        )
+        request = PlannerRequest(
+            instruction="wait for five seconds",
+            world_context=_world_context(),
+            mission_id=_MISSION_ID,
+            uav_id=_UAV_ID,
+            plan_version=1,
+            allow_trusted_safety_completion=True,
+        )
+
+        result = planner.plan(request)
+
+        self.assertEqual(
+            tuple(step.skill for step in result.steps),
+            ("TAKEOFF", "HOVER"),
+        )
+        self.assertNotIn("TRACK", tuple(step.skill for step in result.steps))
+        prompt_payload = json.loads(client.calls[0][0][1].content)
+        completeness = prompt_payload["mission_completeness_contract"]
+        self.assertTrue(completeness["trusted_runtime_safety_completion"])
+        self.assertTrue(completeness["omit_unrequested_return_or_land"])
+        self.assertEqual(planner.repair_budget, 0)
+
+    def test_repair_budget_zero_returns_outer_repair_diagnostics_after_one_call(self) -> None:
+        invalid = deepcopy(_sector_v3_plan())
+        del invalid["steps"][1]["args"]["region"]["frame"]  # type: ignore[index]
+        client = _FakeModelClient([invalid])
+        planner = DynamicLLMPlanner(
+            client,
+            _V3_PROMPT,
+            planning_contract="v3",
+            repair_budget=0,
+        )
+
+        with self.assertRaisesRegex(PlannerOutputError, "internal repair is disabled"):
+            planner.plan(_request())
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(planner.last_diagnostics.model_calls, 1)  # type: ignore[union-attr]
+        self.assertFalse(planner.last_diagnostics.repair_used)  # type: ignore[union-attr]
+        self.assertEqual(planner.last_diagnostics.initial_error_code, "SCHEMA_INVALID")  # type: ignore[union-attr]
+        self.assertTrue(planner.last_diagnostics.initial_error_message)  # type: ignore[union-attr]
+
+        with self.assertRaisesRegex(ValueError, "repair_budget"):
+            DynamicLLMPlanner(
+                _FakeModelClient([]),
+                _V3_PROMPT,
+                planning_contract="v3",
+                repair_budget=2,
+            )
 
     def test_v3_adaptive_strategy_is_capability_negotiated_everywhere(self) -> None:
         disabled_schema = search_strategy_json_schema()

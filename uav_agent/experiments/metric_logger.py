@@ -16,10 +16,15 @@ from typing import Mapping, Sequence
 
 from .evaluator import compute_mission_success_strict, parse_metric_bool
 from .schemas import (
+    AGENT_METRIC_FIELDS,
     EPISODE_METRIC_FIELDS,
     EVAL_METRIC_FIELDS,
     FAILURE_CASE_FIELDS,
+    FLEET_METRIC_FIELDS,
     FINAL_METRIC_FIELDS,
+    GOAL_METRIC_FIELDS,
+    SKILL_EXECUTION_FIELDS,
+    STATE_SAMPLE_FIELDS,
     TRAIN_METRIC_FIELDS,
     FailureReason,
     MetricPhase,
@@ -335,6 +340,10 @@ class MetricLogger:
         )
         self._final = _AppendCsv(self.metrics_dir / "final_metrics.csv", FINAL_METRIC_FIELDS)
         self._tables = (self._train, self._eval, self._episode, self._failure, self._final)
+        # Fleet tables remain lazy so existing training runs keep their exact
+        # five-file output contract. FleetResultRecorder can share these fixed
+        # schemas without forcing unrelated experiments to create empty files.
+        self._fleet_tables: dict[str, _AppendCsv] = {}
         self._episode_keys = self._read_keys(self._episode)
         self._failure_keys = self._read_keys(self._failure)
         self._final_logged = bool(self._final.rows())
@@ -393,6 +402,33 @@ class MetricLogger:
     def _ensure_open(self) -> None:
         if self._closed:
             raise MetricLoggerError("MetricLogger is closed")
+
+    def _fleet_table(self, filename: str, fields: Sequence[str]) -> _AppendCsv:
+        table = self._fleet_tables.get(filename)
+        if table is None:
+            table = _AppendCsv(self.metrics_dir / filename, fields)
+            self._fleet_tables[filename] = table
+        return table
+
+    def log_fleet_metrics(self, metrics: Mapping[str, object] | object) -> None:
+        self._ensure_open()
+        self._fleet_table("fleet_metrics.csv", FLEET_METRIC_FIELDS).append(_mapping(metrics))
+
+    def log_agent_metrics(self, metrics: Mapping[str, object] | object) -> None:
+        self._ensure_open()
+        self._fleet_table("agent_metrics.csv", AGENT_METRIC_FIELDS).append(_mapping(metrics))
+
+    def log_goal_metrics(self, metrics: Mapping[str, object] | object) -> None:
+        self._ensure_open()
+        self._fleet_table("goal_metrics.csv", GOAL_METRIC_FIELDS).append(_mapping(metrics))
+
+    def log_skill_execution(self, metrics: Mapping[str, object] | object) -> None:
+        self._ensure_open()
+        self._fleet_table("skill_executions.csv", SKILL_EXECUTION_FIELDS).append(_mapping(metrics))
+
+    def log_state_sample(self, metrics: Mapping[str, object] | object) -> None:
+        self._ensure_open()
+        self._fleet_table("state_samples_1hz.csv", STATE_SAMPLE_FIELDS).append(_mapping(metrics))
 
     @staticmethod
     def _merge(
@@ -632,6 +668,8 @@ class MetricLogger:
         self._ensure_open()
         for table in self._tables:
             table.flush()
+        for table in self._fleet_tables.values():
+            table.flush()
         if self.tensorboard is not None:
             self.tensorboard.flush()
 
@@ -639,6 +677,8 @@ class MetricLogger:
         if self._closed:
             return
         for table in self._tables:
+            table.close()
+        for table in self._fleet_tables.values():
             table.close()
         if self.tensorboard is not None:
             self.tensorboard.close()

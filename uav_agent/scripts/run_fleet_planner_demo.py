@@ -13,14 +13,18 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+from common.ids import generate_routing_id  # noqa: E402
 from configs.loader import load_config  # noqa: E402
 from fleet.compiler import FleetAssignmentCompiler  # noqa: E402
-from fleet.llm_planner import LLMFleetPlanner  # noqa: E402
+from fleet.llm_planner_v2 import LLMFleetPlannerV2  # noqa: E402
+from fleet.llm_task_interpreter import LLMFleetTaskInterpreter  # noqa: E402
 from fleet.local_spatial_planner import ScriptedAssignmentSpatialPlanner  # noqa: E402
 from fleet.request_builder import (  # noqa: E402
-    FleetRequestBuildError,
     build_agent_world_contexts,
+    build_agent_world_contexts_v2,
     build_fleet_mission_request,
+    build_fleet_mission_request_v2,
+    build_target_catalog,
     parse_explicit_assignment_instruction,
 )
 from fleet.scripted_planner import ScriptedFleetPlanner  # noqa: E402
@@ -46,9 +50,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     parser.add_argument("--fleet-planner", choices=("scripted", "llm"), default="scripted")
     parser.add_argument(
+        "--mission-interpreter",
+        choices=("scripted", "llm"),
+        default=None,
+        help="defaults to the selected Fleet Planner contract",
+    )
+    parser.add_argument(
         "--local-planner",
         choices=("dynamic_scripted", "dynamic_llm"),
-        default="dynamic_scripted",
+        default=None,
+        help="defaults to dynamic_llm for Fleet llm, otherwise dynamic_scripted",
     )
     parser.add_argument("--planning-contract", choices=("v3",), default="v3")
     parser.add_argument("--adapter-config", type=Path, default=DEFAULT_ADAPTER_CONFIG)
@@ -59,60 +70,85 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(args: argparse.Namespace) -> dict[str, object]:
-    config = load_config(args.config)
-    registry = AdapterRegistry(args.adapter_config)
-    if args.model is not None and args.model != registry.base_model_name:
+def _effective_interpreter(args: argparse.Namespace) -> str:
+    selected = args.mission_interpreter or args.fleet_planner
+    if selected != args.fleet_planner:
         raise ValueError(
-            "--model must match configs/adapters.json base_model.served_model_name"
+            "--mission-interpreter must match --fleet-planner: the scripted "
+            "baseline uses Fleet v1 while the LLM pipeline uses Fleet v2"
         )
-    selection_records: list[dict[str, object]] = []
-    client_factory = ModelClientFactory(
-        registry,
-        base_url=args.base_url,
-        api_key=args.api_key,
-        selection_logger=lambda value: selection_records.append(dict(value)),
-    )
+    return selected
 
-    directives = None
-    try:
-        directives = parse_explicit_assignment_instruction(args.instruction, config)
-    except FleetRequestBuildError:
-        if args.fleet_planner == "scripted":
-            raise
+
+def _effective_local_planner(args: argparse.Namespace) -> str:
+    expected = (
+        "dynamic_llm" if args.fleet_planner == "llm" else "dynamic_scripted"
+    )
+    selected = args.local_planner or expected
+    if selected != expected:
+        raise ValueError(
+            f"--fleet-planner {args.fleet_planner} requires "
+            f"--local-planner {expected}; cross-contract fallback is disabled"
+        )
+    return selected
+
+
+def _alias_catalogs(config: object) -> tuple[dict[str, str], dict[str, str]]:
+    uav_aliases: dict[str, str] = {}
+    for uav in config.uavs:
+        uav_aliases[uav.id] = uav.id
+        if uav.display_name:
+            uav_aliases[uav.display_name] = uav.id
+    target_aliases: dict[str, str] = {}
+    for target in config.targets:
+        target_aliases[target.id] = target.id
+        if target.semantic_alias:
+            target_aliases[target.semantic_alias] = target.id
+    return uav_aliases, target_aliases
+
+
+def _diagnostics_payload(planner: object) -> dict[str, object]:
+    source = getattr(planner, "source", type(planner).__name__)
+    diagnostics = getattr(planner, "last_diagnostics", None)
+    if diagnostics is None:
+        return {
+            "source": source,
+            "model_calls": 0,
+            "structured_output_enabled": False,
+            "final_output_valid": True,
+        }
+    return {"source": source, **diagnostics.to_dict()}
+
+
+def _semantic_finding_payload(finding: object) -> dict[str, object]:
+    return {
+        "code": finding.code,
+        "message": finding.message,
+        "constraint_id": finding.constraint_id,
+        "goal_id": finding.goal_id,
+        "assignment_id": finding.assignment_id,
+    }
+
+
+def _run_scripted_v1(
+    args: argparse.Namespace,
+    config: object,
+    registry: AdapterRegistry,
+    selection_records: list[dict[str, object]],
+) -> dict[str, object]:
+    directives = parse_explicit_assignment_instruction(args.instruction, config)
     request = build_fleet_mission_request(
         config,
         args.instruction,
         directives=directives,
     )
+    interpreter_selection = registry.resolve(ModelCallRole.MISSION_INTERPRETATION)
+    selection_records.append({**interpreter_selection.to_dict(), "used": False})
 
-    if args.fleet_planner == "scripted":
-        fleet_planner = ScriptedFleetPlanner()
-        fleet_selection = registry.resolve(ModelCallRole.FLEET_PLAN)
-        selection_records.append({**fleet_selection.to_dict(), "used": False})
-        fleet_diagnostics: dict[str, object] = {
-            "source": fleet_planner.source,
-            "model_calls": 0,
-            "structured_output": False,
-            "final_output_valid": True,
-        }
-    else:
-        fleet_planner = LLMFleetPlanner(
-            client_factory.for_role(ModelCallRole.FLEET_PLAN)
-        )
-        fleet_diagnostics = {
-            "source": fleet_planner.source,
-            "model_calls": 1,
-            "structured_output": True,
-        }
+    fleet_planner = ScriptedFleetPlanner()
+    fleet_selection = registry.resolve(ModelCallRole.FLEET_PLAN)
+    selection_records.append({**fleet_selection.to_dict(), "used": False})
     fleet_plan = fleet_planner.plan(request)
-    if args.fleet_planner == "llm":
-        fleet_diagnostics.update(
-            {
-                "response_text_length": fleet_planner.last_response_text_length,
-                "final_output_valid": True,
-            }
-        )
 
     contexts = build_agent_world_contexts(config, fleet_plan)
     local_planners: dict[str, object] = {}
@@ -122,19 +158,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         local_selection = registry.resolve(ModelCallRole.AGENT_SPATIAL_PLAN)
         selection_records.append({**local_selection.to_dict(), "used": False})
     else:
-        from planner.dynamic_llm_planner import DynamicLLMPlanner
-
-        prompt = _PROJECT_ROOT / "prompts/dynamic_skill_planner_v3_system.txt"
-        for assignment in fleet_plan.assignments:
-            local_planners[assignment.uav_id] = DynamicLLMPlanner(
-                client_factory.for_role(ModelCallRole.AGENT_SPATIAL_PLAN),
-                system_prompt_path=prompt,
-                planning_contract="v3",
-            )
-    compiler = FleetAssignmentCompiler(
-        local_planners,
-        validator=PlanValidator(),
-    )
+        raise ValueError(
+            "the scripted Fleet v1 baseline requires "
+            "--local-planner dynamic_scripted"
+        )
+    compiler = FleetAssignmentCompiler(local_planners, validator=PlanValidator())
     compilations = compiler.compile(request, fleet_plan, contexts)
 
     local_plans: dict[str, object] = {}
@@ -144,22 +172,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         local_plans[uav_id] = {
             "agent_planner_request": result.agent_request.to_dict(),
             "spatial_plan_draft_v3": result.planner_output.to_dict(),
-            "compiled_task_plan": (
-                None if compiled is None else compiled.task_plan.to_dict()
-            ),
+            "compiled_task_plan": None if compiled is None else compiled.task_plan.to_dict(),
         }
-        planner = local_planners[uav_id]
-        diagnostics = getattr(planner, "last_diagnostics", None)
-        if diagnostics is not None:
-            local_diagnostics[uav_id] = diagnostics.to_dict()
-        else:
-            local_diagnostics[uav_id] = {
-                "source": getattr(planner, "source", "unknown"),
-                "model_calls": 0,
-                "final_output_valid": True,
-            }
+        local_diagnostics[uav_id] = _diagnostics_payload(local_planners[uav_id])
 
     return {
+        "fleet_task_spec": None,
         "fleet_mission_plan": fleet_plan.to_dict(),
         "assignment_summary": [
             {
@@ -175,9 +193,148 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         ],
         "per_agent_local_plan": local_plans,
         "adapter_selection": selection_records,
-        "fleet_planner_diagnostics": fleet_diagnostics,
+        "mission_interpreter_diagnostics": {
+            "source": "fixed_explicit_assignment_parser",
+            "model_calls": 0,
+            "structured_output_enabled": False,
+            "final_output_valid": True,
+        },
+        "fleet_planner_diagnostics": _diagnostics_payload(fleet_planner),
+        "fleet_plan_semantic_findings": [],
         "per_agent_planner_diagnostics": local_diagnostics,
     }
+
+
+def _run_llm_v2(
+    args: argparse.Namespace,
+    config: object,
+    client_factory: ModelClientFactory,
+    selection_records: list[dict[str, object]],
+) -> dict[str, object]:
+    if args.local_planner != "dynamic_llm":
+        raise ValueError(
+            "the LLM Fleet v2 pipeline requires --local-planner dynamic_llm; "
+            "dynamic_scripted is the fixed Fleet v1 baseline"
+        )
+    uav_aliases, target_aliases = _alias_catalogs(config)
+    fleet_mission_id = generate_routing_id("fleet_mission")
+    interpreter = LLMFleetTaskInterpreter(
+        client_factory.for_role(
+            ModelCallRole.MISSION_INTERPRETATION,
+            fleet_mission_id=fleet_mission_id,
+        ),
+        uav_alias_catalog=uav_aliases,
+        target_alias_catalog=target_aliases,
+    )
+    task_spec = interpreter.interpret(args.instruction)
+    request = build_fleet_mission_request_v2(
+        config,
+        task_spec,
+        fleet_mission_id=fleet_mission_id,
+    )
+
+    fleet_planner = LLMFleetPlannerV2(
+        client_factory.for_role(
+            ModelCallRole.FLEET_PLAN,
+            fleet_mission_id=request.fleet_mission_id,
+        )
+    )
+    fleet_plan = fleet_planner.plan(request)
+    semantic_findings = fleet_plan.semantic_findings(request)
+    contexts = build_agent_world_contexts_v2(config, request, fleet_plan)
+
+    from planner.dynamic_llm_planner import DynamicLLMPlanner
+
+    prompt = _PROJECT_ROOT / "prompts/dynamic_skill_planner_v3_system.txt"
+    local_planners: dict[str, object] = {}
+    for assignment in fleet_plan.assignments:
+        local_planners[assignment.uav_id] = DynamicLLMPlanner(
+            client_factory.for_role(
+                ModelCallRole.AGENT_SPATIAL_PLAN,
+                fleet_mission_id=request.fleet_mission_id,
+                assignment_id=assignment.assignment_id,
+                uav_id=assignment.uav_id,
+            ),
+            system_prompt_path=prompt,
+            planning_contract="v3",
+        )
+
+    compilations: dict[str, object] = {}
+    if local_planners:
+        compiler = FleetAssignmentCompiler(local_planners, validator=PlanValidator())
+        compilations = compiler.compile_v2(
+            request,
+            fleet_plan,
+            contexts,
+            target_catalog=build_target_catalog(config),
+        )
+
+    local_plans: dict[str, object] = {}
+    local_diagnostics: dict[str, object] = {}
+    for uav_id, result in sorted(compilations.items()):
+        compiled = result.compiled_mission
+        local_plans[uav_id] = {
+            "agent_planner_request": result.agent_request.to_dict(),
+            "spatial_plan_draft_v3": result.planner_output.to_dict(),
+            "compiled_task_plan": None if compiled is None else compiled.task_plan.to_dict(),
+            "goal_coverage": result.goal_coverage.to_dict(),
+            "validation_report": result.validation_report.to_dict(),
+        }
+        local_diagnostics[uav_id] = _diagnostics_payload(local_planners[uav_id])
+
+    interpreter_diagnostics = _diagnostics_payload(interpreter)
+    interpreter_diagnostics["model_proposals"] = list(interpreter.model_proposals)
+    fleet_diagnostics = _diagnostics_payload(fleet_planner)
+    fleet_diagnostics["model_proposals"] = list(fleet_planner.model_proposals)
+    return {
+        "fleet_task_spec": task_spec.to_dict(),
+        "fleet_mission_plan": fleet_plan.to_dict(),
+        "assignment_summary": [
+            {
+                "assignment_id": item.assignment_id,
+                "uav_id": item.uav_id,
+                "goal_ids": list(item.goal_ids),
+                "priority": item.priority,
+                "start_policy": item.start_policy.value,
+                "deviations": [value.to_dict() for value in item.deviations],
+            }
+            for item in fleet_plan.assignments
+        ],
+        "per_agent_local_plan": local_plans,
+        "adapter_selection": selection_records,
+        "mission_interpreter_diagnostics": interpreter_diagnostics,
+        "fleet_planner_diagnostics": fleet_diagnostics,
+        "fleet_plan_semantic_findings": [
+            _semantic_finding_payload(item) for item in semantic_findings
+        ],
+        "per_agent_planner_diagnostics": local_diagnostics,
+    }
+
+
+def run(args: argparse.Namespace) -> dict[str, object]:
+    config = load_config(args.config)
+    interpreter_mode = _effective_interpreter(args)
+    args.local_planner = _effective_local_planner(args)
+    registry = AdapterRegistry(args.adapter_config)
+    if args.model is not None and args.model != registry.base_model_name:
+        raise ValueError(
+            "--model must match configs/adapters.json base_model.served_model_name"
+        )
+    selection_records: list[dict[str, object]] = []
+    client_factory = ModelClientFactory(
+        registry,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        selection_logger=lambda value: selection_records.append(dict(value)),
+    )
+    if interpreter_mode == "scripted":
+        return _run_scripted_v1(args, config, registry, selection_records)
+    return _run_llm_v2(
+        args,
+        config,
+        client_factory,
+        selection_records,
+    )
 
 
 def _print_sections(result: dict[str, object]) -> None:
@@ -188,6 +345,9 @@ def _print_sections(result: dict[str, object]) -> None:
         ("Adapter selection", "adapter_selection"),
         ("Fleet Planner diagnostics", "fleet_planner_diagnostics"),
         ("Per-agent planner diagnostics", "per_agent_planner_diagnostics"),
+        ("FleetTaskSpec", "fleet_task_spec"),
+        ("Mission Interpreter diagnostics", "mission_interpreter_diagnostics"),
+        ("Fleet Plan semantic findings", "fleet_plan_semantic_findings"),
     )
     for label, key in labels:
         print(f"=== {label} ===")

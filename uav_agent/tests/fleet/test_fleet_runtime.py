@@ -250,11 +250,12 @@ def test_local_failure_isolated_and_reports_partial_success() -> None:
     snapshot = runtime.tick()
 
     assert snapshot.status is FleetStatus.PARTIAL_SUCCESS
-    assert a.cancels == b.cancels == 0
+    assert a.cancels == 1
+    assert b.cancels == 0
     assert b.ticks == 1
     statuses = {row["uav_id"]: row["status"] for row in snapshot.assignments.values()}
     assert statuses == {
-        "uav_a": "REASSIGNMENT_REQUIRED",
+        "uav_a": "FAILED",
         "uav_b": "SUCCEEDED",
     }
     assert any(event["event_type"] == "REASSIGNMENT_REQUIRED" for event in snapshot.events)
@@ -520,7 +521,7 @@ def test_optional_assignment_failure_does_not_block_required_success() -> None:
     assert snapshot.status is FleetStatus.SUCCEEDED
     assert {
         row["uav_id"]: row["status"] for row in snapshot.assignments.values()
-    } == {"uav_a": "SUCCEEDED", "uav_b": "REASSIGNMENT_REQUIRED"}
+    } == {"uav_a": "SUCCEEDED", "uav_b": "FAILED"}
 
 
 def test_agent_plan_versions_advance_independently_and_never_decrease() -> None:
@@ -558,9 +559,7 @@ def test_agent_plan_versions_advance_independently_and_never_decrease() -> None:
     a.next_version = 2
     stale = runtime.tick()
     assert stale.status is FleetStatus.RUNNING
-    assert runtime.assignments.for_uav("uav_a").status is (
-        AssignmentStatus.REASSIGNMENT_REQUIRED
-    )
+    assert runtime.assignments.for_uav("uav_a").status is AssignmentStatus.FAILED
     assert runtime.assignments.for_uav("uav_a").local_plan_version == 4
     assert runtime.assignments.for_uav("uav_b").local_plan_version == 1
 

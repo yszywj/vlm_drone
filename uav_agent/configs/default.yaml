@@ -121,7 +121,7 @@ planner:
 # the visual reviewer remains opt-in and non-controlling by default.
 model_worker:
   max_inflight_per_uav: 1
-  request_timeout_s: 20.0
+  request_timeout_s: 60.0
 
 model_broker:
   max_inflight_global: 4

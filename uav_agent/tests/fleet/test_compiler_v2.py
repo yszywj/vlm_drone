@@ -268,7 +268,13 @@ def test_v2_request_contains_only_assignment_goals_and_no_fixed_six_step_chain()
         result.planner_request.instruction
     )
     assert focused["trusted_runtime_safety_completion"] is True
+    assert focused["required_spatial_assumptions"] == []
+    assert any(
+        "Set top-level assumptions to []" in requirement
+        for requirement in focused["requirements"]
+    )
     assert result.planner_request.allow_trusted_safety_completion is True
+    assert result.planner_request.require_empty_spatial_assumptions is True
     assert result.planner_request.world_context.search_regions == {}
     assert set(result.planner_request.world_context.landing_zones) == {"home_a"}
     assert result.executable is True

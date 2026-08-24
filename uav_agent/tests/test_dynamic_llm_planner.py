@@ -547,7 +547,7 @@ class DynamicLLMPlannerTest(unittest.TestCase):
             self.assertEqual(options.temperature, 0.0)
         self.assertEqual(
             [options.max_tokens for _, options in client.calls],
-            [1024, 1536],
+            [768, 1536],
         )
 
     def test_runtime_messages_equal_shared_builder_byte_for_byte(self) -> None:

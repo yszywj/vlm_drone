@@ -142,7 +142,10 @@ _LOCAL_PROPOSAL_REPAIR_MESSAGES: Mapping[str, str] = MappingProxyType(
         ),
         "V3_CONTRACT_VIOLATION": (
             "Correct Skill ordering, references, call limits, and Spatial V3 "
-            "contracts."
+            "contracts. Never use a ground-level z=0 POINT as an airborne GOTO: "
+            "omit that GOTO because SEARCH enters its region, or use a positive "
+            "flight altitude. If an assigned RETURN_HOME or LAND goal exists, "
+            "include an own_home NAMED_LOCATION GOTO followed by LAND."
         ),
         "MODEL_CLIENT_ERROR": (
             "Return one complete schema-valid proposal for this bounded retry."

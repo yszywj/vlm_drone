@@ -46,7 +46,12 @@ def build_fleet_mission_request_v2_json_schema(
 def build_fleet_mission_plan_v2_json_schema(
     request: FleetMissionRequestV2,
 ) -> dict[str, object]:
-    """Bind routing and trusted enums without locking user assignment wishes."""
+    """Bind routing and trusted enums without locking user assignment wishes.
+
+    ``uniqueItems`` is deliberately absent because vLLM 0.27.1 returns HTTP
+    500 while compiling that keyword.  The strict V2 Python contracts enforce
+    all duplicate invariants after decoding.
+    """
 
     if not isinstance(request, FleetMissionRequestV2):
         raise TypeError("request must be a FleetMissionRequestV2")
@@ -60,26 +65,40 @@ def build_fleet_mission_plan_v2_json_schema(
         item.constraint_id for item in request.task_spec.assignment_constraints
     ]
     evidence_ids = list(request.trusted_evidence_ids)
-    deviation = _object(
-        {
-            "constraint_id": {
-                "type": "string",
-                "enum": constraint_ids,
+    # xgrammar also raises an internal error for ``enum: []``.  When no
+    # trusted deviation can be expressed, make the array structurally empty
+    # without compiling unreachable child enums.  Python still validates all
+    # deviation references when this branch is enabled.
+    if constraint_ids and evidence_ids:
+        deviation = _object(
+            {
+                "constraint_id": {
+                    "type": "string",
+                    "enum": constraint_ids,
+                },
+                "reason_code": {
+                    "type": "string",
+                    "enum": [item.value for item in DeviationReasonCode],
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "items": {"type": "string", "enum": evidence_ids},
+                },
             },
-            "reason_code": {
-                "type": "string",
-                "enum": [item.value for item in DeviationReasonCode],
-            },
-            "evidence_refs": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 16,
-                "uniqueItems": True,
-                "items": {"type": "string", "enum": evidence_ids},
-            },
-        },
-        ["constraint_id", "reason_code", "evidence_refs"],
-    )
+            ["constraint_id", "reason_code", "evidence_refs"],
+        )
+        deviations_schema: dict[str, object] = {
+            "type": "array",
+            "maxItems": min(MAX_ASSIGNMENT_DEVIATIONS, len(constraint_ids)),
+            "items": deviation,
+        }
+    else:
+        deviations_schema = {
+            "type": "array",
+            "maxItems": 0,
+        }
     assignment = _object(
         {
             "assignment_id": {
@@ -93,23 +112,18 @@ def build_fleet_mission_plan_v2_json_schema(
                 "type": "array",
                 "minItems": 1,
                 "maxItems": min(MAX_ASSIGNMENT_GOALS, len(goal_ids)),
-                "uniqueItems": True,
                 "items": {"type": "string", "enum": goal_ids},
             },
             "priority": {"type": "integer", "minimum": 0, "maximum": 1000},
             "start_policy": {
                 "type": "string",
-                "enum": [item.value for item in FleetStartPolicy],
+                # FleetMissionRequest/FleetMissionPlan V1 lowering, used by
+                # both current linear and graph runtimes, intentionally has no
+                # SEQUENTIAL execution semantics.  Do not advertise a V2
+                # value that the trusted runtime must reject later.
+                "enum": [FleetStartPolicy.PARALLEL.value],
             },
-            "deviations": {
-                "type": "array",
-                "maxItems": (
-                    min(MAX_ASSIGNMENT_DEVIATIONS, len(constraint_ids))
-                    if constraint_ids and evidence_ids
-                    else 0
-                ),
-                "items": deviation,
-            },
+            "deviations": deviations_schema,
         },
         [
             "assignment_id",
@@ -145,13 +159,11 @@ def build_fleet_mission_plan_v2_json_schema(
             "assumptions": {
                 "type": "array",
                 "maxItems": 32,
-                "uniqueItems": True,
                 "items": _text(),
             },
             "unassigned_goal_ids": {
                 "type": "array",
                 "maxItems": len(goal_ids),
-                "uniqueItems": True,
                 "items": {"type": "string", "enum": goal_ids},
             },
         },

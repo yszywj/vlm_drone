@@ -140,11 +140,29 @@ def test_v2_round_trip_and_schema_do_not_const_lock_user_uav_constraint() -> Non
     uav_schema = schema["properties"]["assignments"]["items"]["properties"]["uav_id"]
     assert "const" not in uav_schema
     assert uav_schema["enum"] == ["uav_a", "uav_b"]
+    start_policy_schema = schema["properties"]["assignments"]["items"][
+        "properties"
+    ]["start_policy"]
+    assert start_policy_schema["enum"] == ["PARALLEL"]
+    rendered_schema = json.dumps(schema, sort_keys=True)
+    assert "uniqueItems" not in rendered_schema
+    assert '"enum": []' not in rendered_schema
 
     plan = FleetMissionPlanV2.from_dict(_payload(request, uav_id="uav_b"), request=request)
     assert plan.assignments[0].uav_id == "uav_b"
     findings = plan.semantic_findings(request)
     assert {item.code for item in findings} == {"EXPLAINED_ASSIGNMENT_DEVIATION"}
+
+
+def test_v2_schema_uses_empty_deviation_array_without_empty_enums() -> None:
+    request = _request(with_evidence=False)
+
+    schema = build_fleet_mission_plan_v2_json_schema(request)
+    assignment = schema["properties"]["assignments"]["items"]
+    deviations = assignment["properties"]["deviations"]
+
+    assert deviations == {"type": "array", "maxItems": 0}
+    assert '"enum": []' not in json.dumps(schema, sort_keys=True)
 
 
 def test_request_builder_consumes_task_spec_without_fixed_instruction_parser() -> None:
@@ -233,6 +251,7 @@ def test_llm_v2_repairs_structural_unknown_goal_then_accepts() -> None:
     assert plan.assignments[0].uav_id == "uav_a"
     assert len(client.calls) == 2
     assert all(call[1].temperature == 0.0 for call in client.calls)
+    assert all(call[1].max_tokens == 2048 for call in client.calls)
     assert client.calls[0][1].response_format.name == "fleet_mission_plan_v2"
     assert planner.last_diagnostics.repair_used
     assert [item["accepted"] for item in planner.model_proposals] == [False, True]

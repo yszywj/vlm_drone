@@ -67,12 +67,14 @@ _JSON_FENCE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 _FIXED_YAW_CONDITION = "only allowed and required when yaw_mode is FIXED"
-# The documented local Qwen service uses a 4096-token context.  Initial output
-# has enough room for a typical draft.  Repair uses a compact context (without
-# the redundant Skill Catalog and full initial system prompt) and has a larger
-# bounded output budget so a complete corrected multi-step object is not cut
-# off mid-JSON on the documented 4096-token local deployment.
-_DYNAMIC_PLAN_MAX_TOKENS = 1024
+# The documented local Qwen service uses a 4096-token context.  A focused
+# Fleet-owned retry can carry roughly 3.1k prompt tokens once bounded Goal and
+# validation findings are included; 1024 output tokens therefore makes vLLM
+# reject the request before generation.  Real two-UAV V3 drafts stay below 700
+# tokens, so 768 preserves a useful completion margin.  Planner-internal repair
+# uses a compact context (without the redundant catalog/full system prompt) and
+# can retain its larger complete-object budget.
+_DYNAMIC_PLAN_MAX_TOKENS = 768
 _DYNAMIC_REPAIR_MAX_TOKENS = 1536
 _COMPACT_REPAIR_SYSTEM_PROMPT = (
     "Repair one UAV Skill plan as strict compact JSON matching the bound "
@@ -426,6 +428,9 @@ class DynamicLLMPlanner(MissionPlanner):
                     request.require_empty_spatial_assumptions
                 ),
                 trusted_target_locked=request.trusted_target_id is not None,
+                allow_trusted_safety_completion=(
+                    request.allow_trusted_safety_completion
+                ),
             )
             response_format_name = "skill_plan_draft_v3"
         response_format = JsonSchemaResponseFormat(
@@ -998,6 +1003,11 @@ class DynamicLLMPlanner(MissionPlanner):
         if not isinstance(allow_trusted_safety_completion, bool):
             raise TypeError("allow_trusted_safety_completion must be bool")
         if allow_trusted_safety_completion:
+            if "LAND" in skills:
+                raise ValueError(
+                    "V3 trusted safety-completion mode requires the model to "
+                    "omit LAND; trusted Python owns the bounded terminal epilogue"
+                )
             if skills.count("LAND") > 1:
                 raise ValueError("V3 plan may contain at most one LAND")
             if skills.count("LAND") == 1 and skills[-1] != "LAND":

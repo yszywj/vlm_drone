@@ -288,6 +288,59 @@ class _RoutingEchoV3Client:
 
 
 class DynamicLLMPlannerV3Test(unittest.TestCase):
+    def test_v3_wire_schema_never_emits_empty_enum_or_union(self) -> None:
+        def assert_nonempty_grammar_choices(value: object, path: str = "$") -> None:
+            if isinstance(value, dict):
+                for key in ("enum", "oneOf", "anyOf"):
+                    if key in value:
+                        self.assertTrue(value[key], f"empty {key} at {path}")
+                for key, item in value.items():
+                    assert_nonempty_grammar_choices(item, f"{path}.{key}")
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    assert_nonempty_grammar_choices(item, f"{path}[{index}]")
+
+        schemas = (
+            build_skill_plan_v3_json_schema(
+                mission_id=_MISSION_ID,
+                uav_id=_UAV_ID,
+                plan_version=1,
+            ),
+            build_skill_plan_v3_json_schema(
+                mission_id=_MISSION_ID,
+                uav_id=_UAV_ID,
+                plan_version=1,
+                search_runtime_capabilities=SearchRuntimeCapabilities(
+                    adaptive_next_best_view=True
+                ),
+                require_empty_assumptions=True,
+                trusted_target_locked=True,
+            ),
+        )
+        for schema in schemas:
+            assert_nonempty_grammar_choices(schema)
+            self.assertNotIn("(?!", json.dumps(schema))
+
+    def test_v3_python_boundary_rejects_reserved_target_ref_without_lock(self) -> None:
+        proposal = deepcopy(_sector_v3_plan())
+        proposal["steps"][2]["args"]["target_ref"] = (  # type: ignore[index]
+            "$trusted_target.target_id"
+        )
+        planner = DynamicLLMPlanner(
+            _FakeModelClient([proposal]),
+            _V3_PROMPT,
+            planning_contract="v3",
+            repair_budget=0,
+        )
+
+        with self.assertRaises(PlannerOutputError):
+            planner.plan(_request())
+
+        self.assertIn(
+            "advertised trusted target lock",
+            planner.last_diagnostics.initial_error_message,  # type: ignore[union-attr]
+        )
+
     def test_default_contract_remains_byte_compatible_v2_path(self) -> None:
         client = _FakeModelClient([_v2_plan()])
         planner = DynamicLLMPlanner(client, _V2_PROMPT)
@@ -390,6 +443,24 @@ class DynamicLLMPlannerV3Test(unittest.TestCase):
         completeness = prompt_payload["mission_completeness_contract"]
         self.assertTrue(completeness["trusted_runtime_safety_completion"])
         self.assertTrue(completeness["omit_unrequested_return_or_land"])
+        self.assertFalse(completeness["model_land_allowed"])
+        self.assertNotIn(
+            "LAND",
+            {
+                item["name"]
+                for item in prompt_payload["skill_catalog"]["skills"]
+            },
+        )
+        wire_variants = client.calls[0][1].response_format.schema["properties"][
+            "steps"
+        ]["items"]["oneOf"]
+        self.assertNotIn(
+            "LAND",
+            {
+                item["properties"]["skill"]["const"]
+                for item in wire_variants
+            },
+        )
         self.assertEqual(planner.repair_budget, 0)
 
     def test_repair_budget_zero_returns_outer_repair_diagnostics_after_one_call(self) -> None:

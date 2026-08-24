@@ -216,7 +216,7 @@ class ModelWorkerConfig:
     """Trusted limits for the per-UAV asynchronous model worker."""
 
     max_inflight_per_uav: int = 1
-    request_timeout_s: float = 20.0
+    request_timeout_s: float = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,9 +508,21 @@ class AppConfig:
     # Legacy singleton constructor inputs are retained for compatibility with
     # existing ``dataclasses.replace(config, uav=...)`` call sites.  The
     # canonical public inventory is always the plural fields below.
-    uav: UavConfig | None = field(repr=False, compare=False)
-    camera: CameraConfig | None = field(repr=False, compare=False)
-    target: TargetConfig | None = field(repr=False, compare=False)
+    uav: UavConfig | None = field(
+        repr=False,
+        compare=False,
+        metadata={"run_manager_exclude": True},
+    )
+    camera: CameraConfig | None = field(
+        repr=False,
+        compare=False,
+        metadata={"run_manager_exclude": True},
+    )
+    target: TargetConfig | None = field(
+        repr=False,
+        compare=False,
+        metadata={"run_manager_exclude": True},
+    )
     search: SearchConfig
     planner: PlannerConfig
     experiment: ExperimentConfig

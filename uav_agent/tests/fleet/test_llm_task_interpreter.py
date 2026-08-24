@@ -50,6 +50,10 @@ def test_interpreter_uses_temperature_zero_schema_and_does_not_assign_work() -> 
     assert options.temperature == 0.0
     assert options.response_format.name == "fleet_task_spec_v1"
     assert "do not assign work" in messages[1].content
+    assert '("search and track") requires one SEARCH_TARGET' in messages[0].content
+    assert "AssignmentConstraint listing every bound goal ID" in messages[0].content
+    assert "as a CIRCLE RegionSpec" in messages[0].content
+    assert "Put them only in termination_goals" in messages[0].content
     assert interpreter.last_diagnostics.model_calls == 1
     assert not interpreter.last_diagnostics.repair_used
     assert interpreter.model_proposals[0]["accepted"] is True
@@ -74,6 +78,25 @@ def test_interpreter_repairs_once_and_records_sanitized_diagnostics() -> None:
     assert diagnostics.initial_error_code == "TASK_SPEC_VALIDATION_ERROR"
     assert [item["accepted"] for item in interpreter.model_proposals] == [False, True]
     assert interpreter.model_proposals[1]["repair"] is True
+
+
+def test_interpreter_repairs_termination_action_misplaced_in_goals() -> None:
+    invalid = deepcopy(_payload())
+    invalid["goals"][0]["goal_type"] = "LAND"
+    invalid["goals"][0]["target_alias"] = None
+    client = _QueuedClient(
+        [
+            json.dumps(invalid, ensure_ascii=False),
+            json.dumps(_payload(), ensure_ascii=False),
+        ]
+    )
+
+    spec = _interpreter(client).interpret(SOURCE)
+
+    assert spec.to_dict() == _payload()
+    repair_message = client.calls[1][0][-1].content
+    assert "termination_goals" in repair_message
+    assert "TASK_SPEC_VALIDATION_ERROR" in repair_message
 
 
 @pytest.mark.parametrize(
@@ -102,4 +125,3 @@ def test_interpreter_forbidden_proposal_is_not_retained() -> None:
     with pytest.raises(FleetTaskInterpretationError):
         interpreter.interpret(SOURCE)
     assert interpreter.model_proposals[0]["proposal"] is None
-

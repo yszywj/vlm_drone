@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from fleet.task_spec import ConstraintStrength, GoalType, MissionGoal
+from fleet.task_spec import (
+    ConstraintStrength,
+    GoalType,
+    MissionGoal,
+    TerminationGoal,
+)
 from planner.goal_checker import GoalSatisfactionChecker
 from planner.schemas import LandingZoneSpec, PlannerWorldContext
 from planner.schemas_v3 import SkillPlanDraftV3
@@ -15,7 +20,21 @@ def _goal(
     goal_type: GoalType,
     *,
     duration_s: float | None = None,
-) -> MissionGoal:
+) -> MissionGoal | TerminationGoal:
+    if goal_type in {
+        GoalType.RETURN_HOME,
+        GoalType.LAND,
+        GoalType.RETURN_HOME_AND_LAND,
+        GoalType.WAIT,
+        GoalType.REPORT,
+    }:
+        return TerminationGoal(
+            goal_id=goal_id,
+            goal_type=goal_type,
+            uav_id=None,
+            duration_s=duration_s,
+            strength=ConstraintStrength.MUST,
+        )
     return MissionGoal(
         goal_id=goal_id,
         goal_type=goal_type,

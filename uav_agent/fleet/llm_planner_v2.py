@@ -23,7 +23,7 @@ from fleet.schemas_v2 import (
 )
 from fleet.strict_json import DuplicateJSONKeyError, strict_json_object_loads
 from fleet.task_spec import reject_forbidden_task_fields
-from fleet.types import FleetMissionError
+from fleet.types import FleetMissionError, FleetStartPolicy
 from fleet.types_v2 import FleetMissionPlanV2, FleetMissionRequestV2
 
 
@@ -65,7 +65,12 @@ class LLMFleetPlannerV2:
         model_client: ModelClient,
         *,
         logger: object | None = None,
-        max_tokens: int = 3072,
+        # The bundled vLLM launcher defaults to a 4096-token context.  A
+        # realistic FleetTaskSpec prompt is already slightly above 1024
+        # tokens, so requesting 3072 output tokens makes vLLM reject the call
+        # before generation (1025 + 3072 > 4096).  FleetPlanV2 is compact;
+        # 2048 leaves safe prompt headroom without reducing schema limits.
+        max_tokens: int = 2048,
         repair_budget: int = 2,
     ) -> None:
         if not callable(getattr(model_client, "chat", None)):
@@ -167,6 +172,14 @@ class LLMFleetPlannerV2:
                 decoded = strict_json_object_loads(raw)
                 reject_forbidden_task_fields(decoded, "FleetMissionPlanV2")
                 plan = parse_fleet_mission_plan_v2(decoded, request=request)
+                if any(
+                    assignment.start_policy is not FleetStartPolicy.PARALLEL
+                    for assignment in plan.assignments
+                ):
+                    raise FleetMissionError(
+                        "current Fleet runtime supports only PARALLEL "
+                        "assignment start_policy"
+                    )
             except (
                 DuplicateJSONKeyError,
                 FleetMissionError,

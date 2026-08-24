@@ -55,21 +55,29 @@ class GoalType(str, Enum):
     REPORT = "REPORT"
 
 
+MISSION_GOAL_TYPES = (
+    GoalType.SEARCH_TARGET,
+    GoalType.TRACK_TARGET,
+    GoalType.INSPECT_TARGET,
+    GoalType.NAVIGATE,
+)
+TERMINATION_GOAL_TYPES = (
+    GoalType.RETURN_HOME,
+    GoalType.LAND,
+    GoalType.RETURN_HOME_AND_LAND,
+    GoalType.WAIT,
+    GoalType.REPORT,
+)
+
+
 SpatialConstraint: TypeAlias = RegionSpec | SpatialTarget
 
 
 _TARGET_GOAL_TYPES = frozenset(
     {GoalType.SEARCH_TARGET, GoalType.TRACK_TARGET, GoalType.INSPECT_TARGET}
 )
-_TERMINATION_TYPES = frozenset(
-    {
-        GoalType.RETURN_HOME,
-        GoalType.LAND,
-        GoalType.RETURN_HOME_AND_LAND,
-        GoalType.WAIT,
-        GoalType.REPORT,
-    }
-)
+_MISSION_TYPES = frozenset(MISSION_GOAL_TYPES)
+_TERMINATION_TYPES = frozenset(TERMINATION_GOAL_TYPES)
 _FORBIDDEN_KEYS = frozenset(
     {
         "velocity",
@@ -284,6 +292,11 @@ class MissionGoal:
             self, "goal_id", validate_routing_id(self.goal_id, "goal_id")
         )
         goal_type = _enum(self.goal_type, GoalType, "goal_type")
+        if goal_type not in _MISSION_TYPES:
+            raise FleetTaskSpecError(
+                f"{goal_type.value} is a termination goal and must be placed in "
+                "FleetTaskSpecV1.termination_goals, not goals"
+            )
         object.__setattr__(self, "goal_type", goal_type)
         target_alias = _optional_text(
             self.target_alias, "target_alias", maximum=64
@@ -293,14 +306,27 @@ class MissionGoal:
         if goal_type in _TARGET_GOAL_TYPES and target_alias is None:
             raise FleetTaskSpecError(f"{goal_type.value} requires target_alias")
         object.__setattr__(self, "target_alias", target_alias)
-        if self.spatial_constraint is not None and not hasattr(
-            self.spatial_constraint, "to_dict"
+        spatial_constraint = self.spatial_constraint
+        if spatial_constraint is not None and not isinstance(
+            spatial_constraint, RegionSpec | SpatialTarget
         ):
             raise TypeError(
                 "spatial_constraint must be a Spatial V3 value or None"
             )
-        if goal_type is GoalType.NAVIGATE and self.spatial_constraint is None:
-            raise FleetTaskSpecError("NAVIGATE requires spatial_constraint")
+        if (
+            goal_type is GoalType.SEARCH_TARGET
+            and spatial_constraint is not None
+            and not isinstance(spatial_constraint, RegionSpec)
+        ):
+            raise FleetTaskSpecError(
+                "SEARCH_TARGET spatial_constraint must be a RegionSpec or None"
+            )
+        if goal_type is GoalType.NAVIGATE and not isinstance(
+            spatial_constraint, SpatialTarget
+        ):
+            raise FleetTaskSpecError(
+                "NAVIGATE requires a SpatialTarget spatial_constraint"
+            )
         object.__setattr__(
             self,
             "duration_s",
@@ -994,11 +1020,13 @@ __all__ = [
     "MAX_ORDERING_CONSTRAINTS",
     "MAX_SOURCE_EVIDENCE",
     "MAX_TERMINATION_GOALS",
+    "MISSION_GOAL_TYPES",
     "MissionGoal",
     "OrderingConstraint",
     "SourceEvidence",
     "SpatialConstraint",
     "TaskAmbiguity",
+    "TERMINATION_GOAL_TYPES",
     "TerminationGoal",
     "parse_fleet_task_spec",
     "reject_forbidden_task_fields",

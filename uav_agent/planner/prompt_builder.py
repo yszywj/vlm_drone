@@ -346,6 +346,14 @@ def build_spatial_v3_skill_planner_messages(
         int(projected_limits["max_plan_steps"]) - 2,
     )
     model_catalog = initial_planner_catalog(skill_catalog)
+    if allow_trusted_safety_completion:
+        model_catalog = SkillCatalog(
+            tuple(
+                contract
+                for contract in model_catalog
+                if contract.name != "LAND"
+            )
+        )
     safe_context = {
         "scene_bounds_world_enu_m": {
             "minimum": list(world_context.scene_min_xyz_m),
@@ -406,8 +414,12 @@ def build_spatial_v3_skill_planner_messages(
             "omit_unrequested_return_or_land": (
                 allow_trusted_safety_completion
             ),
+            "model_land_allowed": not allow_trusted_safety_completion,
             "when_return_and_land_are_requested": (
-                "emit a safe matching return and landing path"
+                "trusted Python owns the bounded home/LAND epilogue; do not "
+                "emit LAND"
+                if allow_trusted_safety_completion
+                else "emit a safe matching return and landing path"
             ),
             "runtime_rule": (
                 "When trusted_runtime_safety_completion is true, emit only "

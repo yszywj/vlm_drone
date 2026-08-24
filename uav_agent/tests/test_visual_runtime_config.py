@@ -37,6 +37,7 @@ class VisualRuntimeConfigTest(unittest.TestCase):
     def test_default_blocks_are_loaded(self) -> None:
         config = load_config(DEFAULT_CONFIG)
         self.assertEqual(config.model_worker, ModelWorkerConfig())
+        self.assertGreaterEqual(config.model_worker.request_timeout_s, 60.0)
         self.assertEqual(config.qwen_visual_review, QwenVisualReviewConfig())
         self.assertEqual(config.plan_revision, PlanRevisionConfig())
         self.assertEqual(config.frame_store, FrameStoreConfig())

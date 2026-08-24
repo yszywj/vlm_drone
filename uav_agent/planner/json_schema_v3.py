@@ -13,7 +13,12 @@ from skills.search_strategy import (
 
 
 _STEP_ID_PATTERN = "^[a-z][a-z0-9_]{0,31}$"
-_TARGET_REF_PATTERN = r"^\$(?!trusted_target\.)[a-z][a-z0-9_]{0,31}\.target_id$"
+# Keep the wire grammar within the regular-expression subset implemented by
+# vLLM/xgrammar.  In particular, negative lookahead makes vLLM 0.27.1 return
+# HTTP 500 while compiling the otherwise valid Local V3 schema.  The trusted
+# Python symbolic checker still rejects the reserved ``trusted_target``
+# reference unless an explicit runtime lock is present.
+_TARGET_REF_PATTERN = r"^\$[a-z][a-z0-9_]{0,31}\.target_id$"
 _TRUSTED_TARGET_REF = "$trusted_target.target_id"
 
 
@@ -242,6 +247,7 @@ def build_skill_plan_v3_json_schema(
     trusted_target_spec: TargetSpec | None = None,
     require_empty_assumptions: bool = False,
     trusted_target_locked: bool = False,
+    allow_trusted_safety_completion: bool = False,
 ) -> dict[str, object]:
     """Return the initial-plan V3 schema bound to trusted routing values."""
 
@@ -266,6 +272,8 @@ def build_skill_plan_v3_json_schema(
         raise TypeError("require_empty_assumptions must be bool")
     if not isinstance(trusted_target_locked, bool):
         raise TypeError("trusted_target_locked must be bool")
+    if not isinstance(allow_trusted_safety_completion, bool):
+        raise TypeError("allow_trusted_safety_completion must be bool")
     target_ref_schema: dict[str, object]
     if trusted_target_locked:
         target_ref_schema = {
@@ -286,8 +294,16 @@ def build_skill_plan_v3_json_schema(
         _step("HOVER", uav, _object({"duration_s": {"type": "number", "minimum": 1.0, "maximum": 60.0}, "yaw_mode": {"type": "string", "enum": ["KEEP_CURRENT", "FIXED"]}, "yaw_deg": _number()}, ["duration_s"])),
         _step("SEARCH", uav, _search_args_schema(capabilities)),
         _step("TRACK", uav, _object({"target_ref": target_ref_schema, "duration_s": _number(exclusive_minimum=0.0), "desired_altitude_m": _number(exclusive_minimum=0.0), "desired_distance_m": _number(exclusive_minimum=0.0), "on_target_lost": {"type": "string", "enum": ["REACQUIRE", "FAIL"]}}, ["target_ref", "duration_s"]), recovery=True),
-        _step("LAND", uav, _object({"zone": {"type": "string", "minLength": 1, "maxLength": 128}, "yaw_mode": {"type": "string", "enum": ["KEEP_CURRENT", "FIXED"]}, "yaw_deg": _number()}, ["zone"])),
     ]
+    # In Fleet goal mode the trusted compiler owns the bounded home/LAND
+    # epilogue.  Hiding LAND at the wire boundary prevents a small model from
+    # emitting an unsafe or incomplete landing sequence while still allowing
+    # arbitrary assigned mission Skills.  When the flag is false, the model
+    # must provide its own validated terminal LAND as before.
+    if not allow_trusted_safety_completion:
+        variants.append(
+            _step("LAND", uav, _object({"zone": {"type": "string", "minLength": 1, "maxLength": 128}, "yaw_mode": {"type": "string", "enum": ["KEEP_CURRENT", "FIXED"]}, "yaw_deg": _number()}, ["zone"]))
+        )
     del empty_args
     target_spec_schema: dict[str, object]
     required = [

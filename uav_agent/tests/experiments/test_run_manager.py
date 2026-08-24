@@ -10,6 +10,7 @@ from unittest import mock
 
 import yaml
 
+from configs.loader import load_config
 from experiments.run_manager import (
     FORBIDDEN_ARTIFACT_DIRECTORIES,
     InsufficientDiskSpaceError,
@@ -36,6 +37,7 @@ GIT_METADATA = {
     "branch": "main",
     "dirty": False,
 }
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class RunManagerTest(unittest.TestCase):
@@ -231,6 +233,52 @@ class RunManagerTest(unittest.TestCase):
             with self.assertRaises(InvalidRunStateError):
                 manager.update_resolved_config({"mission": {"goal_count": 4}})
             self.assertEqual(manager.paths.resolved_config.read_bytes(), before)
+
+    def test_update_resolved_config_uses_canonical_single_and_multi_inventories(
+        self,
+    ) -> None:
+        config_paths = (
+            PROJECT_ROOT / "configs" / "default.yaml",
+            PROJECT_ROOT / "configs" / "multi_uav_demo.yaml",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for index, config_path in enumerate(config_paths):
+                with self.subTest(config_path=config_path.name):
+                    manager = self.create_run(
+                        Path(temporary) / str(index),
+                        experiment_name=f"resolved_config_{index}",
+                    )
+                    config = load_config(config_path)
+
+                    manager.update_resolved_config(config)
+
+                    persisted = yaml.safe_load(
+                        manager.paths.resolved_config.read_text(encoding="utf-8")
+                    )
+                    self.assertNotIn("uav", persisted)
+                    self.assertNotIn("target", persisted)
+                    self.assertNotIn("camera", persisted)
+                    self.assertEqual(
+                        [item["id"] for item in persisted["uavs"]],
+                        [item.id for item in config.uavs],
+                    )
+                    self.assertEqual(
+                        [item["id"] for item in persisted["targets"]],
+                        [item.id for item in config.targets],
+                    )
+                    self.assertEqual(
+                        set(persisted["camera_profiles"]),
+                        set(config.camera_profiles),
+                    )
+                    reloaded = load_config(manager.paths.resolved_config)
+                    self.assertEqual(
+                        [item.id for item in reloaded.uavs],
+                        [item.id for item in config.uavs],
+                    )
+                    self.assertEqual(
+                        [item.id for item in reloaded.targets],
+                        [item.id for item in config.targets],
+                    )
 
     def test_lifecycle_updates_manifest_and_exit_code_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -21,7 +21,7 @@ from fleet.types_v2 import (
     FleetMissionPlanV2,
     FleetMissionRequestV2,
 )
-from planner.spatial import CircleRegion, CoordinateFrame
+from planner.spatial import CircleRegion, CoordinateFrame, PointTarget
 from scripts.run_fleet_mission import (
     FleetLaunchConfigurationError,
     RuntimeEnvelopeMetadata,
@@ -75,7 +75,7 @@ def _targetless_goal(goal_type: GoalType) -> MissionGoal | TerminationGoal:
             "goal_navigate",
             goal_type,
             None,
-            CircleRegion(CoordinateFrame.WORLD_ENU, (12.0, 5.0, 0.0), 2.0),
+            PointTarget(CoordinateFrame.WORLD_ENU, (12.0, 5.0, 0.0)),
             None,
             None,
             ConstraintStrength.MUST,

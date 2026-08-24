@@ -11,13 +11,14 @@ from planner.spatial import CoordinateFrame
 
 from fleet.task_spec import (
     ConstraintStrength,
-    GoalType,
     MAX_AMBIGUITIES,
     MAX_ASSIGNMENT_CONSTRAINTS,
     MAX_GOALS,
     MAX_ORDERING_CONSTRAINTS,
     MAX_SOURCE_EVIDENCE,
     MAX_TERMINATION_GOALS,
+    GoalType,
+    TERMINATION_GOAL_TYPES,
 )
 
 
@@ -43,11 +44,13 @@ def _id() -> dict[str, object]:
 
 
 def _id_array(maximum: int = 16, *, minimum: int = 0) -> dict[str, object]:
+    # vLLM 0.27.1's structured-output grammar returns HTTP 500 when it sees
+    # ``uniqueItems``.  The strict trusted TaskSpec parser independently
+    # rejects duplicates for every corresponding tuple.
     return {
         "type": "array",
         "minItems": minimum,
         "maxItems": maximum,
-        "uniqueItems": True,
         "items": _id(),
     }
 
@@ -125,13 +128,12 @@ def build_fleet_task_spec_json_schema(
         "type": "string",
         "enum": [item.value for item in ConstraintStrength],
     }
-    goal_type = {"type": "string", "enum": [item.value for item in GoalType]}
     target_schema: dict[str, object]
     if targets:
         target_schema = _nullable({"type": "string", "enum": list(targets)})
     else:
         target_schema = {"type": "null"}
-    spatial = {
+    general_spatial = {
         "oneOf": [
             {"type": "null"},
             _constrain_frames(region_spec_json_schema(), frames),
@@ -144,28 +146,54 @@ def build_fleet_task_spec_json_schema(
     positive_distance = _nullable(
         {"type": "number", "exclusiveMinimum": 0.0, "maximum": 100000.0}
     )
-    mission_goal = _object(
-        {
-            "goal_id": _id(),
-            "goal_type": goal_type,
-            "target_alias": target_schema,
-            "spatial_constraint": spatial,
-            "duration_s": positive_seconds,
-            "distance_m": positive_distance,
-            "strength": strength,
-            "evidence_refs": _id_array(),
-        },
-        [
-            "goal_id",
-            "goal_type",
-            "target_alias",
-            "spatial_constraint",
-            "duration_s",
-            "distance_m",
-            "strength",
-            "evidence_refs",
-        ],
-    )
+    common_goal_properties: dict[str, object] = {
+        "goal_id": _id(),
+        "target_alias": target_schema,
+        "duration_s": positive_seconds,
+        "distance_m": positive_distance,
+        "strength": strength,
+        "evidence_refs": _id_array(),
+    }
+    goal_required = [
+        "goal_id",
+        "goal_type",
+        "target_alias",
+        "spatial_constraint",
+        "duration_s",
+        "distance_m",
+        "strength",
+        "evidence_refs",
+    ]
+
+    def mission_goal_variant(
+        goal_type: GoalType,
+        spatial_constraint: dict[str, object],
+    ) -> dict[str, object]:
+        properties = deepcopy(common_goal_properties)
+        properties["goal_type"] = {"const": goal_type.value}
+        properties["spatial_constraint"] = spatial_constraint
+        return _object(properties, goal_required)
+
+    # Keep the semantic distinction in the wire grammar.  In particular, a
+    # point is a navigation destination, not a search region: accepting it for
+    # SEARCH_TARGET loses the user's "within N metres" extent before Fleet
+    # planning even starts.  ``goal_type`` is a const in every branch so the
+    # oneOf is discriminated without the less-portable JSON Schema
+    # ``discriminator`` extension.
+    mission_goal = {
+        "oneOf": [
+            mission_goal_variant(
+                GoalType.SEARCH_TARGET,
+                _nullable(_constrain_frames(region_spec_json_schema(), frames)),
+            ),
+            mission_goal_variant(GoalType.TRACK_TARGET, deepcopy(general_spatial)),
+            mission_goal_variant(GoalType.INSPECT_TARGET, deepcopy(general_spatial)),
+            mission_goal_variant(
+                GoalType.NAVIGATE,
+                _constrain_frames(spatial_target_json_schema(), frames),
+            ),
+        ]
+    }
     assignment_constraint = _object(
         {
             "constraint_id": _id(),
@@ -197,13 +225,7 @@ def build_fleet_task_spec_json_schema(
             "goal_id": _id(),
             "goal_type": {
                 "type": "string",
-                "enum": [
-                    GoalType.RETURN_HOME.value,
-                    GoalType.LAND.value,
-                    GoalType.RETURN_HOME_AND_LAND.value,
-                    GoalType.WAIT.value,
-                    GoalType.REPORT.value,
-                ],
+                "enum": [item.value for item in TERMINATION_GOAL_TYPES],
             },
             "uav_id": _nullable({"type": "string", "enum": list(uav_ids)}),
             "duration_s": deepcopy(positive_seconds),
@@ -227,7 +249,6 @@ def build_fleet_task_spec_json_schema(
             "candidate_values": {
                 "type": "array",
                 "maxItems": 8,
-                "uniqueItems": True,
                 "items": _bounded_text(128),
             },
             "resolution_required": {"type": "boolean"},

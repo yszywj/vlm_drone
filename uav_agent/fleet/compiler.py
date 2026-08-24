@@ -22,6 +22,7 @@ from runtime.validation_report import (
 from target.types import TargetSpec
 
 from fleet.planner_base import FleetPlannerError
+from fleet.task_spec import TerminationGoal
 from fleet.schemas import validate_fleet_mission_plan
 from fleet.schemas_v2 import validate_fleet_mission_plan_v2
 from fleet.types import (
@@ -412,6 +413,10 @@ class FleetAssignmentCompiler:
         structural_repair_findings = self._proposal_repair_findings(
             proposal_repair_findings
         )
+        has_assigned_termination = any(
+            isinstance(goal, TerminationGoal) for goal in agent_request.goals
+        )
+        trusted_safety_completion = not has_assigned_termination
         focused_payload: dict[str, object] = {
             "schema_version": 2,
             "task": (
@@ -429,7 +434,7 @@ class FleetAssignmentCompiler:
             # The model owns only assigned semantic Goals.  The trusted
             # compiler, not Qwen, closes an otherwise-airborne plan with a
             # bounded return/LAND epilogue after Goal coverage is measured.
-            "trusted_runtime_safety_completion": True,
+            "trusted_runtime_safety_completion": trusted_safety_completion,
             "requirements": [
                 "Plan only the assigned_goals in this request.",
                 (
@@ -440,7 +445,13 @@ class FleetAssignmentCompiler:
                     "Do not invent unassigned semantic Goals or change trusted "
                     "routing, Goal fields, or target specifications."
                 ),
+                (
+                    "Set top-level assumptions to []. All spatial values in "
+                    "assigned_goals are already trusted structured inputs; do "
+                    "not reinterpret them as model assumptions."
+                ),
             ],
+            "required_spatial_assumptions": [],
             "fleet_safety_summary": [
                 item.to_dict() for item in agent_request.fleet_safety_summary
             ],
@@ -477,8 +488,11 @@ class FleetAssignmentCompiler:
                 target_specs[0] if len(target_specs) == 1 else None
             ),
             trusted_target_id=trusted_target_id,
-            require_empty_spatial_assumptions=False,
-            allow_trusted_safety_completion=True,
+            # FleetTaskSpec and FleetPlan have already resolved natural-language
+            # spatial semantics into trusted Goal values.  A Local Planner must
+            # consume those values, not introduce a second interpretation layer.
+            require_empty_spatial_assumptions=True,
+            allow_trusted_safety_completion=trusted_safety_completion,
         )
 
     def compile_assignment(

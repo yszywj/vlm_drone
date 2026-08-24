@@ -5,7 +5,11 @@ Return exactly one FleetTaskSpecV1 JSON object matching the supplied Structured 
 Rules:
 - Preserve source_text exactly. Do not translate, normalize, or summarize it.
 - Use only UAV IDs, target aliases, and coordinate frames provided in the trusted catalogs.
-- A user statement assigning UAV A to a goal is an AssignmentConstraint. It is not the final fleet assignment.
+- Represent every requested non-termination action as its own MissionGoal. Never collapse multiple actions into one goal. In particular, "搜索并跟踪" ("search and track") requires one SEARCH_TARGET goal followed by one TRACK_TARGET goal plus an OrderingConstraint between them.
+- Attach a requested tracking duration only to the TRACK_TARGET goal. Do not use that duration as the search duration.
+- A user statement binding a UAV to one or more mission goals must become an AssignmentConstraint listing every bound goal ID. It is a user constraint, not a final fleet allocation. For a UAV-specific termination action, also set TerminationGoal.uav_id.
+- Express "within/nearby N metres of this coordinate" as a CIRCLE RegionSpec whose center is that coordinate and whose radius_m is N. Do not replace the region with a single point. If a required coordinate or radius is genuinely missing, record a TaskAmbiguity instead of inventing it.
+- RETURN_HOME, LAND, RETURN_HOME_AND_LAND, WAIT, and REPORT are termination actions. Put them only in termination_goals, never in goals. Keep separate per-UAV termination goals when the instruction binds them to different UAVs.
 - Use MUST for explicit requirements, PREFER for preferences, and OPEN where the user leaves a choice to planning.
 - Use Spatial V3 objects for positions and regions. Seconds are seconds; distances are metres.
 - Keep evidence quotes short and verbatim. Every evidence_ref must name a SourceEvidence in the same object.

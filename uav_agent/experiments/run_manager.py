@@ -296,10 +296,18 @@ def _to_plain_data_inner(
     if is_dataclass(value) and not isinstance(value, type):
         result: dict[str, Any] = {}
         for field in fields(value):
+            # Some configuration dataclasses retain compatibility-only
+            # constructor fields whose public attributes are computed views.
+            # They must not be persisted alongside their canonical fields
+            # (for example AppConfig.uav beside AppConfig.uavs), because that
+            # would either invoke an intentionally ambiguous accessor or emit
+            # a configuration that cannot be loaded again.
+            if field.metadata.get("run_manager_exclude") is True:
+                continue
             if _is_sensitive_key(field.name):
                 raise SensitiveDataError(f"refusing to persist sensitive field: {path}.{field.name}")
             result[field.name] = _to_plain_data(
-                getattr(value, field.name),
+                object.__getattribute__(value, field.name),
                 f"{path}.{field.name}",
                 _active_ids=active_ids,
                 _depth=depth + 1,

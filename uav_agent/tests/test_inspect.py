@@ -73,7 +73,20 @@ class IllicitProductionOracleResolver:
             uav_id=candidate.uav_id,
             candidate_id=candidate.candidate_id,
             position_xyz_m=(6.0, 0.0, 0.0),
-            source="oracle_evaluation",
+            source="depth_oracle_bridge",
+        )
+
+
+class EvaluatorOracleAliasResolver:
+    profile = PerceptionRuntimeProfile.ORACLE_EVALUATION
+
+    def resolve(self, candidate, *, timestamp_s: float):
+        del timestamp_s
+        return ResolvedCandidatePosition(
+            uav_id=candidate.uav_id,
+            candidate_id=candidate.candidate_id,
+            position_xyz_m=(6.0, 0.0, 0.0),
+            source="evaluator_oracle_debug",
         )
 
 
@@ -390,6 +403,19 @@ class InspectSkillTest(unittest.TestCase):
                     bank.get("candidate_1").lifecycle,
                     CandidateLifecycle.PROVISIONAL,
                 )
+
+    def test_explicit_evaluator_profile_accepts_privileged_resolver_alias(self) -> None:
+        skill, _, _, bank, _, context = _fixture(
+            resolver=EvaluatorOracleAliasResolver()
+        )
+
+        skill.start(InspectGoal(candidate_id="candidate_1"), context)
+
+        self.assertIs(skill.status, SkillStatus.RUNNING)
+        self.assertIs(
+            bank.get("candidate_1").lifecycle,
+            CandidateLifecycle.UNDER_INSPECTION,
+        )
 
     def test_timeout_does_not_fabricate_confirmation(self) -> None:
         policy = InspectPolicy(

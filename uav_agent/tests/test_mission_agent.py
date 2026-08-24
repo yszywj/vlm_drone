@@ -22,6 +22,7 @@ from agents.mission_agent import (
     MissionAgentError,
     MissionAgentSnapshot,
 )
+from common.target_estimate import TargetEstimate
 from env.kinematic_uav import KinematicUAV, UAVState
 from planner.base import MissionPlanner
 from perception.runtime import PerceptionRuntimeProfile
@@ -341,6 +342,29 @@ def observation(
         uav_pose=pose or UAVState(0.0, 0.0, 10.0, 0.0),
         uav_velocity=np.zeros(3),
         camera_rgb=np.zeros((8, 8, 3), dtype=np.uint8),
+    )
+
+
+def privileged_target_estimate(
+    timestamp: float,
+    source: str,
+) -> TargetEstimate:
+    return TargetEstimate(
+        timestamp_s=timestamp,
+        target_id="target_0",
+        candidate_id="candidate_0",
+        tracker_id="track_0",
+        visible=False,
+        confirmed=True,
+        predicted_only=True,
+        class_id=0,
+        class_name="person",
+        confidence=0.9,
+        bbox_xyxy_normalized=None,
+        position_world_m=(1.0, 0.0, 0.0),
+        velocity_world_mps=(0.0, 0.0, 0.0),
+        measurement_age_s=0.0,
+        source=source,
     )
 
 
@@ -722,6 +746,53 @@ class MissionAgentTickAndTargetTests(unittest.TestCase):
         self.assertIs(snapshot.target.lifecycle, TargetLifecycle.TRACKING)
         self.assertEqual(snapshot.target.source, "confirmed_vision")
 
+    def test_production_visual_lock_rejects_all_oracle_source_aliases(self) -> None:
+        for source in ("oracle", "oracle_truth", "OrAcLe_BrIdGe"):
+            with self.subTest(source=source):
+                harness = make_harness(
+                    perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
+                    acknowledge_privileged_oracle=False,
+                )
+                harness.start()
+                harness.tick(1.0)
+                harness.tick(2.0)
+                coordinator = CandidateConfirmationCoordinator()
+                coordinator.register_candidate(
+                    DetectionCandidate("tracklet_0", 2.1, 0.8),
+                    harness.target,
+                )
+                coordinator.evaluate(
+                    target_manager=harness.target,
+                    track=ShortTrackEvidence(
+                        "tracklet_0", 2.7, 4, 0.6, True, 0.9
+                    ),
+                    semantic=SemanticVerification(
+                        "tracklet_0",
+                        2.8,
+                        "moving red target",
+                        True,
+                        0.9,
+                        "qwen-vl",
+                    ),
+                    identity=IdentityConsistencyEvidence(
+                        "tracklet_0",
+                        "target_0",
+                        2.9,
+                        True,
+                        True,
+                        4,
+                        0.9,
+                    ),
+                )
+                # Adversarially relabel an otherwise valid visual lock.  This
+                # models an upstream plugin trying to bypass the source gate.
+                harness.target._source = source
+
+                snapshot = harness.tick(3.0)
+
+                self.assertEqual(snapshot.active_skill, "LAND")
+                self.assertIn("Oracle target lock", snapshot.last_error or "")
+
     def test_track_lost_enters_reacquiring_with_real_last_seen_data(self) -> None:
         lost_data = {
             "target_id": "target_0",
@@ -916,6 +987,26 @@ class MissionAgentSafetyAndLifecycleTests(unittest.TestCase):
         self.assertEqual(snapshot.active_skill, "LAND")
         self.assertIn("perception boundary", snapshot.last_error or "")
 
+    def test_production_agent_rejects_oracle_target_estimate_aliases(self) -> None:
+        for source in ("oracle", "oracle_truth", "OrAcLe_BrIdGe"):
+            with self.subTest(source=source):
+                harness = make_harness(
+                    perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
+                    acknowledge_privileged_oracle=False,
+                )
+                harness.start()
+                privileged = replace(
+                    observation(1.0),
+                    target_estimate=privileged_target_estimate(1.0, source),
+                )
+
+                snapshot = harness.agent.tick(privileged)
+
+                self.assertEqual(harness.safety.evaluate_calls, 0)
+                self.assertEqual(harness.manager.tick_calls, 0)
+                self.assertEqual(snapshot.active_skill, "LAND")
+                self.assertIn("perception boundary", snapshot.last_error or "")
+
     def test_repeated_oracle_violation_cannot_starve_fail_safe_land(self) -> None:
         harness = make_harness(
             perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
@@ -957,6 +1048,27 @@ class MissionAgentSafetyAndLifecycleTests(unittest.TestCase):
         harness.clock.set(1.0)
 
         harness.agent.tick(privileged)
+
+        self.assertEqual(harness.safety.evaluate_calls, 1)
+        self.assertEqual(harness.manager.tick_calls, 1)
+
+    def test_oracle_evaluation_profile_accepts_oracle_source_alias(self) -> None:
+        harness = make_harness(
+            perception_runtime_profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
+            acknowledge_privileged_oracle=True,
+        )
+        harness.start()
+        harness.clock.set(1.0)
+
+        harness.agent.tick(
+            replace(
+                observation(1.0),
+                target_estimate=privileged_target_estimate(
+                    1.0,
+                    "OrAcLe_TrUtH",
+                ),
+            )
+        )
 
         self.assertEqual(harness.safety.evaluate_calls, 1)
         self.assertEqual(harness.manager.tick_calls, 1)

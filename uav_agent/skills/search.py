@@ -9,7 +9,6 @@ from numbers import Real
 
 import numpy as np
 
-from env.moving_target import TargetState
 from planner.region_compiler import CompiledSearchGeometry, RegionCompiler
 from planner.spatial import (
     CircleRegion,
@@ -433,12 +432,32 @@ class SearchSkill(Skill):
         frame_elapsed = max(0.0, frame_elapsed)
         elapsed = max(clock_elapsed, frame_elapsed)
 
-        if observation.oracle_target_visible is None:
-            raise SkillExecutionStateError(
-                "SEARCH requires oracle_target_visible for ideal detection"
-            )
+        estimate = observation.target_estimate
         if (
-            observation.oracle_target_visible
+            estimate is not None
+            and estimate.visible
+            and not estimate.predicted_only
+            and not estimate.confirmed
+        ):
+            self._candidate_id = estimate.candidate_id
+            self._candidate_source = estimate.source
+            self._reported_phase = (
+                SearchPhase.CANDIDATE_PENDING
+                if estimate.candidate_id is not None
+                else SearchPhase.WAITING_FOR_REVIEW
+            )
+        elif self._reported_phase in {
+            SearchPhase.CANDIDATE_PENDING,
+            SearchPhase.WAITING_FOR_REVIEW,
+        } and (estimate is None or not estimate.visible):
+            self._candidate_id = None
+            self._candidate_source = None
+            self._reported_phase = self._phase
+        if (
+            estimate is not None
+            and estimate.visible
+            and estimate.confirmed
+            and not estimate.predicted_only
             and frame_elapsed <= goal.timeout + 1e-12
         ):
             self._complete_target_found(observation, elapsed)
@@ -880,15 +899,15 @@ class SearchSkill(Skill):
         elapsed: float,
     ) -> None:
         goal = self._search_goal(self._active_goal)
-        target_id = observation.oracle_target_id
-        target_pose = observation.oracle_target_pose
+        estimate = observation.target_estimate
+        if estimate is None or not estimate.visible or not estimate.confirmed:
+            raise SkillExecutionStateError(
+                "TARGET_FOUND requires a visible confirmed TargetEstimate"
+            )
+        target_id = estimate.target_id
         if not isinstance(target_id, str) or not target_id.strip():
             raise SkillExecutionStateError(
-                "visible Oracle target is missing oracle_target_id"
-            )
-        if not isinstance(target_pose, TargetState):
-            raise SkillExecutionStateError(
-                "visible Oracle target is missing oracle_target_pose"
+                "confirmed TargetEstimate is missing target_id"
             )
         if (
             observation.camera_position_m is None
@@ -911,20 +930,32 @@ class SearchSkill(Skill):
                     float(value) for value in observation.camera_orientation_wxyz
                 ),
             },
-            "oracle_target_pose": _target_pose_dict(target_pose),
+            "target_position_world_m": estimate.position_world_m,
+            "target_velocity_world_mps": estimate.velocity_world_mps,
+            "perception_source": estimate.source,
+            "tracker_id": estimate.tracker_id,
+            "candidate_id": estimate.candidate_id,
+            "measurement_age_s": estimate.measurement_age_s,
             "elapsed_time": elapsed,
             "coverage_ratio": self._coverage_ratio(),
             "visited_viewpoints": tuple(self._visited_viewpoints),
             "search_exhausted_reason": None,
         }
-        if observation.oracle_target_velocity is not None:
-            data["oracle_target_velocity_mps"] = tuple(
-                float(value) for value in observation.oracle_target_velocity
-            )
+        if estimate.source == "oracle_evaluation" and estimate.position_world_m is not None:
+            # Stable result-key compatibility for evaluator regression reports;
+            # the values still come from the neutral estimate above.
+            data["oracle_target_pose"] = {
+                "x": estimate.position_world_m[0],
+                "y": estimate.position_world_m[1],
+                "z": estimate.position_world_m[2],
+                "yaw": 0.0,
+            }
+            if estimate.velocity_world_mps is not None:
+                data["oracle_target_velocity_mps"] = estimate.velocity_world_mps
         self._reported_phase = SearchPhase.TARGET_LOCKED
         self._set_feedback(
             self._overall_progress(),
-            "Target visible in Camera FOV",
+            "Confirmed target visible in Camera FOV",
             self._feedback_data(target_visible=True, elapsed=elapsed),
         )
         self._succeed(
@@ -1088,15 +1119,6 @@ def _uav_position(observation: Observation) -> np.ndarray:
 
 def _uav_pose_dict(observation: Observation) -> dict[str, float]:
     pose = observation.uav_pose
-    return {
-        "x": float(pose.x),
-        "y": float(pose.y),
-        "z": float(pose.z),
-        "yaw": float(pose.yaw),
-    }
-
-
-def _target_pose_dict(pose: TargetState) -> dict[str, float]:
     return {
         "x": float(pose.x),
         "y": float(pose.y),

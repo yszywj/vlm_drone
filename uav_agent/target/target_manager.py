@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from common.provenance import is_privileged_oracle_source
 from target.types import (
     TargetEvent,
     TargetLifecycle,
@@ -149,7 +150,7 @@ class TargetManager:
             last_seen_position=last_seen_position,
             last_seen_velocity=last_seen_velocity,
         )
-        if values[2].casefold() == "oracle":
+        if is_privileged_oracle_source(values[2]):
             raise ValueError(
                 "set_candidate() does not accept Oracle evidence"
             )
@@ -214,7 +215,7 @@ class TargetManager:
             last_seen_position=last_seen_position,
             last_seen_velocity=last_seen_velocity,
         )
-        if values[2].casefold() == "oracle":
+        if is_privileged_oracle_source(values[2]):
             raise ValueError(
                 "confirmed visual lock does not accept Oracle evidence; use "
                 "an explicit Oracle evaluation shortcut"

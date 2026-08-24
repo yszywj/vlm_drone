@@ -29,7 +29,7 @@ from runtime.events import (
     MissionEventBus,
     MissionEventType,
 )
-from runtime.frame_store import FrameStore
+from runtime.frame_store import FrameRef, FrameStore
 from runtime.review_scheduler import ReviewScheduler
 from runtime.plan_validator import PlanValidator
 from runtime.safety_supervisor import SafetyAction, SafetyDecision
@@ -149,7 +149,11 @@ class FakeAsyncWorker:
         plan_version: int | None = None,
     ) -> None:
         request = self.requests[-1]
-        present = decision in {"POSSIBLE_TARGET", "TARGET_MATCH"}
+        present = decision in {
+            "POSSIBLE_TARGET",
+            "TARGET_MATCH",
+            "TARGET_MISMATCH",
+        }
         content = {
             "schema_version": 1,
             "review_id": request.review_id,
@@ -318,6 +322,7 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
         event_bus: MissionEventBus | None = None,
         candidate_bank: CandidateBank | None = None,
         await_revision_completion: bool = False,
+        require_stable_search_candidate: bool = False,
     ) -> VisualReviewCoordinator:
         return VisualReviewCoordinator(
             uav_id="uav_1",
@@ -336,6 +341,146 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
             max_result_age_s=5.0,
             blocking_timeout_fallback=fallback,
             await_revision_completion=await_revision_completion,
+            require_stable_search_candidate=require_stable_search_candidate,
+        )
+
+    def test_search_qwen_waits_for_stable_detector_candidate(self) -> None:
+        manager, clock, uav = make_runtime(SkillName.SEARCH)
+        worker = FakeAsyncWorker()
+        bank = CandidateBank(uav_id="uav_1")
+        coordinator = self.make_coordinator(
+            manager,
+            worker,
+            mode=VisualReviewMode.GATE,
+            intervals={"SEARCH": 0.1},
+            candidate_bank=bank,
+            require_stable_search_candidate=True,
+        )
+        coordinator.submit_event(event(MissionEventType.LOW_VISIBILITY, 0.0))
+
+        tick_coordinator(coordinator, manager, clock, uav)
+        self.assertEqual(worker.requests, [])
+        for index, timestamp in enumerate((0.1, 0.3)):
+            bank.propose(
+                candidate_id="detector_track_7",
+                timestamp_s=timestamp,
+                bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+                frame_ref=FrameRef(
+                    "uav_1", f"detector_frame_{index}", timestamp, 8, 8
+                ),
+                source="ultralytics_service",
+            )
+            clock.time_s = timestamp
+            tick_coordinator(coordinator, manager, clock, uav)
+            self.assertEqual(worker.requests, [])
+
+        bank.propose(
+            candidate_id="detector_track_7",
+            timestamp_s=0.6,
+            bbox_xyxy_normalized=(0.11, 0.2, 0.41, 0.6),
+            frame_ref=FrameRef("uav_1", "detector_frame_2", 0.6, 8, 8),
+            source="ultralytics_service",
+        )
+        clock.time_s = 0.6
+        tick_coordinator(coordinator, manager, clock, uav)
+        self.assertEqual(len(worker.requests), 1)
+
+    def test_search_review_is_bound_to_one_detector_candidate_and_bbox(self) -> None:
+        manager, clock, uav = make_runtime(SkillName.SEARCH)
+        worker = FakeAsyncWorker()
+        bank = CandidateBank(uav_id="uav_1")
+        for index, timestamp in enumerate((0.0, 0.25, 0.5)):
+            bank.propose(
+                candidate_id="detector_bound_candidate",
+                timestamp_s=timestamp,
+                bbox_xyxy_normalized=(0.05, 0.2, 0.35, 0.6),
+                frame_ref=FrameRef(
+                    "uav_1", f"detector_bound_{index}", timestamp, 8, 8
+                ),
+                source="ultralytics_service",
+            )
+        coordinator = self.make_coordinator(
+            manager,
+            worker,
+            mode=VisualReviewMode.GATE,
+            intervals={"SEARCH": 0.1},
+            candidate_bank=bank,
+            await_revision_completion=True,
+            require_stable_search_candidate=True,
+        )
+
+        coordinator.submit_event(event(MissionEventType.LOW_VISIBILITY, 0.5))
+        clock.time_s = 0.5
+        tick_coordinator(coordinator, manager, clock, uav)
+        self.assertEqual(len(worker.requests), 1)
+        # A model-reported box for a different object cannot create its own
+        # candidate or inherit detector A's stability authorization.
+        worker.complete_latest(
+            decision="POSSIBLE_TARGET",
+            recommended_action="INSPECT",
+            bbox_xyxy_normalized=(0.65, 0.2, 0.95, 0.6),
+        )
+        clock.time_s = 0.6
+        tick_coordinator(coordinator, manager, clock, uav)
+        self.assertGreaterEqual(len(worker.requests), 2)
+        worker.complete_latest(
+            decision="POSSIBLE_TARGET",
+            recommended_action="INSPECT",
+            bbox_xyxy_normalized=(0.65, 0.2, 0.95, 0.6),
+        )
+        clock.time_s = 0.7
+        tick_coordinator(coordinator, manager, clock, uav)
+
+        self.assertEqual(coordinator.revision_events, ())
+        self.assertIsNone(coordinator.pending_revision)
+        self.assertIs(manager.active_name, SkillName.SEARCH)
+        candidates = bank.snapshots()
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].candidate_id, "detector_bound_candidate")
+        self.assertEqual(candidates[0].source, "ultralytics_service")
+        self.assertEqual(candidates[0].review_history, ())
+
+    def test_repeated_candidate_mismatch_is_terminal_negative_evidence(self) -> None:
+        manager, clock, uav = make_runtime(SkillName.SEARCH)
+        worker = FakeAsyncWorker()
+        bank = CandidateBank(uav_id="uav_1")
+        candidate_id = "detector_track_8"
+        for index, timestamp in enumerate((0.0, 0.25, 0.5)):
+            bank.propose(
+                candidate_id=candidate_id,
+                timestamp_s=timestamp,
+                bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+                frame_ref=FrameRef(
+                    "uav_1", f"mismatch_frame_{index}", timestamp, 8, 8
+                ),
+                source="ultralytics_service",
+            )
+        coordinator = self.make_coordinator(
+            manager,
+            worker,
+            mode=VisualReviewMode.GATE,
+            intervals={"SEARCH": 100.0},
+            candidate_bank=bank,
+            require_stable_search_candidate=True,
+        )
+
+        for timestamp in (0.5, 0.6):
+            coordinator.submit_event(
+                event(MissionEventType.LOW_VISIBILITY, timestamp)
+            )
+            clock.time_s = timestamp
+            tick_coordinator(coordinator, manager, clock, uav)
+            worker.complete_latest(decision="TARGET_MISMATCH")
+            clock.time_s = timestamp + 0.05
+            tick_coordinator(coordinator, manager, clock, uav)
+
+        review = coordinator.latest_candidate_review(candidate_id)
+        self.assertIsNotNone(review)
+        assert review is not None
+        self.assertEqual(review.decision.value, "TARGET_MISMATCH")
+        self.assertEqual(
+            coordinator.latest_candidate_review_reference_handles(candidate_id),
+            (),
         )
 
     def test_shadow_blocking_event_records_without_hover_or_target_effect(self) -> None:
@@ -530,6 +675,8 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
 
         clock.time_s = 0.1
         tick_coordinator(coordinator, manager, clock, uav)
+        self.assertEqual(worker.requests[-1].broker_priority, 3)
+        self.assertTrue(worker.requests[-1].broker_replaceable)
         self.assertIs(manager.active_name, SkillName.HOVER)
         self.assertTrue(manager.is_supervisory_paused)
         worker.complete_latest(decision="NO_RELEVANT_CHANGE")
@@ -581,6 +728,8 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
         tick_coordinator(coordinator, manager, clock, uav)
 
         self.assertEqual(len(worker.requests), 1)
+        self.assertEqual(worker.requests[-1].broker_priority, 4)
+        self.assertTrue(worker.requests[-1].broker_replaceable)
         self.assertIs(manager.active_name, SkillName.TRACK)
         self.assertFalse(manager.is_supervisory_paused)
         # No ModelClient exists in this test: coordinator tick performed only
@@ -915,7 +1064,7 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
             first.visual_review["latest_frame_ref"],
         )
 
-    def test_qwen_candidate_requires_consensus_before_inspect_event(self) -> None:
+    def test_qwen_only_candidate_never_authorizes_inspect_revision(self) -> None:
         manager, clock, uav = make_runtime()
         worker = FakeAsyncWorker()
         bank = CandidateBank(uav_id="uav_1")
@@ -967,14 +1116,7 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
         clock.time_s = 0.2
         tick_coordinator(coordinator, manager, clock, uav)
 
-        revision = coordinator.revision_events[-1]
-        payload = revision.to_dict()["payload"]
-        self.assertEqual(payload["candidate_id"], candidate.candidate_id)
-        self.assertEqual(payload["action"], "INSPECT")
-        self.assertEqual(payload["authorization_source"], "visual_consensus")
-        self.assertFalse(payload["trusted_runtime_event"])
-        self.assertNotIn("position", payload)
-        self.assertNotIn("steps", payload)
+        self.assertEqual(coordinator.revision_events, ())
         self.assertIs(manager.active_name, SkillName.GOTO)
         updated = bank.get(candidate.candidate_id)
         assert updated is not None
@@ -1015,6 +1157,13 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
         manager, clock, uav = make_runtime(SkillName.SEARCH)
         worker = FakeAsyncWorker()
         bank = CandidateBank(uav_id="uav_1")
+        bank.propose(
+            candidate_id="detector_search_no_owner",
+            timestamp_s=0.0,
+            bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+            frame_ref=FrameRef("uav_1", "detector_search_frame", 0.0, 8, 8),
+            source="ultralytics_service",
+        )
         coordinator = self.make_coordinator(
             manager,
             worker,
@@ -1111,6 +1260,81 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
         self.assertEqual(len(candidates[0].review_history), 2)
         self.assertEqual(coordinator.records[-1].disposition, "CONSENSUS_REACHED")
         self.assertTrue(coordinator.records[-1].accepted_for_control)
+
+    def test_qwen_review_preserves_matching_yolo_candidate_identity(self) -> None:
+        manager, clock, uav = make_runtime(SkillName.SEARCH)
+        worker = FakeAsyncWorker()
+        bank = CandidateBank(uav_id="uav_1")
+        detector_candidate_id = "mission_1_uav_1_track_7"
+        bank.propose(
+            candidate_id=detector_candidate_id,
+            timestamp_s=0.0,
+            bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+            frame_ref=FrameRef("uav_1", "frame_detector", 0.0, 8, 8),
+            source="ultralytics_service",
+        )
+        coordinator = self.make_coordinator(
+            manager,
+            worker,
+            mode=VisualReviewMode.GATE,
+            intervals={"SEARCH": 100.0},
+            candidate_bank=bank,
+        )
+
+        coordinator.submit_event(event(MissionEventType.LOW_VISIBILITY, 0.0))
+        tick_coordinator(coordinator, manager, clock, uav)
+        worker.complete_latest(decision="TARGET_MATCH")
+        # Detector tracking advances while the asynchronous Qwen review for
+        # t=0.0 is still pending.  Association must use the retained t=0.0
+        # bbox and must not attempt to move this tracker timeline backwards.
+        bank.propose(
+            candidate_id=detector_candidate_id,
+            timestamp_s=0.05,
+            bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+            frame_ref=FrameRef("uav_1", "frame_detector_newer", 0.05, 8, 8),
+            source="ultralytics_service",
+        )
+        coordinator.submit_event(event(MissionEventType.LOW_VISIBILITY, 0.1))
+        clock.time_s = 0.1
+        tick_coordinator(coordinator, manager, clock, uav)
+        worker.complete_latest(decision="TARGET_MATCH")
+        bank.propose(
+            candidate_id=detector_candidate_id,
+            timestamp_s=0.15,
+            bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+            frame_ref=FrameRef("uav_1", "frame_detector_latest", 0.15, 8, 8),
+            source="ultralytics_service",
+        )
+        clock.time_s = 0.2
+        tick_coordinator(coordinator, manager, clock, uav)
+
+        candidates = bank.snapshots()
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].candidate_id, detector_candidate_id)
+        self.assertEqual(candidates[0].source, "ultralytics_service")
+        self.assertIsNotNone(
+            coordinator.latest_candidate_review(detector_candidate_id)
+        )
+
+        bank.reject(detector_candidate_id, timestamp_s=0.2)
+        bank.propose(
+            candidate_id=detector_candidate_id,
+            timestamp_s=10.3,
+            bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+            frame_ref=FrameRef(
+                "uav_1", "frame_detector_new_epoch", 10.3, 8, 8
+            ),
+            source="ultralytics_service",
+        )
+        self.assertIsNone(
+            coordinator.latest_candidate_review(detector_candidate_id)
+        )
+        self.assertEqual(
+            coordinator.latest_candidate_review_reference_handles(
+                detector_candidate_id
+            ),
+            (),
+        )
 
     def test_rejected_candidate_cooldown_cannot_complete_consensus(self) -> None:
         manager, clock, uav = make_runtime(SkillName.SEARCH)
@@ -1271,6 +1495,13 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
         manager, clock, uav = make_runtime()
         worker = FakeAsyncWorker()
         bank = CandidateBank(uav_id="uav_1")
+        bank.propose(
+            candidate_id="detector_goto_revision",
+            timestamp_s=0.0,
+            bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+            frame_ref=FrameRef("uav_1", "detector_goto_frame", 0.0, 8, 8),
+            source="ultralytics_service",
+        )
         coordinator = self.make_coordinator(
             manager,
             worker,
@@ -1353,6 +1584,8 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
             target_manager=target,
             candidate_bank=bank,
             await_revision_completion=True,
+            min_search_candidate_observations=3,
+            min_search_candidate_duration_s=0.09,
         )
         safety = SafetySupervisor(
             scene_min_xyz_m=(-50.0, -50.0, 0.0),
@@ -1405,7 +1638,20 @@ class VisualReviewCoordinatorTests(unittest.TestCase):
         self.assertEqual(search_snapshot.active_skill, "SEARCH")
         self.assertIs(target.lifecycle, TargetLifecycle.SEARCHING)
 
-        # Establish SEARCH's periodic cadence; no candidate event is injected.
+        # The detector/tracker must establish a stable candidate before the
+        # periodic Qwen semantic reviewer is eligible.
+        for index, timestamp in enumerate((0.2, 0.25, 0.3)):
+            bank.propose(
+                candidate_id="detector_track_periodic",
+                timestamp_s=timestamp,
+                bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+                frame_ref=FrameRef(
+                    "uav_1", f"periodic_detector_{index}", timestamp, 8, 8
+                ),
+                source="ultralytics_service",
+            )
+
+        # Establish SEARCH's low-frequency periodic cadence.
         clock.time_s = 0.3
         agent.tick(observation(clock, uav))
         clock.time_s = 0.4

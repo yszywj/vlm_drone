@@ -8,8 +8,11 @@ depend on the configuration contract without importing the loader itself.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
+from types import MappingProxyType
+from typing import Mapping
 
-from common.ids import validate_uav_id
+from common.ids import validate_routing_id, validate_uav_id
 from common.obstacle_types import ObstacleSpec
 from planner.policy import PlannerLimits, PlannerPolicy
 
@@ -35,9 +38,28 @@ class UavConfig:
     max_speed_mps: float
     max_yaw_rate_deg_s: float
     id: str = "uav_1"
+    display_name: str | None = None
+    home_name: str | None = None
+    camera_profile: str = "default"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "id", validate_uav_id(self.id))
+        uav_id = validate_uav_id(self.id)
+        display_name = uav_id if self.display_name is None else self.display_name
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ValueError("display_name must be a non-empty string")
+        home_name = f"home_{uav_id}" if self.home_name is None else self.home_name
+        object.__setattr__(self, "id", uav_id)
+        object.__setattr__(self, "display_name", display_name.strip())
+        object.__setattr__(
+            self,
+            "home_name",
+            validate_routing_id(home_name, "home_name"),
+        )
+        object.__setattr__(
+            self,
+            "camera_profile",
+            validate_routing_id(self.camera_profile, "camera_profile"),
+        )
 
 
 @dataclass(frozen=True)
@@ -59,6 +81,87 @@ class ObstaclePerceptionConfig:
     max_occlusion_ratio: float = 0.95
 
 
+@dataclass(frozen=True, slots=True)
+class YoloServiceClientConfig:
+    """Bounded local HTTP client settings for target perception."""
+
+    url: str = "http://127.0.0.1:8011"
+    request_timeout_s: float = 0.5
+    max_result_age_s: float = 0.5
+    jpeg_quality: int = 90
+    max_inflight_per_uav: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class TargetDetectorConfig:
+    """Detector family and audited target-query mapping settings."""
+
+    model_family: str = "yolo"
+    proposal_mode: str = "closed_set"
+    confidence_threshold: float = 0.25
+    class_aliases_path: str = "configs/yolo/class_aliases.yaml"
+
+
+@dataclass(frozen=True, slots=True)
+class TargetTrackerConfig:
+    """Image-space tracker evidence requirements."""
+
+    type: str = "botsort"
+    min_track_observations: int = 3
+    min_track_duration_s: float = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class TargetGeometryConfig:
+    """Trusted RGB-D candidate-position resolver settings."""
+
+    mode: str = "isaac_depth"
+    depth_anchor: str = "bbox_bottom_center"
+    depth_patch_radius_px: int = 4
+    min_depth_m: float = 0.2
+    max_depth_m: float = 200.0
+    max_measurement_age_s: float = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class TargetStateEstimatorConfig:
+    """World-space target filter limits, independent of BoT-SORT state."""
+
+    type: str = "constant_velocity_kalman"
+    max_prediction_age_s: float = 2.0
+    max_position_jump_m: float = 10.0
+    process_noise: float = 1.0
+    measurement_noise: float = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class VisualConfirmationConfig:
+    """Rules for turning visual candidates into a stable target lock."""
+
+    mode: str = "class_track_or_qwen"
+    require_qwen_for_attributes: bool = True
+    require_qwen_for_reacquire_new_track_id: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class TargetPerceptionConfig:
+    """Independent target-perception backend and its bounded subcomponents."""
+
+    backend: str = "disabled"
+    yolo_service: YoloServiceClientConfig = field(
+        default_factory=YoloServiceClientConfig
+    )
+    detector: TargetDetectorConfig = field(default_factory=TargetDetectorConfig)
+    tracker: TargetTrackerConfig = field(default_factory=TargetTrackerConfig)
+    geometry: TargetGeometryConfig = field(default_factory=TargetGeometryConfig)
+    state_estimator: TargetStateEstimatorConfig = field(
+        default_factory=TargetStateEstimatorConfig
+    )
+    confirmation: VisualConfirmationConfig = field(
+        default_factory=VisualConfirmationConfig
+    )
+
+
 @dataclass(frozen=True)
 class TargetRegionConfig:
     min_xyz_m: tuple[float, float, float]
@@ -76,10 +179,29 @@ class TargetMotionConfig:
 
 
 @dataclass(frozen=True)
+class TargetAppearanceConfig:
+    shape: str = "CUBE"
+    color_name: str = "red"
+    color_rgb: tuple[float, float, float] = (1.0, 0.12, 0.05)
+    size_xyz_m: tuple[float, float, float] = (0.6, 0.6, 1.0)
+
+
+@dataclass(frozen=True)
 class TargetConfig:
     initial_region: TargetRegionConfig
     max_speed_mps: float
     motion: TargetMotionConfig
+    id: str = "target"
+    semantic_alias: str | None = None
+    appearance: TargetAppearanceConfig = field(default_factory=TargetAppearanceConfig)
+
+    def __post_init__(self) -> None:
+        target_id = validate_routing_id(self.id, "target_id")
+        alias = target_id if self.semantic_alias is None else self.semantic_alias
+        if not isinstance(alias, str) or not alias.strip():
+            raise ValueError("semantic_alias must be a non-empty string")
+        object.__setattr__(self, "id", target_id)
+        object.__setattr__(self, "semantic_alias", alias.strip())
 
 
 @dataclass(frozen=True)
@@ -260,13 +382,70 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class FleetConfig:
+    minimum_uav_separation_m: float = 5.0
+    target_claim_policy: str = "EXCLUSIVE"
+    route_conflict_policy: str = "LOWER_PRIORITY_HOLDS"
+    assignment_failure_policy: str = "REPORT_AND_REPLAN"
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.minimum_uav_separation_m, bool)
+            or not isinstance(self.minimum_uav_separation_m, (int, float))
+            or not isfinite(float(self.minimum_uav_separation_m))
+            or self.minimum_uav_separation_m <= 0.0
+        ):
+            raise ValueError("minimum_uav_separation_m must be greater than 0")
+        if self.target_claim_policy != "EXCLUSIVE":
+            raise ValueError("target_claim_policy must be EXCLUSIVE")
+        if self.route_conflict_policy != "LOWER_PRIORITY_HOLDS":
+            raise ValueError(
+                "route_conflict_policy must be LOWER_PRIORITY_HOLDS"
+            )
+        if self.assignment_failure_policy != "REPORT_AND_REPLAN":
+            raise ValueError(
+                "assignment_failure_policy must be REPORT_AND_REPLAN"
+            )
+
+
+@dataclass(frozen=True)
+class ModelBrokerConfig:
+    max_inflight_global: int = 4
+    max_inflight_per_uav: int = 1
+    max_pending_per_uav: int = 2
+    starvation_timeout_s: float = 15.0
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_inflight_global",
+            "max_inflight_per_uav",
+            "max_pending_per_uav",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if self.max_inflight_per_uav != 1:
+            raise ValueError("max_inflight_per_uav must be exactly 1")
+        if (
+            isinstance(self.starvation_timeout_s, bool)
+            or not isinstance(self.starvation_timeout_s, (int, float))
+            or not isfinite(float(self.starvation_timeout_s))
+            or self.starvation_timeout_s <= 0.0
+        ):
+            raise ValueError("starvation_timeout_s must be greater than 0")
+
+
+@dataclass(frozen=True)
 class AppConfig:
     schema_version: int
     simulation: SimulationConfig
     scene: SceneConfig
-    uav: UavConfig
-    camera: CameraConfig
-    target: TargetConfig
+    # Legacy singleton constructor inputs are retained for compatibility with
+    # existing ``dataclasses.replace(config, uav=...)`` call sites.  The
+    # canonical public inventory is always the plural fields below.
+    uav: UavConfig | None = field(repr=False, compare=False)
+    camera: CameraConfig | None = field(repr=False, compare=False)
+    target: TargetConfig | None = field(repr=False, compare=False)
     search: SearchConfig
     planner: PlannerConfig
     experiment: ExperimentConfig
@@ -290,6 +469,87 @@ class AppConfig:
     obstacle_perception: ObstaclePerceptionConfig = field(
         default_factory=ObstaclePerceptionConfig
     )
+    target_perception: TargetPerceptionConfig = field(
+        default_factory=TargetPerceptionConfig
+    )
+    uavs: tuple[UavConfig, ...] = ()
+    targets: tuple[TargetConfig, ...] = ()
+    camera_profiles: Mapping[str, CameraConfig] = field(default_factory=dict)
+    fleet: FleetConfig = field(default_factory=FleetConfig)
+    model_broker: ModelBrokerConfig = field(default_factory=ModelBrokerConfig)
+
+    def __post_init__(self) -> None:
+        raw_uav = object.__getattribute__(self, "uav")
+        raw_camera = object.__getattribute__(self, "camera")
+        raw_target = object.__getattribute__(self, "target")
+        uavs = tuple(self.uavs)
+        targets = tuple(self.targets)
+        profiles = dict(self.camera_profiles)
+
+        # A legacy value wins for singleton construction/replacement.  Multi
+        # inventory construction passes these three compatibility inputs as
+        # ``None`` and therefore cannot be silently collapsed to one item.
+        if raw_uav is not None:
+            if len(uavs) > 1:
+                raise ValueError("legacy uav cannot be combined with multiple uavs")
+            uavs = (raw_uav,)
+        if raw_target is not None:
+            if len(targets) > 1:
+                raise ValueError("legacy target cannot be combined with multiple targets")
+            targets = (raw_target,)
+        if raw_camera is not None:
+            if len(uavs) != 1:
+                raise ValueError("legacy camera requires exactly one UAV")
+            profiles[uavs[0].camera_profile] = raw_camera
+
+        if not uavs:
+            raise ValueError("uavs must contain at least one UAV")
+        if not targets:
+            raise ValueError("targets must contain at least one target")
+        if not profiles:
+            raise ValueError("camera_profiles must contain at least one profile")
+        if len({item.id for item in uavs}) != len(uavs):
+            raise ValueError("uavs must have unique IDs")
+        if len({item.id for item in targets}) != len(targets):
+            raise ValueError("targets must have unique IDs")
+        for name in profiles:
+            validate_routing_id(name, "camera_profile")
+        for item in uavs:
+            if item.camera_profile not in profiles:
+                raise ValueError(
+                    f"UAV {item.id!r} references unknown camera profile "
+                    f"{item.camera_profile!r}"
+                )
+
+        object.__setattr__(self, "uavs", uavs)
+        object.__setattr__(self, "targets", targets)
+        object.__setattr__(self, "camera_profiles", MappingProxyType(profiles))
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "uav":
+            uavs = object.__getattribute__(self, "uavs")
+            if len(uavs) != 1:
+                raise ValueError(
+                    "config.uav is ambiguous for a multi-UAV config; use config.uavs"
+                )
+            return uavs[0]
+        if name == "target":
+            targets = object.__getattribute__(self, "targets")
+            if len(targets) != 1:
+                raise ValueError(
+                    "config.target is ambiguous for a multi-target config; use config.targets"
+                )
+            return targets[0]
+        if name == "camera":
+            uavs = object.__getattribute__(self, "uavs")
+            if len(uavs) != 1:
+                raise ValueError(
+                    "config.camera is ambiguous for a multi-UAV config; "
+                    "use config.camera_profiles"
+                )
+            profiles = object.__getattribute__(self, "camera_profiles")
+            return profiles[uavs[0].camera_profile]
+        return object.__getattribute__(self, name)
 
 
 __all__ = [
@@ -300,11 +560,19 @@ __all__ = [
     "ExperimentConfig",
     "ArtifactsConfig",
     "FiguresConfig",
+    "FleetConfig",
     "FrameStoreConfig",
     "DebugImagesConfig",
     "LoggingConfig",
     "ModelWorkerConfig",
     "ObstaclePerceptionConfig",
+    "TargetDetectorConfig",
+    "TargetGeometryConfig",
+    "TargetPerceptionConfig",
+    "TargetStateEstimatorConfig",
+    "TargetTrackerConfig",
+    "VisualConfirmationConfig",
+    "YoloServiceClientConfig",
     "PlanRevisionConfig",
     "PlannerConfig",
     "SceneConfig",
@@ -313,6 +581,7 @@ __all__ = [
     "StorageConfig",
     "SimulationConfig",
     "TargetConfig",
+    "TargetAppearanceConfig",
     "TargetMotionConfig",
     "TargetRegionConfig",
     "TensorboardConfig",

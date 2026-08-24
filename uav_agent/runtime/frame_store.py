@@ -1,4 +1,4 @@
-"""Bounded in-memory RGB frame storage for asynchronous visual review.
+"""Bounded in-memory synchronized RGB-D frame storage.
 
 Only :class:`FrameRef` metadata is intended to leave this module.  Pixel data
 is owned by :class:`FrameStore`, never embedded in mission events or world
@@ -15,6 +15,7 @@ from threading import RLock
 import numpy as np
 
 from common.ids import validate_routing_id, validate_uav_id
+from env.camera_types import CameraIntrinsics, CameraSample
 
 
 def _timestamp(value: object, field_name: str = "timestamp_s") -> float:
@@ -74,9 +75,21 @@ class FrameRef:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameCameraGeometry:
+    """Camera calibration and world pose captured with one ``FrameRef``."""
+
+    timestamp_s: float
+    intrinsics: CameraIntrinsics
+    camera_position_world_m: tuple[float, float, float]
+    camera_orientation_world_wxyz: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
 class _StoredFrame:
     ref: FrameRef
     rgb: np.ndarray
+    depth_to_image_plane_m: np.ndarray | None
+    camera_geometry: FrameCameraGeometry | None
     byte_count: int
     sequence: int
 
@@ -167,21 +180,63 @@ class FrameStore:
         frame_id: str,
         timestamp_s: float,
         rgb: np.ndarray,
+        depth_to_image_plane_m: np.ndarray | None = None,
+        intrinsics: CameraIntrinsics | None = None,
+        camera_position_world_m: tuple[float, float, float] | None = None,
+        camera_orientation_world_wxyz: tuple[float, float, float, float] | None = None,
     ) -> FrameRef:
-        """Store one RGB frame and evict the oldest entries as needed."""
+        """Store one frame and evict the oldest entries as needed.
+
+        Legacy RGB-only callers omit all optional arguments.  Geometry fields
+        are all-or-none, and a depth plane is accepted only with matching
+        intrinsics and pose so it can never become detached from its frame.
+        """
 
         normalized_uav_id = validate_uav_id(uav_id)
         normalized_frame_id = validate_routing_id(frame_id, "frame_id")
         normalized_timestamp = _timestamp(timestamp_s)
-        if not isinstance(rgb, np.ndarray):
-            raise TypeError("rgb must be a numpy.ndarray")
-        if rgb.dtype != np.uint8:
-            raise TypeError("rgb must have dtype uint8")
-        if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError("rgb must have shape (height, width, 3)")
-        height = _positive_integer(int(rgb.shape[0]), "rgb height")
-        width = _positive_integer(int(rgb.shape[1]), "rgb width")
-        byte_count = int(rgb.nbytes)
+        geometry_values = (
+            intrinsics,
+            camera_position_world_m,
+            camera_orientation_world_wxyz,
+        )
+        has_geometry = any(value is not None for value in geometry_values)
+        if has_geometry and not all(value is not None for value in geometry_values):
+            raise ValueError(
+                "intrinsics and camera world pose must be supplied together"
+            )
+        if depth_to_image_plane_m is not None and not has_geometry:
+            raise ValueError("depth_to_image_plane_m requires camera geometry")
+
+        camera_sample: CameraSample | None = None
+        if has_geometry:
+            assert intrinsics is not None
+            assert camera_position_world_m is not None
+            assert camera_orientation_world_wxyz is not None
+            camera_sample = CameraSample(
+                timestamp_s=normalized_timestamp,
+                rgb=rgb,
+                depth_to_image_plane_m=depth_to_image_plane_m,
+                camera_position_world_m=camera_position_world_m,
+                camera_orientation_world_wxyz=camera_orientation_world_wxyz,
+                intrinsics=intrinsics,
+            )
+            normalized_rgb = camera_sample.rgb
+            normalized_depth = camera_sample.depth_to_image_plane_m
+        else:
+            if not isinstance(rgb, np.ndarray):
+                raise TypeError("rgb must be a numpy.ndarray")
+            if rgb.dtype != np.uint8:
+                raise TypeError("rgb must have dtype uint8")
+            if rgb.ndim != 3 or rgb.shape[2] != 3:
+                raise ValueError("rgb must have shape (height, width, 3)")
+            normalized_rgb = rgb
+            normalized_depth = None
+        height = _positive_integer(int(normalized_rgb.shape[0]), "rgb height")
+        width = _positive_integer(int(normalized_rgb.shape[1]), "rgb width")
+        byte_count = int(normalized_rgb.nbytes) + (
+            0 if normalized_depth is None else int(normalized_depth.nbytes)
+        )
         if byte_count > self._max_total_bytes:
             raise ValueError("one frame exceeds max_bytes")
 
@@ -209,12 +264,28 @@ class FrameStore:
             ):
                 raise ValueError("frame is older than the configured age window")
 
-            stored_rgb = np.ascontiguousarray(rgb).copy()
+            stored_rgb = np.ascontiguousarray(normalized_rgb).copy()
             stored_rgb.setflags(write=False)
+            stored_depth: np.ndarray | None = None
+            stored_geometry: FrameCameraGeometry | None = None
+            if camera_sample is not None:
+                if normalized_depth is not None:
+                    stored_depth = np.ascontiguousarray(normalized_depth).copy()
+                    stored_depth.setflags(write=False)
+                stored_geometry = FrameCameraGeometry(
+                    timestamp_s=camera_sample.timestamp_s,
+                    intrinsics=camera_sample.intrinsics,
+                    camera_position_world_m=camera_sample.camera_position_world_m,
+                    camera_orientation_world_wxyz=(
+                        camera_sample.camera_orientation_world_wxyz
+                    ),
+                )
             self._sequence += 1
             self._frames[key] = _StoredFrame(
                 ref=ref,
                 rgb=stored_rgb,
+                depth_to_image_plane_m=stored_depth,
+                camera_geometry=stored_geometry,
                 byte_count=byte_count,
                 sequence=self._sequence,
             )
@@ -227,6 +298,31 @@ class FrameStore:
             self._latest_timestamp_by_uav[normalized_uav_id] = latest_for_uav
             self._evict_locked(normalized_uav_id, latest_for_uav)
         return ref
+
+    def add_sample(
+        self,
+        *,
+        uav_id: str,
+        frame_id: str,
+        sample: CameraSample,
+    ) -> FrameRef:
+        """Store all channels from one already-synchronized camera sample."""
+
+        if not isinstance(sample, CameraSample):
+            raise TypeError("sample must be a CameraSample")
+        return self.add_frame(
+            uav_id=uav_id,
+            frame_id=frame_id,
+            timestamp_s=sample.timestamp_s,
+            rgb=sample.rgb,
+            depth_to_image_plane_m=sample.depth_to_image_plane_m,
+            intrinsics=sample.intrinsics,
+            camera_position_world_m=sample.camera_position_world_m,
+            camera_orientation_world_wxyz=sample.camera_orientation_world_wxyz,
+        )
+
+    # Explicit long name for call sites where ``sample`` might be ambiguous.
+    add_camera_sample = add_sample
 
     def get_frame(
         self,
@@ -249,6 +345,46 @@ class FrameStore:
             view = stored.rgb.view()
             view.setflags(write=False)
             return view
+
+    def get_depth(
+        self,
+        ref: FrameRef,
+        *,
+        copy: bool = True,
+    ) -> np.ndarray | None:
+        """Return the synchronized metric Z-depth plane, if retained."""
+
+        if not isinstance(ref, FrameRef):
+            raise TypeError("ref must be a FrameRef")
+        if not isinstance(copy, bool):
+            raise TypeError("copy must be a bool")
+        with self._lock:
+            stored = self._frames.get((ref.uav_id, ref.frame_id))
+            if (
+                stored is None
+                or stored.ref != ref
+                or stored.depth_to_image_plane_m is None
+            ):
+                return None
+            if copy:
+                return stored.depth_to_image_plane_m.copy()
+            view = stored.depth_to_image_plane_m.view()
+            view.setflags(write=False)
+            return view
+
+    def get_camera_geometry(
+        self,
+        ref: FrameRef,
+    ) -> FrameCameraGeometry | None:
+        """Return immutable calibration/pose captured with exactly ``ref``."""
+
+        if not isinstance(ref, FrameRef):
+            raise TypeError("ref must be a FrameRef")
+        with self._lock:
+            stored = self._frames.get((ref.uav_id, ref.frame_id))
+            if stored is None or stored.ref != ref:
+                return None
+            return stored.camera_geometry
 
     def contains(self, ref: FrameRef) -> bool:
         return self.get_frame(ref, copy=False) is not None
@@ -402,4 +538,9 @@ class FrameStore:
 BoundedFrameStore = FrameStore
 
 
-__all__ = ["BoundedFrameStore", "FrameRef", "FrameStore"]
+__all__ = [
+    "BoundedFrameStore",
+    "FrameCameraGeometry",
+    "FrameRef",
+    "FrameStore",
+]

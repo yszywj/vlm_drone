@@ -9,7 +9,6 @@ from numbers import Real
 
 import numpy as np
 
-from env.moving_target import TargetState
 from skills.base import (
     Skill,
     SkillExecutionStateError,
@@ -160,10 +159,6 @@ class ReacquireSkill(Skill):
         frame_elapsed = max(0.0, frame_elapsed)
         elapsed = max(max(0.0, now - self._start_time), frame_elapsed)
 
-        if observation.oracle_target_visible is None:
-            raise SkillExecutionStateError(
-                "REACQUIRE requires oracle_target_visible for ideal detection"
-            )
         requested_target_visible = self._requested_target_visible(observation, goal)
         if requested_target_visible and frame_elapsed <= goal.timeout + 1e-12:
             self._complete_target_found(observation, elapsed)
@@ -200,14 +195,16 @@ class ReacquireSkill(Skill):
         observation: Observation,
         goal: ReacquireGoal,
     ) -> bool:
-        if not observation.oracle_target_visible:
+        estimate = observation.target_estimate
+        if (
+            estimate is None
+            or not estimate.visible
+            or estimate.predicted_only
+            or not estimate.confirmed
+            or estimate.position_world_m is None
+        ):
             return False
-        target_id = observation.oracle_target_id
-        if not isinstance(target_id, str) or not target_id.strip():
-            raise SkillExecutionStateError(
-                "visible Oracle target is missing oracle_target_id"
-            )
-        return target_id.strip() == goal.target_id.strip()
+        return estimate.target_id == goal.target_id.strip()
 
     def _tick_transit(
         self,
@@ -316,10 +313,16 @@ class ReacquireSkill(Skill):
         elapsed: float,
     ) -> None:
         goal = self._reacquire_goal(self._active_goal)
-        target_pose = observation.oracle_target_pose
-        if not isinstance(target_pose, TargetState):
+        estimate = observation.target_estimate
+        if (
+            estimate is None
+            or not estimate.visible
+            or not estimate.confirmed
+            or estimate.target_id != goal.target_id.strip()
+            or estimate.position_world_m is None
+        ):
             raise SkillExecutionStateError(
-                "visible requested target is missing oracle_target_pose"
+                "visible requested target is missing a confirmed 3D TargetEstimate"
             )
         if (
             observation.camera_position_m is None
@@ -345,17 +348,27 @@ class ReacquireSkill(Skill):
                     float(value) for value in observation.camera_orientation_wxyz
                 ),
             },
-            "oracle_target_pose": _target_pose_dict(target_pose),
+            "target_position_world_m": estimate.position_world_m,
+            "target_velocity_world_mps": estimate.velocity_world_mps,
+            "perception_source": estimate.source,
+            "tracker_id": estimate.tracker_id,
+            "candidate_id": estimate.candidate_id,
+            "measurement_age_s": estimate.measurement_age_s,
             "completed_scans": self._completed_scans,
             "elapsed_time": elapsed,
         }
-        if observation.oracle_target_velocity is not None:
-            data["oracle_target_velocity_mps"] = tuple(
-                float(value) for value in observation.oracle_target_velocity
-            )
+        if estimate.source == "oracle_evaluation":
+            data["oracle_target_pose"] = {
+                "x": estimate.position_world_m[0],
+                "y": estimate.position_world_m[1],
+                "z": estimate.position_world_m[2],
+                "yaw": 0.0,
+            }
+            if estimate.velocity_world_mps is not None:
+                data["oracle_target_velocity_mps"] = estimate.velocity_world_mps
         self._set_feedback(
             min(1.0, elapsed / goal.timeout),
-            "Requested target visible in Camera FOV",
+            "Requested confirmed target visible in Camera FOV",
             self._feedback_data(target_visible=True, elapsed=elapsed),
         )
         self._succeed(
@@ -438,15 +451,6 @@ def _uav_position(observation: Observation) -> np.ndarray:
 
 def _uav_pose_dict(observation: Observation) -> dict[str, float]:
     pose = observation.uav_pose
-    return {
-        "x": float(pose.x),
-        "y": float(pose.y),
-        "z": float(pose.z),
-        "yaw": float(pose.yaw),
-    }
-
-
-def _target_pose_dict(pose: TargetState) -> dict[str, float]:
     return {
         "x": float(pose.x),
         "y": float(pose.y),

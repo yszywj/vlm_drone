@@ -27,6 +27,8 @@ from pxr import Gf, Tf, UsdGeom, UsdLux
 
 from configs.schema import AppConfig
 from env.camera_sensor import ImageProjection, RGBCameraSensor
+from env.camera_types import CameraSample
+from env.fleet_uav_search_env import camera_prim_path, target_prim_path, uav_prim_path
 from env.obstacle_registry import ObstacleRegistry, obstacle_scene_prim_key
 
 
@@ -40,13 +42,22 @@ class ScenePoseState:
     target_orientation: np.ndarray
 
 
+@dataclass(frozen=True)
+class FleetScenePoseState:
+    """One atomic read of every fleet entity pose."""
+
+    uav_positions: dict[str, np.ndarray]
+    uav_orientations: dict[str, np.ndarray]
+    target_positions: dict[str, np.ndarray]
+    target_orientations: dict[str, np.ndarray]
+
+
 class UavSearchScene:
-    """Build and expose the objects in the first UAV-search scene."""
+    """Build one or more UAVs/targets while retaining singleton conveniences."""
 
     GROUND_PRIM_PATH = "/World/Ground"
-    UAV_PRIM_PATH = "/World/UAV"
-    CAMERA_PRIM_PATH = "/World/UAV/Camera"
-    TARGET_PRIM_PATH = "/World/Target"
+    UAV_ROOT_PRIM_PATH = "/World/UAVs"
+    TARGET_ROOT_PRIM_PATH = "/World/Targets"
 
     def __init__(
         self,
@@ -65,6 +76,23 @@ class UavSearchScene:
         if not isinstance(self.obstacle_registry, ObstacleRegistry):
             raise TypeError("obstacle_registry must be an ObstacleRegistry")
         self.ground = None
+        self.uav_prims: dict[str, SingleXFormPrim] = {}
+        self.camera_sensors: dict[str, RGBCameraSensor] = {}
+        self.target_prims: dict[str, SingleXFormPrim] = {}
+        self.uav_prim_paths = {
+            item.id: uav_prim_path(item.id) for item in config.uavs
+        }
+        self.camera_prim_paths = {
+            item.id: camera_prim_path(item.id) for item in config.uavs
+        }
+        self.target_prim_paths = {
+            item.id: target_prim_path(item.id) for item in config.targets
+        }
+        if len(set(self.uav_prim_paths.values())) != len(self.uav_prim_paths):
+            raise ValueError("UAV IDs must resolve to unique Prim paths")
+        if len(set(self.target_prim_paths.values())) != len(self.target_prim_paths):
+            raise ValueError("target IDs must resolve to unique Prim paths")
+        # Singleton aliases used by the existing SimpleUavSearchEnv.
         self.uav: SingleXFormPrim | None = None
         self.camera_sensor: RGBCameraSensor | None = None
         self.target: SingleXFormPrim | None = None
@@ -77,8 +105,14 @@ class UavSearchScene:
             raise RuntimeError("scene has already been built")
         self._add_ground_and_lights()
         self._add_obstacles()
-        self._add_uav()
-        self._add_target()
+        self._add_uavs()
+        self._add_targets()
+        if len(self.config.uavs) == 1:
+            sole_uav_id = self.config.uavs[0].id
+            self.uav = self.uav_prims[sole_uav_id]
+            self.camera_sensor = self.camera_sensors[sole_uav_id]
+        if len(self.config.targets) == 1:
+            self.target = self.target_prims[self.config.targets[0].id]
         self._built = True
 
     def _add_ground_and_lights(self) -> None:
@@ -124,16 +158,9 @@ class UavSearchScene:
                 )
             )
 
-    def _add_uav(self) -> None:
-        uav_position = np.asarray(self.config.uav.initial_position_xyz_m, dtype=np.float64)
-        self.uav = self.world.scene.add(
-            SingleXFormPrim(
-                prim_path=self.UAV_PRIM_PATH,
-                name="uav",
-                position=uav_position,
-            )
-        )
-
+    def _add_uavs(self) -> None:
+        stage = get_current_stage()
+        UsdGeom.Xform.Define(stage, self.UAV_ROOT_PRIM_PATH)
         components = (
             ("Body", [0.0, 0.0, 0.0], [0.90, 0.55, 0.22], [0.08, 0.30, 0.90]),
             ("ArmX", [0.0, 0.0, 0.04], [1.70, 0.12, 0.08], [0.18, 0.38, 0.75]),
@@ -144,50 +171,81 @@ class UavSearchScene:
             ("MotorRight", [0.0, -0.75, 0.08], [0.24, 0.24, 0.12], [0.10, 0.10, 0.12]),
             ("Nose", [0.48, 0.0, 0.08], [0.14, 0.28, 0.10], [1.00, 0.45, 0.05]),
         )
-        for name, translation, scale, color in components:
-            self.world.scene.add(
-                VisualCuboid(
-                    prim_path=f"{self.UAV_PRIM_PATH}/{name}",
-                    name=f"uav_{name.lower()}",
-                    translation=np.asarray(translation),
-                    scale=np.asarray(scale),
-                    size=1.0,
-                    color=np.asarray(color),
+        for uav_config in self.config.uavs:
+            prim_path = self.uav_prim_paths[uav_config.id]
+            prim_name = Tf.MakeValidIdentifier(f"uav_{uav_config.id}")
+            self.uav_prims[uav_config.id] = self.world.scene.add(
+                SingleXFormPrim(
+                    prim_path=prim_path,
+                    name=prim_name,
+                    position=np.asarray(
+                        uav_config.initial_position_xyz_m, dtype=np.float64
+                    ),
                 )
             )
-
-        self.camera_sensor = RGBCameraSensor(self.world, self.config.camera)
-        self.camera_sensor.build()
-
-    def _add_target(self) -> None:
-        region = self.config.target.initial_region
-        target_position = (
-            np.asarray(region.min_xyz_m, dtype=np.float64)
-            + np.asarray(region.max_xyz_m, dtype=np.float64)
-        ) / 2.0
-        self.target = self.world.scene.add(
-            SingleXFormPrim(
-                prim_path=self.TARGET_PRIM_PATH,
-                name="target",
-                position=target_position,
+            for component_name, translation, scale, color in components:
+                self.world.scene.add(
+                    VisualCuboid(
+                        prim_path=f"{prim_path}/{component_name}",
+                        name=Tf.MakeValidIdentifier(
+                            f"{prim_name}_{component_name.lower()}"
+                        ),
+                        translation=np.asarray(translation),
+                        scale=np.asarray(scale),
+                        size=1.0,
+                        color=np.asarray(color),
+                    )
+                )
+            sensor = RGBCameraSensor(
+                self.world,
+                self.config.camera_profiles[uav_config.camera_profile],
+                camera_prim_path=self.camera_prim_paths[uav_config.id],
+                housing_prim_path=f"{prim_path}/CameraHousing",
+                sensor_name=f"uav_rgb_camera_{uav_config.id}",
+                acquisition_frequency_hz=round(
+                    1.0 / self.config.simulation.rendering_dt_s
+                ),
             )
-        )
-        self.world.scene.add(
-            VisualCuboid(
-                prim_path=f"{self.TARGET_PRIM_PATH}/Body",
-                name="target_body",
-                translation=np.zeros(3),
-                scale=np.asarray([0.6, 0.6, 1.0]),
-                size=1.0,
-                color=np.asarray([1.0, 0.12, 0.05]),
+            sensor.build()
+            self.camera_sensors[uav_config.id] = sensor
+
+    def _add_targets(self) -> None:
+        stage = get_current_stage()
+        UsdGeom.Xform.Define(stage, self.TARGET_ROOT_PRIM_PATH)
+        for target_config in self.config.targets:
+            region = target_config.initial_region
+            target_position = (
+                np.asarray(region.min_xyz_m, dtype=np.float64)
+                + np.asarray(region.max_xyz_m, dtype=np.float64)
+            ) / 2.0
+            prim_path = self.target_prim_paths[target_config.id]
+            prim_name = Tf.MakeValidIdentifier(f"target_{target_config.id}")
+            self.target_prims[target_config.id] = self.world.scene.add(
+                SingleXFormPrim(
+                    prim_path=prim_path,
+                    name=prim_name,
+                    position=target_position,
+                )
             )
-        )
+            self.world.scene.add(
+                VisualCuboid(
+                    prim_path=f"{prim_path}/Body",
+                    name=f"{prim_name}_body",
+                    translation=np.zeros(3),
+                    scale=np.asarray(target_config.appearance.size_xyz_m),
+                    size=1.0,
+                    color=np.asarray(target_config.appearance.color_rgb),
+                )
+            )
 
     def configure_overview_viewport(self) -> None:
         """Aim the GUI viewport so Ground, UAV, CameraHousing, and Target share the view."""
 
-        poses = self.read_poses()
-        focus = (poses.uav_position + poses.target_position) / 2.0
+        poses = self.read_fleet_poses()
+        all_positions = tuple(poses.uav_positions.values()) + tuple(
+            poses.target_positions.values()
+        )
+        focus = np.mean(np.stack(all_positions), axis=0)
         span = max(12.0, min(25.0, min(self.config.scene.size_xyz_m[:2]) * 0.20))
         eye = focus + np.asarray([0.70 * span, -0.80 * span, 0.50 * span])
         set_camera_view(
@@ -208,6 +266,32 @@ class UavSearchScene:
             uav_orientation=np.asarray(uav_orientation).copy(),
             target_position=np.asarray(target_position).copy(),
             target_orientation=np.asarray(target_orientation).copy(),
+        )
+
+    def read_fleet_poses(self) -> FleetScenePoseState:
+        """Read every root pose before any agent is ticked."""
+
+        uav_positions: dict[str, np.ndarray] = {}
+        uav_orientations: dict[str, np.ndarray] = {}
+        target_positions: dict[str, np.ndarray] = {}
+        target_orientations: dict[str, np.ndarray] = {}
+        for uav_id in sorted(self.uav_prims):
+            position, orientation = self.uav_prims[uav_id].get_world_pose()
+            uav_positions[uav_id] = np.asarray(position).copy()
+            uav_orientations[uav_id] = np.asarray(orientation).copy()
+        for target_id in sorted(self.target_prims):
+            position, orientation = self.target_prims[target_id].get_world_pose()
+            target_positions[target_id] = np.asarray(position).copy()
+            target_orientations[target_id] = np.asarray(orientation).copy()
+        if len(uav_positions) != len(self.config.uavs) or len(target_positions) != len(
+            self.config.targets
+        ):
+            raise RuntimeError("scene must be built before reading fleet poses")
+        return FleetScenePoseState(
+            uav_positions=uav_positions,
+            uav_orientations=uav_orientations,
+            target_positions=target_positions,
+            target_orientations=target_orientations,
         )
 
     @property
@@ -233,7 +317,19 @@ class UavSearchScene:
     ) -> None:
         """Set the UAV root pose; every child, including Camera, follows it."""
 
-        self._require_uav().set_world_pose(
+        self.set_uav_pose_for(
+            self.config.uav.id,
+            position_m=position_m,
+            orientation_wxyz=orientation_wxyz,
+        )
+
+    def set_uav_pose_for(
+        self,
+        uav_id: str,
+        position_m: Sequence[float] | None = None,
+        orientation_wxyz: Sequence[float] | None = None,
+    ) -> None:
+        self._require_uav(uav_id).set_world_pose(
             position=_position(position_m) if position_m is not None else None,
             orientation=_unit_quaternion(orientation_wxyz) if orientation_wxyz is not None else None,
         )
@@ -245,7 +341,19 @@ class UavSearchScene:
     ) -> None:
         """Set the Target root pose in meters and scalar-first quaternion form."""
 
-        self._require_target().set_world_pose(
+        self.set_target_pose_for(
+            self.config.target.id,
+            position_m=position_m,
+            orientation_wxyz=orientation_wxyz,
+        )
+
+    def set_target_pose_for(
+        self,
+        target_id: str,
+        position_m: Sequence[float] | None = None,
+        orientation_wxyz: Sequence[float] | None = None,
+    ) -> None:
+        self._require_target(target_id).set_world_pose(
             position=_position(position_m) if position_m is not None else None,
             orientation=_unit_quaternion(orientation_wxyz) if orientation_wxyz is not None else None,
         )
@@ -254,6 +362,11 @@ class UavSearchScene:
         """Return the latest RGB image; render simulation steps first."""
 
         return self._require_camera_sensor().get_rgb()
+
+    def get_camera_sample(self) -> CameraSample:
+        """Return one synchronized RGB-D Camera sample."""
+
+        return self._require_camera_sensor().get_sample()
 
     def save_camera_rgb(self, path: str, image: np.ndarray | None = None) -> str:
         return str(self._require_camera_sensor().save_rgb(path, image=image))
@@ -267,17 +380,42 @@ class UavSearchScene:
     ) -> ImageProjection:
         return self._require_camera_sensor().world_to_image(points_xyz_m)
 
-    def _require_uav(self) -> SingleXFormPrim:
+    def get_camera_sensor(self, uav_id: str) -> RGBCameraSensor:
+        return self._require_camera_sensor(uav_id)
+
+    def world_to_image_for(
+        self,
+        uav_id: str,
+        points_xyz_m: Sequence[float] | Sequence[Sequence[float]],
+    ) -> ImageProjection:
+        return self._require_camera_sensor(uav_id).world_to_image(points_xyz_m)
+
+    def _require_uav(self, uav_id: str | None = None) -> SingleXFormPrim:
+        if uav_id is not None:
+            try:
+                return self.uav_prims[uav_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown uav_id: {uav_id}") from exc
         if self.uav is None:
             raise RuntimeError("scene must be built before accessing UAV pose")
         return self.uav
 
-    def _require_target(self) -> SingleXFormPrim:
+    def _require_target(self, target_id: str | None = None) -> SingleXFormPrim:
+        if target_id is not None:
+            try:
+                return self.target_prims[target_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown target_id: {target_id}") from exc
         if self.target is None:
             raise RuntimeError("scene must be built before accessing Target pose")
         return self.target
 
-    def _require_camera_sensor(self) -> RGBCameraSensor:
+    def _require_camera_sensor(self, uav_id: str | None = None) -> RGBCameraSensor:
+        if uav_id is not None:
+            try:
+                return self.camera_sensors[uav_id]
+            except KeyError as exc:
+                raise KeyError(f"unknown uav_id: {uav_id}") from exc
         if self.camera_sensor is None:
             raise RuntimeError("scene must be built before accessing the camera")
         return self.camera_sensor

@@ -19,7 +19,22 @@ from perception.confirmation import (
     ConfirmationPolicy,
     ConfirmationResult,
 )
+from perception.class_aliases import (
+    ClassAliasConfigError,
+    ClassAliasMapper,
+    ResolvedClassAlias,
+    UNSUPPORTED_TARGET_CATEGORY,
+    UnsupportedTargetCategory,
+    compile_target_query,
+)
 from perception.detector_tracker import DetectorTrackerPerception
+from perception.evaluation import (
+    ISAAC_EVALUATOR_GROUND_TRUTH,
+    TargetEvaluationError,
+    TargetEvaluationMode,
+    TargetEstimateEvaluator,
+    TargetGroundTruth,
+)
 from perception.grounding import (
     CandidateResolutionUnavailable,
     CandidateResolver,
@@ -33,6 +48,7 @@ from perception.grounding import (
     ProductionCandidateResolver,
     QwenVLGrounder,
     ResolvedCandidatePosition,
+    UltralyticsGrounder,
     YOLOEGrounder,
 )
 from perception.ideal_obstacle_perception import IdealObstaclePerception
@@ -60,6 +76,12 @@ from perception.qwen_vlm_verifier import (
     VisualReviewInput,
 )
 from perception.reid_verifier import ReIDVerifier
+from perception.target_debug_images import (
+    BoundedTargetDebugImageWriter,
+    TARGET_DEBUG_EVENTS,
+    TargetDebugAnnotation,
+    TargetDebugImageStats,
+)
 from perception.runtime import (
     GuardedPerceptionBackend,
     PerceptionBoundaryError,
@@ -108,6 +130,19 @@ from perception.visual_review import (
     VisualReviewStaleReason,
     build_qwen_visual_review_json_schema,
 )
+from perception.visual_evidence import (
+    ClosedSetClassSemanticVerifier,
+    NonMonotonicTrackTime,
+    QwenEvidencePending,
+    QwenReacquireIdentityVerifierAdapter,
+    QwenSemanticVerifierAdapter,
+    ReacquireIdentityRequiresQwen,
+    SemanticVerificationRequiresQwen,
+    TemporalTrackIdentityVerifier,
+    TrackBoxObservation,
+    UltralyticsShortTrackEvidenceBuilder,
+    VisualEvidenceError,
+)
 
 __all__ = [
     "CandidateBank",
@@ -119,9 +154,13 @@ __all__ = [
     "ConfirmationDecision",
     "ConfirmationPolicy",
     "ConfirmationResult",
+    "ClassAliasConfigError",
+    "ClassAliasMapper",
+    "ClosedSetClassSemanticVerifier",
     "DetectionCandidate",
     "DetectorTrackerBackend",
     "DetectorTrackerPerception",
+    "ISAAC_EVALUATOR_GROUND_TRUTH",
     "DeterministicPromptCompiler",
     "GuardedPerceptionBackend",
     "GroundingBackend",
@@ -168,6 +207,10 @@ __all__ = [
     "RuntimeVisualProtocolError",
     "RuntimeVisualReviewInputV2",
     "TargetAssessmentStatus",
+    "BoundedTargetDebugImageWriter",
+    "TARGET_DEBUG_EVENTS",
+    "TargetDebugAnnotation",
+    "TargetDebugImageStats",
     "TaskProgressAssessment",
     "QwenVisualReview",
     "ReviewDisposition",
@@ -175,10 +218,15 @@ __all__ = [
     "SemanticVerifierBackend",
     "ShortTrackEvidence",
     "TargetPromptAdapter",
+    "TargetEvaluationError",
+    "TargetEvaluationMode",
+    "TargetEstimateEvaluator",
+    "TargetGroundTruth",
     "CandidateResolutionUnavailable",
     "CandidateResolver",
     "LearnedGrounder",
     "ResolvedCandidatePosition",
+    "ResolvedClassAlias",
     "VLMVerifier",
     "VisualReviewAcceptance",
     "VisualReviewAction",
@@ -192,9 +240,23 @@ __all__ = [
     "VisualReviewParseErrorCode",
     "VisualReviewProtocolError",
     "VisualReviewStaleReason",
+    "NonMonotonicTrackTime",
+    "QwenEvidencePending",
+    "QwenReacquireIdentityVerifierAdapter",
+    "QwenSemanticVerifierAdapter",
+    "ReacquireIdentityRequiresQwen",
+    "SemanticVerificationRequiresQwen",
+    "TemporalTrackIdentityVerifier",
+    "TrackBoxObservation",
+    "UNSUPPORTED_TARGET_CATEGORY",
+    "UltralyticsGrounder",
+    "UltralyticsShortTrackEvidenceBuilder",
+    "UnsupportedTargetCategory",
+    "VisualEvidenceError",
     "YOLOEGrounder",
     "build_qwen_visual_review_json_schema",
     "build_runtime_visual_assessment_v2_schema",
+    "compile_target_query",
     "observation_contains_oracle_data",
     "validate_observation_access",
 ]

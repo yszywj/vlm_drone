@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "base_model": {
+    "served_model_name": "Qwen3-VL-4B-Instruct"
+  },
+  "adapters": {
+    "fleet_planner": {
+      "status": "placeholder",
+      "served_model_name": "Qwen3-VL-4B-Fleet-Planner-LoRA",
+      "path": null,
+      "base_model_name": "Qwen3-VL-4B-Instruct",
+      "rank": null
+    },
+    "spatial_mission": {
+      "status": "placeholder",
+      "served_model_name": "Qwen3-VL-4B-Spatial-Mission-LoRA",
+      "path": null,
+      "base_model_name": "Qwen3-VL-4B-Instruct",
+      "rank": null
+    },
+    "runtime_visual": {
+      "status": "placeholder",
+      "served_model_name": "Qwen3-VL-4B-Runtime-Visual-LoRA",
+      "path": null,
+      "base_model_name": "Qwen3-VL-4B-Instruct",
+      "rank": null
+    },
+    "runtime_replanner": {
+      "status": "placeholder",
+      "served_model_name": "Qwen3-VL-4B-Runtime-Replanner-LoRA",
+      "path": null,
+      "base_model_name": "Qwen3-VL-4B-Instruct",
+      "rank": null
+    }
+  },
+  "routing": {
+    "FLEET_PLAN": "fleet_planner",
+    "FLEET_REPLAN": "fleet_planner",
+    "AGENT_SPATIAL_PLAN": "spatial_mission",
+    "RUNTIME_VISUAL_REVIEW": "runtime_visual",
+    "RUNTIME_REPLAN": "runtime_replanner"
+  },
+  "fallback_to_base": true
+}

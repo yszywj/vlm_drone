@@ -28,24 +28,28 @@ scene:
       collidable: true
       motion_state: STATIC
 
-uav:
-  id: uav_1
-  # Initial orientation is identity: yaw=0, with the UAV nose along world +X.
-  initial_position_xyz_m: [0.0, 0.0, 10.0]
-  max_speed_mps: 5.0
-  max_yaw_rate_deg_s: 60.0
+uavs:
+  - id: uav_1
+    display_name: UAV 1
+    home_name: home_uav_1
+    # Initial orientation is identity: yaw=0, with the UAV nose along world +X.
+    initial_position_xyz_m: [0.0, 0.0, 10.0]
+    max_speed_mps: 5.0
+    max_yaw_rate_deg_s: 60.0
+    camera_profile: default_rgb
 
-camera:
-  # [width, height]
-  resolution_wh_px: [640, 480]
-  # Must be an integer divisor of the 60 Hz rendering rate.
-  frequency_hz: 10
-  horizontal_fov_deg: 90.0
-  # Optional Isaac Camera focal length in stage units (meter here).
-  # When null, focal length is derived from horizontal_fov_deg.
-  focal_length_m: null
-  # Negative pitch points the camera downward relative to the UAV body.
-  pitch_deg: -45.0
+camera_profiles:
+  default_rgb:
+    # [width, height]
+    resolution_wh_px: [640, 480]
+    # Must be an integer divisor of the 60 Hz rendering rate.
+    frequency_hz: 10
+    horizontal_fov_deg: 90.0
+    # Optional Isaac Camera focal length in stage units (meter here).
+    # When null, focal length is derived from horizontal_fov_deg.
+    focal_length_m: null
+    # Negative pitch points the camera downward relative to the UAV body.
+    pitch_deg: -45.0
 
 # Privileged geometry is filtered through the rendered camera frustum before
 # it is exposed.  The feature remains disabled unless explicitly requested.
@@ -55,22 +59,40 @@ obstacle_perception:
   min_bbox_area_px: 64
   max_occlusion_ratio: 0.95
 
-target:
-  # Closed axis-aligned bounds; setup uses their center as the spawn position.
-  initial_region:
-    # This default puts the first target near the onboard camera's optical axis.
-    min_xyz_m: [9.0, -1.0, 0.5]
-    max_xyz_m: [11.0, 1.0, 0.5]
-  max_speed_mps: 1.5
-  motion:
-    mode: RANDOM_WALK  # STATIC | LINEAR | RANDOM_WALK
-    region:
-      min_xyz_m: [-40.0, -40.0, 0.5]
-      max_xyz_m: [40.0, 40.0, 0.5]
-    speed_mps: 1.0
-    initial_heading_deg: 0.0
-    direction_change_interval_s: 4.0
-    seed: 7
+# Target perception is an independent capability.  Keep it off in the public
+# default so legacy/unit-test runs never start a model service implicitly.
+target_perception:
+  backend: disabled  # disabled | oracle_evaluation | ultralytics_service
+
+targets:
+  - id: target
+    semantic_alias: moving target
+    appearance:
+      shape: CUBE
+      color_name: red
+      color_rgb: [1.0, 0.12, 0.05]
+      size_xyz_m: [0.6, 0.6, 1.0]
+    # Closed axis-aligned bounds; setup uses their center as the spawn position.
+    initial_region:
+      # This default puts the first target near the onboard camera's optical axis.
+      min_xyz_m: [9.0, -1.0, 0.5]
+      max_xyz_m: [11.0, 1.0, 0.5]
+    max_speed_mps: 1.5
+    motion:
+      mode: RANDOM_WALK  # STATIC | LINEAR | RANDOM_WALK
+      region:
+        min_xyz_m: [-40.0, -40.0, 0.5]
+        max_xyz_m: [40.0, 40.0, 0.5]
+      speed_mps: 1.0
+      initial_heading_deg: 0.0
+      direction_change_interval_s: 4.0
+      seed: 7
+
+fleet:
+  minimum_uav_separation_m: 5.0
+  target_claim_policy: EXCLUSIVE
+  route_conflict_policy: LOWER_PRIORITY_HOLDS
+  assignment_failure_policy: REPORT_AND_REPLAN
 
 search:
   # SearchSkill constructor accepts this mode; FACE_POINT keeps the camera
@@ -100,6 +122,12 @@ planner:
 model_worker:
   max_inflight_per_uav: 1
   request_timeout_s: 20.0
+
+model_broker:
+  max_inflight_global: 4
+  max_inflight_per_uav: 1
+  max_pending_per_uav: 2
+  starvation_timeout_s: 15.0
 
 qwen_visual_review:
   enabled: false

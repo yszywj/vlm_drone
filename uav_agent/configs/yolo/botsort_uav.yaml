@@ -1,0 +1,17 @@
+# Project-owned BoT-SORT profile.  Do not edit Ultralytics' installed YAML.
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.80
+fuse_score: true
+
+# Camera motion compensation is useful for the moving onboard UAV camera.
+gmc_method: sparseOptFlow
+
+# Additional appearance ReID remains explicitly disabled in v1.
+proximity_thresh: 0.50
+appearance_thresh: 0.80
+with_reid: false
+model: auto

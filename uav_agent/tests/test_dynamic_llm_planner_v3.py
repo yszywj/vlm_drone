@@ -507,6 +507,42 @@ class DynamicLLMPlannerV3Test(unittest.TestCase):
             "SECTOR_SWEEP",
         )
 
+    def test_v3_ground_level_world_point_is_repaired_before_runtime(self) -> None:
+        invalid = deepcopy(_sector_v3_plan())
+        invalid["steps"].insert(  # type: ignore[union-attr]
+            1,
+            {
+                "id": "goto_ground_center",
+                "uav_id": _UAV_ID,
+                "skill": "GOTO",
+                "args": {
+                    "target": {
+                        "kind": "POINT",
+                        "frame": "WORLD_ENU",
+                        "xyz_m": [20, 30, 0],
+                    }
+                },
+            },
+        )
+        client = _FakeModelClient([invalid, _sector_v3_plan()])
+        planner = DynamicLLMPlanner(client, _V3_PROMPT, planning_contract="v3")
+
+        execution = planner.plan_with_diagnostics(_request())
+
+        self.assertTrue(execution.diagnostics.repair_used)
+        self.assertTrue(execution.diagnostics.repair_succeeded)
+        self.assertIn(
+            "WORLD_ENU POINT target z must be greater than zero",
+            execution.diagnostics.initial_error_message,
+        )
+        repair_payload = json.loads(client.calls[1][0][-1].content)
+        self.assertTrue(
+            any(
+                "positive flight altitude" in item
+                for item in repair_payload["mandatory_repairs"]
+            )
+        )
+
     def test_v3_incomplete_prefix_repair_must_expand_complete_mission(self) -> None:
         incomplete = deepcopy(_sector_v3_plan())
         incomplete["steps"] = incomplete["steps"][:2]  # type: ignore[index]

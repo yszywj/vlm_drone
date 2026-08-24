@@ -9,8 +9,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import cos, radians, sin, tan
+from numbers import Integral
 from pathlib import Path
-from typing import Sequence
+import re
+from typing import Mapping, Sequence
 
 import numpy as np
 from isaacsim.core.api import World
@@ -20,10 +22,7 @@ from isaacsim.sensors.camera import Camera
 from PIL import Image
 
 from configs.schema import CameraConfig
-
-
-class CameraFrameNotReady(RuntimeError):
-    """Raised only while the RGB annotator has not produced a fresh frame."""
+from env.camera_types import CameraFrameNotReady, CameraIntrinsics, CameraSample
 
 
 @dataclass(frozen=True)
@@ -48,13 +47,31 @@ class RGBCameraSensor:
         *,
         camera_prim_path: str = CAMERA_PRIM_PATH,
         housing_prim_path: str = HOUSING_PRIM_PATH,
+        sensor_name: str = "uav_rgb_camera",
+        acquisition_frequency_hz: int | None = None,
     ) -> None:
         self.world = world
         self.config = config
         self.camera_prim_path = camera_prim_path
         self.housing_prim_path = housing_prim_path
+        if not isinstance(sensor_name, str) or not sensor_name:
+            raise ValueError("sensor_name must be a non-empty string")
+        self.sensor_name = re.sub(r"[^A-Za-z0-9_]", "_", sensor_name)
+        if acquisition_frequency_hz is None:
+            acquisition_frequency_hz = config.frequency_hz
+        if (
+            isinstance(acquisition_frequency_hz, bool)
+            or not isinstance(acquisition_frequency_hz, Integral)
+            or int(acquisition_frequency_hz) <= 0
+        ):
+            raise ValueError("acquisition_frequency_hz must be a positive integer")
+        # Fleet Camera render products acquire every renderer frame.  The
+        # environment performs one shared software downsample to the public
+        # CameraConfig frequency after proving every UAV has the same render ID.
+        self.acquisition_frequency_hz = int(acquisition_frequency_hz)
         self.camera: Camera | None = None
         self._built = False
+        self._depth_enabled = False
 
     def build(self) -> Camera:
         """Create the housing and Camera prim before the caller resets World."""
@@ -73,7 +90,7 @@ class RGBCameraSensor:
         self.world.scene.add(
             VisualCuboid(
                 prim_path=self.housing_prim_path,
-                name="uav_camera_housing",
+                name=f"{self.sensor_name}_housing",
                 translation=housing_translation,
                 orientation=orientation_wxyz,
                 scale=np.asarray([0.24, 0.32, 0.22]),
@@ -85,9 +102,9 @@ class RGBCameraSensor:
         self.camera = self.world.scene.add(
             Camera(
                 prim_path=self.camera_prim_path,
-                name="uav_rgb_camera",
+                name=self.sensor_name,
                 resolution=self.config.resolution_wh_px,
-                frequency=self.config.frequency_hz,
+                frequency=self.acquisition_frequency_hz,
             )
         )
         pitch_rad = radians(pitch_rotation_deg)
@@ -108,33 +125,96 @@ class RGBCameraSensor:
         self._built = True
         return self.camera
 
+    def enable_depth(self) -> None:
+        """Attach Isaac Sim's image-plane Z-depth annotator after Camera init.
+
+        ``World.reset()`` initializes scene sensors and creates the render
+        product.  Isaac Sim 5.1 therefore requires this method to be called
+        after that reset, rather than while :meth:`build` is constructing the
+        prim.  Repeated calls are intentionally harmless for coordinated
+        environment resets.
+        """
+
+        if self._depth_enabled:
+            return
+        camera = self._require_camera()
+        camera.add_distance_to_image_plane_to_frame()
+        self._depth_enabled = True
+
+    def synchronize_acquisition_clock(self) -> None:
+        """Reset this Camera's cadence after every Fleet annotator is attached."""
+
+        if not self._depth_enabled:
+            raise RuntimeError("enable_depth() must precede Camera clock synchronization")
+        self._require_camera().post_reset()
+
     def get_rgb(self) -> np.ndarray:
         """Return a copy of the latest frequency-governed RGB frame."""
 
-        image, _ = self.get_sample()
-        return image
+        frame = self._snapshot_frame()
+        return self._rgb_from_frame(frame)
 
-    def get_sample(self) -> tuple[np.ndarray, float]:
-        """Atomically copy the latest RGB frame and its simulation timestamp."""
+    def get_sample(self) -> CameraSample:
+        """Return one atomic RGB-D, pose, calibration, and timestamp sample.
 
-        frame = self._require_camera().get_current_frame()
-        image = frame.get("rgb")
-        if image is None or np.asarray(image).size == 0:
-            raise CameraFrameNotReady("camera frame is not ready; render simulation steps first")
-        array = np.asarray(image)
-        if array.ndim != 3 or array.shape[2] < 3:
-            raise RuntimeError(f"unexpected camera frame shape: {array.shape}")
-        timestamp = frame.get("rendering_time")
-        if timestamp is None or not np.isfinite(float(timestamp)):
-            raise RuntimeError("camera rendering timestamp is not available or finite")
-        return np.ascontiguousarray(array[:, :, :3]).copy(), float(timestamp)
+        The RGB and ``distance_to_image_plane`` arrays are copied from the
+        same cloned Isaac frame.  Missing depth is treated as annotator warmup,
+        never as an all-zero range image.
+        """
+
+        if not self._depth_enabled:
+            raise CameraFrameNotReady(
+                "distance_to_image_plane annotator is not enabled; reset the World "
+                "and call enable_depth()"
+            )
+        frame = self._snapshot_frame()
+        rgb = self._rgb_from_frame(frame)
+        timestamp_s = self._timestamp_from_frame(frame)
+        depth_value = frame.get("distance_to_image_plane")
+        if depth_value is None or np.asarray(depth_value).size == 0:
+            raise CameraFrameNotReady(
+                "camera depth frame is not ready; render simulation steps first"
+            )
+        depth = np.asarray(depth_value)
+        if depth.ndim == 3 and depth.shape[2] == 1:
+            depth = depth[:, :, 0]
+        expected_depth_shape = rgb.shape[:2]
+        if depth.shape != expected_depth_shape:
+            raise RuntimeError(
+                "RGB/depth resolution mismatch: "
+                f"rgb={expected_depth_shape}, depth={depth.shape}"
+            )
+        if not np.issubdtype(depth.dtype, np.number):
+            raise RuntimeError("camera depth frame must contain numeric values")
+        depth = np.ascontiguousarray(depth, dtype=np.float32).copy()
+        near_m, far_m = self._require_camera().get_clipping_range()
+        invalid = (
+            ~np.isfinite(depth)
+            | (depth <= 0.0)
+            | (depth < float(near_m))
+            | (depth > float(far_m))
+        )
+        depth[invalid] = np.nan
+
+        position, orientation = self.get_camera_pose()
+        intrinsics = self.get_intrinsics()
+        return CameraSample(
+            timestamp_s=timestamp_s,
+            rgb=rgb,
+            depth_to_image_plane_m=depth,
+            camera_position_world_m=tuple(float(value) for value in position),
+            camera_orientation_world_wxyz=tuple(float(value) for value in orientation),
+            intrinsics=intrinsics,
+            render_frame_id=self._render_frame_id_from_frame(frame),
+        )
 
     def invalidate_frame(self) -> None:
         """Prevent an image from a previous pose/episode from being reused."""
 
         frame = self._require_camera().get_current_frame()
-        if "rgb" in frame:
-            frame["rgb"] = None
+        for channel in ("rgb", "distance_to_image_plane"):
+            if channel in frame:
+                frame[channel] = None
 
     def save_rgb(self, path: str | Path, image: np.ndarray | None = None) -> Path:
         """Save the latest RGB frame, appending ``.png`` if no suffix is given."""
@@ -159,8 +239,33 @@ class RGBCameraSensor:
     def get_rendering_time_s(self) -> float:
         """Return the simulation timestamp associated with the latest RGB frame."""
 
-        _, timestamp = self.get_sample()
-        return timestamp
+        return self.get_render_metadata()[0]
+
+    def get_render_metadata(self) -> tuple[float, tuple[int, int] | None]:
+        """Peek the latest renderer clock without copying RGB/depth arrays."""
+
+        frame = self._require_camera().get_current_frame()
+        return (
+            self._timestamp_from_frame(frame),
+            self._render_frame_id_from_frame(frame),
+        )
+
+    def get_intrinsics(self) -> CameraIntrinsics:
+        """Return calibrated pinhole intrinsics for the configured resolution."""
+
+        camera = self._require_camera()
+        matrix = np.asarray(camera.get_intrinsics_matrix(), dtype=np.float64)
+        if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+            raise RuntimeError(f"unexpected Camera intrinsics matrix: {matrix!r}")
+        width, height = camera.get_resolution()
+        return CameraIntrinsics(
+            fx=float(matrix[0, 0]),
+            fy=float(matrix[1, 1]),
+            cx=float(matrix[0, 2]),
+            cy=float(matrix[1, 2]),
+            width=int(width),
+            height=int(height),
+        )
 
     def get_camera_pose(self) -> tuple[np.ndarray, np.ndarray]:
         """Return camera world position (m) and orientation (wxyz)."""
@@ -211,6 +316,65 @@ class RGBCameraSensor:
         if self.camera is not None:
             self.camera.destroy()
             self.camera = None
+        self._depth_enabled = False
+
+    def _snapshot_frame(self) -> dict[str, object]:
+        """Clone the mutable Isaac frame dictionary for a coherent read."""
+
+        return self._require_camera().get_current_frame(clone=True)
+
+    def _rgb_from_frame(self, frame: dict[str, object]) -> np.ndarray:
+        image = frame.get("rgb")
+        if image is None or np.asarray(image).size == 0:
+            raise CameraFrameNotReady(
+                "camera RGB frame is not ready; render simulation steps first"
+            )
+        array = np.asarray(image)
+        if array.ndim != 3 or array.shape[2] < 3:
+            raise RuntimeError(f"unexpected camera RGB frame shape: {array.shape}")
+        width, height = self._require_camera().get_resolution()
+        expected_shape = (int(height), int(width), 3)
+        rgb = np.ascontiguousarray(array[:, :, :3])
+        if rgb.shape != expected_shape:
+            raise RuntimeError(
+                f"camera RGB resolution mismatch: expected {expected_shape}, got {rgb.shape}"
+            )
+        if not np.all(np.isfinite(rgb)):
+            raise RuntimeError("camera RGB frame contains non-finite values")
+        if rgb.dtype != np.uint8:
+            rgb = rgb.astype(np.float64)
+            if rgb.size and float(np.max(rgb)) <= 1.0:
+                rgb *= 255.0
+            rgb = np.clip(rgb, 0.0, 255.0).astype(np.uint8)
+        return rgb.copy()
+
+    @staticmethod
+    def _timestamp_from_frame(frame: dict[str, object]) -> float:
+        timestamp = frame.get("rendering_time")
+        if timestamp is None or not np.isfinite(float(timestamp)):
+            raise CameraFrameNotReady("camera rendering timestamp is not ready")
+        return float(timestamp)
+
+    @staticmethod
+    def _render_frame_id_from_frame(
+        frame: Mapping[str, object],
+    ) -> tuple[int, int] | None:
+        reference_time = frame.get("rendering_frame")
+        if not isinstance(reference_time, Mapping):
+            return None
+        numerator = reference_time.get("referenceTimeNumerator")
+        denominator = reference_time.get("referenceTimeDenominator")
+        if (
+            isinstance(numerator, bool)
+            or not isinstance(numerator, Integral)
+            or isinstance(denominator, bool)
+            or not isinstance(denominator, Integral)
+        ):
+            raise CameraFrameNotReady("camera renderer frame ID is not ready")
+        normalized = (int(numerator), int(denominator))
+        if normalized[0] < 0 or normalized[1] <= 0:
+            raise CameraFrameNotReady("camera renderer frame ID is invalid")
+        return normalized
 
     def _require_camera(self) -> Camera:
         if self.camera is None:

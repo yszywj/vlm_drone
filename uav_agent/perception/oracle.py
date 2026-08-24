@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
+from common.target_estimate import TargetEstimate
 from env.moving_target import TargetState
 from perception.runtime import PerceptionCapability
 from common.ids import validate_uav_id
@@ -94,10 +95,32 @@ class OraclePerception:
                 "EvaluatorFrame target_velocity_mps must contain three finite values"
             )
 
+        visible = bool(projection_visible[0])
+        bbox = None
+        if visible:
+            projected = getattr(evaluator_frame.target_projection, "pixels_uv", None)
+            if projected is None:
+                # Legacy evaluator fixtures exposed only the already-computed
+                # visibility bit.  A full-frame compatibility box preserves
+                # their upper-bound semantics without affecting production.
+                bbox = (0.0, 0.0, 1.0, 1.0)
+            else:
+                try:
+                    pixels_uv = np.asarray(projected)
+                    bbox = _point_bbox_normalized(
+                        pixels_uv,
+                        np.asarray(agent.rgb).shape,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise OraclePerceptionError(
+                        "visible Oracle target requires one finite projected pixel"
+                    ) from exc
+
         try:
+            timestamp_s = float(agent.camera_timestamp_s)
             observation = Observation(
                 uav_id=self.uav_id,
-                timestamp=float(agent.camera_timestamp_s),
+                timestamp=timestamp_s,
                 uav_pose=agent.uav_state,
                 uav_velocity=np.asarray(agent.uav_velocity_mps).copy(),
                 camera_rgb=np.asarray(agent.rgb).copy(),
@@ -105,8 +128,31 @@ class OraclePerception:
                 camera_orientation_wxyz=np.asarray(
                     agent.camera_orientation_wxyz
                 ).copy(),
+                target_estimate=TargetEstimate(
+                    timestamp_s=timestamp_s,
+                    target_id=self.target_id,
+                    candidate_id=None,
+                    tracker_id=None,
+                    visible=visible,
+                    confirmed=True,
+                    predicted_only=False,
+                    class_id=None,
+                    class_name=None,
+                    confidence=1.0,
+                    bbox_xyxy_normalized=bbox,
+                    position_world_m=(
+                        float(target_state.x),
+                        float(target_state.y),
+                        float(target_state.z),
+                    ),
+                    velocity_world_mps=tuple(
+                        float(value) for value in target_velocity
+                    ),
+                    measurement_age_s=0.0,
+                    source="oracle_evaluation",
+                ),
                 oracle_target_id=self.target_id,
-                oracle_target_visible=bool(projection_visible[0]),
+                oracle_target_visible=visible,
                 oracle_target_pose=target_state,
                 oracle_target_velocity=target_velocity.copy(),
             )
@@ -121,6 +167,38 @@ class OraclePerception:
         """Compatibility alias for runtimes that use ``get_*`` naming."""
 
         return self.observe(frame)
+
+
+def _point_bbox_normalized(
+    pixels_uv: np.ndarray,
+    rgb_shape: tuple[int, ...],
+) -> tuple[float, float, float, float]:
+    """Represent the evaluator's projected target point as a tiny valid box."""
+
+    if pixels_uv.shape != (1, 2) or not np.all(np.isfinite(pixels_uv)):
+        raise ValueError("pixels_uv must contain one finite (u, v) point")
+    if len(rgb_shape) != 3 or rgb_shape[0] <= 0 or rgb_shape[1] <= 0:
+        raise ValueError("rgb shape must contain positive height and width")
+    height, width = int(rgb_shape[0]), int(rgb_shape[1])
+    u = min(max(float(pixels_uv[0, 0]), 0.0), max(0.0, width - 1.0))
+    v = min(max(float(pixels_uv[0, 1]), 0.0), max(0.0, height - 1.0))
+    half_width = max(0.5, min(2.0, width / 2.0))
+    half_height = max(0.5, min(2.0, height / 2.0))
+    x1 = max(0.0, (u - half_width) / width)
+    x2 = min(1.0, (u + half_width) / width)
+    y1 = max(0.0, (v - half_height) / height)
+    y2 = min(1.0, (v + half_height) / height)
+    if x1 >= x2:
+        x1, x2 = (0.0, min(1.0, 1.0 / width)) if u <= 0.0 else (
+            max(0.0, 1.0 - 1.0 / width),
+            1.0,
+        )
+    if y1 >= y2:
+        y1, y2 = (0.0, min(1.0, 1.0 / height)) if v <= 0.0 else (
+            max(0.0, 1.0 - 1.0 / height),
+            1.0,
+        )
+    return x1, y1, x2, y2
 
 
 __all__ = ["OraclePerception", "OraclePerceptionError"]

@@ -39,8 +39,10 @@ from planner.skill_catalog import (
 )
 from planner.spatial import (
     CircleRegion,
+    CoordinateFrame,
     CorridorRegion,
     NamedLocationTarget,
+    PointTarget,
     RouteTarget,
     SectorRegion,
 )
@@ -392,6 +394,10 @@ class DynamicLLMPlanner(MissionPlanner):
                 uav_id=request.uav_id,
                 plan_version=request.plan_version,
                 search_runtime_capabilities=self._search_runtime_capabilities,
+                trusted_target_spec=request.trusted_target_spec,
+                require_empty_assumptions=(
+                    request.require_empty_spatial_assumptions
+                ),
             )
             response_format_name = "skill_plan_draft_v3"
         response_format = JsonSchemaResponseFormat(
@@ -627,6 +633,20 @@ class DynamicLLMPlanner(MissionPlanner):
             else:
                 self._reject_v3_goto_route_targets(parsed)
                 draft = SkillPlanDraftV3.from_dict(parsed)
+                if (
+                    request.trusted_target_spec is not None
+                    and draft.target_spec != request.trusted_target_spec
+                ):
+                    raise ValueError(
+                        "target_spec must exactly echo the trusted PlannerRequest"
+                    )
+                if (
+                    request.require_empty_spatial_assumptions
+                    and draft.assumptions
+                ):
+                    raise ValueError(
+                        "assumptions must be empty for this fully structured request"
+                    )
             self._require_initial_plan_skills(draft)
             if draft.mission_id != request.mission_id:
                 raise ValueError(
@@ -822,6 +842,16 @@ class DynamicLLMPlanner(MissionPlanner):
             ):
                 raise ValueError(
                     f"step {step.id} uses a ROUTE target; use FOLLOW_ROUTE"
+                )
+            if step.skill == "GOTO" and isinstance(
+                target := step.args.get("target"), PointTarget
+            ) and (
+                target.frame is CoordinateFrame.WORLD_ENU
+                and target.xyz_m[2] <= 0.0
+            ):
+                raise ValueError(
+                    f"GOTO step {step.id} WORLD_ENU POINT target z must be "
+                    "greater than zero"
                 )
 
             if step.recovery is None:
@@ -1245,6 +1275,18 @@ class DynamicLLMPlanner(MissionPlanner):
                 "Insert exactly one GOTO immediately before the final LAND. "
                 "Set GOTO.args.destination exactly equal to LAND.args.zone, "
                 "use a new unique step id, and preserve the trusted uav_id."
+            )
+        if (
+            self._planning_contract is PlanningContract.V3
+            and code == "V3_CONTRACT_VIOLATION"
+            and isinstance(message, str)
+            and "POINT target z" in message
+        ):
+            return (
+                "For every WORLD_ENU GOTO POINT, set target.xyz_m[2] to a "
+                "positive flight altitude. Do not navigate to a ground-level "
+                "search-region center; SEARCH enters its RegionSpec itself. "
+                "Return home with NAMED_LOCATION, not a ground-level POINT."
             )
         if (
             self._planning_contract is PlanningContract.V3

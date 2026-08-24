@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from common.ids import ROUTING_ID_PATTERN_TEXT, validate_mission_id, validate_uav_id
 from planner.spatial import CoordinateFrame, SpatialRelation
+from target.types import TargetSpec
 from skills.search_strategy import (
     SearchEntryPolicy,
     SearchRuntimeCapabilities,
@@ -237,6 +238,8 @@ def build_skill_plan_v3_json_schema(
     uav_id: str,
     plan_version: int,
     search_runtime_capabilities: SearchRuntimeCapabilities | None = None,
+    trusted_target_spec: TargetSpec | None = None,
+    require_empty_assumptions: bool = False,
 ) -> dict[str, object]:
     """Return the initial-plan V3 schema bound to trusted routing values."""
 
@@ -253,6 +256,12 @@ def build_skill_plan_v3_json_schema(
         raise TypeError(
             "search_runtime_capabilities must be a SearchRuntimeCapabilities or None"
         )
+    if trusted_target_spec is not None and not isinstance(
+        trusted_target_spec, TargetSpec
+    ):
+        raise TypeError("trusted_target_spec must be a TargetSpec or None")
+    if not isinstance(require_empty_assumptions, bool):
+        raise TypeError("require_empty_assumptions must be bool")
     empty_args = _object({}, [])
     variants = [
         _step("TAKEOFF", uav, _object(_yaw_properties(), [])),
@@ -263,6 +272,27 @@ def build_skill_plan_v3_json_schema(
         _step("LAND", uav, _object({"zone": {"type": "string", "minLength": 1, "maxLength": 128}, "yaw_mode": {"type": "string", "enum": ["KEEP_CURRENT", "FIXED"]}, "yaw_deg": _number()}, ["zone"])),
     ]
     del empty_args
+    target_spec_schema: dict[str, object]
+    required = [
+        "schema_version",
+        "mission_id",
+        "uav_id",
+        "plan_version",
+        "assumptions",
+        "steps",
+    ]
+    if trusted_target_spec is None:
+        target_spec_schema = _target_spec_schema()
+    else:
+        target_spec_value = trusted_target_spec.to_dict()
+        target_spec_schema = _object(
+            {
+                key: {"const": value}
+                for key, value in target_spec_value.items()
+            },
+            list(target_spec_value),
+        )
+        required.append("target_spec")
     return _object(
         {
             "schema_version": {"const": 3},
@@ -270,7 +300,8 @@ def build_skill_plan_v3_json_schema(
             "uav_id": {"type": "string", "const": uav, "pattern": ROUTING_ID_PATTERN_TEXT},
             "plan_version": {"type": "integer", "const": plan_version},
             "assumptions": {
-                "type": "array", "maxItems": 32,
+                "type": "array",
+                "maxItems": 0 if require_empty_assumptions else 32,
                 "items": _object(
                     {
                         "source_text": {"type": "string", "minLength": 1, "maxLength": 256},
@@ -280,7 +311,7 @@ def build_skill_plan_v3_json_schema(
                     ["source_text", "interpretation", "confidence"],
                 ),
             },
-            "target_spec": _target_spec_schema(),
+            "target_spec": target_spec_schema,
             "steps": {
                 "type": "array",
                 "minItems": 2,
@@ -288,7 +319,7 @@ def build_skill_plan_v3_json_schema(
                 "items": {"oneOf": variants},
             },
         },
-        ["schema_version", "mission_id", "uav_id", "plan_version", "assumptions", "steps"],
+        required,
     )
 
 

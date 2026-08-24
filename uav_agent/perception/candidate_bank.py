@@ -8,6 +8,7 @@ from math import isfinite
 from numbers import Real
 
 from common.ids import validate_review_id, validate_routing_id, validate_uav_id
+from common.provenance import is_privileged_oracle_source
 from runtime.frame_store import FrameRef
 
 
@@ -52,10 +53,13 @@ def _source(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("source must be a non-empty string")
     normalized = value.strip()
-    if normalized.casefold() == "oracle":
+    if (
+        is_privileged_oracle_source(normalized)
+        and normalized != "oracle_evaluation"
+    ):
         raise ValueError(
-            "privileged candidates must use the explicit source "
-            "'oracle_evaluation'"
+            "privileged candidates must use the explicit canonical source "
+            "'oracle_evaluation'; production boundaries still reject it"
         )
     return normalized
 
@@ -209,24 +213,34 @@ class CandidateBank:
                 < self._rejected_cooldown_s
             ):
                 return None
+            starts_new_evidence_epoch = existing.lifecycle in {
+                CandidateLifecycle.REJECTED,
+                CandidateLifecycle.STALE,
+            }
             first = (
                 timestamp
-                if existing.lifecycle in {
-                    CandidateLifecycle.REJECTED,
-                    CandidateLifecycle.STALE,
-                }
+                if starts_new_evidence_epoch
                 else existing.first_seen_timestamp_s
             )
-            bboxes = (*existing.bbox_history, bbox)[-self._max_history :]
-            frames = (*existing.frame_history, frame_ref)[-self._max_history :]
+            # Cooldown retains only negative-memory identity.  Once recovery
+            # is allowed, the reused candidate_id begins a new evidence epoch:
+            # old images, boxes, and semantic reviews cannot count again.
+            bboxes = (
+                (bbox,)
+                if starts_new_evidence_epoch
+                else (*existing.bbox_history, bbox)[-self._max_history :]
+            )
+            frames = (
+                (frame_ref,)
+                if starts_new_evidence_epoch
+                else (*existing.frame_history, frame_ref)[-self._max_history :]
+            )
             lifecycle = (
                 CandidateLifecycle.PROVISIONAL
-                if existing.lifecycle in {
-                    CandidateLifecycle.REJECTED,
-                    CandidateLifecycle.STALE,
-                }
+                if starts_new_evidence_epoch
                 else existing.lifecycle
             )
+            reviews = () if starts_new_evidence_epoch else existing.review_history
             snapshot = CandidateSnapshot(
                 self._uav_id,
                 candidate_id,
@@ -236,7 +250,7 @@ class CandidateBank:
                 frames,
                 normalized_source,
                 lifecycle,
-                existing.review_history,
+                reviews,
             )
         else:
             snapshot = CandidateSnapshot(
@@ -286,14 +300,31 @@ class CandidateBank:
                 continue
             if normalized_source is not None and candidate.source != normalized_source:
                 continue
-            if timestamp < candidate.last_seen_timestamp_s:
+            # A model review is asynchronous: by completion time the same
+            # detector track may already have newer observations.  Associate
+            # against the most recent retained box at (or before) the review
+            # observation time instead of rejecting the candidate merely
+            # because its live ``last_seen`` has advanced.
+            historical = [
+                (frame.timestamp_s, candidate_bbox)
+                for frame, candidate_bbox in zip(
+                    candidate.frame_history,
+                    candidate.bbox_history,
+                )
+                if frame.timestamp_s <= timestamp + 1e-9
+            ]
+            if not historical:
                 continue
-            overlap = _bbox_iou(candidate.bbox_history[-1], bbox)
+            association_time, association_bbox = max(
+                historical,
+                key=lambda item: item[0],
+            )
+            overlap = _bbox_iou(association_bbox, bbox)
             if overlap >= threshold:
                 matches.append(
                     (
                         overlap,
-                        candidate.last_seen_timestamp_s,
+                        association_time,
                         candidate.candidate_id,
                         candidate,
                     )
@@ -438,6 +469,13 @@ class CandidateBank:
                 key=lambda item: (item.first_seen_timestamp_s, item.candidate_id),
             )
         )
+
+    def clear(self) -> int:
+        """Reset mission-scoped candidate and negative-memory state."""
+
+        removed = len(self._candidates)
+        self._candidates.clear()
+        return removed
 
     def _require(self, candidate_id: str) -> CandidateSnapshot:
         normalized = validate_routing_id(candidate_id, "candidate_id")

@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from common.provenance import is_privileged_oracle_source
 from perception.base import PerceptionBackend
 from skills.types import Observation
 
@@ -54,9 +55,14 @@ def observation_contains_oracle_data(observation: Observation) -> bool:
 
     if not isinstance(observation, Observation):
         raise TypeError("observation must be an Observation")
-    return any(
+    legacy_oracle = any(
         getattr(observation, name, None) is not None
         for name in _ORACLE_FIELDS
+    )
+    estimate = getattr(observation, "target_estimate", None)
+    return legacy_oracle or (
+        estimate is not None
+        and is_privileged_oracle_source(estimate.source)
     )
 
 
@@ -75,9 +81,20 @@ def validate_observation_access(
         profile is PerceptionRuntimeProfile.PRODUCTION
         and observation_contains_oracle_data(observation)
     ):
-        populated = ", ".join(
+        populated_fields = [
             name for name in _ORACLE_FIELDS if getattr(observation, name) is not None
-        )
+        ]
+        if (
+            observation.target_estimate is not None
+            and is_privileged_oracle_source(
+                observation.target_estimate.source
+            )
+        ):
+            populated_fields.append(
+                "target_estimate.source="
+                f"{observation.target_estimate.source}"
+            )
+        populated = ", ".join(populated_fields)
         raise PerceptionBoundaryError(
             "production Agent Runtime rejects privileged Oracle fields: "
             f"{populated}"

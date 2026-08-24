@@ -1,0 +1,21 @@
+# Python 3.11 / CUDA 12.6 direct pins used by the real-model smoke test.
+# This file intentionally does not claim to be a hash-complete transitive lock:
+# regenerate and archive `python -m pip freeze --all` plus a wheelhouse after a
+# real-host acceptance run when byte-for-byte environment replay is required.
+# Runtime/export preflights fail closed on missing direct capabilities instead
+# of asking Ultralytics to auto-install packages.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.7.0+cu126
+torchvision==0.22.0+cu126
+ultralytics==8.3.222
+lap==0.5.13
+onnx==1.22.0
+fastapi==0.115.7
+uvicorn[standard]==0.29.0
+python-multipart==0.0.20
+opencv-python-headless==4.11.0.86
+Pillow==11.3.0
+numpy==1.26.0
+PyYAML==6.0.2
+httpx==0.28.1
+pytest==8.4.1

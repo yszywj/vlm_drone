@@ -15,6 +15,7 @@ from numbers import Real
 import numpy as np
 
 from common.ids import generate_routing_id, validate_routing_id, validate_uav_id
+from common.provenance import is_privileged_oracle_source
 from perception.candidate_bank import (
     CandidateBank,
     CandidateLifecycle,
@@ -293,7 +294,7 @@ class InspectSkill(Skill):
                 "CandidateResolver returned mismatched routing IDs"
             )
         if (
-            resolved.source == "oracle_evaluation"
+            is_privileged_oracle_source(resolved.source)
             and self._candidate_resolver.profile
             is not PerceptionRuntimeProfile.ORACLE_EVALUATION
         ):

@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from common.target_estimate import TargetEstimate
 from env.moving_target import TargetState
 from env.uav_controller import UAVController, UAVState
 from common.ids import (
@@ -199,6 +200,11 @@ class Observation:
     camera_position_m: np.ndarray | None = None
     camera_orientation_wxyz: np.ndarray | None = None
 
+    # Backend-neutral target state consumed by SEARCH/TRACK/REACQUIRE.  The
+    # legacy oracle_target_* fields below remain evaluator-only compatibility
+    # data and must never be read by production Skill logic.
+    target_estimate: TargetEstimate | None = None
+
     oracle_target_id: str | None = None
     oracle_target_visible: bool | None = None
     oracle_target_pose: TargetState | None = None
@@ -234,6 +240,15 @@ class Observation:
             )
             if float(np.linalg.norm(self.camera_orientation_wxyz)) <= 1e-12:
                 raise ValueError("Observation.camera_orientation_wxyz must be non-zero")
+        if self.target_estimate is not None:
+            if not isinstance(self.target_estimate, TargetEstimate):
+                raise TypeError(
+                    "Observation.target_estimate must be TargetEstimate or None"
+                )
+            if self.target_estimate.timestamp_s > float(self.timestamp) + 1e-9:
+                raise ValueError(
+                    "Observation.target_estimate cannot be newer than the frame"
+                )
         if self.oracle_target_id is not None and (
             not isinstance(self.oracle_target_id, str)
             or not self.oracle_target_id.strip()
@@ -251,6 +266,46 @@ class Observation:
             _validate_vector3(
                 self.oracle_target_velocity,
                 "Observation.oracle_target_velocity",
+            )
+        # Backward-compatible evaluator adapter for older pure-Python tests
+        # and callers that construct the legacy Oracle fields directly.  New
+        # backends (including OraclePerception) populate target_estimate
+        # explicitly; Skills consume only that neutral field.
+        if (
+            self.target_estimate is None
+            and isinstance(self.oracle_target_visible, bool)
+            and isinstance(self.oracle_target_id, str)
+            and self.oracle_target_id.strip()
+            and isinstance(self.oracle_target_pose, TargetState)
+        ):
+            pose = self.oracle_target_pose
+            velocity = self.oracle_target_velocity
+            object.__setattr__(
+                self,
+                "target_estimate",
+                TargetEstimate(
+                    timestamp_s=float(self.timestamp),
+                    target_id=self.oracle_target_id.strip(),
+                    candidate_id=None,
+                    tracker_id=None,
+                    visible=self.oracle_target_visible,
+                    confirmed=True,
+                    predicted_only=False,
+                    class_id=None,
+                    class_name=None,
+                    confidence=1.0,
+                    bbox_xyxy_normalized=(0.0, 0.0, 1.0, 1.0)
+                    if self.oracle_target_visible
+                    else None,
+                    position_world_m=(float(pose.x), float(pose.y), float(pose.z)),
+                    velocity_world_mps=(
+                        None
+                        if velocity is None
+                        else tuple(float(component) for component in velocity)
+                    ),
+                    measurement_age_s=0.0,
+                    source="oracle_evaluation",
+                ),
             )
 
 

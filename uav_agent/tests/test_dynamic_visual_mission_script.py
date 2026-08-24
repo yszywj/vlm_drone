@@ -16,6 +16,7 @@ from scripts.run_dynamic_visual_mission import (
     LaunchConfigurationError,
     TestInjectionSpec,
     _VisualRuntime,
+    _best_effort_production_failure_land,
     _build_initial_spatial_resolver,
     _create_logging_runtime,
     _route_debug_records,
@@ -51,6 +52,172 @@ def _args(*extra: str) -> argparse.Namespace:
 
 
 class DynamicVisualMissionScriptTest(unittest.TestCase):
+    def test_unexpected_production_failure_ticks_oracle_free_cancel_and_land(self) -> None:
+        running = SimpleNamespace(
+            status=SimpleNamespace(value="RUNNING"),
+            active_skill="TRACK",
+        )
+        landing = SimpleNamespace(
+            status=SimpleNamespace(value="RUNNING"),
+            active_skill="LAND",
+        )
+        terminal = SimpleNamespace(
+            status=SimpleNamespace(value="CANCELED"),
+            active_skill=None,
+        )
+
+        class Agent:
+            def __init__(self) -> None:
+                self.current = running
+                self.cancel_count = 0
+                self.tick_count = 0
+
+            def snapshot(self):
+                return self.current
+
+            def cancel(self):
+                self.cancel_count += 1
+                self.current = landing
+                return landing
+
+            def tick(self, observation):
+                self.tick_count += 1
+                self.asserted_observation = observation
+                self.current = terminal
+                return terminal
+
+        class Environment:
+            def __init__(self) -> None:
+                self.uav_controller = SimpleNamespace(stop=lambda: None)
+                self.include_oracle_values = []
+
+            def step(self):
+                return True
+
+            def get_skill_observation(self, *, include_oracle):
+                self.include_oracle_values.append(include_oracle)
+                return "base_observation"
+
+        agent = Agent()
+        environment = Environment()
+        perception = SimpleNamespace(
+            attach_target_estimate=lambda base, estimate: (base, estimate)
+        )
+        result = _best_effort_production_failure_land(
+            simulation_app=SimpleNamespace(is_running=lambda: True),
+            environment=environment,
+            perception=perception,
+            agent=agent,
+            clock=SimpleNamespace(now=lambda: 1.0),
+            shutdown_guard_s=5.0,
+        )
+
+        self.assertIs(result.snapshot, terminal)
+        self.assertIsNone(result.guard_error)
+        self.assertEqual(agent.cancel_count, 1)
+        self.assertEqual(agent.tick_count, 1)
+        self.assertEqual(environment.include_oracle_values, [False])
+        self.assertEqual(agent.asserted_observation, ("base_observation", None))
+
+    def test_target_query_failure_requests_cancel_and_land_once(self) -> None:
+        from perception.target_perception_coordinator import TargetQueryUnsupported
+
+        running = SimpleNamespace(
+            status=SimpleNamespace(value="RUNNING"),
+            active_skill="SEARCH",
+            mission_id="mission_1",
+            uav_id="uav_1",
+            plan_version=1,
+        )
+        landing = SimpleNamespace(
+            status=SimpleNamespace(value="RUNNING"),
+            active_skill="LAND",
+            mission_id="mission_1",
+            uav_id="uav_1",
+            plan_version=1,
+        )
+        terminal = SimpleNamespace(
+            status=SimpleNamespace(value="CANCELED"),
+            active_skill=None,
+            mission_id="mission_1",
+            uav_id="uav_1",
+            plan_version=1,
+        )
+
+        class Agent:
+            def __init__(self) -> None:
+                self.current = running
+                self.cancel_count = 0
+
+            def snapshot(self):
+                return self.current
+
+            def cancel(self):
+                self.cancel_count += 1
+                self.current = landing
+                return landing
+
+            def tick(self, observation):
+                del observation
+                self.current = terminal
+                return terminal
+
+        class Coordinator:
+            def __init__(self) -> None:
+                self.submit_count = 0
+
+            def submit_frame(self, **kwargs):
+                del kwargs
+                self.submit_count += 1
+                raise TargetQueryUnsupported("unsupported category 'red cube'")
+
+            def poll(self, **kwargs):  # pragma: no cover - fail-fast assertion
+                raise AssertionError(kwargs)
+
+        observation = SimpleNamespace(
+            timestamp=1.0,
+            uav_pose=SimpleNamespace(x=0.0, y=0.0, z=1.0),
+            uav_velocity=(0.0, 0.0, 0.0),
+        )
+        agent = Agent()
+        coordinator = Coordinator()
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            result = _run_until_terminal(
+                simulation_app=SimpleNamespace(is_running=lambda: True),
+                debug_visualizer=None,
+                environment=SimpleNamespace(
+                    step=lambda: True,
+                    get_skill_observation=lambda **kwargs: observation,
+                    get_camera_sample=lambda: object(),
+                ),
+                perception=SimpleNamespace(
+                    attach_target_estimate=lambda base, estimate: base,
+                ),
+                agent=agent,
+                manager=SimpleNamespace(
+                    task_plan=None,
+                    active_invocation=None,
+                    active_planned_step_id="search",
+                    transition_log=(),
+                ),
+                clock=SimpleNamespace(now=lambda: 1.0),
+                task_start_s=0.0,
+                max_sim_time_s=10.0,
+                shutdown_guard_s=5.0,
+                debug_ground_truth=False,
+                injections=(),
+                visual_runtime=None,
+                target_perception_coordinator=coordinator,
+                target_manager=SimpleNamespace(target_spec=object()),
+                production_target_perception=True,
+            )
+
+        self.assertIs(result.snapshot, terminal)
+        self.assertEqual(agent.cancel_count, 1)
+        self.assertEqual(coordinator.submit_count, 1)
+        self.assertIn("action=CANCEL_AND_LAND", stderr.getvalue())
+
     def test_route_debug_records_include_rejected_proposals_before_registry(self) -> None:
         rejected = SimpleNamespace(outcome="REVISE")
         accepted = SimpleNamespace(state="ACCEPTED")

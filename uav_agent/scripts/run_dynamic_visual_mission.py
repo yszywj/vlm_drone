@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Run the routed dynamic mission with opt-in asynchronous Qwen vision.
 
-This is an experimental Isaac standalone entry point.  It deliberately fails
-closed when production perception is selected because this repository does
-not yet ship a real detector/tracker.  The retained Oracle execution path is
-available only through the two-part ``oracle_evaluation`` acknowledgement.
+This is an experimental Isaac standalone entry point.  Production target
+perception uses an isolated loopback YOLO/YOLOE service and fails closed when
+that service is unavailable.  The retained Oracle execution path is available
+only through the two-part ``oracle_evaluation`` acknowledgement.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from enum import Enum
 import json
@@ -244,6 +245,29 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="second explicit opt-in required with oracle_evaluation",
     )
     parser.add_argument(
+        "--target-perception-backend",
+        choices=("disabled", "oracle_evaluation", "ultralytics_service"),
+        default=None,
+        help="override target_perception.backend from config",
+    )
+    parser.add_argument(
+        "--yolo-service-url",
+        default=None,
+        help="override the loopback YOLO service URL",
+    )
+    parser.add_argument(
+        "--yolo-request-timeout-s",
+        type=_positive_float,
+        default=None,
+        help="override the bounded YOLO HTTP timeout",
+    )
+    parser.add_argument(
+        "--yolo-max-result-age-s",
+        type=_positive_float,
+        default=None,
+        help="override maximum accepted YOLO result age",
+    )
+    parser.add_argument(
         "--output-dir",
         default="logs/dynamic_visual_missions",
         help="parent directory for bounded image-free run logs",
@@ -461,12 +485,31 @@ def validate_launch_args(
         raise LaunchConfigurationError(
             "Oracle acknowledgement is invalid in production profile"
         )
-    if not oracle_selected:
+    target_backend = getattr(args, "effective_target_perception_backend", None)
+    if target_backend is None:
+        target_backend = getattr(args, "target_perception_backend", None)
+    if target_backend is None and oracle_selected:
+        # Backward-compatible explicit Oracle command: the profile plus its
+        # acknowledgement remains the required two-part opt-in.
+        target_backend = "oracle_evaluation"
+    if target_backend is None:
         raise LaunchConfigurationError(
             "production visual geometry is unavailable: no real detector/tracker "
-            "is implemented; select oracle_evaluation and explicitly acknowledge "
-            "the privileged evaluation boundary"
+            "backend was selected"
         )
+    if oracle_selected and target_backend != "oracle_evaluation":
+        raise LaunchConfigurationError(
+            "oracle_evaluation profile requires target backend oracle_evaluation"
+        )
+    if not oracle_selected and target_backend == "oracle_evaluation":
+        raise LaunchConfigurationError(
+            "production profile forbids target backend oracle_evaluation"
+        )
+    if not oracle_selected and target_backend not in {
+        "disabled",
+        "ultralytics_service",
+    }:
+        raise LaunchConfigurationError("invalid production target backend")
 
     injections = build_test_injection_specs(args)
     if injections and not args.enable_qwen_vision:
@@ -513,6 +556,12 @@ def startup_fields(
     review_mode: str,
     perception_profile: str,
     oracle_acknowledged: bool,
+    target_perception_backend: str = "unspecified",
+    yolo_service_url: str | None = None,
+    model_family: str | None = None,
+    geometry_mode: str | None = None,
+    state_estimator: str | None = None,
+    confirmation_mode: str | None = None,
 ) -> tuple[tuple[str, object], ...]:
     """Stable launch metadata used by both the terminal and unit tests."""
 
@@ -526,6 +575,12 @@ def startup_fields(
         ),
         ("perception_runtime_profile", perception_profile),
         ("oracle_acknowledged", oracle_acknowledged),
+        ("target_perception_backend", target_perception_backend),
+        ("yolo_service_url", yolo_service_url or "none"),
+        ("model_family", model_family or "none"),
+        ("geometry_mode", geometry_mode or "none"),
+        ("state_estimator", state_estimator or "none"),
+        ("confirmation_mode", confirmation_mode or "none"),
     )
 
 
@@ -754,6 +809,7 @@ def visual_manifest_context(
             "plan_revision",
             "frame_store",
             "debug_images",
+            "target_perception",
         )
     }
     obstacle_mode = getattr(
@@ -769,6 +825,16 @@ def visual_manifest_context(
         "git_commit": _read_git_commit(),
         "perception_runtime_profile": args.perception_runtime_profile,
         "oracle_acknowledged": bool(args.acknowledge_privileged_oracle),
+        "target_perception_backend": getattr(
+            args,
+            "effective_target_perception_backend",
+            config.target_perception.backend,
+        ),
+        "target_evaluator_enabled": bool(
+            args.debug_ground_truth
+            or args.perception_runtime_profile == "oracle_evaluation"
+        ),
+        "target_evaluator_ground_truth_to_control": False,
         "qwen_visual_review_mode": review_mode,
         "qwen_next_best_view_enabled": bool(
             args.enable_qwen_next_best_view
@@ -812,6 +878,7 @@ class _VisualRuntime:
     obstacle_revision_coordinator: object | None = None
     runtime_visual_assessment_coordinator: object | None = None
     next_best_view_provider: object | None = None
+    target_debug_image_writer: object | None = None
     extra_workers: list[object] = field(default_factory=list)
     seen_review_ids: frozenset[str] = frozenset()
     seen_event_ids: frozenset[str] = frozenset()
@@ -1475,6 +1542,52 @@ class _VisualRuntime:
                 self._disable_failed_logger(exc)
         self._write_manifest()
 
+    def record_target_perception_metrics(self, metrics: object) -> None:
+        """Persist one bounded image-free row and mirror it in the manifest."""
+
+        converter = getattr(metrics, "to_dict", None)
+        if not callable(converter):
+            raise TypeError("target perception metrics must provide to_dict()")
+        raw = converter()
+        if not isinstance(raw, dict) or not raw:
+            raise TypeError("target perception metrics must be a non-empty mapping")
+        payload = {
+            str(key): _json_compatible(value)
+            for key, value in raw.items()
+        }
+        self.terminal_manifest["target_perception_metrics"] = payload
+        run_dir = self.run_dir
+        if run_dir is not None:
+            temporary = run_dir / ".target_perception_metrics.csv.tmp"
+            destination = run_dir / "target_perception_metrics.csv"
+            try:
+                with temporary.open("w", encoding="utf-8", newline="") as stream:
+                    writer = csv.DictWriter(stream, fieldnames=tuple(payload))
+                    writer.writeheader()
+                    writer.writerow(
+                        {
+                            key: "" if value is None else value
+                            for key, value in payload.items()
+                        }
+                    )
+                os.replace(temporary, destination)
+            except Exception:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        self._write_manifest()
+
+    def bind_target_debug_image_writer(self, writer: object) -> None:
+        """Expose bounded writer accounting to ``run_manifest.json``."""
+
+        stats = getattr(writer, "stats", None)
+        if stats is None:
+            raise TypeError("target debug image writer must provide stats")
+        self.target_debug_image_writer = writer
+        self._write_manifest()
+
     def record_initial_planner_calls(self, count: int) -> None:
         if self.logger is None or count <= 0:
             return
@@ -1574,6 +1687,25 @@ class _VisualRuntime:
         run_dir = self.run_dir
         if run_dir is None:
             return
+        debug_images_count = 0
+        debug_images_bytes = 0
+        writer = self.target_debug_image_writer
+        if writer is not None:
+            writer_stats = getattr(writer, "stats", None)
+            raw_count = getattr(writer_stats, "count", 0)
+            raw_bytes = getattr(writer_stats, "bytes", 0)
+            if (
+                isinstance(raw_count, int)
+                and not isinstance(raw_count, bool)
+                and raw_count >= 0
+            ):
+                debug_images_count = raw_count
+            if (
+                isinstance(raw_bytes, int)
+                and not isinstance(raw_bytes, bool)
+                and raw_bytes >= 0
+            ):
+                debug_images_bytes = raw_bytes
         stats: dict[str, object]
         if self.logger is None:
             stats = {
@@ -1588,12 +1720,18 @@ class _VisualRuntime:
                 "shadow_strict_route_valid": None,
                 "route_validity_source": "shadow_strict_route_valid",
                 "supervisory_hover": {"count": 0, "total_time_s": 0.0},
-                "debug_images": {"count": 0, "bytes": 0},
+                "debug_images": {
+                    "count": debug_images_count,
+                    "bytes": debug_images_bytes,
+                },
                 "dropped_log_records": 0,
             }
         else:
             try:
-                stats = self.logger.snapshot().to_manifest_dict()
+                stats = self.logger.snapshot().to_manifest_dict(
+                    debug_images_count=debug_images_count,
+                    debug_images_bytes=debug_images_bytes,
+                )
             except Exception:
                 return
         payload = {
@@ -1693,6 +1831,13 @@ def _create_visual_runtime(
         skill_manager=manager,
         target_manager=target_manager,
         candidate_bank=candidate_bank,
+        require_stable_search_candidate=True,
+        min_search_candidate_observations=(
+            config.target_perception.tracker.min_track_observations
+        ),
+        min_search_candidate_duration_s=(
+            config.target_perception.tracker.min_track_duration_s
+        ),
         event_bus=event_bus,
         max_recent_frames=config.qwen_visual_review.max_recent_frames,
         review_timeout_s=config.qwen_visual_review.blocking_hover_timeout_s,
@@ -1764,6 +1909,10 @@ def _run_until_terminal(
     obstacle_runtime: object | None = None,
     obstacle_route_runtime: object | None = None,
     route_collision_monitor: object | None = None,
+    target_perception_coordinator: object | None = None,
+    target_manager: object | None = None,
+    production_target_perception: bool = False,
+    target_estimate_evaluator: object | None = None,
 ) -> object:
     """Advance on fresh Camera samples; all HTTP work stays in the worker."""
 
@@ -1777,6 +1926,7 @@ def _run_until_terminal(
     obstacle_route_failed = False
     route_collision_failed = False
     route_collision_terminal = False
+    target_perception_failed = False
 
     while simulation_app.is_running() and snapshot.status.value == "RUNNING":
         now = clock.now()
@@ -1800,8 +1950,78 @@ def _run_until_terminal(
         # call occurs on rendering ticks that did not produce a new RGB sample.
         if not environment.step():
             continue
-        frame = environment.get_evaluator_frame()
-        observation = perception.observe(frame)
+        if production_target_perception:
+            base_observation = environment.get_skill_observation(
+                include_oracle=False
+            )
+            estimate = None
+            if target_perception_coordinator is not None:
+                if not target_perception_failed:
+                    if target_manager is None:
+                        raise RuntimeError(
+                            "production target coordinator requires TargetManager"
+                        )
+                    target_spec = target_manager.target_spec
+                    try:
+                        if target_spec is not None:
+                            target_perception_coordinator.submit_frame(
+                                camera_sample=environment.get_camera_sample(),
+                                target_spec=target_spec,
+                            )
+                        estimate = target_perception_coordinator.poll(
+                            now_s=float(base_observation.timestamp),
+                            target_manager=target_manager,
+                        )
+                    except Exception as exc:
+                        # Import locally to keep the script's pre-Isaac startup
+                        # boundary pure Python. Unsupported closed-set targets
+                        # never become ordinary "not found" results.
+                        from perception.target_perception_coordinator import (
+                            TargetPerceptionError,
+                        )
+
+                        if not isinstance(exc, TargetPerceptionError):
+                            raise
+                        target_perception_failed = True
+                        print(
+                            "[TargetPerception] failed closed: "
+                            f"{type(exc).__name__}; action=CANCEL_AND_LAND",
+                            file=sys.stderr,
+                        )
+                        if not cancel_requested:
+                            cancel_requested = True
+                            snapshot = agent.cancel()
+                            landing_deadline_s = now + shutdown_guard_s
+                observation = perception.attach_target_estimate(
+                    base_observation,
+                    estimate,
+                )
+            else:
+                observation = perception.observe(base_observation)
+            frame = (
+                environment.get_evaluator_frame()
+                if debug_ground_truth
+                else None
+            )
+        else:
+            frame = environment.get_evaluator_frame()
+            observation = perception.observe(frame)
+        if target_estimate_evaluator is not None:
+            if frame is None:
+                raise RuntimeError(
+                    "target evaluator requires an explicit synchronized evaluator frame"
+                )
+            evaluate = getattr(target_estimate_evaluator, "evaluate", None)
+            if not callable(evaluate):
+                raise TypeError("target_estimate_evaluator must provide evaluate()")
+            evaluation_result = evaluate(
+                getattr(observation, "target_estimate", None),
+                _target_ground_truth_from_evaluator_frame(frame),
+            )
+            if evaluation_result is not None:
+                raise RuntimeError(
+                    "target evaluator must be a write-only side channel returning None"
+                )
         if visual_runtime is not None:
             visual_runtime.record_path_position(
                 (
@@ -1810,7 +2030,11 @@ def _run_until_terminal(
                     float(observation.uav_pose.z),
                 )
             )
-        if debug_ground_truth and observation.timestamp >= next_debug_time_s:
+        if (
+            debug_ground_truth
+            and frame is not None
+            and observation.timestamp >= next_debug_time_s
+        ):
             _print_ground_truth(frame, observation.timestamp)
             next_debug_time_s = observation.timestamp + 1.0
 
@@ -2130,6 +2354,89 @@ def _run_until_terminal(
     return _LoopResult(snapshot)
 
 
+def _best_effort_production_failure_land(
+    *,
+    simulation_app: object,
+    environment: object,
+    perception: object,
+    agent: object,
+    clock: object,
+    shutdown_guard_s: float,
+) -> object:
+    """Tick trusted cancel-and-LAND after an unexpected production failure."""
+
+    from scripts.run_llm_oracle_pipeline import _LoopResult
+
+    snapshot = agent.snapshot()
+    if snapshot.status.value != "RUNNING":
+        return _LoopResult(snapshot)
+    try:
+        snapshot = agent.cancel()
+    except Exception as exc:
+        snapshot = agent.snapshot()
+        if snapshot.status.value == "RUNNING" and snapshot.active_skill != "LAND":
+            stop = getattr(environment.uav_controller, "stop", None)
+            if callable(stop):
+                stop()
+            return _LoopResult(
+                snapshot,
+                "runtime failure could not start fail-safe LAND: "
+                f"{type(exc).__name__}",
+            )
+
+    deadline_s = float(clock.now()) + float(shutdown_guard_s)
+    while simulation_app.is_running() and snapshot.status.value == "RUNNING":
+        if float(clock.now()) > deadline_s:
+            stop = getattr(environment.uav_controller, "stop", None)
+            if callable(stop):
+                stop()
+            return _LoopResult(
+                snapshot,
+                "runtime failure LAND exceeded its shutdown guard",
+            )
+        try:
+            if not environment.step():
+                continue
+            base = environment.get_skill_observation(include_oracle=False)
+            observation = perception.attach_target_estimate(base, None)
+            snapshot = agent.tick(observation)
+        except Exception as exc:
+            stop = getattr(environment.uav_controller, "stop", None)
+            if callable(stop):
+                stop()
+            return _LoopResult(
+                snapshot,
+                "runtime failure LAND observation/tick failed: "
+                f"{type(exc).__name__}",
+            )
+    if snapshot.status.value == "RUNNING":
+        return _LoopResult(
+            snapshot,
+            "SimulationApp stopped before runtime failure LAND completed",
+        )
+    return _LoopResult(snapshot)
+
+
+def _target_ground_truth_from_evaluator_frame(frame: object) -> object:
+    """Copy privileged Isaac truth into the evaluator-only pure value type."""
+
+    from perception.evaluation import TargetGroundTruth
+
+    try:
+        timestamp_s = float(frame.observation.camera_timestamp_s)
+        position = tuple(float(value) for value in frame.target_position_m)
+        velocity = tuple(float(value) for value in frame.target_velocity_mps)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError(
+            "target evaluator requires a synchronized environment EvaluatorFrame"
+        ) from exc
+    return TargetGroundTruth(
+        timestamp_s=timestamp_s,
+        position_world_m=position,
+        velocity_world_mps=velocity,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parse_args(argv)
@@ -2147,6 +2454,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         config = replace(config, uav=replace(config.uav, id=args.uav_id))
+        effective_target_backend = (
+            args.target_perception_backend
+            or (
+                "oracle_evaluation"
+                if args.perception_runtime_profile == "oracle_evaluation"
+                else config.target_perception.backend
+            )
+        )
+        from common.loopback_url import validate_loopback_http_url
+
+        yolo_service_config = replace(
+            config.target_perception.yolo_service,
+            url=validate_loopback_http_url(
+                (
+                    args.yolo_service_url
+                    if args.yolo_service_url is not None
+                    else config.target_perception.yolo_service.url
+                ),
+                "--yolo-service-url",
+            ),
+            request_timeout_s=(
+                args.yolo_request_timeout_s
+                if args.yolo_request_timeout_s is not None
+                else config.target_perception.yolo_service.request_timeout_s
+            ),
+            max_result_age_s=(
+                args.yolo_max_result_age_s
+                if args.yolo_max_result_age_s is not None
+                else config.target_perception.yolo_service.max_result_age_s
+            ),
+        )
+        config = replace(
+            config,
+            target_perception=replace(
+                config.target_perception,
+                backend=effective_target_backend,
+                yolo_service=yolo_service_config,
+            ),
+        )
+        args.effective_target_perception_backend = effective_target_backend
         args.effective_obstacle_perception_mode = (
             args.obstacle_perception or config.obstacle_perception.mode
         )
@@ -2190,6 +2537,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from skills.search_strategy import SearchRuntimeCapabilities
     from scripts.run_llm_oracle_pipeline import (
         IsaacSimulationClock,
+        _LoopResult,
         _CountingModelClient,
         _best_effort_interrupt_land,
         _landing_zone_name,
@@ -2313,6 +2661,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     next_best_view_worker = None
     next_best_view_provider = None
     next_best_view_worker_registered = False
+    target_perception_coordinator = None
+    target_estimate_evaluator = None
+    target_evaluation_metrics = None
     interrupted = False
     try:
         from agents.mission_agent import MissionAgent
@@ -2358,39 +2709,119 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.debug_ground_truth:
             print(f"[GroundTruth] target_spawn_m={target_spawn}")
 
-        profile = PerceptionRuntimeProfile.ORACLE_EVALUATION
-        print(
-            "[Perception] PRIVILEGED ORACLE_EVALUATION explicitly enabled; "
-            "geometry_source=oracle_evaluation, never qwen_vl"
+        profile = (
+            PerceptionRuntimeProfile.ORACLE_EVALUATION
+            if args.perception_runtime_profile == "oracle_evaluation"
+            else PerceptionRuntimeProfile.PRODUCTION
         )
-        perception = _build_oracle_evaluation_backend(args.uav_id)
-        clock = IsaacSimulationClock(environment)
-        context = environment.make_skill_context(clock, perception=perception)
         frame_store = FrameStore(
             max_frames=config.frame_store.max_frames,
             max_bytes=config.frame_store.max_bytes,
             max_age_s=config.frame_store.max_age_s,
         )
         candidate_bank = CandidateBank(uav_id=args.uav_id)
+        from perception.factory import build_target_perception_backend
 
-        def oracle_candidate_position(
-            resolved_uav_id: str,
-            candidate_id: str,
-            timestamp_s: float,
-        ) -> object:
-            # This provider exists only inside the explicitly acknowledged
-            # ORACLE_EVALUATION process.  Neither Qwen nor MissionAgent sees
-            # the returned world coordinate.
-            del candidate_id, timestamp_s
-            if resolved_uav_id != args.uav_id:
-                raise ValueError("candidate resolver UAV route mismatch")
-            return environment.get_evaluator_frame().target_position_m
-
-        candidate_resolver = OracleEvaluationCandidateResolver(
-            oracle_candidate_position,
-            profile=profile,
-            acknowledge_privileged_oracle=True,
+        perception = build_target_perception_backend(
+            config,
+            runtime_profile=profile,
+            acknowledge_privileged_oracle=args.acknowledge_privileged_oracle,
+            uav_id=args.uav_id,
         )
+        if profile is PerceptionRuntimeProfile.ORACLE_EVALUATION:
+            print(
+                "[Perception] PRIVILEGED ORACLE_EVALUATION explicitly enabled; "
+                "geometry_source=oracle_evaluation, never qwen_vl"
+            )
+
+            def oracle_candidate_position(
+                resolved_uav_id: str,
+                candidate_id: str,
+                timestamp_s: float,
+            ) -> object:
+                # Evaluator-only label/INSPECT resolver. It is never created
+                # for production and its value never enters Qwen or YOLO.
+                del candidate_id, timestamp_s
+                if resolved_uav_id != args.uav_id:
+                    raise ValueError("candidate resolver UAV route mismatch")
+                return environment.get_evaluator_frame().target_position_m
+
+            candidate_resolver = OracleEvaluationCandidateResolver(
+                oracle_candidate_position,
+                profile=profile,
+                acknowledge_privileged_oracle=True,
+            )
+        elif config.target_perception.backend == "ultralytics_service":
+            from perception.depth_geometry import DepthCandidateResolver
+            from perception.target_perception_coordinator import (
+                TargetPerceptionCoordinator,
+            )
+
+            candidate_resolver = DepthCandidateResolver(
+                frame_store,
+                sampling_strategy=config.target_perception.geometry.depth_anchor,
+                patch_radius_px=(
+                    config.target_perception.geometry.depth_patch_radius_px
+                ),
+                min_depth_m=config.target_perception.geometry.min_depth_m,
+                max_depth_m=config.target_perception.geometry.max_depth_m,
+            )
+            target_perception_coordinator = TargetPerceptionCoordinator(
+                config.target_perception,
+                frame_store=frame_store,
+                candidate_bank=candidate_bank,
+                resolver=candidate_resolver,
+            )
+            print(
+                "[Perception] production ultralytics_service enabled; "
+                "geometry_source=isaac_depth, oracle_fallback=forbidden"
+            )
+        else:
+            from perception.grounding import ProductionCandidateResolver
+
+            candidate_resolver = ProductionCandidateResolver()
+            print("[Perception] production target perception disabled")
+
+        if (
+            args.debug_ground_truth
+            or profile is PerceptionRuntimeProfile.ORACLE_EVALUATION
+        ):
+            from perception.evaluation import (
+                TargetEvaluationMode,
+                TargetEstimateEvaluator,
+            )
+            from perception.target_perception_coordinator import (
+                TargetPerceptionMetrics,
+            )
+
+            target_evaluation_metrics = (
+                target_perception_coordinator.metrics
+                if target_perception_coordinator is not None
+                else TargetPerceptionMetrics()
+            )
+            allowed_sources = (
+                frozenset({"oracle_evaluation"})
+                if profile is PerceptionRuntimeProfile.ORACLE_EVALUATION
+                else frozenset(
+                    {
+                        "yolo26_botsort",
+                        "yoloe26_botsort",
+                        "kalman_prediction",
+                    }
+                )
+            )
+            target_estimate_evaluator = TargetEstimateEvaluator(
+                target_evaluation_metrics,
+                mode=TargetEvaluationMode.ORACLE_GROUND_TRUTH,
+                allowed_estimate_sources=allowed_sources,
+            )
+            print(
+                "[TargetEvaluator] privileged RMSE side-channel enabled; "
+                "ground_truth_to_control=false"
+            )
+
+        clock = IsaacSimulationClock(environment)
+        context = environment.make_skill_context(clock, perception=perception)
         inspect_skill = InspectSkill(
             candidate_bank=candidate_bank,
             candidate_resolver=candidate_resolver,
@@ -2466,6 +2897,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Metrics, transitions and manifests are experiment outputs, not
             # a side effect of enabling the periodic Qwen vision reviewer.
             visual_runtime = _create_logging_runtime(args=args)
+        if (
+            target_perception_coordinator is not None
+            and visual_runtime.coordinator is not None
+        ):
+            review_provider = getattr(
+                visual_runtime.coordinator,
+                "latest_candidate_review",
+                None,
+            )
+            reference_provider = getattr(
+                visual_runtime.coordinator,
+                "latest_candidate_review_reference_handles",
+                None,
+            )
+            if not callable(review_provider):
+                raise RuntimeError(
+                    "visual review coordinator lacks typed candidate evidence bridge"
+                )
+            if not callable(reference_provider):
+                raise RuntimeError(
+                    "visual review coordinator lacks identity-reference bridge"
+                )
+            target_perception_coordinator.bind_visual_review_provider(
+                review_provider,
+                reference_provider,
+            )
+            print(
+                "[Perception] accepted routed Qwen candidate reviews are "
+                "available as typed semantic evidence"
+            )
         if next_best_view_worker is not None:
             assert visual_runtime is not None
             visual_runtime.add_worker(next_best_view_worker)
@@ -2610,13 +3071,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_manager,
             clock,
             perception_runtime_profile=profile,
-            acknowledge_privileged_oracle=True,
+            acknowledge_privileged_oracle=args.acknowledge_privileged_oracle,
+            target_perception_backend=config.target_perception.backend,
             runtime_program=args.runtime_program,
             **agent_kwargs,
         )
 
         task_start_s = clock.now()
         compiled = agent.start(args.instruction, world_context)
+        if target_perception_coordinator is not None:
+            target_perception_coordinator.reset(
+                mission_id=compiled.task_plan.mission_id,
+                uav_id=args.uav_id,
+            )
         assert environment.scene is not None
 
         def on_route_collision(collision: object) -> None:
@@ -2722,6 +3189,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             review_mode=review_mode,
             perception_profile=args.perception_runtime_profile,
             oracle_acknowledged=args.acknowledge_privileged_oracle,
+            target_perception_backend=config.target_perception.backend,
+            yolo_service_url=(
+                config.target_perception.yolo_service.url
+                if config.target_perception.backend == "ultralytics_service"
+                else None
+            ),
+            model_family=config.target_perception.detector.model_family,
+            geometry_mode=config.target_perception.geometry.mode,
+            state_estimator=config.target_perception.state_estimator.type,
+            confirmation_mode=config.target_perception.confirmation.mode,
         ):
             print(f"[Launch] {key}={value}")
         print(
@@ -2744,6 +3221,28 @@ def main(argv: Sequence[str] | None = None) -> int:
                     model_name=visual_runtime.model_name,
                 ),
             )
+            if target_perception_coordinator is not None:
+                # This branch exists only for the production
+                # ultralytics_service backend.  Oracle evaluation never
+                # creates or binds a target-image writer.
+                from perception.target_debug_images import (
+                    BoundedTargetDebugImageWriter,
+                )
+
+                assert visual_runtime.run_dir is not None
+                target_debug_writer = BoundedTargetDebugImageWriter(
+                    visual_runtime.run_dir / "debug_images" / "target_perception",
+                    enabled=config.debug_images.enabled,
+                    max_images_per_run=(
+                        config.debug_images.max_images_per_run
+                    ),
+                )
+                target_perception_coordinator.bind_debug_image_writer(
+                    target_debug_writer
+                )
+                visual_runtime.bind_target_debug_image_writer(
+                    target_debug_writer
+                )
             visual_runtime.log_initial_planner_proposals(
                 planner,
                 compiled,
@@ -2793,17 +3292,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 obstacle_runtime=obstacle_runtime,
                 obstacle_route_runtime=obstacle_route_runtime,
                 route_collision_monitor=route_collision_monitor,
+                target_perception_coordinator=target_perception_coordinator,
+                target_manager=target_manager,
+                production_target_perception=(
+                    profile is PerceptionRuntimeProfile.PRODUCTION
+                ),
+                target_estimate_evaluator=target_estimate_evaluator,
             )
         except KeyboardInterrupt:
             interrupted = True
-            loop_result = _best_effort_interrupt_land(
-                simulation_app=simulation_app,
-                environment=environment,
-                oracle=perception,
-                agent=agent,
-                clock=clock,
-                shutdown_guard_s=shutdown_guard_s,
-            )
+            if profile is PerceptionRuntimeProfile.ORACLE_EVALUATION:
+                loop_result = _best_effort_interrupt_land(
+                    simulation_app=simulation_app,
+                    environment=environment,
+                    oracle=perception,
+                    agent=agent,
+                    clock=clock,
+                    shutdown_guard_s=shutdown_guard_s,
+                )
+            else:
+                loop_result = _best_effort_production_failure_land(
+                    simulation_app=simulation_app,
+                    environment=environment,
+                    perception=perception,
+                    agent=agent,
+                    clock=clock,
+                    shutdown_guard_s=shutdown_guard_s,
+                )
 
         final_pose = environment.uav_controller.get_pose()
         final_xyz = (final_pose.x, final_pose.y, final_pose.z)
@@ -2858,7 +3373,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 130
         return 0 if checks_passed else 1
     except KeyboardInterrupt:
-        if all(value is not None for value in (agent, environment, perception, clock)):
+        if (
+            args.perception_runtime_profile == "oracle_evaluation"
+            and all(value is not None for value in (agent, environment, perception, clock))
+        ):
             _best_effort_interrupt_land(
                 simulation_app=simulation_app,
                 environment=environment,
@@ -2867,11 +3385,66 @@ def main(argv: Sequence[str] | None = None) -> int:
                 clock=clock,
                 shutdown_guard_s=shutdown_guard_s,
             )
+        elif all(
+            value is not None
+            for value in (agent, environment, perception, clock)
+        ):
+            _best_effort_production_failure_land(
+                simulation_app=simulation_app,
+                environment=environment,
+                perception=perception,
+                agent=agent,
+                clock=clock,
+                shutdown_guard_s=shutdown_guard_s,
+            )
+        elif agent is not None:
+            try:
+                agent.cancel()
+            except Exception:
+                pass
         return 130
     except Exception as exc:
         # Never include prompts, API headers, base64 image content, or raw
         # evaluator frames in this error boundary.
         print(f"dynamic visual pipeline failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        if all(
+            value is not None
+            for value in (agent, environment, perception, clock)
+        ):
+            try:
+                if args.perception_runtime_profile == "oracle_evaluation":
+                    _best_effort_interrupt_land(
+                        simulation_app=simulation_app,
+                        environment=environment,
+                        oracle=perception,
+                        agent=agent,
+                        clock=clock,
+                        shutdown_guard_s=shutdown_guard_s,
+                    )
+                else:
+                    _best_effort_production_failure_land(
+                        simulation_app=simulation_app,
+                        environment=environment,
+                        perception=perception,
+                        agent=agent,
+                        clock=clock,
+                        shutdown_guard_s=shutdown_guard_s,
+                    )
+            except Exception as landing_exc:
+                # A final direct stop is safer than leaving a previous
+                # velocity command latched when LAND observation assembly is
+                # itself unavailable.
+                try:
+                    stop = getattr(environment.uav_controller, "stop", None)
+                    if callable(stop):
+                        stop()
+                except Exception:
+                    pass
+                print(
+                    "fail-safe LAND cleanup failed: "
+                    f"{type(landing_exc).__name__}",
+                    file=sys.stderr,
+                )
         return 1
     finally:
         try:
@@ -2886,6 +3459,58 @@ def main(argv: Sequence[str] | None = None) -> int:
                 except Exception as exc:
                     print(
                         "next-best-view worker shutdown failed: "
+                        f"{type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+            if target_perception_coordinator is not None:
+                perception_metrics = target_perception_coordinator.metrics
+                try:
+                    print(
+                        "[TargetPerceptionMetrics] "
+                        + json.dumps(
+                            perception_metrics.to_dict(),
+                            sort_keys=True,
+                            allow_nan=False,
+                        )
+                    )
+                    if visual_runtime is not None:
+                        visual_runtime.record_target_perception_metrics(
+                            perception_metrics
+                        )
+                except Exception as exc:
+                    print(
+                        "target perception metrics output failed: "
+                        f"{type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+                try:
+                    target_perception_coordinator.close()
+                except Exception as exc:
+                    print(
+                        "target perception shutdown failed: "
+                        f"{type(exc).__name__}",
+                        file=sys.stderr,
+                    )
+            elif target_evaluation_metrics is not None:
+                # Oracle upper-bound runs have no production coordinator, but
+                # their evaluator-only RMSE output follows the same bounded
+                # metrics schema.  No truth object is persisted.
+                try:
+                    print(
+                        "[TargetPerceptionMetrics] "
+                        + json.dumps(
+                            target_evaluation_metrics.to_dict(),
+                            sort_keys=True,
+                            allow_nan=False,
+                        )
+                    )
+                    if visual_runtime is not None:
+                        visual_runtime.record_target_perception_metrics(
+                            target_evaluation_metrics
+                        )
+                except Exception as exc:
+                    print(
+                        "target evaluator metrics output failed: "
                         f"{type(exc).__name__}",
                         file=sys.stderr,
                     )

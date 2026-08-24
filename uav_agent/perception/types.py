@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from math import isfinite
 from numbers import Integral, Real
 
+from common.provenance import is_privileged_oracle_source
+
 
 def _text(value: object, name: str) -> str:
     if not isinstance(value, str):
@@ -84,8 +86,10 @@ class DetectionCandidate:
         object.__setattr__(self, "timestamp_s", _finite(self.timestamp_s, "timestamp_s"))
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "source", _text(self.source, "source"))
-        if self.source.casefold() == "oracle":
-            raise ValueError("a visual DetectionCandidate cannot use source='oracle'")
+        if is_privileged_oracle_source(self.source):
+            raise ValueError(
+                "a visual DetectionCandidate cannot use privileged Oracle evidence"
+            )
         object.__setattr__(
             self,
             "estimated_position",
@@ -146,7 +150,7 @@ class SemanticVerification:
             raise TypeError("matches must be bool")
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "verifier", _text(self.verifier, "verifier"))
-        if self.verifier.casefold() == "oracle":
+        if is_privileged_oracle_source(self.verifier):
             raise ValueError("visual semantic verification cannot use Oracle")
 
 
@@ -178,7 +182,7 @@ class IdentityConsistencyEvidence:
         )
         object.__setattr__(self, "confidence", _confidence(self.confidence))
         object.__setattr__(self, "source", _text(self.source, "source"))
-        if self.source.casefold() == "oracle":
+        if is_privileged_oracle_source(self.source):
             raise ValueError("visual identity confirmation cannot use Oracle")
 
 

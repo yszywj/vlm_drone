@@ -16,6 +16,7 @@ from numbers import Real
 import inspect
 
 from common.ids import generate_routing_id, validate_mission_id, validate_uav_id
+from common.provenance import is_privileged_oracle_source
 from perception.runtime import (
     PerceptionBoundaryError,
     PerceptionRuntimeProfile,
@@ -211,6 +212,7 @@ class MissionAgent:
         plan_revision_coordinator: PlanRevisionCoordinator | None = None,
         runtime_program: str = "linear",
         program_patch_coordinator: ProgramPatchCoordinator | None = None,
+        target_perception_backend: str | None = None,
     ) -> None:
         if not isinstance(planner, MissionPlanner):
             raise TypeError("planner must be a MissionPlanner")
@@ -228,6 +230,13 @@ class MissionAgent:
             raise TypeError("logger must be callable or None")
         if runtime_program not in {"linear", "graph"}:
             raise ValueError("runtime_program must be linear or graph")
+        if target_perception_backend not in {
+            None,
+            "disabled",
+            "oracle_evaluation",
+            "ultralytics_service",
+        }:
+            raise ValueError("unsupported target_perception_backend")
         if not isinstance(perception_runtime_profile, PerceptionRuntimeProfile):
             raise TypeError(
                 "perception_runtime_profile must be a PerceptionRuntimeProfile"
@@ -332,6 +341,7 @@ class MissionAgent:
         self._plan_revision_coordinator = plan_revision_coordinator
         self._program_patch_coordinator = program_patch_coordinator
         self._runtime_program = runtime_program
+        self._target_perception_backend = target_perception_backend
 
         self._status = AgentStatus.IDLE
         self._compiled_mission: CompiledMission | None = None
@@ -435,6 +445,17 @@ class MissionAgent:
             owned_compiled = _copy_compiled_mission(compiled)
         except Exception as exc:
             self._raise_start_failure("plan validation failed", exc)
+
+        if self._target_perception_backend == "disabled":
+            try:
+                from perception.factory import validate_target_perception_preflight
+
+                validate_target_perception_preflight(
+                    "disabled",
+                    (step.skill for step in owned_compiled.task_plan.steps),
+                )
+            except Exception as exc:
+                self._raise_start_failure("target perception preflight failed", exc)
 
         try:
             decision = self._safety.preflight(owned_compiled)
@@ -583,7 +604,8 @@ class MissionAgent:
         )
         if boundary_violation and self._shutdown_outcome is None:
             exc = PerceptionBoundaryError(
-                "production MissionAgent rejects oracle_target_* fields"
+                "production MissionAgent rejects Oracle fields and "
+                "target_estimate.source=oracle_evaluation"
             )
             message = self._error_text("perception boundary rejected observation", exc)
             self._last_error = message
@@ -603,6 +625,7 @@ class MissionAgent:
             # even if a misconfigured backend keeps emitting Oracle data.
             observation = replace(
                 observation,
+                target_estimate=None,
                 oracle_target_id=None,
                 oracle_target_visible=None,
                 oracle_target_pose=None,
@@ -1677,7 +1700,10 @@ class MissionAgent:
                 f"production {skill_name}->TRACK target_id does not match "
                 "the confirmed visual target"
             )
-        if snapshot.source is None or snapshot.source.casefold() == "oracle":
+        if (
+            snapshot.source is None
+            or is_privileged_oracle_source(snapshot.source)
+        ):
             raise MissionAgentError(
                 f"production {skill_name}->TRACK rejects an Oracle target lock"
             )

@@ -87,6 +87,37 @@ def evidence(
 
 
 class CandidateConfirmationTests(unittest.TestCase):
+    def test_production_evidence_types_reject_all_oracle_provenance_aliases(self) -> None:
+        for source in ("oracle", "oracle_truth", "oracle_evaluation", "QWEN_ORACLE_BRIDGE"):
+            with self.subTest(kind="detection", source=source), self.assertRaisesRegex(
+                ValueError, "Oracle"
+            ):
+                DetectionCandidate("tracklet_7", 1.0, 0.8, source=source)
+            with self.subTest(kind="semantic", source=source), self.assertRaisesRegex(
+                ValueError, "Oracle"
+            ):
+                SemanticVerification(
+                    "tracklet_7",
+                    1.0,
+                    "red moving vehicle",
+                    True,
+                    0.8,
+                    source,
+                )
+            with self.subTest(kind="identity", source=source), self.assertRaisesRegex(
+                ValueError, "Oracle"
+            ):
+                IdentityConsistencyEvidence(
+                    "tracklet_7",
+                    "target_7",
+                    1.0,
+                    True,
+                    True,
+                    3,
+                    0.8,
+                    source=source,
+                )
+
     def test_register_candidate_uses_real_candidate_lifecycle(self) -> None:
         manager = searching_manager()
         result = CandidateConfirmationCoordinator().register_candidate(

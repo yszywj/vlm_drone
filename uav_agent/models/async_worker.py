@@ -58,6 +58,11 @@ class AsyncModelRequest:
     frame_id: str
     messages: Sequence[ChatMessage]
     options: GenerationOptions | None = None
+    # Trusted internal scheduling metadata.  Visual review requests are
+    # deliberately limited to Broker P3 (event/runtime) and P4 (periodic);
+    # callers cannot use this data-plane contract to manufacture P0/P1 work.
+    broker_priority: int = 3
+    broker_replaceable: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "request_id", validate_request_id(self.request_id))
@@ -92,6 +97,14 @@ class AsyncModelRequest:
             GenerationOptions,
         ):
             raise TypeError("options must be GenerationOptions or None")
+        if (
+            isinstance(self.broker_priority, bool)
+            or not isinstance(self.broker_priority, int)
+            or self.broker_priority not in {3, 4}
+        ):
+            raise ValueError("broker_priority must be visual-review priority 3 or 4")
+        if not isinstance(self.broker_replaceable, bool):
+            raise TypeError("broker_replaceable must be bool")
 
 
 @dataclass(frozen=True, slots=True)

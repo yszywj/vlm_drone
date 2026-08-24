@@ -61,6 +61,10 @@ class CandidateBankTest(unittest.TestCase):
             frame_ref=frame("frame_1", 1.0),
             source="qwen_vl",
         )
+        bank.add_review(
+            "candidate_1",
+            CandidateReviewRef("review_old", 1.5, "TARGET_MISMATCH"),
+        )
         bank.reject("candidate_1", timestamp_s=2.0)
 
         suppressed = bank.propose(
@@ -81,6 +85,11 @@ class CandidateBankTest(unittest.TestCase):
         self.assertIsNone(suppressed)
         self.assertIsNotNone(restored)
         self.assertIs(restored.lifecycle, CandidateLifecycle.PROVISIONAL)  # type: ignore[union-attr]
+        self.assertEqual(restored.first_seen_timestamp_s, 12.0)  # type: ignore[union-attr]
+        self.assertEqual(restored.last_seen_timestamp_s, 12.0)  # type: ignore[union-attr]
+        self.assertEqual(restored.bbox_history, ((0.1, 0.2, 0.4, 0.6),))  # type: ignore[union-attr]
+        self.assertEqual(restored.frame_history, (frame("frame_3", 12.0),))  # type: ignore[union-attr]
+        self.assertEqual(restored.review_history, ())  # type: ignore[union-attr]
 
     def test_bank_count_and_staleness_are_bounded(self) -> None:
         bank = CandidateBank(
@@ -112,14 +121,17 @@ class CandidateBankTest(unittest.TestCase):
                 frame_ref=frame("frame_1", 1.0, uav_id="uav_2"),
                 source="detector",
             )
-        with self.assertRaisesRegex(ValueError, "oracle_evaluation"):
-            bank.propose(
-                candidate_id="candidate_1",
-                timestamp_s=1.0,
-                bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
-                frame_ref=frame("frame_1", 1.0),
-                source="oracle",
-            )
+        for source in ("oracle", "oracle_truth", "OrAcLe_BrIdGe"):
+            with self.subTest(source=source), self.assertRaisesRegex(
+                ValueError, "oracle_evaluation"
+            ):
+                bank.propose(
+                    candidate_id="candidate_1",
+                    timestamp_s=1.0,
+                    bbox_xyxy_normalized=(0.1, 0.2, 0.4, 0.6),
+                    frame_ref=frame("frame_1", 1.0),
+                    source=source,
+                )
 
 
 if __name__ == "__main__":

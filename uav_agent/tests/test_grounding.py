@@ -16,6 +16,7 @@ from perception.grounding import (
     OracleEvaluationGrounder,
     ProductionCandidateResolver,
     QwenVLGrounder,
+    UltralyticsGrounder,
     YOLOEGrounder,
 )
 from perception.runtime import (
@@ -23,6 +24,7 @@ from perception.runtime import (
     PerceptionRuntimeProfile,
 )
 from runtime.frame_store import FrameRef
+from yolo_service.protocol import TimingMs, TrackDetection, TrackResponse
 
 
 def _candidate() -> CandidateSnapshot:
@@ -140,6 +142,7 @@ class GroundingBoundaryTest(unittest.TestCase):
             ),
             QwenVLGrounder(),
             LearnedGrounder(),
+            UltralyticsGrounder(),
             YOLOEGrounder(),
         )
         for grounder in grounders:
@@ -153,6 +156,55 @@ class GroundingBoundaryTest(unittest.TestCase):
                         target_spec=object(),  # type: ignore[arg-type]
                         prompt_bundle=object(),  # type: ignore[arg-type]
                     )
+
+    def test_ultralytics_response_becomes_bounded_grounding_proposals(self) -> None:
+        response = TrackResponse(
+            schema_version=1,
+            request_id="request_1",
+            mission_id="mission_1",
+            uav_id="uav_1",
+            stream_id="mission_1:uav_1",
+            frame_id="frame_1",
+            timestamp_s=1.0,
+            detections=(
+                TrackDetection(
+                    track_id=7,
+                    class_id=0,
+                    class_name="person",
+                    confidence=0.86,
+                    bbox_xyxy_normalized=(0.3, 0.25, 0.42, 0.71),
+                ),
+            ),
+            timing_ms=TimingMs(1.0, 2.0, 1.0, 4.0),
+        )
+        frame_ref = FrameRef("uav_1", "frame_1", 1.0, 640, 480)
+
+        proposals = UltralyticsGrounder.from_response(response, frame_ref)
+
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0].uav_id, "uav_1")
+        self.assertEqual(proposals[0].candidate_id, "mission_1_uav_1_track_7")
+        self.assertEqual(proposals[0].confidence, 0.86)
+        self.assertEqual(proposals[0].source, "ultralytics_service")
+        self.assertNotIn("class_name", proposals[0].to_dict())
+
+    def test_ultralytics_response_must_match_the_frame(self) -> None:
+        response = TrackResponse(
+            1,
+            "request_1",
+            "mission_1",
+            "uav_1",
+            "mission_1:uav_1",
+            "frame_1",
+            1.0,
+            (),
+            TimingMs(0.0, 0.0, 0.0, 0.0),
+        )
+        with self.assertRaisesRegex(ValueError, "frame_id"):
+            UltralyticsGrounder.from_response(
+                response,
+                FrameRef("uav_1", "frame_2", 1.0, 640, 480),
+            )
 
 
 if __name__ == "__main__":

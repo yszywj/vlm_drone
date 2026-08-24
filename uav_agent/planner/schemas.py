@@ -14,6 +14,7 @@ from common.ids import (
     validate_routing_id,
     validate_uav_id,
 )
+from planner.scripted_target_semantics import compile_scripted_target_description
 from planner.text_safety import reject_forbidden_planner_text
 from skills.plan import TaskPlan
 from target.types import TargetSpec
@@ -977,11 +978,7 @@ def _target_spec_from_steps(steps: Sequence[PlanStepDraftV2]) -> TargetSpec:
         ),
         "unspecified mission target",
     )
-    return TargetSpec(
-        original_description=description,
-        category="unspecified",
-        immutable_identity_summary=description,
-    )
+    return compile_scripted_target_description(description)
 
 
 def _validate_planner_target_spec(target_spec: TargetSpec) -> None:
@@ -1071,6 +1068,8 @@ class PlannerRequest:
     mission_id: str | None
     uav_id: str | None
     plan_version: int | None
+    trusted_target_spec: TargetSpec | None
+    require_empty_spatial_assumptions: bool
 
     def __init__(
         self,
@@ -1080,6 +1079,8 @@ class PlannerRequest:
         mission_id: str | None = None,
         uav_id: str | None = None,
         plan_version: int | None = None,
+        trusted_target_spec: TargetSpec | None = None,
+        require_empty_spatial_assumptions: bool = False,
     ) -> None:
         supplied = (mission_id is not None, uav_id is not None, plan_version is not None)
         if any(supplied) and not all(supplied):
@@ -1091,6 +1092,12 @@ class PlannerRequest:
         object.__setattr__(self, "mission_id", mission_id)
         object.__setattr__(self, "uav_id", uav_id)
         object.__setattr__(self, "plan_version", plan_version)
+        object.__setattr__(self, "trusted_target_spec", trusted_target_spec)
+        object.__setattr__(
+            self,
+            "require_empty_spatial_assumptions",
+            require_empty_spatial_assumptions,
+        )
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -1101,6 +1108,16 @@ class PlannerRequest:
         )
         if not isinstance(self.world_context, PlannerWorldContext):
             raise TypeError("world_context must be a PlannerWorldContext")
+        if self.trusted_target_spec is not None:
+            if not isinstance(self.trusted_target_spec, TargetSpec):
+                raise TypeError("trusted_target_spec must be a TargetSpec or None")
+            if self.trusted_target_spec.mutable_appearance_notes:
+                raise ValueError(
+                    "trusted_target_spec.mutable_appearance_notes must be empty "
+                    "for initial planning"
+                )
+        if not isinstance(self.require_empty_spatial_assumptions, bool):
+            raise TypeError("require_empty_spatial_assumptions must be bool")
         if self.mission_id is not None:
             object.__setattr__(
                 self,

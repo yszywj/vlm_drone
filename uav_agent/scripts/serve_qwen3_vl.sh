@@ -13,6 +13,8 @@ QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-4096}"
 QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.90}"
 QWEN_CUDA_VISIBLE_DEVICES="${QWEN_CUDA_VISIBLE_DEVICES:-1}"
 VLLM_BIN="${VLLM_BIN:-vllm}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+QWEN_ADAPTER_CONFIG="${QWEN_ADAPTER_CONFIG:-${SCRIPT_DIR}/../configs/adapters.json}"
 
 fail() {
   local exit_code="$1"
@@ -43,6 +45,26 @@ elif ! command -v "${VLLM_BIN}" >/dev/null 2>&1; then
   fail 127 "vLLM command not found: ${VLLM_BIN}. Install vLLM in a separate compatible environment or set VLLM_BIN."
 fi
 
+[[ -f "${QWEN_ADAPTER_CONFIG}" ]] || \
+  fail 2 "adapter config does not exist: ${QWEN_ADAPTER_CONFIG}"
+if [[ "${PYTHON_BIN}" == */* ]]; then
+  [[ -x "${PYTHON_BIN}" ]] || fail 127 "Python executable is unavailable: ${PYTHON_BIN}"
+elif ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  fail 127 "Python command not found: ${PYTHON_BIN}"
+fi
+
+lora_args_file="$(mktemp)"
+trap 'rm -f -- "${lora_args_file}"' EXIT
+if ! "${PYTHON_BIN}" "${SCRIPT_DIR}/build_vllm_lora_args.py" \
+  --config "${QWEN_ADAPTER_CONFIG}" \
+  --expected-base-model-name "${QWEN_SERVED_MODEL_NAME}" \
+  --format lines >"${lora_args_file}"; then
+  fail 2 "invalid Adapter/LoRA configuration"
+fi
+mapfile -t QWEN_LORA_ARGS <"${lora_args_file}"
+rm -f -- "${lora_args_file}"
+trap - EXIT
+
 printf '%s\n' \
   '[Qwen3-VL server]' \
   "Model path: ${QWEN_MODEL_PATH}" \
@@ -51,6 +73,11 @@ printf '%s\n' \
   "CUDA visible devices: ${QWEN_CUDA_VISIBLE_DEVICES}" \
   "Maximum model length: ${QWEN_MAX_MODEL_LEN}" \
   "GPU memory utilization: ${QWEN_GPU_MEMORY_UTILIZATION}"
+if ((${#QWEN_LORA_ARGS[@]} > 0)); then
+  printf 'Static active LoRA adapters: enabled (%s vLLM arguments)\n' "${#QWEN_LORA_ARGS[@]}"
+else
+  printf 'Static active LoRA adapters: none; serving base model only\n'
+fi
 
 export CUDA_VISIBLE_DEVICES="${QWEN_CUDA_VISIBLE_DEVICES}"
 exec "${VLLM_BIN}" serve "${QWEN_MODEL_PATH}" \
@@ -59,4 +86,5 @@ exec "${VLLM_BIN}" serve "${QWEN_MODEL_PATH}" \
   --port "${QWEN_PORT}" \
   --dtype float16 \
   --max-model-len "${QWEN_MAX_MODEL_LEN}" \
-  --gpu-memory-utilization "${QWEN_GPU_MEMORY_UTILIZATION}"
+  --gpu-memory-utilization "${QWEN_GPU_MEMORY_UTILIZATION}" \
+  "${QWEN_LORA_ARGS[@]}"

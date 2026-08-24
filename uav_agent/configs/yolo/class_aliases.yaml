@@ -1,0 +1,39 @@
+# Exact, auditable aliases for ordinary closed-set YOLO models.
+# The mapped key is still checked against the loaded model.names at runtime.
+person:
+  aliases:
+    - person
+    - a person
+    - one person
+    - pedestrian
+    - human
+    - 人
+    - 一个人
+    - 一名行人
+    - 行人
+car:
+  aliases:
+    - car
+    - automobile
+    - 汽车
+    - 轿车
+bicycle:
+  aliases:
+    - bicycle
+    - bike
+    - 自行车
+motorcycle:
+  aliases:
+    - motorcycle
+    - motorbike
+    - 摩托车
+bus:
+  aliases:
+    - bus
+    - 公交车
+    - 巴士
+truck:
+  aliases:
+    - truck
+    - lorry
+    - 卡车

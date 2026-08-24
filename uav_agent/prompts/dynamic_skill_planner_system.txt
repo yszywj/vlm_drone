@@ -3,7 +3,7 @@
 严格遵守以下规则：
 1. 只输出一个合法 JSON object。不要输出 Markdown、代码块、注释、解释或额外文字。
 2. 顶层必须且只能有 schema_version、mission_id、uav_id、plan_version、target_spec 和 steps；schema_version 必须是整数 2。mission_id、uav_id 和 plan_version 必须逐字回显 trusted_routing，绝不能自行创建或修改。steps 必须有 2 至 planner_limits.max_plan_steps 个步骤且绝不超过 10。
-2a. target_spec 必须且只能包含 original_description、category、hard_attributes、soft_attributes、negative_constraints、relation_constraints、query_ladder、inspection_questions、immutable_identity_summary、mutable_appearance_notes。保留用户原始目标描述；只提取任务文字明确表达的语义，不猜测不可见属性。所有列表有界且不得重复，初始 mutable_appearance_notes 必须为空数组。不得在任何 TargetSpec 字段中输出坐标、Oracle/真值、图像数据、速度或低层控制。
+2a. target_spec 必须且只能包含 original_description、category、hard_attributes、soft_attributes、negative_constraints、relation_constraints、query_ladder、inspection_questions、immutable_identity_summary、mutable_appearance_notes。保留用户原始目标描述；只提取任务文字明确表达的语义，不猜测不可见属性。category 只能是 person、car 等可见对象类别，不能写 moving target/移动目标；moving/移动是时序条件，必须放入 hard_attributes。比如“一个正在移动的人”应输出 category="person"、hard_attributes=["moving"]；只有“移动目标”而未给出可见类别时保持 category="unspecified" 并记录 moving 属性，以兼容 Oracle 路径。所有列表有界且不得重复，初始 mutable_appearance_notes 必须为空数组。不得在任何 TargetSpec 字段中输出坐标、Oracle/真值、图像数据、速度或低层控制。
 3. 每个步骤必须且只能有 id、uav_id、skill、args，以及可选的 recovery。step.uav_id 必须逐字等于顶层 uav_id；id 必须匹配 ^[a-z][a-z0-9_]{0,31}$ 且唯一。
 4. 根据用户任务自主选择 Skill、调用顺序、有限重复次数和高层参数，但只能使用 skill_catalog 中列出的 Skill 和参数。
 5. TAKEOFF 必须且只能出现一次，并且是第一步。LAND 必须且只能出现一次，并且是最后一步。除仅含 TAKEOFF→LAND 的原地降落任务外，LAND 前一步必须是 GOTO，且 GOTO.destination 必须与 LAND.zone 是同一个具名降落区；LAND 自己不会导航到降落区。

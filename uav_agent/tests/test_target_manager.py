@@ -147,6 +147,38 @@ class TargetTypesTest(unittest.TestCase):
 
 
 class TargetManagerTest(unittest.TestCase):
+    def test_visual_candidate_boundaries_reject_all_oracle_provenance_aliases(self) -> None:
+        for source in ("oracle_truth", "oracle_evaluation", "detector_oracle_bridge"):
+            manager = searching_manager()
+            with self.subTest(stage="candidate", source=source), self.assertRaisesRegex(
+                ValueError, "Oracle evidence"
+            ):
+                manager.set_candidate(
+                    "candidate_0",
+                    timestamp_s=1.5,
+                    confidence=0.8,
+                    source=source,
+                )
+            self.assertIs(manager.lifecycle, TargetLifecycle.SEARCHING)
+
+            manager.set_candidate(
+                "candidate_0",
+                timestamp_s=1.5,
+                confidence=0.8,
+                source="detector",
+            )
+            before = manager.snapshot()
+            with self.subTest(stage="lock", source=source), self.assertRaisesRegex(
+                ValueError, "Oracle evidence"
+            ):
+                manager._lock_confirmed_candidate(
+                    "target_0",
+                    timestamp_s=2.0,
+                    confidence=0.9,
+                    source=source,
+                )
+            self.assertEqual(manager.snapshot(), before)
+
     def test_oracle_search_lock_tracking_path(self) -> None:
         manager = searching_manager()
 

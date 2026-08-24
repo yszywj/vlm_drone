@@ -1,0 +1,12 @@
+schema_version: 1
+host: 127.0.0.1
+port: 8011
+model_family: yolo
+device: 0
+tracker_path: configs/yolo/botsort_uav.yaml
+confidence_threshold: 0.25
+iou_threshold: 0.70
+image_size_px: 960
+max_image_bytes: 8388608
+max_image_width_px: 4096
+max_image_height_px: 4096

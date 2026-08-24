@@ -112,7 +112,15 @@ class MissionStatusOverlay:
     model prompts can never enter it.
     """
 
-    def __init__(self, *, ui_module: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        ui_module: object | None = None,
+        title: str = "VLM Drone Mission Status",
+        width: int = 390,
+        height: int = 190,
+        initial_text: str = "Mission status unavailable",
+    ) -> None:
         if ui_module is None:
             import omni.ui as ui_module  # type: ignore[no-redef]
         window_factory = getattr(ui_module, "Window", None)
@@ -120,19 +128,19 @@ class MissionStatusOverlay:
         if not callable(window_factory) or not callable(label_factory):
             raise TypeError("ui_module must provide Window and Label")
         self._window = window_factory(
-            "VLM Drone Mission Status",
-            width=390,
-            height=190,
+            title,
+            width=width,
+            height=height,
         )
         frame = getattr(self._window, "frame", None)
         if frame is None or not callable(getattr(frame, "__enter__", None)):
             raise TypeError("ui Window must expose a context-managed frame")
         with frame:
             self._label = label_factory(
-                "Mission status unavailable",
+                initial_text,
                 word_wrap=True,
             )
-        self._text = "Mission status unavailable"
+        self._text = initial_text
 
     @property
     def text(self) -> str:
@@ -145,7 +153,7 @@ class MissionStatusOverlay:
         strategies = ", ".join(snapshot.search_strategies) or "none"
         routes = ", ".join(snapshot.route_states) or "none"
         version = "none" if snapshot.plan_version is None else str(snapshot.plan_version)
-        self._text = (
+        self._set_text(
             f"Plan version: {version}\n"
             f"Current Skill: {snapshot.current_skill}\n"
             f"Search: {regions} / {strategies} "
@@ -154,7 +162,14 @@ class MissionStatusOverlay:
             f"HOLD: {'ACTIVE' if snapshot.hold_active else 'clear'} | "
             f"Trajectory segments: {snapshot.trajectory_segment_count}"
         )
-        setattr(self._label, "text", self._text)
+
+    def _set_text(self, text: str) -> None:
+        """Update the shared viewport text shell without touching Camera data."""
+
+        if not isinstance(text, str):
+            raise TypeError("overlay text must be a string")
+        self._text = text
+        setattr(self._label, "text", text)
 
     def close(self) -> None:
         window = self._window

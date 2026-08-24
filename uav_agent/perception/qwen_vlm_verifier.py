@@ -49,6 +49,14 @@ _ALLOWED_CONTEXT_KEYS = frozenset(
         "lighting_summary",
         "weather_summary",
         "trigger_event_type",
+        "detector_candidate_id",
+        "detector_candidate_source",
+        "detector_candidate_frame_id",
+        "detector_candidate_timestamp_s",
+        "detector_candidate_x1",
+        "detector_candidate_y1",
+        "detector_candidate_x2",
+        "detector_candidate_y2",
     }
 )
 
@@ -302,6 +310,9 @@ class QwenVLMVerifier:
                     )
                 )
             )
+        # Prompt contents never grant scheduler priority.  The verifier emits
+        # the conservative periodic default; VisualReviewCoordinator replaces
+        # it from its trusted ReviewTicket when this is event/runtime work.
         return AsyncModelRequest(
             request_id=request_id,
             review_id=review_input.review_id,
@@ -321,6 +332,8 @@ class QwenVLMVerifier:
                     schema,
                 ),
             ),
+            broker_priority=4,
+            broker_replaceable=True,
         )
 
     def parse_async_result(

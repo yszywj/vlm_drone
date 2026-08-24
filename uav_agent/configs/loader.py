@@ -10,7 +10,8 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from common.ids import validate_uav_id
+from common.ids import validate_routing_id, validate_uav_id
+from common.loopback_url import validate_loopback_http_url
 from configs.schema import (
     AppConfig,
     ArtifactsConfig,
@@ -19,10 +20,12 @@ from configs.schema import (
     DebugImagesConfig,
     EvaluationConfig,
     ExperimentConfig,
+    FleetConfig,
     FiguresConfig,
     FrameStoreConfig,
     LoggingConfig,
     ModelWorkerConfig,
+    ModelBrokerConfig,
     ObstaclePerceptionConfig,
     PlanRevisionConfig,
     PlannerConfig,
@@ -31,11 +34,19 @@ from configs.schema import (
     QwenVisualReviewConfig,
     StorageConfig,
     SimulationConfig,
+    TargetDetectorConfig,
+    TargetAppearanceConfig,
     TargetConfig,
+    TargetGeometryConfig,
     TargetMotionConfig,
+    TargetPerceptionConfig,
     TargetRegionConfig,
+    TargetStateEstimatorConfig,
+    TargetTrackerConfig,
     TensorboardConfig,
     UavConfig,
+    VisualConfirmationConfig,
+    YoloServiceClientConfig,
 )
 from common.obstacle_types import ObstacleMotionState, ObstacleSpec
 
@@ -44,15 +55,56 @@ class ConfigError(ValueError):
     """Raised when a configuration file is missing or invalid."""
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: _UniqueKeyLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    result: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 _EXPERIMENT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 _DEFAULT_PLANNER_CONFIG = PlannerConfig()
 _DEFAULT_MODEL_WORKER_CONFIG = ModelWorkerConfig()
+_DEFAULT_MODEL_BROKER_CONFIG = ModelBrokerConfig()
 _DEFAULT_QWEN_VISUAL_REVIEW_CONFIG = QwenVisualReviewConfig()
 _DEFAULT_PLAN_REVISION_CONFIG = PlanRevisionConfig()
 _DEFAULT_FRAME_STORE_CONFIG = FrameStoreConfig()
 _DEFAULT_DEBUG_IMAGES_CONFIG = DebugImagesConfig()
 _DEFAULT_OBSTACLE_PERCEPTION_CONFIG = ObstaclePerceptionConfig()
+_DEFAULT_TARGET_PERCEPTION_CONFIG = TargetPerceptionConfig()
 
 _MAX_REQUEST_TIMEOUT_S = 300.0
 _MAX_REVIEW_INTERVAL_S = 3_600.0
@@ -156,6 +208,38 @@ def _strict_optional_block(
     return raw
 
 
+def _strict_nested_block(
+    parent: Mapping[str, Any],
+    name: str,
+    path: str,
+    expected_keys: frozenset[str],
+) -> Mapping[str, Any] | None:
+    """Validate an optional nested block without accepting partial schemas."""
+
+    if name not in parent:
+        return None
+    raw = _mapping(parent[name], f"{path}.{name}")
+    if any(not isinstance(key, str) for key in raw):
+        raise ConfigError(f"{path}.{name} keys must be strings")
+    missing = sorted(expected_keys - set(raw))
+    unknown = sorted(set(raw) - expected_keys)
+    if missing:
+        raise ConfigError(
+            f"{path}.{name} is missing required keys: " + ", ".join(missing)
+        )
+    if unknown:
+        raise ConfigError(
+            f"{path}.{name} contains unknown keys: " + ", ".join(unknown)
+        )
+    return raw
+
+
+def _non_empty_string(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{path} must be a non-empty string")
+    return value.strip()
+
+
 def _uav_id(value: Any, path: str) -> str:
     try:
         return validate_uav_id(value)
@@ -184,50 +268,348 @@ def _resolution(value: Any, path: str) -> tuple[int, int]:
     return int(value[0]), int(value[1])
 
 
+def _inventory_sequence(value: Any, path: str) -> tuple[Any, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ConfigError(f"{path} must be a sequence")
+    result = tuple(value)
+    if not result:
+        raise ConfigError(f"{path} must contain at least one item")
+    return result
+
+
+def _check_keys(
+    raw: Mapping[str, Any],
+    *,
+    path: str,
+    required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
+) -> None:
+    if any(not isinstance(key, str) for key in raw):
+        raise ConfigError(f"{path} keys must be strings")
+    missing = sorted(required - set(raw))
+    unknown = sorted(set(raw) - required - optional)
+    if missing:
+        raise ConfigError(f"{path} is missing required keys: " + ", ".join(missing))
+    if unknown:
+        raise ConfigError(f"{path} contains unknown keys: " + ", ".join(unknown))
+
+
+def _parse_uav_config(
+    value: Any,
+    path: str,
+    *,
+    legacy: bool,
+) -> UavConfig:
+    raw = _mapping(value, path)
+    _check_keys(
+        raw,
+        path=path,
+        required=frozenset(
+            {"initial_position_xyz_m", "max_speed_mps", "max_yaw_rate_deg_s"}
+        ),
+        optional=frozenset(
+            {"id", "display_name", "home_name", "camera_profile"}
+        ),
+    )
+    default_id = "uav_1"
+    uav_id = _uav_id(raw.get("id", default_id), f"{path}.id")
+    camera_profile = raw.get("camera_profile", "default")
+    if not isinstance(camera_profile, str):
+        raise ConfigError(f"{path}.camera_profile must be a string")
+    display_name = raw.get("display_name", uav_id)
+    home_name = raw.get("home_name", f"home_{uav_id}")
+    try:
+        return UavConfig(
+            id=uav_id,
+            display_name=_non_empty_string(display_name, f"{path}.display_name"),
+            home_name=_non_empty_string(home_name, f"{path}.home_name"),
+            camera_profile=camera_profile,
+            initial_position_xyz_m=_float_vector(
+                _required(raw, "initial_position_xyz_m", path),
+                f"{path}.initial_position_xyz_m",
+                3,
+            ),
+            max_speed_mps=_positive_number(
+                _required(raw, "max_speed_mps", path), f"{path}.max_speed_mps"
+            ),
+            max_yaw_rate_deg_s=_positive_number(
+                _required(raw, "max_yaw_rate_deg_s", path),
+                f"{path}.max_yaw_rate_deg_s",
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"invalid {path}: {exc}") from exc
+
+
+def _parse_camera_config(
+    value: Any,
+    path: str,
+    *,
+    rendering_hz: int,
+) -> CameraConfig:
+    raw = _mapping(value, path)
+    _check_keys(
+        raw,
+        path=path,
+        required=frozenset(
+            {
+                "resolution_wh_px",
+                "frequency_hz",
+                "horizontal_fov_deg",
+                "focal_length_m",
+                "pitch_deg",
+            }
+        ),
+    )
+    frequency_hz = raw["frequency_hz"]
+    if (
+        isinstance(frequency_hz, bool)
+        or not isinstance(frequency_hz, int)
+        or frequency_hz <= 0
+    ):
+        raise ConfigError(f"{path}.frequency_hz must be a positive integer")
+    focal_length_raw = raw["focal_length_m"]
+    camera = CameraConfig(
+        resolution_wh_px=_resolution(raw["resolution_wh_px"], f"{path}.resolution_wh_px"),
+        frequency_hz=frequency_hz,
+        horizontal_fov_deg=_finite_number(
+            raw["horizontal_fov_deg"], f"{path}.horizontal_fov_deg"
+        ),
+        focal_length_m=(
+            None
+            if focal_length_raw is None
+            else _positive_number(focal_length_raw, f"{path}.focal_length_m")
+        ),
+        pitch_deg=_finite_number(raw["pitch_deg"], f"{path}.pitch_deg"),
+    )
+    if not 0.0 < camera.horizontal_fov_deg < 180.0:
+        raise ConfigError(f"{path}.horizontal_fov_deg must be between 0 and 180")
+    if not -90.0 <= camera.pitch_deg <= 90.0:
+        raise ConfigError(f"{path}.pitch_deg must be between -90 and 90")
+    if rendering_hz % camera.frequency_hz != 0:
+        raise ConfigError(
+            f"{path}.frequency_hz must be an integer divisor of the rendering frequency"
+        )
+    return camera
+
+
+def _parse_target_config(value: Any, path: str, *, legacy: bool) -> TargetConfig:
+    raw = _mapping(value, path)
+    _check_keys(
+        raw,
+        path=path,
+        required=frozenset({"initial_region", "motion"}),
+        optional=frozenset({"id", "semantic_alias", "appearance", "max_speed_mps"}),
+    )
+    target_id_raw = raw.get("id", "target")
+    try:
+        target_id = validate_routing_id(target_id_raw, "target_id")
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{path}.id: {exc}") from exc
+    semantic_alias = _non_empty_string(
+        raw.get("semantic_alias", target_id), f"{path}.semantic_alias"
+    )
+
+    appearance_raw = _mapping(raw.get("appearance", {}), f"{path}.appearance")
+    _check_keys(
+        appearance_raw,
+        path=f"{path}.appearance",
+        required=frozenset(),
+        optional=frozenset({"shape", "color_name", "color_rgb", "size_xyz_m"}),
+    )
+    shape = appearance_raw.get("shape", "CUBE")
+    if not isinstance(shape, str) or shape.upper() != "CUBE":
+        raise ConfigError(f"{path}.appearance.shape must be CUBE")
+    color_name = _non_empty_string(
+        appearance_raw.get("color_name", "red"), f"{path}.appearance.color_name"
+    )
+    color_rgb = _float_vector(
+        appearance_raw.get("color_rgb", (1.0, 0.12, 0.05)),
+        f"{path}.appearance.color_rgb",
+        3,
+    )
+    if any(component < 0.0 or component > 1.0 for component in color_rgb):
+        raise ConfigError(f"{path}.appearance.color_rgb values must be between 0 and 1")
+    size_xyz_m = _float_vector(
+        appearance_raw.get("size_xyz_m", (0.6, 0.6, 1.0)),
+        f"{path}.appearance.size_xyz_m",
+        3,
+    )
+    if any(component <= 0.0 for component in size_xyz_m):
+        raise ConfigError(f"{path}.appearance.size_xyz_m values must be greater than 0")
+
+    region_raw = _mapping(_required(raw, "initial_region", path), f"{path}.initial_region")
+    _check_keys(
+        region_raw,
+        path=f"{path}.initial_region",
+        required=frozenset({"min_xyz_m", "max_xyz_m"}),
+    )
+    initial_region = TargetRegionConfig(
+        min_xyz_m=_float_vector(
+            region_raw["min_xyz_m"], f"{path}.initial_region.min_xyz_m", 3
+        ),
+        max_xyz_m=_float_vector(
+            region_raw["max_xyz_m"], f"{path}.initial_region.max_xyz_m", 3
+        ),
+    )
+    motion_raw = _mapping(_required(raw, "motion", path), f"{path}.motion")
+    _check_keys(
+        motion_raw,
+        path=f"{path}.motion",
+        required=frozenset({"mode", "region", "speed_mps", "seed"}),
+        optional=frozenset({"initial_heading_deg", "direction_change_interval_s"}),
+    )
+    motion_mode = motion_raw["mode"]
+    if (
+        not isinstance(motion_mode, str)
+        or motion_mode.upper() not in {"STATIC", "LINEAR", "RANDOM_WALK"}
+    ):
+        raise ConfigError(f"{path}.motion.mode must be STATIC, LINEAR, or RANDOM_WALK")
+    motion_region_raw = _mapping(motion_raw["region"], f"{path}.motion.region")
+    _check_keys(
+        motion_region_raw,
+        path=f"{path}.motion.region",
+        required=frozenset({"min_xyz_m", "max_xyz_m"}),
+    )
+    motion_region = TargetRegionConfig(
+        min_xyz_m=_float_vector(
+            motion_region_raw["min_xyz_m"], f"{path}.motion.region.min_xyz_m", 3
+        ),
+        max_xyz_m=_float_vector(
+            motion_region_raw["max_xyz_m"], f"{path}.motion.region.max_xyz_m", 3
+        ),
+    )
+    motion_speed = _nonnegative_number(motion_raw["speed_mps"], f"{path}.motion.speed_mps")
+    max_speed_raw = raw.get("max_speed_mps")
+    max_target_speed = (
+        max(1.0, motion_speed)
+        if max_speed_raw is None
+        else _positive_number(max_speed_raw, f"{path}.max_speed_mps")
+    )
+    if motion_speed > max_target_speed:
+        raise ConfigError(f"{path}.motion.speed_mps must not exceed {path}.max_speed_mps")
+    motion_seed = motion_raw["seed"]
+    if isinstance(motion_seed, bool) or not isinstance(motion_seed, int) or motion_seed < 0:
+        raise ConfigError(f"{path}.motion.seed must be a non-negative integer")
+    return TargetConfig(
+        id=target_id,
+        semantic_alias=semantic_alias,
+        appearance=TargetAppearanceConfig(
+            shape="CUBE",
+            color_name=color_name,
+            color_rgb=color_rgb,
+            size_xyz_m=size_xyz_m,
+        ),
+        initial_region=initial_region,
+        max_speed_mps=max_target_speed,
+        motion=TargetMotionConfig(
+            mode=motion_mode.upper(),
+            region=motion_region,
+            speed_mps=motion_speed,
+            initial_heading_deg=_finite_number(
+                motion_raw.get("initial_heading_deg", 0.0),
+                f"{path}.motion.initial_heading_deg",
+            ),
+            direction_change_interval_s=_positive_number(
+                motion_raw.get("direction_change_interval_s", 4.0),
+                f"{path}.motion.direction_change_interval_s",
+            ),
+            seed=motion_seed,
+        ),
+    )
+
+
+def _inventory_layout(
+    root: Mapping[str, Any],
+) -> tuple[tuple[Any, ...], Mapping[str, Any], tuple[Any, ...], bool]:
+    legacy_keys = frozenset({"uav", "camera", "target"})
+    canonical_keys = frozenset({"uavs", "camera_profiles", "targets"})
+    present_legacy = sorted(legacy_keys & set(root))
+    present_canonical = sorted(canonical_keys & set(root))
+    if present_legacy and present_canonical:
+        raise ConfigError(
+            "legacy and canonical fleet keys cannot be mixed: "
+            + ", ".join(present_legacy + present_canonical)
+        )
+    if present_legacy:
+        missing = sorted(legacy_keys - set(root))
+        if missing:
+            raise ConfigError("legacy fleet layout is missing keys: " + ", ".join(missing))
+        return (
+            (root["uav"],),
+            {"default": root["camera"]},
+            (root["target"],),
+            True,
+        )
+    missing = sorted(canonical_keys - set(root))
+    if missing:
+        raise ConfigError("canonical fleet layout is missing keys: " + ", ".join(missing))
+    camera_profiles = _mapping(root["camera_profiles"], "camera_profiles")
+    if not camera_profiles:
+        raise ConfigError("camera_profiles must contain at least one profile")
+    return (
+        _inventory_sequence(root["uavs"], "uavs"),
+        camera_profiles,
+        _inventory_sequence(root["targets"], "targets"),
+        False,
+    )
+
+
 def _validate_spatial_bounds(config: AppConfig) -> None:
     size_x, size_y, size_z = config.scene.size_xyz_m
-    uav_x, uav_y, uav_z = config.uav.initial_position_xyz_m
-    if not (-size_x / 2.0 <= uav_x <= size_x / 2.0):
-        raise ConfigError("uav.initial_position_xyz_m x is outside the scene")
-    if not (-size_y / 2.0 <= uav_y <= size_y / 2.0):
-        raise ConfigError("uav.initial_position_xyz_m y is outside the scene")
-    if not (0.0 <= uav_z <= size_z):
-        raise ConfigError("uav.initial_position_xyz_m z is outside the scene")
+    for uav in config.uavs:
+        uav_x, uav_y, uav_z = uav.initial_position_xyz_m
+        path = f"uavs[{uav.id!r}].initial_position_xyz_m"
+        if not (-size_x / 2.0 <= uav_x <= size_x / 2.0):
+            raise ConfigError(f"{path} x is outside the scene")
+        if not (-size_y / 2.0 <= uav_y <= size_y / 2.0):
+            raise ConfigError(f"{path} y is outside the scene")
+        if not (0.0 <= uav_z <= size_z):
+            raise ConfigError(f"{path} z is outside the scene")
 
-    region_min = config.target.initial_region.min_xyz_m
-    region_max = config.target.initial_region.max_xyz_m
-    if any(low > high for low, high in zip(region_min, region_max)):
-        raise ConfigError("target.initial_region min_xyz_m must not exceed max_xyz_m")
-    if region_min[0] < -size_x / 2.0 or region_max[0] > size_x / 2.0:
-        raise ConfigError("target.initial_region x bounds are outside the scene")
-    if region_min[1] < -size_y / 2.0 or region_max[1] > size_y / 2.0:
-        raise ConfigError("target.initial_region y bounds are outside the scene")
-    if region_min[2] < 0.0 or region_max[2] > size_z:
-        raise ConfigError("target.initial_region z bounds are outside the scene")
+    for target in config.targets:
+        target_path = f"targets[{target.id!r}]"
+        region_min = target.initial_region.min_xyz_m
+        region_max = target.initial_region.max_xyz_m
+        if any(low > high for low, high in zip(region_min, region_max)):
+            raise ConfigError(
+                f"{target_path}.initial_region min_xyz_m must not exceed max_xyz_m"
+            )
+        if region_min[0] < -size_x / 2.0 or region_max[0] > size_x / 2.0:
+            raise ConfigError(f"{target_path}.initial_region x bounds are outside the scene")
+        if region_min[1] < -size_y / 2.0 or region_max[1] > size_y / 2.0:
+            raise ConfigError(f"{target_path}.initial_region y bounds are outside the scene")
+        if region_min[2] < 0.0 or region_max[2] > size_z:
+            raise ConfigError(f"{target_path}.initial_region z bounds are outside the scene")
 
-    motion_min = config.target.motion.region.min_xyz_m
-    motion_max = config.target.motion.region.max_xyz_m
-    if any(low > high for low, high in zip(motion_min, motion_max)):
-        raise ConfigError("target.motion.region min_xyz_m must not exceed max_xyz_m")
-    if motion_min[0] < -size_x / 2.0 or motion_max[0] > size_x / 2.0:
-        raise ConfigError("target.motion.region x bounds are outside the scene")
-    if motion_min[1] < -size_y / 2.0 or motion_max[1] > size_y / 2.0:
-        raise ConfigError("target.motion.region y bounds are outside the scene")
-    if motion_min[2] < 0.0 or motion_max[2] > size_z:
-        raise ConfigError("target.motion.region z bounds are outside the scene")
-    if motion_min[0] == motion_max[0] or motion_min[1] == motion_max[1]:
-        raise ConfigError("target.motion.region must have positive x and y width")
-    initial_inside_motion = all(
-        initial_low >= motion_low and initial_high <= motion_high
-        for initial_low, initial_high, motion_low, motion_high in zip(
-            region_min,
-            region_max,
-            motion_min,
-            motion_max,
+        motion_min = target.motion.region.min_xyz_m
+        motion_max = target.motion.region.max_xyz_m
+        if any(low > high for low, high in zip(motion_min, motion_max)):
+            raise ConfigError(
+                f"{target_path}.motion.region min_xyz_m must not exceed max_xyz_m"
+            )
+        if motion_min[0] < -size_x / 2.0 or motion_max[0] > size_x / 2.0:
+            raise ConfigError(f"{target_path}.motion.region x bounds are outside the scene")
+        if motion_min[1] < -size_y / 2.0 or motion_max[1] > size_y / 2.0:
+            raise ConfigError(f"{target_path}.motion.region y bounds are outside the scene")
+        if motion_min[2] < 0.0 or motion_max[2] > size_z:
+            raise ConfigError(f"{target_path}.motion.region z bounds are outside the scene")
+        if motion_min[0] == motion_max[0] or motion_min[1] == motion_max[1]:
+            raise ConfigError(f"{target_path}.motion.region must have positive x and y width")
+        initial_inside_motion = all(
+            initial_low >= motion_low and initial_high <= motion_high
+            for initial_low, initial_high, motion_low, motion_high in zip(
+                region_min,
+                region_max,
+                motion_min,
+                motion_max,
+            )
         )
-    )
-    if not initial_inside_motion:
-        raise ConfigError("target.initial_region must be contained in target.motion.region")
+        if not initial_inside_motion:
+            raise ConfigError(
+                f"{target_path}.initial_region must be contained in "
+                f"{target_path}.motion.region"
+            )
 
     for spec in config.scene.obstacles:
         minimum = spec.aabb.min_xyz_m
@@ -246,7 +628,7 @@ def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path).expanduser()
     try:
         with config_path.open("r", encoding="utf-8") as stream:
-            raw = yaml.safe_load(stream)
+            raw = yaml.load(stream, Loader=_UniqueKeyLoader)
     except FileNotFoundError as exc:
         raise ConfigError(f"config file not found: {config_path}") from exc
     except OSError as exc:
@@ -366,44 +748,40 @@ def load_config(path: str | Path) -> AppConfig:
     if any(value <= 0.0 for value in scene.size_xyz_m):
         raise ConfigError("scene.size_xyz_m values must be greater than 0")
 
-    uav_raw = _mapping(_required(root, "uav", "config"), "uav")
-    uav = UavConfig(
-        id=_uav_id(uav_raw.get("id", "uav_1"), "uav.id"),
-        initial_position_xyz_m=_float_vector(
-            _required(uav_raw, "initial_position_xyz_m", "uav"), "uav.initial_position_xyz_m", 3
-        ),
-        max_speed_mps=_positive_number(_required(uav_raw, "max_speed_mps", "uav"), "uav.max_speed_mps"),
-        max_yaw_rate_deg_s=_positive_number(
-            _required(uav_raw, "max_yaw_rate_deg_s", "uav"), "uav.max_yaw_rate_deg_s"
-        ),
+    uav_entries, camera_entries, target_entries, legacy_inventory = _inventory_layout(root)
+    uavs = tuple(
+        _parse_uav_config(
+            value,
+            "uav" if legacy_inventory else f"uavs[{index}]",
+            legacy=legacy_inventory,
+        )
+        for index, value in enumerate(uav_entries)
     )
+    uav_ids = tuple(item.id for item in uavs)
+    if len(uav_ids) != len(set(uav_ids)):
+        raise ConfigError("uavs must have unique IDs")
 
-    camera_raw = _mapping(_required(root, "camera", "config"), "camera")
-    frequency_hz = _required(camera_raw, "frequency_hz", "camera")
-    if isinstance(frequency_hz, bool) or not isinstance(frequency_hz, int) or frequency_hz <= 0:
-        raise ConfigError("camera.frequency_hz must be a positive integer")
-    focal_length_raw = _required(camera_raw, "focal_length_m", "camera")
-    camera = CameraConfig(
-        resolution_wh_px=_resolution(
-            _required(camera_raw, "resolution_wh_px", "camera"), "camera.resolution_wh_px"
-        ),
-        frequency_hz=frequency_hz,
-        horizontal_fov_deg=_finite_number(
-            _required(camera_raw, "horizontal_fov_deg", "camera"), "camera.horizontal_fov_deg"
-        ),
-        focal_length_m=(
-            None
-            if focal_length_raw is None
-            else _positive_number(focal_length_raw, "camera.focal_length_m")
-        ),
-        pitch_deg=_finite_number(_required(camera_raw, "pitch_deg", "camera"), "camera.pitch_deg"),
-    )
-    if not 0.0 < camera.horizontal_fov_deg < 180.0:
-        raise ConfigError("camera.horizontal_fov_deg must be between 0 and 180")
-    if not -90.0 <= camera.pitch_deg <= 90.0:
-        raise ConfigError("camera.pitch_deg must be between -90 and 90")
-    if rendering_hz % camera.frequency_hz != 0:
-        raise ConfigError("camera.frequency_hz must be an integer divisor of the rendering frequency")
+    camera_profiles: dict[str, CameraConfig] = {}
+    for profile_name, value in camera_entries.items():
+        try:
+            normalized_name = validate_routing_id(profile_name, "camera_profile")
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"camera_profiles key {profile_name!r}: {exc}") from exc
+        path = "camera" if legacy_inventory else f"camera_profiles.{normalized_name}"
+        camera_profiles[normalized_name] = _parse_camera_config(
+            value,
+            path,
+            rendering_hz=rendering_hz,
+        )
+    camera_frequencies = {item.frequency_hz for item in camera_profiles.values()}
+    if len(camera_frequencies) != 1:
+        raise ConfigError("all camera_profiles must use the same frequency_hz")
+    for item in uavs:
+        if item.camera_profile not in camera_profiles:
+            raise ConfigError(
+                f"uavs entry {item.id!r} references unknown camera_profile "
+                f"{item.camera_profile!r}"
+            )
 
     obstacle_perception_raw = _strict_optional_block(
         root,
@@ -448,68 +826,384 @@ def load_config(path: str | Path) -> AppConfig:
             max_occlusion_ratio=max_occlusion,
         )
 
-    target_raw = _mapping(_required(root, "target", "config"), "target")
-    region_raw = _mapping(_required(target_raw, "initial_region", "target"), "target.initial_region")
-    initial_region = TargetRegionConfig(
-        min_xyz_m=_float_vector(
-            _required(region_raw, "min_xyz_m", "target.initial_region"),
-            "target.initial_region.min_xyz_m",
-            3,
-        ),
-        max_xyz_m=_float_vector(
-            _required(region_raw, "max_xyz_m", "target.initial_region"),
-            "target.initial_region.max_xyz_m",
-            3,
-        ),
-    )
-    max_target_speed = _positive_number(
-        _required(target_raw, "max_speed_mps", "target"), "target.max_speed_mps"
-    )
-    motion_raw = _mapping(_required(target_raw, "motion", "target"), "target.motion")
-    motion_mode = _required(motion_raw, "mode", "target.motion")
-    if not isinstance(motion_mode, str) or motion_mode.upper() not in {"STATIC", "LINEAR", "RANDOM_WALK"}:
-        raise ConfigError("target.motion.mode must be STATIC, LINEAR, or RANDOM_WALK")
-    motion_region_raw = _mapping(
-        _required(motion_raw, "region", "target.motion"), "target.motion.region"
-    )
-    motion_region = TargetRegionConfig(
-        min_xyz_m=_float_vector(
-            _required(motion_region_raw, "min_xyz_m", "target.motion.region"),
-            "target.motion.region.min_xyz_m",
-            3,
-        ),
-        max_xyz_m=_float_vector(
-            _required(motion_region_raw, "max_xyz_m", "target.motion.region"),
-            "target.motion.region.max_xyz_m",
-            3,
-        ),
-    )
-    motion_speed = _nonnegative_number(
-        _required(motion_raw, "speed_mps", "target.motion"), "target.motion.speed_mps"
-    )
-    if motion_speed > max_target_speed:
-        raise ConfigError("target.motion.speed_mps must not exceed target.max_speed_mps")
-    motion_seed = _required(motion_raw, "seed", "target.motion")
-    if isinstance(motion_seed, bool) or not isinstance(motion_seed, int) or motion_seed < 0:
-        raise ConfigError("target.motion.seed must be a non-negative integer")
-    target = TargetConfig(
-        initial_region=initial_region,
-        max_speed_mps=max_target_speed,
-        motion=TargetMotionConfig(
-            mode=motion_mode.upper(),
-            region=motion_region,
-            speed_mps=motion_speed,
-            initial_heading_deg=_finite_number(
-                _required(motion_raw, "initial_heading_deg", "target.motion"),
-                "target.motion.initial_heading_deg",
+    target_perception_raw = None
+    if "target_perception" in root:
+        target_perception_raw = _mapping(
+            root["target_perception"], "target_perception"
+        )
+        allowed_target_perception_keys = frozenset(
+            {
+                "backend",
+                "yolo_service",
+                "detector",
+                "tracker",
+                "geometry",
+                "state_estimator",
+                "confirmation",
+            }
+        )
+        unknown = sorted(set(target_perception_raw) - allowed_target_perception_keys)
+        if unknown:
+            raise ConfigError(
+                "target_perception contains unknown keys: " + ", ".join(unknown)
+            )
+        if "backend" not in target_perception_raw:
+            raise ConfigError("missing required key: target_perception.backend")
+
+    if target_perception_raw is None:
+        target_perception = _DEFAULT_TARGET_PERCEPTION_CONFIG
+    else:
+        backend = _non_empty_string(
+            target_perception_raw["backend"], "target_perception.backend"
+        )
+        if backend not in {"disabled", "oracle_evaluation", "ultralytics_service"}:
+            raise ConfigError(
+                "target_perception.backend must be disabled, oracle_evaluation, "
+                "or ultralytics_service"
+            )
+
+        service_raw = _strict_nested_block(
+            target_perception_raw,
+            "yolo_service",
+            "target_perception",
+            frozenset(
+                {
+                    "url",
+                    "request_timeout_s",
+                    "max_result_age_s",
+                    "jpeg_quality",
+                    "max_inflight_per_uav",
+                }
             ),
-            direction_change_interval_s=_positive_number(
-                _required(motion_raw, "direction_change_interval_s", "target.motion"),
-                "target.motion.direction_change_interval_s",
+        )
+        if service_raw is None:
+            yolo_service = _DEFAULT_TARGET_PERCEPTION_CONFIG.yolo_service
+        else:
+            try:
+                url = validate_loopback_http_url(
+                    service_raw["url"],
+                    "target_perception.yolo_service.url",
+                )
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
+            inflight = _positive_integer(
+                service_raw["max_inflight_per_uav"],
+                "target_perception.yolo_service.max_inflight_per_uav",
+            )
+            if inflight != 1:
+                raise ConfigError(
+                    "target_perception.yolo_service.max_inflight_per_uav must be exactly 1"
+                )
+            yolo_service = YoloServiceClientConfig(
+                url=url,
+                request_timeout_s=_bounded_positive_number(
+                    service_raw["request_timeout_s"],
+                    "target_perception.yolo_service.request_timeout_s",
+                    30.0,
+                ),
+                max_result_age_s=_bounded_positive_number(
+                    service_raw["max_result_age_s"],
+                    "target_perception.yolo_service.max_result_age_s",
+                    30.0,
+                ),
+                jpeg_quality=_bounded_positive_integer(
+                    service_raw["jpeg_quality"],
+                    "target_perception.yolo_service.jpeg_quality",
+                    95,
+                ),
+                max_inflight_per_uav=inflight,
+            )
+
+        detector_raw = _strict_nested_block(
+            target_perception_raw,
+            "detector",
+            "target_perception",
+            frozenset(
+                {
+                    "model_family",
+                    "proposal_mode",
+                    "confidence_threshold",
+                    "class_aliases_path",
+                }
             ),
-            seed=motion_seed,
-        ),
+        )
+        if detector_raw is None:
+            detector = _DEFAULT_TARGET_PERCEPTION_CONFIG.detector
+        else:
+            model_family = _non_empty_string(
+                detector_raw["model_family"],
+                "target_perception.detector.model_family",
+            )
+            proposal_mode = _non_empty_string(
+                detector_raw["proposal_mode"],
+                "target_perception.detector.proposal_mode",
+            )
+            if model_family not in {"yolo", "yoloe"}:
+                raise ConfigError(
+                    "target_perception.detector.model_family must be yolo or yoloe"
+                )
+            if proposal_mode not in {"closed_set", "open_vocabulary"}:
+                raise ConfigError(
+                    "target_perception.detector.proposal_mode must be closed_set "
+                    "or open_vocabulary"
+                )
+            if model_family == "yolo" and proposal_mode != "closed_set":
+                raise ConfigError("ordinary YOLO requires proposal_mode=closed_set")
+            if model_family == "yoloe" and proposal_mode != "open_vocabulary":
+                raise ConfigError("YOLOE requires proposal_mode=open_vocabulary")
+            threshold = _finite_number(
+                detector_raw["confidence_threshold"],
+                "target_perception.detector.confidence_threshold",
+            )
+            if not 0.0 < threshold <= 1.0:
+                raise ConfigError(
+                    "target_perception.detector.confidence_threshold must be in (0, 1]"
+                )
+            detector = TargetDetectorConfig(
+                model_family=model_family,
+                proposal_mode=proposal_mode,
+                confidence_threshold=threshold,
+                class_aliases_path=_non_empty_string(
+                    detector_raw["class_aliases_path"],
+                    "target_perception.detector.class_aliases_path",
+                ),
+            )
+
+        tracker_raw = _strict_nested_block(
+            target_perception_raw,
+            "tracker",
+            "target_perception",
+            frozenset({"type", "min_track_observations", "min_track_duration_s"}),
+        )
+        if tracker_raw is None:
+            tracker = _DEFAULT_TARGET_PERCEPTION_CONFIG.tracker
+        else:
+            tracker_type = _non_empty_string(
+                tracker_raw["type"], "target_perception.tracker.type"
+            )
+            if tracker_type != "botsort":
+                raise ConfigError("target_perception.tracker.type must be botsort")
+            tracker = TargetTrackerConfig(
+                type=tracker_type,
+                min_track_observations=_bounded_positive_integer(
+                    tracker_raw["min_track_observations"],
+                    "target_perception.tracker.min_track_observations",
+                    100,
+                ),
+                min_track_duration_s=_bounded_positive_number(
+                    tracker_raw["min_track_duration_s"],
+                    "target_perception.tracker.min_track_duration_s",
+                    60.0,
+                ),
+            )
+
+        geometry_raw = _strict_nested_block(
+            target_perception_raw,
+            "geometry",
+            "target_perception",
+            frozenset(
+                {
+                    "mode",
+                    "depth_anchor",
+                    "depth_patch_radius_px",
+                    "min_depth_m",
+                    "max_depth_m",
+                    "max_measurement_age_s",
+                }
+            ),
+        )
+        if geometry_raw is None:
+            geometry = _DEFAULT_TARGET_PERCEPTION_CONFIG.geometry
+        else:
+            geometry_mode = _non_empty_string(
+                geometry_raw["mode"], "target_perception.geometry.mode"
+            )
+            if geometry_mode not in {"isaac_depth", "disabled"}:
+                raise ConfigError(
+                    "target_perception.geometry.mode must be isaac_depth or disabled"
+                )
+            depth_anchor = _non_empty_string(
+                geometry_raw["depth_anchor"],
+                "target_perception.geometry.depth_anchor",
+            )
+            if depth_anchor not in {
+                "bbox_center",
+                "bbox_bottom_center",
+                "bbox_patch_median",
+                "mask_median",
+            }:
+                raise ConfigError("unsupported target_perception.geometry.depth_anchor")
+            patch_radius = _bounded_positive_integer(
+                geometry_raw["depth_patch_radius_px"],
+                "target_perception.geometry.depth_patch_radius_px",
+                64,
+            )
+            min_depth = _positive_number(
+                geometry_raw["min_depth_m"],
+                "target_perception.geometry.min_depth_m",
+            )
+            max_depth = _positive_number(
+                geometry_raw["max_depth_m"],
+                "target_perception.geometry.max_depth_m",
+            )
+            if max_depth <= min_depth:
+                raise ConfigError(
+                    "target_perception.geometry.max_depth_m must exceed min_depth_m"
+                )
+            geometry = TargetGeometryConfig(
+                mode=geometry_mode,
+                depth_anchor=depth_anchor,
+                depth_patch_radius_px=patch_radius,
+                min_depth_m=min_depth,
+                max_depth_m=max_depth,
+                max_measurement_age_s=_bounded_positive_number(
+                    geometry_raw["max_measurement_age_s"],
+                    "target_perception.geometry.max_measurement_age_s",
+                    30.0,
+                ),
+            )
+
+        estimator_raw = _strict_nested_block(
+            target_perception_raw,
+            "state_estimator",
+            "target_perception",
+            frozenset(
+                {
+                    "type",
+                    "max_prediction_age_s",
+                    "max_position_jump_m",
+                    "process_noise",
+                    "measurement_noise",
+                }
+            ),
+        )
+        if estimator_raw is None:
+            state_estimator = _DEFAULT_TARGET_PERCEPTION_CONFIG.state_estimator
+        else:
+            estimator_type = _non_empty_string(
+                estimator_raw["type"], "target_perception.state_estimator.type"
+            )
+            if estimator_type != "constant_velocity_kalman":
+                raise ConfigError(
+                    "target_perception.state_estimator.type must be "
+                    "constant_velocity_kalman"
+                )
+            state_estimator = TargetStateEstimatorConfig(
+                type=estimator_type,
+                max_prediction_age_s=_bounded_positive_number(
+                    estimator_raw["max_prediction_age_s"],
+                    "target_perception.state_estimator.max_prediction_age_s",
+                    60.0,
+                ),
+                max_position_jump_m=_bounded_positive_number(
+                    estimator_raw["max_position_jump_m"],
+                    "target_perception.state_estimator.max_position_jump_m",
+                    1_000.0,
+                ),
+                process_noise=_bounded_positive_number(
+                    estimator_raw["process_noise"],
+                    "target_perception.state_estimator.process_noise",
+                    1_000.0,
+                ),
+                measurement_noise=_bounded_positive_number(
+                    estimator_raw["measurement_noise"],
+                    "target_perception.state_estimator.measurement_noise",
+                    1_000.0,
+                ),
+            )
+
+        confirmation_raw = _strict_nested_block(
+            target_perception_raw,
+            "confirmation",
+            "target_perception",
+            frozenset(
+                {
+                    "mode",
+                    "require_qwen_for_attributes",
+                    "require_qwen_for_reacquire_new_track_id",
+                }
+            ),
+        )
+        if confirmation_raw is None:
+            confirmation = _DEFAULT_TARGET_PERCEPTION_CONFIG.confirmation
+        else:
+            confirmation_mode = _non_empty_string(
+                confirmation_raw["mode"],
+                "target_perception.confirmation.mode",
+            )
+            if confirmation_mode not in {"class_track_or_qwen", "qwen_required"}:
+                raise ConfigError("unsupported target_perception.confirmation.mode")
+            confirmation = VisualConfirmationConfig(
+                mode=confirmation_mode,
+                require_qwen_for_attributes=_boolean(
+                    confirmation_raw["require_qwen_for_attributes"],
+                    "target_perception.confirmation.require_qwen_for_attributes",
+                ),
+                require_qwen_for_reacquire_new_track_id=_boolean(
+                    confirmation_raw["require_qwen_for_reacquire_new_track_id"],
+                    "target_perception.confirmation.require_qwen_for_reacquire_new_track_id",
+                ),
+            )
+
+        target_perception = TargetPerceptionConfig(
+            backend=backend,
+            yolo_service=yolo_service,
+            detector=detector,
+            tracker=tracker,
+            geometry=geometry,
+            state_estimator=state_estimator,
+            confirmation=confirmation,
+        )
+
+    targets = tuple(
+        _parse_target_config(
+            value,
+            "target" if legacy_inventory else f"targets[{index}]",
+            legacy=legacy_inventory,
+        )
+        for index, value in enumerate(target_entries)
     )
+    target_ids = tuple(item.id for item in targets)
+    if len(target_ids) != len(set(target_ids)):
+        raise ConfigError("targets must have unique IDs")
+
+    if "fleet" not in root:
+        fleet = FleetConfig()
+    else:
+        fleet_raw = _mapping(root["fleet"], "fleet")
+        _check_keys(
+            fleet_raw,
+            path="fleet",
+            required=frozenset(
+                {
+                    "minimum_uav_separation_m",
+                    "target_claim_policy",
+                    "route_conflict_policy",
+                    "assignment_failure_policy",
+                }
+            ),
+        )
+        try:
+            fleet = FleetConfig(
+                minimum_uav_separation_m=_positive_number(
+                    fleet_raw["minimum_uav_separation_m"],
+                    "fleet.minimum_uav_separation_m",
+                ),
+                target_claim_policy=_non_empty_string(
+                    fleet_raw["target_claim_policy"],
+                    "fleet.target_claim_policy",
+                ),
+                route_conflict_policy=_non_empty_string(
+                    fleet_raw["route_conflict_policy"],
+                    "fleet.route_conflict_policy",
+                ),
+                assignment_failure_policy=_non_empty_string(
+                    fleet_raw["assignment_failure_policy"],
+                    "fleet.assignment_failure_policy",
+                ),
+            )
+        except ValueError as exc:
+            raise ConfigError(f"invalid fleet: {exc}") from exc
 
     search_raw = _mapping(_required(root, "search", "config"), "search")
     transit_yaw_mode = _required(search_raw, "transit_yaw_mode", "search")
@@ -652,6 +1346,47 @@ def load_config(path: str | Path) -> AppConfig:
                 _MAX_REQUEST_TIMEOUT_S,
             ),
         )
+
+    model_broker_raw = _strict_optional_block(
+        root,
+        "model_broker",
+        frozenset(
+            {
+                "max_inflight_global",
+                "max_inflight_per_uav",
+                "max_pending_per_uav",
+                "starvation_timeout_s",
+            }
+        ),
+    )
+    if model_broker_raw is None:
+        model_broker = _DEFAULT_MODEL_BROKER_CONFIG
+    else:
+        try:
+            model_broker = ModelBrokerConfig(
+                max_inflight_global=_bounded_positive_integer(
+                    model_broker_raw["max_inflight_global"],
+                    "model_broker.max_inflight_global",
+                    64,
+                ),
+                max_inflight_per_uav=_bounded_positive_integer(
+                    model_broker_raw["max_inflight_per_uav"],
+                    "model_broker.max_inflight_per_uav",
+                    64,
+                ),
+                max_pending_per_uav=_bounded_positive_integer(
+                    model_broker_raw["max_pending_per_uav"],
+                    "model_broker.max_pending_per_uav",
+                    64,
+                ),
+                starvation_timeout_s=_bounded_positive_number(
+                    model_broker_raw["starvation_timeout_s"],
+                    "model_broker.starvation_timeout_s",
+                    3600.0,
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"invalid model_broker configuration: {exc}") from exc
 
     visual_review_raw = _strict_optional_block(
         root,
@@ -1015,9 +1750,9 @@ def load_config(path: str | Path) -> AppConfig:
         schema_version=schema_version,
         simulation=simulation,
         scene=scene,
-        uav=uav,
-        camera=camera,
-        target=target,
+        uav=uavs[0] if legacy_inventory else None,
+        camera=camera_profiles["default"] if legacy_inventory else None,
+        target=targets[0] if legacy_inventory else None,
         search=search,
         planner=planner,
         experiment=experiment,
@@ -1029,11 +1764,17 @@ def load_config(path: str | Path) -> AppConfig:
         figures=figures,
         storage=storage,
         model_worker=model_worker,
+        model_broker=model_broker,
         qwen_visual_review=qwen_visual_review,
         plan_revision=plan_revision,
         frame_store=frame_store,
         debug_images=debug_images,
         obstacle_perception=obstacle_perception,
+        target_perception=target_perception,
+        uavs=uavs,
+        targets=targets,
+        camera_profiles=camera_profiles,
+        fleet=fleet,
     )
     _validate_spatial_bounds(config)
     return config

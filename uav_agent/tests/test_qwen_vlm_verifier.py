@@ -81,6 +81,8 @@ class QwenVLMVerifierTest(unittest.TestCase):
         request = verifier.build_async_request(value, request_id="request_1")
 
         self.assertEqual(request.uav_id, "uav_1")
+        self.assertEqual(request.broker_priority, 4)
+        self.assertTrue(request.broker_replaceable)
         self.assertEqual(request.options.temperature, 0.0)  # type: ignore[union-attr]
         self.assertIsNotNone(request.options.response_format)  # type: ignore[union-attr]
         user = request.messages[1]
@@ -121,6 +123,13 @@ class QwenVLMVerifierTest(unittest.TestCase):
             allowed.environment_context["trigger_event_type"],
             MissionEventType.PATH_BLOCKED.value,
         )
+        event_request = QwenVLMVerifier().build_async_request(
+            allowed,
+            request_id="request_event_priority",
+        )
+        # Prompt/event context alone cannot elevate Broker priority.  The
+        # coordinator applies P3 only from its trusted ReviewTicket.
+        self.assertEqual(event_request.broker_priority, 4)
         with self.assertRaisesRegex(ValueError, "not supported"):
             VisualReviewInput(
                 **{

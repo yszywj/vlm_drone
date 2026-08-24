@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import json
 from math import isfinite
@@ -27,6 +27,7 @@ from common.ids import (
     validate_routing_id,
     validate_uav_id,
 )
+from common.provenance import is_privileged_oracle_source
 from models import AsyncModelRequest, AsyncModelResult, ModelProtocolError
 from perception.qwen_vlm_verifier import (
     QwenVLMVerifier,
@@ -37,6 +38,7 @@ from perception.candidate_bank import (
     CandidateBank,
     CandidateLifecycle,
     CandidateReviewRef,
+    CandidateSnapshot,
 )
 from perception.visual_review import (
     QwenVisualReview,
@@ -62,6 +64,7 @@ from runtime.review_scheduler import (
     ReviewScheduleReason,
     ReviewScheduler,
     ReviewTicket,
+    ReviewTrigger,
 )
 from runtime.safety_supervisor import SafetyAction, SafetyDecision
 from skills.hover import HoverTimeoutFallback
@@ -286,9 +289,30 @@ class _PendingReview:
     target_id: str | None
     blocking_hover_started: bool
     trigger_event: MissionEvent | None
+    identity_reference_handles: tuple[str, ...] = ()
+    bound_candidate_id: str | None = None
+    bound_candidate_first_seen_s: float | None = None
+    bound_candidate_bbox: tuple[float, float, float, float] | None = None
+    bound_candidate_frame_ref: FrameRef | None = None
 
 
 _REVIEWABLE_SKILL_NAMES = frozenset({"GOTO", "SEARCH", "INSPECT", "TRACK"})
+
+# SEARCH reviews about target identity must be grounded in a detector/tracker
+# candidate.  Runtime obstacle/progress events remain independently reviewable
+# because they are not candidate-semantic evidence.
+_SEARCH_TARGET_REVIEW_EVENTS = frozenset(
+    {
+        MissionEventType.PERIODIC_REVIEW_DUE,
+        MissionEventType.CANDIDATE_PERSISTENT,
+        MissionEventType.MULTIPLE_CANDIDATES,
+        MissionEventType.TARGET_CONFIRMATION_REQUIRED,
+        MissionEventType.TARGET_IDENTITY_UNCERTAIN,
+        MissionEventType.TRACK_CONFIDENCE_DROP,
+        MissionEventType.TRACK_LOST,
+        MissionEventType.LOW_VISIBILITY,
+    }
+)
 
 
 class VisualReviewCoordinator:
@@ -327,6 +351,11 @@ class VisualReviewCoordinator:
         await_revision_completion: bool = False,
         max_recent_frames: int = 3,
         candidate_association_iou_threshold: float = 0.5,
+        require_stable_search_candidate: bool = True,
+        min_search_candidate_observations: int = 3,
+        min_search_candidate_duration_s: float = 0.5,
+        max_search_candidate_center_jump: float = 0.25,
+        candidate_mismatch_threshold: int = 2,
         debug_model_responses: bool | None = None,
     ) -> None:
         self._uav_id = validate_uav_id(uav_id)
@@ -368,6 +397,8 @@ class VisualReviewCoordinator:
             debug_model_responses, bool
         ):
             raise TypeError("debug_model_responses must be bool or None")
+        if not isinstance(require_stable_search_candidate, bool):
+            raise TypeError("require_stable_search_candidate must be bool")
 
         self._review_timeout_s = _positive_finite(review_timeout_s, "review_timeout_s")
         self._max_result_age_s = _positive_finite(max_result_age_s, "max_result_age_s")
@@ -400,6 +431,23 @@ class VisualReviewCoordinator:
             candidate_association_iou_threshold,
             "candidate_association_iou_threshold",
         )
+        self._require_stable_search_candidate = require_stable_search_candidate
+        self._min_search_candidate_observations = _positive_int(
+            min_search_candidate_observations,
+            "min_search_candidate_observations",
+        )
+        self._min_search_candidate_duration_s = _nonnegative_finite(
+            min_search_candidate_duration_s,
+            "min_search_candidate_duration_s",
+        )
+        self._max_search_candidate_center_jump = _unit_interval(
+            max_search_candidate_center_jump,
+            "max_search_candidate_center_jump",
+        )
+        self._candidate_mismatch_threshold = _positive_int(
+            candidate_mismatch_threshold,
+            "candidate_mismatch_threshold",
+        )
         self._debug_model_responses = (
             _debug_visual_review_from_environment()
             if debug_model_responses is None
@@ -418,6 +466,13 @@ class VisualReviewCoordinator:
         self._await_revision_completion = await_revision_completion
         self._pending_events: deque[MissionEvent] = deque(maxlen=max_pending_events)
         self._records: deque[VisualReviewRecord] = deque(maxlen=max_records)
+        self._accepted_candidate_reviews: dict[str, QwenVisualReview] = {}
+        self._accepted_candidate_review_references: dict[
+            str, tuple[str, ...]
+        ] = {}
+        self._candidate_mismatch_streaks: dict[str, int] = {}
+        self._candidate_review_epochs: dict[str, float] = {}
+        self._max_candidate_reviews = max_records
         self._pending: _PendingReview | None = None
         self._latest_frame_ref: FrameRef | None = None
         self._last_frame_timestamp_s: float | None = None
@@ -440,6 +495,48 @@ class VisualReviewCoordinator:
     @property
     def records(self) -> tuple[VisualReviewRecord, ...]:
         return tuple(self._records)
+
+    def latest_candidate_review(
+        self,
+        candidate_id: str,
+    ) -> QwenVisualReview | None:
+        """Return the latest accepted terminal review for one candidate.
+
+        A positive review must pass the existing temporal consensus gate.  A
+        negative ``TARGET_MISMATCH`` requires its own repeated, routed and
+        non-stale candidate-bound evidence before it enters the cache.  Raw
+        model text and image bytes are never exposed through this bridge.
+        """
+
+        normalized = validate_routing_id(candidate_id, "candidate_id")
+        review = self._accepted_candidate_reviews.get(normalized)
+        if review is None:
+            return None
+        bank = self._candidate_bank
+        candidate = None if bank is None else bank.get(normalized)
+        if (
+            candidate is None
+            or candidate.lifecycle
+            in {CandidateLifecycle.REJECTED, CandidateLifecycle.STALE}
+            or self._candidate_review_epochs.get(normalized)
+            != candidate.first_seen_timestamp_s
+            or review.observation_timestamp_s
+            < candidate.first_seen_timestamp_s
+        ):
+            self._discard_candidate_review_cache(normalized)
+            return None
+        return review
+
+    def latest_candidate_review_reference_handles(
+        self,
+        candidate_id: str,
+    ) -> tuple[str, ...]:
+        """Return verified historical frame handles actually sent to Qwen."""
+
+        normalized = validate_routing_id(candidate_id, "candidate_id")
+        if self.latest_candidate_review(normalized) is None:
+            return ()
+        return self._accepted_candidate_review_references.get(normalized, ())
 
     @property
     def revision_events(self) -> tuple[MissionEvent, ...]:
@@ -635,6 +732,7 @@ class VisualReviewCoordinator:
             self._gate.reset()
             self._gate_target_id = None
             self._consecutive_track_mismatches = 0
+            self._candidate_mismatch_streaks.clear()
 
         if self._last_frame_timestamp_s is not None and now <= self._last_frame_timestamp_s:
             if now == self._last_frame_timestamp_s:
@@ -703,6 +801,26 @@ class VisualReviewCoordinator:
             raise VisualReviewCoordinatorError("reviewable Skill has no active step_id")
 
         event = self._next_event_for_route(mission, version, now)
+        bound_search_candidate: CandidateSnapshot | None = None
+        if (
+            active_skill is SkillName.SEARCH
+            and self._require_stable_search_candidate
+            and (event is None or event.event_type in _SEARCH_TARGET_REVIEW_EVENTS)
+        ):
+            bound_search_candidate = self._stable_search_candidate(now)
+        if (
+            active_skill is SkillName.SEARCH
+            and self._require_stable_search_candidate
+            and (event is None or event.event_type in _SEARCH_TARGET_REVIEW_EVENTS)
+            and bound_search_candidate is None
+        ):
+            # Preserve a routed event until detector/tracker evidence becomes
+            # stable.  Periodic review (event=None) is simply skipped.  This
+            # prevents Qwen from becoming a frame-by-frame detector.
+            if event is not None:
+                self._pending_events.appendleft(event)
+            self._drain_orphan_result(now)
+            return self.snapshot()
         decision = self._scheduler.schedule(
             mission_id=mission,
             uav_id=self._uav_id,
@@ -737,10 +855,23 @@ class VisualReviewCoordinator:
                 skill_feedback=skill_feedback,
                 mission_elapsed_s=elapsed,
                 trigger_event_type=(None if event is None else event.event_type),
+                bound_search_candidate=bound_search_candidate,
             )
             request = self._verifier.build_async_request(
                 review_input,
                 request_id=ticket.request_id,
+            )
+            # Broker priority is trusted scheduler metadata, not something
+            # inferred from prompt contents.  Event/blocking reviews are
+            # runtime work (P3); replaceable cadence reviews are P4.
+            request = replace(
+                request,
+                broker_priority=(
+                    3
+                    if ticket.blocking or ticket.trigger is ReviewTrigger.EVENT
+                    else 4
+                ),
+                broker_replaceable=True,
             )
             self._frame_store.pin(frame_ref)
             frame_pinned = True
@@ -779,6 +910,29 @@ class VisualReviewCoordinator:
             # Authorization is retained from the typed immutable event. Its
             # arbitrary payload is never consulted by review control policy.
             trigger_event=event,
+            identity_reference_handles=self._identity_reference_handles(
+                review_input.frames
+            ),
+            bound_candidate_id=(
+                None
+                if bound_search_candidate is None
+                else bound_search_candidate.candidate_id
+            ),
+            bound_candidate_first_seen_s=(
+                None
+                if bound_search_candidate is None
+                else bound_search_candidate.first_seen_timestamp_s
+            ),
+            bound_candidate_bbox=(
+                None
+                if bound_search_candidate is None
+                else bound_search_candidate.bbox_history[-1]
+            ),
+            bound_candidate_frame_ref=(
+                None
+                if bound_search_candidate is None
+                else bound_search_candidate.frame_history[-1]
+            ),
         )
         self._publish_status_event(
             MissionEventType.MODEL_REVIEW_STARTED,
@@ -860,6 +1014,10 @@ class VisualReviewCoordinator:
         self._frame_store.clear(uav_id=self._uav_id)
         self._pending_events.clear()
         self._records.clear()
+        self._accepted_candidate_reviews.clear()
+        self._accepted_candidate_review_references.clear()
+        self._candidate_mismatch_streaks.clear()
+        self._candidate_review_epochs.clear()
         self._latest_frame_ref = None
         self._last_frame_timestamp_s = None
         self._route = None
@@ -882,12 +1040,32 @@ class VisualReviewCoordinator:
         skill_feedback: Mapping[str, object] | None,
         mission_elapsed_s: float,
         trigger_event_type: MissionEventType | None,
+        bound_search_candidate: CandidateSnapshot | None,
     ) -> VisualReviewInput:
         refs = [
             ref
             for ref in self._frame_store.refs(uav_id=self._uav_id)
             if ref.timestamp_s <= latest.timestamp_s
         ][-self._max_recent_frames :]
+        reference = self._latest_verified_reference(latest)
+        if (
+            reference is not None
+            and reference not in refs
+            and self._max_recent_frames >= 2
+        ):
+            refs = [reference, *refs[-(self._max_recent_frames - 1) :]]
+        if bound_search_candidate is not None and self._max_recent_frames >= 2:
+            candidate_ref = bound_search_candidate.frame_history[-1]
+            if (
+                candidate_ref != latest
+                and candidate_ref.timestamp_s <= latest.timestamp_s
+                and self._frame_store.contains(candidate_ref)
+            ):
+                remaining = [ref for ref in refs if ref != candidate_ref]
+                refs = [
+                    candidate_ref,
+                    *remaining[-(self._max_recent_frames - 1) :],
+                ]
         frames: list[VisualReviewFrame] = []
         for ref in refs:
             rgb = self._frame_store.get_frame(ref)
@@ -904,6 +1082,21 @@ class VisualReviewCoordinator:
             # Only this closed enum value is projected; arbitrary event
             # payload content is deliberately excluded from the model input.
             environment_context["trigger_event_type"] = trigger_event_type.value
+        if bound_search_candidate is not None:
+            bbox = bound_search_candidate.bbox_history[-1]
+            evidence_frame = bound_search_candidate.frame_history[-1]
+            environment_context.update(
+                {
+                    "detector_candidate_id": bound_search_candidate.candidate_id,
+                    "detector_candidate_source": bound_search_candidate.source,
+                    "detector_candidate_frame_id": evidence_frame.frame_id,
+                    "detector_candidate_timestamp_s": evidence_frame.timestamp_s,
+                    "detector_candidate_x1": bbox[0],
+                    "detector_candidate_y1": bbox[1],
+                    "detector_candidate_x2": bbox[2],
+                    "detector_candidate_y2": bbox[3],
+                }
+            )
         return VisualReviewInput(
             review_id=ticket.review_id,
             mission_id=ticket.mission_id,
@@ -918,6 +1111,101 @@ class VisualReviewCoordinator:
             target_snapshot=target_snapshot,
             skill_feedback_summary=_feedback_summary(skill_feedback),
             environment_context=environment_context,
+        )
+
+    def _latest_verified_reference(self, latest: FrameRef) -> FrameRef | None:
+        bank = self._candidate_bank
+        if bank is None:
+            return None
+        retained = [
+            frame
+            for candidate in bank.snapshots()
+            if candidate.lifecycle is CandidateLifecycle.VERIFIED
+            for frame in candidate.frame_history
+            if frame != latest
+            and frame.timestamp_s <= latest.timestamp_s
+            and self._frame_store.contains(frame)
+        ]
+        return max(
+            retained,
+            key=lambda item: (item.timestamp_s, item.frame_id),
+            default=None,
+        )
+
+    def _stable_search_candidate(self, now: float) -> CandidateSnapshot | None:
+        """Select one fresh detector candidate and bind the review to it."""
+
+        bank = self._candidate_bank
+        if bank is None:
+            return None
+        bank.expire(now)
+        stable: list[CandidateSnapshot] = []
+        for candidate in bank.snapshots():
+            if candidate.lifecycle in {
+                CandidateLifecycle.REJECTED,
+                CandidateLifecycle.STALE,
+            }:
+                continue
+            if candidate.source.casefold() == "qwen_vl" or is_privileged_oracle_source(
+                candidate.source
+            ):
+                continue
+            if now - candidate.last_seen_timestamp_s > self._max_result_age_s:
+                continue
+            if len(candidate.frame_history) < self._min_search_candidate_observations:
+                continue
+            if (
+                candidate.last_seen_timestamp_s
+                - candidate.first_seen_timestamp_s
+                < self._min_search_candidate_duration_s
+            ):
+                continue
+            centers = tuple(
+                ((bbox[0] + bbox[2]) * 0.5, (bbox[1] + bbox[3]) * 0.5)
+                for bbox in candidate.bbox_history
+            )
+            if any(
+                ((right[0] - left[0]) ** 2 + (right[1] - left[1]) ** 2)
+                ** 0.5
+                > self._max_search_candidate_center_jump
+                for left, right in zip(centers, centers[1:])
+            ):
+                continue
+            stable.append(candidate)
+        if not stable:
+            return None
+        target_id = (
+            None
+            if self._target_manager is None
+            else self._target_manager.snapshot().target_id
+        )
+        return max(
+            stable,
+            key=lambda candidate: (
+                candidate.candidate_id == target_id,
+                candidate.last_seen_timestamp_s,
+                len(candidate.frame_history),
+                candidate.candidate_id,
+            ),
+        )
+
+    def _identity_reference_handles(
+        self,
+        frames: tuple[VisualReviewFrame, ...],
+    ) -> tuple[str, ...]:
+        bank = self._candidate_bank
+        if bank is None:
+            return ()
+        verified_refs = {
+            frame
+            for candidate in bank.snapshots()
+            if candidate.lifecycle is CandidateLifecycle.VERIFIED
+            for frame in candidate.frame_history
+        }
+        return tuple(
+            frame.ref.frame_id
+            for frame in frames[:-1]
+            if frame.ref in verified_refs
         )
 
     def _poll_result(
@@ -1008,6 +1296,7 @@ class VisualReviewCoordinator:
                     self._gate_target_id = pending.target_id
                 candidate_id, candidate_suppressed = self._associate_candidate(
                     review=review,
+                    pending=pending,
                 )
                 acceptance = self._gate.evaluate(
                     review,
@@ -1101,6 +1390,13 @@ class VisualReviewCoordinator:
             and result.error_code is None
             and not stale
         )
+        if review_is_valid and review is not None and acceptance is not None:
+            self._cache_terminal_candidate_review(
+                review=review,
+                acceptance=acceptance,
+                candidate_id=candidate_id,
+                identity_reference_handles=pending.identity_reference_handles,
+            )
         if review_is_valid and trusted_path_blocked:
             # PATH_BLOCKED is an allowlisted typed runtime authorization. The
             # visual result only has to satisfy routing/protocol validity; its
@@ -1168,6 +1464,85 @@ class VisualReviewCoordinator:
                 # mission in HOVER.
                 self._skill_manager.resume_interrupted_step()
         return False
+
+    def _cache_terminal_candidate_review(
+        self,
+        *,
+        review: QwenVisualReview,
+        acceptance: VisualReviewAcceptance,
+        candidate_id: str | None,
+        identity_reference_handles: tuple[str, ...],
+    ) -> None:
+        """Bridge only repeated terminal evidence to target confirmation."""
+
+        if candidate_id is None:
+            return
+        bank = self._candidate_bank
+        candidate = None if bank is None else bank.get(candidate_id)
+        if candidate is None or candidate.lifecycle in {
+            CandidateLifecycle.REJECTED,
+            CandidateLifecycle.STALE,
+        }:
+            self._candidate_mismatch_streaks.pop(candidate_id, None)
+            return
+
+        retained_epoch = self._candidate_review_epochs.get(candidate_id)
+        if (
+            retained_epoch is not None
+            and retained_epoch != candidate.first_seen_timestamp_s
+        ):
+            self._discard_candidate_review_cache(candidate_id)
+        self._candidate_review_epochs[candidate_id] = (
+            candidate.first_seen_timestamp_s
+        )
+
+        if review.decision is VisualReviewDecision.TARGET_MISMATCH:
+            streak = self._candidate_mismatch_streaks.pop(candidate_id, 0) + 1
+            self._candidate_mismatch_streaks[candidate_id] = streak
+            live_candidate_ids = {
+                item.candidate_id for item in bank.snapshots()
+            }
+            for retained_id in tuple(self._candidate_mismatch_streaks):
+                if retained_id not in live_candidate_ids:
+                    self._candidate_mismatch_streaks.pop(retained_id, None)
+            while len(self._candidate_mismatch_streaks) > self._max_candidate_reviews:
+                oldest = next(iter(self._candidate_mismatch_streaks))
+                del self._candidate_mismatch_streaks[oldest]
+            if streak < self._candidate_mismatch_threshold:
+                return
+            # A negative review does not grant an identity-reference claim.
+            references: tuple[str, ...] = ()
+        elif review.decision is VisualReviewDecision.TARGET_MATCH:
+            self._candidate_mismatch_streaks.pop(candidate_id, None)
+            if not acceptance.accepted_for_control:
+                return
+            references = identity_reference_handles
+        else:
+            # Ambiguous/POSSIBLE evidence breaks a consecutive negative run
+            # and is never terminal semantic evidence for the downstream
+            # CandidateConfirmationCoordinator.
+            self._candidate_mismatch_streaks.pop(candidate_id, None)
+            return
+
+        # Reinsert to make ordinary dict order an explicit bounded LRU.  The
+        # value is an immutable parsed review; raw model output is not kept.
+        self._accepted_candidate_reviews.pop(candidate_id, None)
+        self._accepted_candidate_review_references.pop(candidate_id, None)
+        self._accepted_candidate_reviews[candidate_id] = review
+        if references:
+            self._accepted_candidate_review_references[candidate_id] = references
+        while len(self._accepted_candidate_reviews) > self._max_candidate_reviews:
+            oldest = next(iter(self._accepted_candidate_reviews))
+            del self._accepted_candidate_reviews[oldest]
+            self._accepted_candidate_review_references.pop(oldest, None)
+            self._candidate_mismatch_streaks.pop(oldest, None)
+            self._candidate_review_epochs.pop(oldest, None)
+
+    def _discard_candidate_review_cache(self, candidate_id: str) -> None:
+        self._accepted_candidate_reviews.pop(candidate_id, None)
+        self._accepted_candidate_review_references.pop(candidate_id, None)
+        self._candidate_mismatch_streaks.pop(candidate_id, None)
+        self._candidate_review_epochs.pop(candidate_id, None)
 
     def _handle_timeout(self, now: float) -> bool:
         pending = self._pending
@@ -1280,13 +1655,20 @@ class VisualReviewCoordinator:
             or review.candidate.bbox_xyxy_normalized is None
         ):
             return None
-        candidate = bank.propose(
-            candidate_id=candidate_id,
-            timestamp_s=review.observation_timestamp_s,
-            bbox_xyxy_normalized=review.candidate.bbox_xyxy_normalized,
-            frame_ref=pending.frame_ref,
-            source="qwen_vl",
-        )
+        existing = bank.get(candidate_id)
+        if existing is None or existing.source == "qwen_vl":
+            candidate = bank.propose(
+                candidate_id=candidate_id,
+                timestamp_s=review.observation_timestamp_s,
+                bbox_xyxy_normalized=review.candidate.bbox_xyxy_normalized,
+                frame_ref=pending.frame_ref,
+                source="qwen_vl",
+            )
+        else:
+            # A delayed semantic result must not rewrite the detector-owned
+            # bbox/source/timestamp timeline or move it backwards.  Its only
+            # contribution here is the typed review evidence below.
+            candidate = existing
         if candidate is None:
             return None
         bank.add_review(
@@ -1304,6 +1686,7 @@ class VisualReviewCoordinator:
         self,
         *,
         review: QwenVisualReview,
+        pending: _PendingReview,
     ) -> tuple[str | None, bool]:
         """Resolve a Qwen box before gate evaluation without adding evidence."""
 
@@ -1311,12 +1694,34 @@ class VisualReviewCoordinator:
         bbox = review.candidate.bbox_xyxy_normalized
         if bank is None or not review.candidate.present or bbox is None:
             return None, False
+        if pending.bound_candidate_id is not None:
+            candidate = bank.get(pending.bound_candidate_id)
+            valid_bound_candidate = bool(
+                candidate is not None
+                and candidate.lifecycle
+                not in {CandidateLifecycle.REJECTED, CandidateLifecycle.STALE}
+                and candidate.first_seen_timestamp_s
+                == pending.bound_candidate_first_seen_s
+                and candidate.source.casefold() != "qwen_vl"
+                and not is_privileged_oracle_source(candidate.source)
+                and pending.bound_candidate_bbox is not None
+                and _bbox_iou(bbox, pending.bound_candidate_bbox)
+                >= self._candidate_association_iou_threshold
+            )
+            return (
+                pending.bound_candidate_id if valid_bound_candidate else None,
+                not valid_bound_candidate,
+            )
         candidate_id = bank.associate_proposal(
             timestamp_s=review.observation_timestamp_s,
             bbox_xyxy_normalized=bbox,
             proposed_candidate_id=generate_routing_id("candidate"),
             min_iou=self._candidate_association_iou_threshold,
-            source="qwen_vl",
+            # Association intentionally crosses proposal sources.  Requiring
+            # qwen_vl here would mint a second ID beside the matching YOLO
+            # candidate, so the typed review could never reach the detector
+            # candidate queried by TargetPerceptionCoordinator.
+            source=None,
         )
         # A None association is a trusted negative-memory suppression, not an
         # invitation to fall back to route-level semantic consensus.
@@ -1347,6 +1752,8 @@ class VisualReviewCoordinator:
             candidate is not None
             and candidate.lifecycle
             not in {CandidateLifecycle.REJECTED, CandidateLifecycle.STALE}
+            and candidate.source.casefold() != "qwen_vl"
+            and not is_privileged_oracle_source(candidate.source)
         )
 
     def _interrupt_search_for_revision(
@@ -1924,6 +2331,26 @@ def _unit_interval(value: object, field_name: str) -> float:
     if normalized > 1.0:
         raise ValueError(f"{field_name} must be within [0, 1]")
     return normalized
+
+
+def _bbox_iou(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    """Return normalized-box IoU for candidate-bound review authorization."""
+
+    intersection_x1 = max(left[0], right[0])
+    intersection_y1 = max(left[1], right[1])
+    intersection_x2 = min(left[2], right[2])
+    intersection_y2 = min(left[3], right[3])
+    intersection = max(0.0, intersection_x2 - intersection_x1) * max(
+        0.0,
+        intersection_y2 - intersection_y1,
+    )
+    left_area = (left[2] - left[0]) * (left[3] - left[1])
+    right_area = (right[2] - right[0]) * (right[3] - right[1])
+    union = left_area + right_area - intersection
+    return 0.0 if union <= 0.0 else intersection / union
 
 
 __all__ = [

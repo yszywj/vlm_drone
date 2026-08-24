@@ -8,7 +8,6 @@ from numbers import Real
 
 import numpy as np
 
-from env.moving_target import TargetState
 from skills.base import (
     Skill,
     SkillExecutionStateError,
@@ -47,6 +46,10 @@ class TrackSkill(Skill):
         self._last_seen_time: float | None = None
         self._last_seen_position: np.ndarray | None = None
         self._last_seen_velocity: np.ndarray | None = None
+        self._perception_source: str | None = None
+        self._tracker_id: str | None = None
+        self._measurement_age_s: float | None = None
+        self._predicted_only = False
 
     def _validate_goal(self, goal: SkillGoal) -> None:
         typed_goal = goal
@@ -85,6 +88,12 @@ class TrackSkill(Skill):
                 "target_relative_bearing": None,
                 "last_seen_age": 0.0,
                 "tracking_duration": 0.0,
+                "perception_source": None,
+                "tracker_id": None,
+                "measurement_age_s": None,
+                "predicted_only": False,
+                "position_available": False,
+                "velocity_available": False,
             },
         )
 
@@ -120,32 +129,65 @@ class TrackSkill(Skill):
         effective_time = max(now, observation_time)
         tracking_duration = max(0.0, effective_time - self._start_time)
 
-        if observation.oracle_target_visible is None:
-            raise SkillExecutionStateError(
-                "TRACK requires oracle_target_visible for ideal visibility"
-            )
-        target_id = observation.oracle_target_id
-        target_pose = observation.oracle_target_pose
-        target_velocity = observation.oracle_target_velocity
-        if target_id != goal.target_id.strip():
-            raise SkillExecutionStateError(
-                "TRACK Observation does not contain the requested oracle target_id"
-            )
-        if not isinstance(target_pose, TargetState):
-            raise SkillExecutionStateError(
-                "TRACK requires oracle_target_pose for ideal control"
-            )
-        if target_velocity is None:
-            raise SkillExecutionStateError(
-                "TRACK requires oracle_target_velocity for last-seen state"
-            )
-
-        target_position = np.asarray(
-            [target_pose.x, target_pose.y, target_pose.z],
-            dtype=np.float64,
+        estimate = observation.target_estimate
+        matching_estimate = (
+            estimate is not None
+            and estimate.confirmed
+            and estimate.target_id == goal.target_id.strip()
         )
-        target_velocity = np.asarray(target_velocity, dtype=np.float64).copy()
-        target_visible = bool(observation.oracle_target_visible)
+        position_available = bool(
+            matching_estimate
+            and estimate.position_world_m is not None
+            and (estimate.visible or estimate.predicted_only)
+        )
+        velocity_available = bool(
+            matching_estimate and estimate.velocity_world_mps is not None
+        )
+        if position_available:
+            assert estimate is not None and estimate.position_world_m is not None
+            target_position = np.asarray(
+                estimate.position_world_m,
+                dtype=np.float64,
+            )
+            target_velocity = np.asarray(
+                estimate.velocity_world_mps
+                if estimate.velocity_world_mps is not None
+                else (0.0, 0.0, 0.0),
+                dtype=np.float64,
+            )
+            target_visible = bool(estimate.visible and not estimate.predicted_only)
+            self._perception_source = estimate.source
+            self._tracker_id = estimate.tracker_id
+            self._measurement_age_s = estimate.measurement_age_s + max(
+                0.0, observation_time - estimate.timestamp_s
+            )
+            self._predicted_only = estimate.predicted_only
+        elif self._last_seen_position is not None:
+            target_position = self._last_seen_position.copy()
+            target_velocity = (
+                np.zeros(3, dtype=np.float64)
+                if self._last_seen_velocity is None
+                else self._last_seen_velocity.copy()
+            )
+            target_visible = False
+            self._predicted_only = False
+            self._measurement_age_s = (
+                None
+                if self._last_seen_time is None
+                else max(0.0, effective_time - self._last_seen_time)
+            )
+        else:
+            self._active_context.uav.stop()
+            self._fail(
+                SkillResultCode.INVALID_STATE,
+                "TRACK has no confirmed three-dimensional target position",
+                {
+                    "target_id": goal.target_id.strip(),
+                    "position_available": False,
+                    "perception_source": None if estimate is None else estimate.source,
+                },
+            )
+            return
 
         # A delayed visible frame may refresh last-seen only if it was captured
         # before the previous grace period expired. This prevents a recovery
@@ -187,7 +229,11 @@ class TrackSkill(Skill):
             and visible_frame_precedes_timeout
             and visible_frame_precedes_completion
         ):
-            self._last_seen_time = observation_time
+            assert estimate is not None
+            self._last_seen_time = max(
+                self._start_time,
+                estimate.timestamp_s - estimate.measurement_age_s,
+            )
             self._last_seen_position = target_position.copy()
             self._last_seen_velocity = target_velocity.copy()
 
@@ -222,6 +268,12 @@ class TrackSkill(Skill):
             "target_relative_bearing": relative_bearing,
             "last_seen_age": last_seen_age,
             "tracking_duration": tracking_duration,
+            "perception_source": self._perception_source,
+            "tracker_id": self._tracker_id,
+            "measurement_age_s": self._measurement_age_s,
+            "predicted_only": self._predicted_only,
+            "position_available": position_available,
+            "velocity_available": velocity_available,
         }
         progress = (
             min(1.0, tracking_duration / goal.track_duration)
@@ -302,7 +354,7 @@ class TrackSkill(Skill):
                 current_uav_position,
                 target_position,
                 target_velocity,
-                target_pose.yaw,
+                0.0,
             )
         desired_position = np.asarray(
             [
@@ -335,7 +387,7 @@ class TrackSkill(Skill):
         )
         self._set_feedback(
             progress,
-            "Tracking Oracle target",
+            "Tracking confirmed target estimate",
             feedback_data,
         )
 
@@ -361,6 +413,12 @@ class TrackSkill(Skill):
             "last_seen_age": last_seen_age,
             "tracking_duration": tracking_duration,
             "track_duration": goal.track_duration,
+            "perception_source": self._perception_source,
+            "tracker_id": self._tracker_id,
+            "measurement_age_s": self._measurement_age_s,
+            "predicted_only": self._predicted_only,
+            "position_available": self._last_seen_position is not None,
+            "velocity_available": self._last_seen_velocity is not None,
         }
 
     @staticmethod
@@ -383,6 +441,10 @@ class TrackSkill(Skill):
         self._last_seen_time = None
         self._last_seen_position = None
         self._last_seen_velocity = None
+        self._perception_source = None
+        self._tracker_id = None
+        self._measurement_age_s = None
+        self._predicted_only = False
 
     def _on_reset(self) -> None:
         self._start_time = None

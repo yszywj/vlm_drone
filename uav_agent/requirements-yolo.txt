@@ -1,0 +1,2 @@
+# Compatibility entry point; the canonical exact lock lives under requirements/.
+-r requirements/yolo.lock

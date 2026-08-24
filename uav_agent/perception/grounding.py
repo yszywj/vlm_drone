@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from hashlib import sha256
 from math import isfinite
 from numbers import Real
 from typing import Protocol, runtime_checkable
@@ -25,6 +26,7 @@ from perception.runtime import (
 )
 from runtime.frame_store import FrameRef
 from target.types import TargetSpec
+from yolo_service.protocol import TrackResponse
 
 
 class CandidateResolutionUnavailable(RuntimeError):
@@ -204,10 +206,83 @@ class LearnedGrounder(_UnimplementedGrounder):
     backend_name = "LearnedGrounder"
 
 
-class YOLOEGrounder(_UnimplementedGrounder):
-    """Future YOLOE slot; this project intentionally does not import YOLOE."""
+class UltralyticsGrounder(_UnimplementedGrounder):
+    """Pure adapter from a strict YOLO service response to image proposals.
 
-    backend_name = "YOLOEGrounder"
+    Network scheduling remains in the target-perception coordinator.  Keeping
+    response parsing here prevents service-specific tensors or response
+    objects from leaking into Skills and preserves the existing
+    ``GroundingBackend`` boundary.
+    """
+
+    backend_name = "UltralyticsGrounder response provider"
+
+    @classmethod
+    def from_response(
+        cls,
+        response: TrackResponse,
+        frame_ref: FrameRef,
+    ) -> tuple[GroundingProposal, ...]:
+        if not isinstance(response, TrackResponse):
+            raise TypeError("response must be a TrackResponse")
+        if not isinstance(frame_ref, FrameRef):
+            raise TypeError("frame_ref must be a FrameRef")
+        mismatched: list[str] = []
+        if response.uav_id != frame_ref.uav_id:
+            mismatched.append("uav_id")
+        if response.frame_id != frame_ref.frame_id:
+            mismatched.append("frame_id")
+        if abs(response.timestamp_s - frame_ref.timestamp_s) > 1e-9:
+            mismatched.append("timestamp_s")
+        if mismatched:
+            raise ValueError(
+                "YOLO response does not match FrameRef fields: "
+                + ", ".join(mismatched)
+            )
+        track_ids = [item.track_id for item in response.detections]
+        if len(track_ids) != len(set(track_ids)):
+            raise ValueError("YOLO response contains duplicate track_id values")
+        return tuple(
+            GroundingProposal(
+                uav_id=response.uav_id,
+                candidate_id=_ultralytics_candidate_id(
+                    response.mission_id,
+                    response.uav_id,
+                    detection.track_id,
+                ),
+                frame_ref=frame_ref,
+                bbox_xyxy_normalized=detection.bbox_xyxy_normalized,
+                source="ultralytics_service",
+                confidence=detection.confidence,
+            )
+            for detection in response.detections
+        )
+
+
+def _ultralytics_candidate_id(
+    mission_id: str,
+    uav_id: str,
+    track_id: int,
+) -> str:
+    """Return a stable, routing-safe candidate ID for one mission stream."""
+
+    readable = f"{mission_id}_{uav_id}_track_{track_id}"
+    try:
+        return validate_routing_id(readable, "candidate_id")
+    except ValueError:
+        # Input IDs are individually bounded but their concatenation can exceed
+        # the 64-character routing contract.  A stable digest retains stream
+        # isolation without silently truncating two IDs to the same prefix.
+        digest = sha256(
+            f"{mission_id}:{uav_id}:track:{track_id}".encode("utf-8")
+        ).hexdigest()[:20]
+        return validate_routing_id(f"track_{track_id}_{digest}", "candidate_id")
+
+
+class YOLOEGrounder(UltralyticsGrounder):
+    """Compatibility name for the shared YOLO/YOLOE response adapter."""
+
+    backend_name = "YOLOEGrounder response provider"
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,5 +430,6 @@ __all__ = [
     "ProductionCandidateResolver",
     "QwenVLGrounder",
     "ResolvedCandidatePosition",
+    "UltralyticsGrounder",
     "YOLOEGrounder",
 ]

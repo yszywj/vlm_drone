@@ -203,6 +203,12 @@ class ScriptedSkill(Skill):
     def _on_start(self, goal: SkillGoal, context: SkillContext) -> None:
         self.started_goals.append(deepcopy(goal))
 
+    @property
+    def next_outcome(self) -> ScriptedOutcome | None:
+        """Expose the next scripted frame to the test perception fixture."""
+
+        return None if not self._outcomes else self._outcomes[0]
+
     def _on_tick(self, observation: Observation) -> None:
         self.tick_count += 1
         if not self._outcomes:
@@ -379,6 +385,7 @@ class Harness:
     clock: FakeClock
     skills: dict[SkillName, ScriptedSkill]
     context: PlannerWorldContext
+    auto_commit_oracle_provider: bool
 
     def start(self) -> CompiledMission:
         return self.agent.start("find, track, and return", self.context)
@@ -390,7 +397,43 @@ class Harness:
         pose: UAVState | None = None,
     ) -> MissionAgentSnapshot:
         self.clock.set(timestamp)
+        self._commit_oracle_provider_lock(timestamp)
         return self.agent.tick(observation(timestamp, pose=pose))
+
+    def _commit_oracle_provider_lock(self, timestamp: float) -> None:
+        """Model the provider-before-Agent ordering used by the real runtime."""
+
+        if not self.auto_commit_oracle_provider:
+            return
+        active = self.manager.active_name
+        if active not in {SkillName.SEARCH, SkillName.REACQUIRE}:
+            return
+        outcome = self.skills[active].next_outcome
+        if (
+            outcome is None
+            or outcome.status is not SkillStatus.SUCCEEDED
+            or outcome.code is not SkillResultCode.TARGET_FOUND
+        ):
+            return
+        target_id = outcome.data.get("target_id")
+        if not isinstance(target_id, str) or not target_id.strip():
+            return
+        provider_values = {
+            "timestamp_s": timestamp,
+            "confidence": 1.0,
+            "last_seen_position": (1.0, 2.0, 0.5),
+            "last_seen_velocity": (0.0, 0.0, 0.0),
+        }
+        if self.target.lifecycle is TargetLifecycle.SEARCHING:
+            self.target.lock_oracle_from_search(
+                target_id.strip(),
+                **provider_values,
+            )
+        elif self.target.lifecycle is TargetLifecycle.REACQUIRING:
+            self.target.mark_reacquired_oracle(
+                target_id.strip(),
+                **provider_values,
+            )
 
 
 def make_harness(
@@ -401,8 +444,9 @@ def make_harness(
     safety: CountingSafetySupervisor | None = None,
     start_error: Exception | None = None,
     logger: object | None = None,
-    # ScriptedSkill outcomes model the Stage-0 ideal Oracle path.  Individual
-    # production-boundary tests override this explicitly.
+    # The fixture models the Oracle provider committing TargetManager before
+    # MissionAgent consumes a TARGET_FOUND Skill transition. Individual
+    # production-boundary tests disable that fixture through their profile.
     perception_runtime_profile: PerceptionRuntimeProfile = (
         PerceptionRuntimeProfile.ORACLE_EVALUATION
     ),
@@ -464,6 +508,10 @@ def make_harness(
         clock=clock,
         skills=skills,
         context=world_context(),
+        auto_commit_oracle_provider=(
+            perception_runtime_profile
+            is PerceptionRuntimeProfile.ORACLE_EVALUATION
+        ),
     )
 
 
@@ -668,7 +716,7 @@ class MissionAgentTickAndTargetTests(unittest.TestCase):
             [TargetLifecycle.SEARCHING],
         )
 
-    def test_search_success_locks_then_starts_tracking(self) -> None:
+    def test_search_success_accepts_provider_lock_then_starts_tracking(self) -> None:
         harness = make_harness()
         harness.start()
         harness.tick(1.0)
@@ -689,6 +737,19 @@ class MissionAgentTickAndTargetTests(unittest.TestCase):
             ],
         )
 
+    def test_oracle_search_result_without_provider_lock_fails_closed(self) -> None:
+        harness = make_harness()
+        harness.auto_commit_oracle_provider = False
+        harness.start()
+        harness.tick(1.0)
+        harness.tick(2.0)
+
+        snapshot = harness.tick(3.0)
+
+        self.assertEqual(snapshot.active_skill, "LAND")
+        self.assertIn("perception provider", snapshot.last_error or "")
+        self.assertNotEqual(snapshot.target.source, "oracle")
+
     def test_production_search_cannot_directly_oracle_lock(self) -> None:
         harness = make_harness(
             perception_runtime_profile=PerceptionRuntimeProfile.PRODUCTION,
@@ -701,7 +762,7 @@ class MissionAgentTickAndTargetTests(unittest.TestCase):
         snapshot = harness.tick(3.0)  # SEARCH result tries to enter TRACK
 
         self.assertEqual(snapshot.active_skill, "LAND")
-        self.assertIn("prior visual", snapshot.last_error or "")
+        self.assertIn("perception provider", snapshot.last_error or "")
         self.assertNotEqual(snapshot.target.source, "oracle")
 
     def test_production_search_accepts_confirmed_candidate_lock(self) -> None:
@@ -833,14 +894,11 @@ class MissionAgentTickAndTargetTests(unittest.TestCase):
         harness.tick(4.0)
 
         target = harness.agent.snapshot().target
-        # The Manager cannot construct REACQUIRE without real last-seen data;
-        # MissionAgent must not invent any while the fail-safe LAND begins.
+        # A missing TRACK-loss payload must not overwrite the provider's last
+        # confirmed estimate while fail-safe LAND begins.
         self.assertIs(target.lifecycle, TargetLifecycle.TERMINATED)
-        self.assertIsNone(target.last_seen_position)
-        self.assertIsNone(target.last_seen_velocity)
-        # TargetManager records the genuine SEARCH lock timestamp.  A missing
-        # TRACK-loss payload must preserve it rather than fabricating a newer
-        # last-seen sample.
+        self.assertEqual(target.last_seen_position, before_loss.last_seen_position)
+        self.assertEqual(target.last_seen_velocity, before_loss.last_seen_velocity)
         self.assertEqual(target.last_seen_time_s, before_loss.last_seen_time_s)
 
     def test_reacquire_success_returns_target_to_tracking(self) -> None:

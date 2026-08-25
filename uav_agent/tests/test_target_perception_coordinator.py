@@ -403,11 +403,20 @@ class TargetPerceptionCoordinatorTest(unittest.TestCase):
         for timestamp in (1.0, 1.3, 1.6):
             coordinator.submit_frame(camera_sample=sample(timestamp), target_spec=spec)
             estimates.append(coordinator.poll(now_s=timestamp, target_manager=manager))
+            if timestamp == 1.0:
+                self.assertTrue(
+                    coordinator.qwen_fallback_required(
+                        "mission_reid_uav_1_track_8"
+                    )
+                )
 
         self.assertFalse(estimates[1].confirmed)
         self.assertTrue(estimates[2].confirmed)
         self.assertEqual(manager.snapshot().target_id, original_target_id)
         self.assertEqual(coordinator.metrics.reacquire_successes, 1)
+        self.assertFalse(
+            coordinator.qwen_fallback_required("mission_reid_uav_1_track_8")
+        )
         coordinator.close()
 
     def test_unconfirmed_tracker_cannot_contaminate_locked_control_prediction(self) -> None:

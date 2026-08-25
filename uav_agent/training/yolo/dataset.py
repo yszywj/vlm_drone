@@ -2,22 +2,94 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
+
+from fleet.strict_json import strict_json_object_loads
 
 
 _IMAGE_SUFFIXES = frozenset(
     {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 )
 _SPLITS = ("train", "val", "test")
+_CUBE_PROTOCOL = "cube-v1"
+_CUBE_CLASS_NAME = "cube"
+_CUBE_COLORS = ("red", "blue", "green", "yellow", "gray")
+_HARD_NEGATIVE_KINDS = (
+    "red_sphere",
+    "blue_sphere",
+    "red_cylinder",
+    "blue_cylinder",
+    "cuboid",
+    "colored_background_block",
+    "partial_noncube",
+)
+_VISIBLE_POSITIVE_STATES = frozenset(
+    {"visible", "edge_clipped", "partially_occluded"}
+)
+_CUBE_VISIBILITY_STATES = frozenset(
+    {
+        "visible",
+        "edge_clipped",
+        "partially_occluded",
+        "fully_occluded",
+        "behind_camera",
+        "out_of_frame",
+        "too_small",
+        "depth_unavailable",
+        "invalid_projection",
+        "invalid_depth",
+        "depth_unresolved",
+        "negative",
+    }
+)
+_PRIVILEGED_METADATA_TOKENS = frozenset(
+    {"image", "depth", "rgb", "crop", "base64", "prompt", "payload"}
+)
+_DATA_URI = re.compile(r"^data:[^,]{0,256},", re.IGNORECASE)
+_BASE64_TEXT = re.compile(r"^[A-Za-z0-9+/_-]+={0,2}$")
+_CUBE_COVERAGE_KEYS = (
+    "positive",
+    "negative",
+    "red_cube",
+    "blue_cube",
+    "partial_occlusion",
+    "multi_cube",
+)
+_CUBE_METADATA_FIELDS = frozenset(
+    {
+        "schema_version",
+        "split",
+        "scene_seed",
+        "episode_id",
+        "trajectory_id",
+        "frame_id",
+        "objects",
+    }
+)
+_CUBE_METADATA_OBJECT_FIELDS = frozenset(
+    {
+        "object_id",
+        "shape",
+        "color_name",
+        "detector_class_id",
+        "detector_class_name",
+        "bbox",
+        "visibility",
+        "occlusion_ratio",
+    }
+)
 
 
 class YoloDatasetError(ValueError):
@@ -66,6 +138,8 @@ class DatasetValidationReport:
     ]
     image_hashes: Mapping[str, tuple[str, ...]]
     empty_label_files: int
+    metadata_counts: Mapping[str, int]
+    cube_protocol_coverage: Mapping[str, Mapping[str, bool]]
     issues: tuple[DatasetIssue, ...]
 
     @property
@@ -106,6 +180,11 @@ class DatasetValidationReport:
                 for split, summary in self.target_area_px_by_split.items()
             },
             "empty_label_files": self.empty_label_files,
+            "metadata_counts": dict(self.metadata_counts),
+            "cube_protocol_coverage": {
+                split: dict(coverage)
+                for split, coverage in self.cube_protocol_coverage.items()
+            },
             "image_hash_summary": {
                 split: {"total": len(hashes), "unique": len(set(hashes))}
                 for split, hashes in self.image_hashes.items()
@@ -237,6 +316,18 @@ def _label_path(image_path: Path, dataset_root: Path, split: str) -> Path:
     return dataset_root / "labels" / split / f"{image_path.stem}.txt"
 
 
+def _metadata_path(image_path: Path, dataset_root: Path, split: str) -> Path:
+    try:
+        relative = image_path.relative_to(dataset_root)
+    except ValueError:
+        return dataset_root / "metadata" / split / f"{image_path.stem}.json"
+    parts = list(relative.parts)
+    if "images" in parts:
+        parts[parts.index("images")] = "metadata"
+        return (dataset_root / Path(*parts)).with_suffix(".json")
+    return dataset_root / "metadata" / split / f"{image_path.stem}.json"
+
+
 def _image_size(path: Path) -> tuple[int, int]:
     try:
         from PIL import Image, UnidentifiedImageError
@@ -299,11 +390,27 @@ def _area_summary(values: Sequence[float]) -> dict[str, float | int | None]:
 class YoloDatasetValidator:
     """Validate images, annotations, distributions, and split leakage."""
 
-    def __init__(self, *, task: str = "detect") -> None:
+    def __init__(
+        self,
+        *,
+        task: str = "detect",
+        protocol: str = "generic",
+        cube_only: bool | None = None,
+    ) -> None:
         normalized = str(task).strip().lower()
         if normalized not in {"detect", "segment"}:
             raise ValueError("task must be detect or segment")
+        normalized_protocol = str(protocol).strip().lower()
+        if cube_only is not None:
+            if not isinstance(cube_only, bool):
+                raise TypeError("cube_only must be a bool or None")
+            normalized_protocol = _CUBE_PROTOCOL if cube_only else "generic"
+        if normalized_protocol not in {"generic", _CUBE_PROTOCOL}:
+            raise ValueError("protocol must be generic or cube-v1")
+        if normalized_protocol == _CUBE_PROTOCOL and normalized != "detect":
+            raise ValueError("cube-v1 supports detection labels only")
         self._task = normalized
+        self._protocol = normalized_protocol
 
     def validate(self, data_yaml: str | Path) -> DatasetValidationReport:
         descriptor = Path(data_yaml).expanduser().resolve()
@@ -311,6 +418,15 @@ class YoloDatasetValidator:
         names = _class_names(raw.get("names"))
         root = _resolve_dataset_root(descriptor, raw.get("path"))
         issues: list[DatasetIssue] = []
+        if self._protocol == _CUBE_PROTOCOL and names != (_CUBE_CLASS_NAME,):
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "cube_class_schema",
+                    "cube-v1 data.yaml must declare exactly names: {0: cube}",
+                    path=str(descriptor),
+                )
+            )
         split_images: dict[str, list[Path]] = {}
         for split in _SPLITS:
             reference = raw.get(split)
@@ -357,10 +473,16 @@ class YoloDatasetValidator:
         hash_locations: defaultdict[str, list[tuple[str, Path]]] = defaultdict(list)
         empty_labels = 0
         expected_labels: dict[str, set[Path]] = {split: set() for split in _SPLITS}
+        image_annotation_counts: dict[tuple[str, Path], int] = {}
+        image_annotation_boxes: defaultdict[
+            tuple[str, Path], list[tuple[float, float, float, float]]
+        ] = defaultdict(list)
+        image_dimensions: dict[tuple[str, Path], tuple[int, int]] = {}
 
         for split, images in split_images.items():
             seen_paths: set[Path] = set()
             for image_path in images:
+                image_annotation_counts[(split, image_path.resolve())] = 0
                 if image_path in seen_paths:
                     issues.append(
                         DatasetIssue(
@@ -411,6 +533,7 @@ class YoloDatasetValidator:
                     continue
                 image_hashes[split].append(image_hash)
                 hash_locations[image_hash].append((split, image_path))
+                image_dimensions[(split, image_path.resolve())] = (width, height)
 
                 label_path = _label_path(image_path, root, split).resolve()
                 expected_labels[split].add(label_path)
@@ -479,9 +602,38 @@ class YoloDatasetValidator:
                     if area is not None:
                         target_areas[split].append(area)
                         split_annotation_counts[split] += 1
+                        image_annotation_counts[(split, image_path.resolve())] += 1
+                        if self._protocol == _CUBE_PROTOCOL:
+                            center_x, center_y, box_width, box_height = (
+                                float(value) for value in line.split()[1:]
+                            )
+                            image_annotation_boxes[
+                                (split, image_path.resolve())
+                            ].append(
+                                (
+                                    (center_x - box_width / 2.0) * width,
+                                    (center_y - box_height / 2.0) * height,
+                                    (center_x + box_width / 2.0) * width,
+                                    (center_y + box_height / 2.0) * height,
+                                )
+                            )
 
         self._check_orphan_labels(root, expected_labels, issues)
         self._check_hash_duplicates(hash_locations, issues)
+        metadata_counts = {split: 0 for split in _SPLITS}
+        cube_protocol_coverage = {
+            split: {key: False for key in _CUBE_COVERAGE_KEYS}
+            for split in _SPLITS
+        }
+        if self._protocol == _CUBE_PROTOCOL:
+            metadata_counts, cube_protocol_coverage = self._check_cube_metadata(
+                root=root,
+                split_images=split_images,
+                image_annotation_counts=image_annotation_counts,
+                image_annotation_boxes=image_annotation_boxes,
+                image_dimensions=image_dimensions,
+                issues=issues,
+            )
         if sum(split_annotation_counts.values()) == 0:
             issues.append(
                 DatasetIssue(
@@ -514,6 +666,8 @@ class YoloDatasetValidator:
                 split: tuple(sorted(hashes)) for split, hashes in image_hashes.items()
             },
             empty_label_files=empty_labels,
+            metadata_counts=metadata_counts,
+            cube_protocol_coverage=cube_protocol_coverage,
             issues=tuple(issues),
         )
 
@@ -584,6 +738,18 @@ class YoloDatasetValidator:
             )
             return None
         class_id = int(class_value)
+        if self._protocol == _CUBE_PROTOCOL and class_value != 0.0:
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "cube_class_id_not_zero",
+                    "cube-v1 labels must use detector class ID 0 only",
+                    split=split,
+                    path=str(label_path),
+                    line=line_number,
+                )
+            )
+            return None
         if class_value != class_id or not 0 <= class_id < class_count:
             issues.append(
                 DatasetIssue(
@@ -662,6 +828,721 @@ class YoloDatasetValidator:
         return float(area)
 
     @staticmethod
+    def _metadata_name_has_privileged_token(value: str) -> bool:
+        collapsed = re.sub(r"[^a-z0-9]+", "", value.casefold())
+        return any(token in collapsed for token in _PRIVILEGED_METADATA_TOKENS)
+
+    @staticmethod
+    def _looks_like_encoded_payload(value: str) -> bool:
+        stripped = value.strip()
+        if _DATA_URI.match(stripped):
+            return True
+        compact = "".join(stripped.split())
+        if len(compact) < 128:
+            return False
+        if _BASE64_TEXT.fullmatch(compact) is None:
+            return False
+        padded = compact + "=" * ((4 - len(compact) % 4) % 4)
+        try:
+            decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
+        except (binascii.Error, ValueError):
+            return False
+        return len(decoded) >= 64
+
+    @classmethod
+    def _metadata_has_privileged_pixels(
+        cls,
+        value: Any,
+        *,
+        parent_key: str | None = None,
+    ) -> bool:
+        """Reject pixel, encoded, or model-prompt payloads at any nesting depth."""
+
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                key_text = str(key)
+                if cls._metadata_name_has_privileged_token(key_text):
+                    return True
+                if cls._metadata_has_privileged_pixels(
+                    item,
+                    parent_key=key_text.strip().casefold(),
+                ):
+                    return True
+            return False
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            # These are scalar status values emitted by the collector, not
+            # embedded depth arrays.  The key remains part of the allow-list.
+            if parent_key == "visibility" and normalized in _CUBE_VISIBILITY_STATES:
+                return False
+            return (
+                cls._metadata_name_has_privileged_token(value)
+                or cls._looks_like_encoded_payload(value)
+            )
+        if isinstance(value, Sequence):
+            return any(
+                cls._metadata_has_privileged_pixels(item, parent_key=parent_key)
+                for item in value
+            )
+        return False
+
+    @staticmethod
+    def _valid_metadata_bbox(value: Any) -> bool:
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 4:
+            return False
+        if any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            for item in value
+        ):
+            return False
+        x1, y1, x2, y2 = (float(item) for item in value)
+        return x1 >= 0.0 and y1 >= 0.0 and x2 > x1 and y2 > y1
+
+    @classmethod
+    def _validate_metadata_object(
+        cls,
+        raw: Any,
+        *,
+        split: str,
+        metadata_path: Path,
+        object_index: int,
+        image_width: int,
+        image_height: int,
+        issues: list[DatasetIssue],
+    ) -> tuple[
+        bool,
+        str | None,
+        bool,
+        bool,
+        tuple[float, float, float, float] | None,
+    ]:
+        """Return visible-cube, colour, partial, validity, and pixel bbox."""
+
+        if not isinstance(raw, Mapping):
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "invalid_cube_metadata_object",
+                    f"objects[{object_index}] must be a mapping",
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+            return False, None, False, False, None
+        required = set(_CUBE_METADATA_OBJECT_FIELDS)
+        missing = sorted(required - set(raw))
+        if missing:
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "incomplete_cube_metadata_object",
+                    f"objects[{object_index}] is missing: {', '.join(missing)}",
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+            return False, None, False, False, None
+        unknown = sorted(set(raw) - _CUBE_METADATA_OBJECT_FIELDS)
+        has_unknown_fields = bool(unknown)
+        if unknown:
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "unknown_cube_metadata_object_fields",
+                    (
+                        f"objects[{object_index}] contains unknown fields: "
+                        + ", ".join(unknown)
+                    ),
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+        object_id = raw.get("object_id")
+        shape = raw.get("shape")
+        color = raw.get("color_name")
+        visibility = raw.get("visibility")
+        if not isinstance(object_id, str) or not object_id.strip():
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "invalid_metadata_object_id",
+                    f"objects[{object_index}].object_id must be non-empty",
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+        if not isinstance(shape, str) or not shape.strip():
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "invalid_metadata_shape",
+                    f"objects[{object_index}].shape must be non-empty",
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+            return False, None, False, False, None
+        shape = shape.strip().lower()
+        semantic_valid = not has_unknown_fields
+        if not isinstance(color, str) or not color.strip():
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "invalid_metadata_color",
+                    f"objects[{object_index}].color_name must be non-empty",
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+            color_name: str | None = None
+        else:
+            color_name = color.strip().lower()
+        if not isinstance(visibility, str) or not visibility.strip():
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "invalid_metadata_visibility",
+                    f"objects[{object_index}].visibility must be non-empty",
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+            visibility_name = ""
+        else:
+            visibility_name = visibility.strip().lower()
+            if visibility_name not in _CUBE_VISIBILITY_STATES:
+                issues.append(
+                    DatasetIssue(
+                        "error",
+                        "invalid_metadata_visibility",
+                        (
+                            f"objects[{object_index}].visibility must be one of: "
+                            + ", ".join(sorted(_CUBE_VISIBILITY_STATES))
+                        ),
+                        split=split,
+                        path=str(metadata_path),
+                    )
+                )
+                semantic_valid = False
+        occlusion = raw.get("occlusion_ratio")
+        if occlusion is not None and (
+            isinstance(occlusion, bool)
+            or not isinstance(occlusion, (int, float))
+            or not math.isfinite(float(occlusion))
+            or not 0.0 <= float(occlusion) <= 1.0
+        ):
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "invalid_metadata_occlusion",
+                    f"objects[{object_index}].occlusion_ratio must be null or in [0, 1]",
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+        bbox = raw.get("bbox")
+        bbox_xyxy: tuple[float, float, float, float] | None = None
+        if bbox is not None:
+            if not cls._valid_metadata_bbox(bbox):
+                issues.append(
+                    DatasetIssue(
+                        "error",
+                        "invalid_metadata_bbox",
+                        f"objects[{object_index}].bbox must be null or valid xyxy pixels",
+                        split=split,
+                        path=str(metadata_path),
+                    )
+                )
+            else:
+                candidate = tuple(float(item) for item in bbox)
+                if candidate[2] > image_width or candidate[3] > image_height:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "metadata_bbox_outside_image",
+                            (
+                                f"objects[{object_index}].bbox must fit inside "
+                                f"the {image_width}x{image_height} image"
+                            ),
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                else:
+                    bbox_xyxy = candidate
+        bbox_valid = bbox_xyxy is not None
+
+        is_cube = shape == _CUBE_CLASS_NAME
+        visible_cube = (
+            is_cube
+            and semantic_valid
+            and visibility_name in _VISIBLE_POSITIVE_STATES
+        )
+        if is_cube:
+            if color_name not in _CUBE_COLORS:
+                issues.append(
+                    DatasetIssue(
+                        "error",
+                        "cube_color_out_of_catalog",
+                        (
+                            f"objects[{object_index}] cube color must be one of: "
+                            + ", ".join(_CUBE_COLORS)
+                        ),
+                        split=split,
+                        path=str(metadata_path),
+                    )
+                )
+                semantic_valid = False
+            if (
+                raw.get("detector_class_id") != 0
+                or raw.get("detector_class_name") != _CUBE_CLASS_NAME
+            ):
+                issues.append(
+                    DatasetIssue(
+                        "error",
+                        "invalid_cube_metadata_class",
+                        f"objects[{object_index}] cube must map exactly to class 0/cube",
+                        split=split,
+                        path=str(metadata_path),
+                    )
+                )
+                semantic_valid = False
+            if visible_cube and not bbox_valid:
+                issues.append(
+                    DatasetIssue(
+                        "error",
+                        "visible_cube_without_bbox",
+                        f"objects[{object_index}] is a visible cube without a real bbox",
+                        split=split,
+                        path=str(metadata_path),
+                    )
+                )
+                semantic_valid = False
+        elif (
+            raw.get("detector_class_id") is not None
+            or raw.get("detector_class_name") is not None
+        ):
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "non_cube_has_detector_class",
+                    f"objects[{object_index}] is a hard negative and must remain unlabelled",
+                    split=split,
+                    path=str(metadata_path),
+                )
+            )
+            semantic_valid = False
+        return (
+            visible_cube and bbox_valid and semantic_valid,
+            color_name,
+            visible_cube and visibility_name == "partially_occluded",
+            semantic_valid,
+            bbox_xyxy,
+        )
+
+    @staticmethod
+    def _bboxes_match_one_to_one(
+        metadata_boxes: Sequence[tuple[float, float, float, float]],
+        label_boxes: Sequence[tuple[float, float, float, float]],
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> bool:
+        if len(metadata_boxes) != len(label_boxes):
+            return False
+        tolerance = max(1e-3, max(image_width, image_height) * 1e-7)
+        adjacency = [
+            [
+                label_index
+                for label_index, label_box in enumerate(label_boxes)
+                if all(
+                    abs(metadata_value - label_value) <= tolerance
+                    for metadata_value, label_value in zip(metadata_box, label_box)
+                )
+            ]
+            for metadata_box in metadata_boxes
+        ]
+        matched_metadata_by_label: dict[int, int] = {}
+
+        def assign(metadata_index: int, seen_labels: set[int]) -> bool:
+            for label_index in adjacency[metadata_index]:
+                if label_index in seen_labels:
+                    continue
+                seen_labels.add(label_index)
+                previous = matched_metadata_by_label.get(label_index)
+                if previous is None or assign(previous, seen_labels):
+                    matched_metadata_by_label[label_index] = metadata_index
+                    return True
+            return False
+
+        return all(assign(index, set()) for index in range(len(metadata_boxes)))
+
+    @staticmethod
+    def _hard_negative_kind(shape: str, color: str | None) -> str | None:
+        if shape == "sphere" and color in {"red", "blue"}:
+            return f"{color}_sphere"
+        if shape == "cylinder" and color in {"red", "blue"}:
+            return f"{color}_cylinder"
+        if shape in {"cuboid", "colored_background_block", "partial_noncube"}:
+            return shape
+        return None
+
+    @classmethod
+    def _check_cube_metadata(
+        cls,
+        *,
+        root: Path,
+        split_images: Mapping[str, Sequence[Path]],
+        image_annotation_counts: Mapping[tuple[str, Path], int],
+        image_annotation_boxes: Mapping[
+            tuple[str, Path], Sequence[tuple[float, float, float, float]]
+        ],
+        image_dimensions: Mapping[tuple[str, Path], tuple[int, int]],
+        issues: list[DatasetIssue],
+    ) -> tuple[dict[str, int], dict[str, dict[str, bool]]]:
+        metadata_counts = {split: 0 for split in _SPLITS}
+        coverage = {
+            split: {key: False for key in _CUBE_COVERAGE_KEYS}
+            for split in _SPLITS
+        }
+        episode_splits: defaultdict[str, set[str]] = defaultdict(set)
+        trajectory_splits: defaultdict[str, set[str]] = defaultdict(set)
+        expected_metadata: dict[str, set[Path]] = {split: set() for split in _SPLITS}
+        cube_colors_seen: set[str] = set()
+        hard_negatives_seen: set[str] = set()
+
+        for split in _SPLITS:
+            for image_path in dict.fromkeys(split_images.get(split, ())):
+                image_path = image_path.resolve()
+                if not image_path.is_file():
+                    continue
+                metadata_path = _metadata_path(image_path, root, split).resolve()
+                expected_metadata[split].add(metadata_path)
+                dimensions = image_dimensions.get((split, image_path))
+                if dimensions is None:
+                    # The image decoder has already emitted the authoritative
+                    # unreadable-image issue; metadata cannot be checked
+                    # against dimensions that were not proven.
+                    continue
+                image_width, image_height = dimensions
+                if not metadata_path.is_file():
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "missing_cube_metadata",
+                            "cube-v1 image has no matching metadata JSON",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                    continue
+                try:
+                    raw = strict_json_object_loads(
+                        metadata_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "invalid_cube_metadata",
+                            f"metadata is not valid UTF-8 JSON: {exc}",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                    continue
+                metadata_counts[split] += 1
+                if cls._metadata_has_privileged_pixels(raw):
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "metadata_contains_pixels",
+                            (
+                                "metadata must not embed RGB/depth/image/crop, "
+                                "base64, prompt, or opaque payload data"
+                            ),
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                required_root = {"schema_version", "episode_id", "trajectory_id", "objects"}
+                missing_root = sorted(required_root - set(raw))
+                if missing_root:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "incomplete_cube_metadata",
+                            "metadata is missing: " + ", ".join(missing_root),
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                    continue
+                unknown_root = sorted(set(raw) - _CUBE_METADATA_FIELDS)
+                if unknown_root:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "unknown_cube_metadata_fields",
+                            "metadata contains unknown fields: "
+                            + ", ".join(unknown_root),
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                if raw.get("schema_version") != 1:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "unsupported_cube_metadata_schema",
+                            "metadata schema_version must be exactly 1",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                if "split" in raw and raw.get("split") != split:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "metadata_split_mismatch",
+                            "metadata split does not match its directory",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                if "frame_id" in raw and raw.get("frame_id") != image_path.stem:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "metadata_frame_mismatch",
+                            "metadata frame_id does not match image stem",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                episode_id = raw.get("episode_id")
+                trajectory_id = raw.get("trajectory_id")
+                if not isinstance(episode_id, str) or not episode_id.strip():
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "invalid_metadata_episode",
+                            "episode_id must be a non-empty string",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                else:
+                    episode_splits[episode_id.strip()].add(split)
+                if not isinstance(trajectory_id, str) or not trajectory_id.strip():
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "invalid_metadata_trajectory",
+                            "trajectory_id must be a non-empty string",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                else:
+                    trajectory_splits[trajectory_id.strip()].add(split)
+                objects = raw.get("objects")
+                if not isinstance(objects, Sequence) or isinstance(objects, (str, bytes)):
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "invalid_cube_metadata_objects",
+                            "metadata objects must be a list",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                    continue
+                object_ids = [
+                    item.get("object_id")
+                    for item in objects
+                    if isinstance(item, Mapping)
+                ]
+                if len(object_ids) != len(set(str(item) for item in object_ids)):
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "duplicate_metadata_object_id",
+                            "metadata object_id values must be unique per frame",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                visible_count = 0
+                visible_boxes: list[tuple[float, float, float, float]] = []
+                cube_count = 0
+                has_red = has_blue = has_partial = False
+                for index, item in enumerate(objects):
+                    if (
+                        isinstance(item, Mapping)
+                        and str(item.get("shape", "")).strip().lower()
+                        == _CUBE_CLASS_NAME
+                    ):
+                        cube_count += 1
+                    (
+                        visible,
+                        color,
+                        partial,
+                        semantic_valid,
+                        bbox_xyxy,
+                    ) = cls._validate_metadata_object(
+                        item,
+                        split=split,
+                        metadata_path=metadata_path,
+                        object_index=index,
+                        image_width=image_width,
+                        image_height=image_height,
+                        issues=issues,
+                    )
+                    visible_count += int(visible)
+                    if visible and bbox_xyxy is not None:
+                        visible_boxes.append(bbox_xyxy)
+                    if semantic_valid and isinstance(item, Mapping):
+                        shape = str(item.get("shape", "")).strip().lower()
+                        if shape == _CUBE_CLASS_NAME and color in _CUBE_COLORS:
+                            assert color is not None
+                            cube_colors_seen.add(color)
+                        elif shape != _CUBE_CLASS_NAME:
+                            kind = cls._hard_negative_kind(shape, color)
+                            if kind is not None:
+                                hard_negatives_seen.add(kind)
+                    has_red = has_red or (visible and color == "red")
+                    has_blue = has_blue or (visible and color == "blue")
+                    has_partial = has_partial or partial
+                if cube_count > 3:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "cube_count_out_of_range",
+                            "metadata may contain at most three cubes per image",
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                label_count = image_annotation_counts.get((split, image_path), 0)
+                if label_count != visible_count:
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "metadata_label_count_mismatch",
+                            (
+                                f"label count {label_count} does not equal visible "
+                                f"cube count {visible_count}"
+                            ),
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                elif not cls._bboxes_match_one_to_one(
+                    visible_boxes,
+                    image_annotation_boxes.get((split, image_path), ()),
+                    image_width=image_width,
+                    image_height=image_height,
+                ):
+                    issues.append(
+                        DatasetIssue(
+                            "error",
+                            "metadata_label_bbox_mismatch",
+                            (
+                                "visible cube metadata bboxes do not match class-0 "
+                                "YOLO label bboxes one-to-one"
+                            ),
+                            split=split,
+                            path=str(metadata_path),
+                        )
+                    )
+                coverage[split]["positive"] |= visible_count > 0
+                coverage[split]["negative"] |= (
+                    cube_count == 0 and visible_count == 0 and label_count == 0
+                )
+                coverage[split]["red_cube"] |= has_red
+                coverage[split]["blue_cube"] |= has_blue
+                coverage[split]["partial_occlusion"] |= has_partial
+                coverage[split]["multi_cube"] |= visible_count >= 2
+
+            metadata_dir = root / "metadata" / split
+            if metadata_dir.is_dir():
+                for metadata_path in metadata_dir.rglob("*.json"):
+                    if metadata_path.resolve() not in expected_metadata[split]:
+                        issues.append(
+                            DatasetIssue(
+                                "error",
+                                "orphan_cube_metadata",
+                                "metadata JSON has no matching image in this split",
+                                split=split,
+                                path=str(metadata_path.resolve()),
+                            )
+                        )
+
+        missing_colors = [color for color in _CUBE_COLORS if color not in cube_colors_seen]
+        if missing_colors:
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "missing_cube_color_coverage",
+                    "cube-v1 metadata lacks cube color(s): " + ", ".join(missing_colors),
+                    path=str(root),
+                )
+            )
+        missing_hard_negatives = [
+            kind for kind in _HARD_NEGATIVE_KINDS if kind not in hard_negatives_seen
+        ]
+        if missing_hard_negatives:
+            issues.append(
+                DatasetIssue(
+                    "error",
+                    "missing_hard_negative_coverage",
+                    (
+                        "cube-v1 metadata lacks hard-negative kind(s): "
+                        + ", ".join(missing_hard_negatives)
+                    ),
+                    path=str(root),
+                )
+            )
+
+        for episode_id, splits in episode_splits.items():
+            if len(splits) > 1:
+                issues.append(
+                    DatasetIssue(
+                        "error",
+                        "episode_split_leakage",
+                        f"episode_id {episode_id!r} occurs across {sorted(splits)}",
+                        path=episode_id,
+                    )
+                )
+        for trajectory_id, splits in trajectory_splits.items():
+            if len(splits) > 1:
+                issues.append(
+                    DatasetIssue(
+                        "error",
+                        "trajectory_split_leakage",
+                        f"trajectory_id {trajectory_id!r} occurs across {sorted(splits)}",
+                        path=trajectory_id,
+                    )
+                )
+        for split, split_coverage in coverage.items():
+            missing = [key for key in _CUBE_COVERAGE_KEYS if not split_coverage[key]]
+            if missing:
+                issues.append(
+                    DatasetIssue(
+                        "error",
+                        "missing_cube_split_coverage",
+                        f"split {split} lacks required cube-v1 coverage: {', '.join(missing)}",
+                        split=split,
+                    )
+                )
+        return metadata_counts, coverage
+
+    @staticmethod
     def _check_orphan_labels(
         root: Path,
         expected: Mapping[str, set[Path]],
@@ -718,7 +1599,23 @@ def validate_yolo_dataset(
     data_yaml: str | Path,
     *,
     task: str = "detect",
+    protocol: str = "generic",
 ) -> DatasetValidationReport:
     """Convenience wrapper used by CLIs and training backends."""
 
-    return YoloDatasetValidator(task=task).validate(data_yaml)
+    return YoloDatasetValidator(task=task, protocol=protocol).validate(data_yaml)
+
+
+class CubeDatasetValidator(YoloDatasetValidator):
+    """Strict validator for the public single-class ``cube-v1`` protocol."""
+
+    def __init__(self) -> None:
+        super().__init__(task="detect", protocol=_CUBE_PROTOCOL)
+
+
+# Descriptive compatibility alias for callers that include the format name.
+CubeYoloDatasetValidator = CubeDatasetValidator
+
+
+def validate_cube_yolo_dataset(data_yaml: str | Path) -> DatasetValidationReport:
+    return CubeDatasetValidator().validate(data_yaml)

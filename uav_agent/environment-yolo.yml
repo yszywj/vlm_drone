@@ -10,8 +10,9 @@ dependencies:
       - --extra-index-url https://download.pytorch.org/whl/cu126
       - torch==2.7.0+cu126
       - torchvision==0.22.0+cu126
-      # The bundled yolo26s.pt records Ultralytics 8.3.222 in its checkpoint.
-      - ultralytics==8.3.222
+      # YOLO26 was released with the expanded SPPF/C3k2 architecture in 8.4.0.
+      # The checkpoint's older self-reported version is not a compatibility pin.
+      - ultralytics==8.4.0
       # Ultralytics BoT-SORT imports LAP at runtime; pin it instead of relying
       # on Ultralytics' process-time auto-install fallback.
       - lap==0.5.13

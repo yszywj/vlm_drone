@@ -8,7 +8,7 @@ requires two independent acknowledgements.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 import json
 from math import isfinite
@@ -21,6 +21,12 @@ from PIL import Image
 import yaml
 
 from env.camera_types import CameraSample
+from training.yolo.collection_scene import (
+    CUBE_CLASS_ID,
+    CUBE_CLASS_NAME,
+    CollectionSceneObject,
+    validate_scene_inventory,
+)
 
 
 class IsaacDatasetCollectionError(RuntimeError):
@@ -312,6 +318,44 @@ class EpisodeRandomizer:
                 target_position[1] - target_camera_distance * np.sin(view_bearing_rad),
             ),
         )
+        uav_altitude = uniform(*self._bounds.uav_altitude_m)
+        uav_speed = uniform(*self._bounds.uav_speed_mps)
+        # Aim from the actual, possibly bounds-clamped UAV pose.  Reusing the
+        # pre-clamp sampling bearing can point the Camera away from the target
+        # near scene edges.  Small deterministic offsets retain off-centre
+        # examples while leaving margin for motion during the first sample.
+        actual_target_bearing_deg = np.degrees(
+            np.arctan2(target_position[1] - uav_y, target_position[0] - uav_x)
+        )
+        yaw_offset_limit_deg = min(
+            10.0,
+            0.20 * self._bounds.camera_horizontal_fov_deg[0],
+        )
+        uav_yaw_deg = (
+            actual_target_bearing_deg
+            + uniform(-yaw_offset_limit_deg, yaw_offset_limit_deg)
+            + 180.0
+        ) % 360.0 - 180.0
+        horizontal_distance_m = max(
+            1e-6,
+            float(
+                np.hypot(
+                    target_position[0] - uav_x,
+                    target_position[1] - uav_y,
+                )
+            ),
+        )
+        target_pitch_deg = np.degrees(
+            np.arctan2(target_position[2] - uav_altitude, horizontal_distance_m)
+        )
+        pitch_offset_deg = uniform(-8.0, 8.0)
+        camera_pitch_deg = min(
+            self._bounds.camera_pitch_deg[1],
+            max(
+                self._bounds.camera_pitch_deg[0],
+                target_pitch_deg + pitch_offset_deg,
+            ),
+        )
         key = EpisodeKey(
             scene_seed=self._scene_seed,
             episode_id=f"episode_{episode_index:06d}",
@@ -322,16 +366,11 @@ class EpisodeRandomizer:
             uav_position_world_m=(
                 uav_x,
                 uav_y,
-                uniform(*self._bounds.uav_altitude_m),
+                uav_altitude,
             ),
-            uav_speed_mps=uniform(*self._bounds.uav_speed_mps),
-            # A bounded offset prevents every Target from being centered.
-            uav_yaw_deg=(
-                np.degrees(view_bearing_rad) + uniform(-55.0, 55.0)
-            )
-            % 360.0
-            - 180.0,
-            camera_pitch_deg=uniform(*self._bounds.camera_pitch_deg),
+            uav_speed_mps=uav_speed,
+            uav_yaw_deg=uav_yaw_deg,
+            camera_pitch_deg=camera_pitch_deg,
             camera_horizontal_fov_deg=uniform(*self._bounds.camera_horizontal_fov_deg),
             target_position_world_m=target_position,
             target_speed_mps=uniform(*self._bounds.target_speed_mps),
@@ -351,6 +390,62 @@ class EpisodeRandomizer:
 
 
 @dataclass(frozen=True, slots=True)
+class OracleObjectTruth:
+    """Privileged projection for one rendered collection-scene object.
+
+    ``shape`` decides whether the object is a detector positive.  Object IDs
+    and colours are metadata only; they never change the YOLO class ID.
+    ``dimensions_xyz_m`` must be read from the rendered object, and the
+    projected points must be generated from those dimensions by the adapter.
+    """
+
+    object_id: str
+    shape: str
+    color_name: str
+    position_world_m: tuple[float, float, float]
+    orientation_world_wxyz: tuple[float, float, float, float]
+    dimensions_xyz_m: tuple[float, float, float]
+    projected_pixels_uv: np.ndarray
+    projected_depth_m: np.ndarray
+    occlusion_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        scene_object = CollectionSceneObject(
+            object_id=self.object_id,
+            shape=self.shape,
+            color_name=self.color_name,
+            position_world_m=self.position_world_m,
+            orientation_world_wxyz=self.orientation_world_wxyz,
+            dimensions_xyz_m=self.dimensions_xyz_m,
+        )
+        object.__setattr__(self, "object_id", scene_object.object_id)
+        object.__setattr__(self, "shape", scene_object.shape)
+        object.__setattr__(self, "color_name", scene_object.color_name)
+        pixels = np.asarray(self.projected_pixels_uv, dtype=np.float64)
+        depths = np.asarray(self.projected_depth_m, dtype=np.float64)
+        if pixels.ndim != 2 or pixels.shape[0] < 2 or pixels.shape[1] != 2:
+            raise ValueError("projected object pixels must have shape (N, 2), N >= 2")
+        if depths.shape != (pixels.shape[0],):
+            raise ValueError("projected object depths must have shape (N,)")
+        object.__setattr__(self, "projected_pixels_uv", pixels)
+        object.__setattr__(self, "projected_depth_m", depths)
+        if self.occlusion_ratio is not None:
+            ratio = _finite(self.occlusion_ratio, "occlusion_ratio")
+            if not 0.0 <= ratio <= 1.0:
+                raise ValueError("occlusion_ratio must be in [0, 1]")
+
+    def as_scene_object(self) -> CollectionSceneObject:
+        return CollectionSceneObject(
+            object_id=self.object_id,
+            shape=self.shape,
+            color_name=self.color_name,
+            position_world_m=self.position_world_m,
+            orientation_world_wxyz=self.orientation_world_wxyz,
+            dimensions_xyz_m=self.dimensions_xyz_m,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class OracleFrameTruth:
     """Privileged truth paired with one atomic Camera sample.
 
@@ -359,15 +454,21 @@ class OracleFrameTruth:
     """
 
     camera_sample: CameraSample
-    target_position_world_m: tuple[float, float, float] | None
-    target_orientation_world_wxyz: tuple[float, float, float, float] | None
-    projected_target_pixels_uv: np.ndarray | None
-    projected_target_depth_m: np.ndarray | None
-    occlusion_ratio: float | None
+    target_position_world_m: tuple[float, float, float] | None = None
+    target_orientation_world_wxyz: tuple[float, float, float, float] | None = None
+    projected_target_pixels_uv: np.ndarray | None = None
+    projected_target_depth_m: np.ndarray | None = None
+    occlusion_ratio: float | None = None
+    objects: tuple[OracleObjectTruth, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.camera_sample, CameraSample):
             raise TypeError("camera_sample must be a CameraSample")
+        if not isinstance(self.objects, tuple) or any(
+            not isinstance(item, OracleObjectTruth) for item in self.objects
+        ):
+            raise TypeError("objects must be a tuple of OracleObjectTruth")
+        validate_scene_inventory(tuple(item.as_scene_object() for item in self.objects))
         absent = self.target_position_world_m is None
         if absent != (self.target_orientation_world_wxyz is None):
             raise ValueError("target position and orientation must be provided together")
@@ -375,6 +476,8 @@ class OracleFrameTruth:
             if self.projected_target_pixels_uv is not None or self.projected_target_depth_m is not None:
                 raise ValueError("negative samples cannot contain projected Target truth")
         else:
+            if self.objects:
+                raise ValueError("legacy target truth and objects cannot be mixed")
             pixels = np.asarray(self.projected_target_pixels_uv)
             depths = np.asarray(self.projected_target_depth_m)
             if pixels.ndim != 2 or pixels.shape[0] < 2 or pixels.shape[1] != 2:
@@ -400,10 +503,53 @@ class ProjectedYoloLabel:
     visibility: str
 
     def yolo_line(self) -> str:
+        center_x, width = self._serialized_axis(self.center_x, self.width)
+        center_y, height = self._serialized_axis(self.center_y, self.height)
         return (
-            f"{self.class_id} {self.center_x:.8f} {self.center_y:.8f} "
-            f"{self.width:.8f} {self.height:.8f}\n"
+            f"{self.class_id} {center_x} {center_y} {width} {height}\n"
         )
+
+    @staticmethod
+    def _serialized_axis(center: float, size: float) -> tuple[str, str]:
+        """Serialize one YOLO axis without rounding a clipped box out of frame.
+
+        Independently rounding center and size can turn an exact edge such as
+        ``center == size / 2`` into a tiny negative coordinate.  Quantize both
+        on one decimal grid and, only at an image edge, shrink the size by at
+        most a few grid units so the text representation remains strictly
+        inside ``[0, 1]`` when parsed as floats.
+        """
+
+        precision = 10
+        scale = 10**precision
+        center_value = _finite(center, "ProjectedYoloLabel center")
+        size_value = _finite(size, "ProjectedYoloLabel size")
+        boundary_tolerance = 1e-12
+        if not 0.0 <= center_value <= 1.0 or size_value <= 0.0:
+            raise IsaacDatasetCollectionError(
+                "projected YOLO center must be in [0, 1] and size must be positive"
+            )
+        if (
+            center_value - size_value / 2.0 < -boundary_tolerance
+            or center_value + size_value / 2.0 > 1.0 + boundary_tolerance
+        ):
+            raise IsaacDatasetCollectionError(
+                "projected YOLO box extends outside the normalized image"
+            )
+
+        center_i = int(round(center_value * scale))
+        size_i = int(round(size_value * scale))
+        maximum_size_i = 2 * min(center_i, scale - center_i) - 1
+        size_i = min(size_i, maximum_size_i)
+        if size_i <= 0:
+            raise IsaacDatasetCollectionError(
+                "projected YOLO box is too close to an image edge to serialize safely"
+            )
+
+        def decimal_text(value: int) -> str:
+            return f"{value // scale}.{value % scale:0{precision}d}"
+
+        return decimal_text(center_i), decimal_text(size_i)
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,6 +787,31 @@ def project_oracle_bbox(
     )
 
 
+def project_oracle_object_bbox(
+    camera_sample: CameraSample,
+    obj: OracleObjectTruth,
+    *,
+    class_id: int = CUBE_CLASS_ID,
+    min_bbox_area_px: float,
+) -> ProjectionDecision:
+    """Project one inventory object using its adapter-supplied real geometry."""
+
+    if not isinstance(obj, OracleObjectTruth):
+        raise TypeError("obj must be an OracleObjectTruth")
+    return project_oracle_bbox(
+        OracleFrameTruth(
+            camera_sample=camera_sample,
+            target_position_world_m=obj.position_world_m,
+            target_orientation_world_wxyz=obj.orientation_world_wxyz,
+            projected_target_pixels_uv=obj.projected_pixels_uv,
+            projected_target_depth_m=obj.projected_depth_m,
+            occlusion_ratio=obj.occlusion_ratio,
+        ),
+        class_id=class_id,
+        min_bbox_area_px=min_bbox_area_px,
+    )
+
+
 @runtime_checkable
 class IsaacCollectionAdapter(Protocol):
     """Adapter implemented only after ``SimulationApp`` has been created."""
@@ -683,6 +854,7 @@ class IsaacYoloDatasetCollector:
         scene_seed: int,
         oracle_label_generation: bool,
         acknowledge_privileged_oracle: bool,
+        cube_protocol: bool | None = None,
     ) -> None:
         require_oracle_label_acknowledgements(
             oracle_label_generation=oracle_label_generation,
@@ -697,9 +869,17 @@ class IsaacYoloDatasetCollector:
             raise ValueError("class_names must be unique non-empty strings")
         if isinstance(class_id, bool) or not isinstance(class_id, int) or not 0 <= class_id < len(names):
             raise ValueError("class_id must index class_names")
+        strict_cube = names == (CUBE_CLASS_NAME,) and class_id == CUBE_CLASS_ID
+        if cube_protocol is not None:
+            if not isinstance(cube_protocol, bool):
+                raise TypeError("cube_protocol must be a bool or None")
+            strict_cube = cube_protocol
+        if strict_cube and (names != (CUBE_CLASS_NAME,) or class_id != CUBE_CLASS_ID):
+            raise ValueError("cube protocol requires exactly class_names=('cube',), class_id=0")
         self._output_dir = Path(output_dir).expanduser().resolve()
         self._class_names = names
         self._class_id = class_id
+        self._cube_protocol = strict_cube
         self._limits = limits
         self._randomizer = EpisodeRandomizer(bounds, scene_seed=scene_seed)
 
@@ -710,12 +890,28 @@ class IsaacYoloDatasetCollector:
         manifest_path = self._output_dir / "manifest.jsonl"
         total = positive = positive_samples = partial = negative = clipped = too_small = 0
         split_counts = {"train": 0, "val": 0, "test": 0}
+        cube_split_bootstrap = {"train": 0, "val": 0, "test": 0}
         with manifest_path.open("w", encoding="utf-8") as manifest:
             for episode_index in range(self._limits.max_episodes):
                 if total >= self._limits.max_samples:
                     break
                 plan = self._randomizer.plan(episode_index)
                 split = split_for_episode(plan.key, self._limits)
+                if self._cube_protocol and cube_split_bootstrap[split] < 3:
+                    # Each grouped split receives one complete positive,
+                    # partial-occlusion, and hard-negative episode before the
+                    # configured random fractions take over.  This does not
+                    # leak groups across splits and makes strict coverage a
+                    # collection invariant rather than a lucky seed outcome.
+                    plan = replace(
+                        plan,
+                        sample_kind=(
+                            "positive",
+                            "partial_occlusion",
+                            "negative",
+                        )[cube_split_bootstrap[split]],
+                    )
+                    cube_split_bootstrap[split] += 1
                 adapter.begin_episode(plan)
                 for episode_frame_index in range(self._limits.frames_per_episode):
                     if total >= self._limits.max_samples:
@@ -723,34 +919,51 @@ class IsaacYoloDatasetCollector:
                     adapter.advance_to_next_sample(1.0 / self._limits.sample_hz)
                     frame_id = f"{plan.key.episode_id}_frame_{episode_frame_index:06d}"
                     truth = adapter.capture_oracle_frame(frame_id)
-                    decision = project_oracle_bbox(
-                        truth,
-                        class_id=self._class_id,
-                        min_bbox_area_px=self._limits.min_bbox_area_px,
+                    decisions = self._project_frame(truth)
+                    label_decisions = tuple(
+                        decision
+                        for obj, decision in decisions
+                        if decision.label is not None
+                        and (obj is None or obj.shape == CUBE_CLASS_NAME)
                     )
-                    self._write_sample(split, frame_id, truth, decision)
+                    self._write_sample(
+                        split,
+                        frame_id,
+                        plan,
+                        truth,
+                        decisions,
+                    )
                     record = self._manifest_record(
                         split=split,
                         frame_id=frame_id,
                         plan=plan,
                         truth=truth,
-                        decision=decision,
+                        decisions=decisions,
                     )
                     manifest.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                     total += 1
                     split_counts[split] += 1
-                    positive += int(decision.label is not None)
-                    positive_samples += int(
-                        plan.sample_kind == "positive" and decision.label is not None
-                    )
+                    positive += len(label_decisions)
+                    positive_samples += int(bool(label_decisions))
                     partial += int(
-                        plan.sample_kind == "partial_occlusion"
-                        and decision.label is not None
-                        and decision.visibility == "partially_occluded"
+                        any(
+                            decision.visibility == "partially_occluded"
+                            for decision in label_decisions
+                        )
                     )
-                    negative += int(decision.visibility == "negative")
-                    clipped += int(decision.visibility == "edge_clipped")
-                    too_small += int(decision.visibility == "too_small")
+                    negative += int(
+                        not (
+                            any(obj.shape == CUBE_CLASS_NAME for obj in truth.objects)
+                            if truth.objects
+                            else truth.target_position_world_m is not None
+                        )
+                    )
+                    clipped += int(
+                        any(decision.visibility == "edge_clipped" for decision in label_decisions)
+                    )
+                    too_small += int(
+                        any(decision.visibility == "too_small" for _, decision in decisions)
+                    )
         self._finalize_dataset(
             split_counts,
             positive_samples=positive_samples,
@@ -779,16 +992,55 @@ class IsaacYoloDatasetCollector:
         for split in ("train", "val", "test"):
             (self._output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
             (self._output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+            (self._output_dir / "metadata" / split).mkdir(parents=True, exist_ok=True)
+
+    def _project_frame(
+        self,
+        truth: OracleFrameTruth,
+    ) -> tuple[tuple[OracleObjectTruth | None, ProjectionDecision], ...]:
+        if not isinstance(truth, OracleFrameTruth):
+            raise TypeError("adapter must return OracleFrameTruth")
+        if truth.objects:
+            return tuple(
+                (
+                    obj,
+                    project_oracle_object_bbox(
+                        truth.camera_sample,
+                        obj,
+                        class_id=CUBE_CLASS_ID,
+                        min_bbox_area_px=self._limits.min_bbox_area_px,
+                    ),
+                )
+                for obj in truth.objects
+            )
+        if self._cube_protocol and truth.target_position_world_m is not None:
+            raise IsaacDatasetCollectionError(
+                "cube-v1 adapters must enumerate every rendered object in "
+                "OracleFrameTruth.objects; legacy single-target truth cannot prove "
+                "that no cube was left unlabelled"
+            )
+        return (
+            (
+                None,
+                project_oracle_bbox(
+                    truth,
+                    class_id=self._class_id,
+                    min_bbox_area_px=self._limits.min_bbox_area_px,
+                ),
+            ),
+        )
 
     def _write_sample(
         self,
         split: str,
         frame_id: str,
+        plan: EpisodeRandomization,
         truth: OracleFrameTruth,
-        decision: ProjectionDecision,
+        decisions: Sequence[tuple[OracleObjectTruth | None, ProjectionDecision]],
     ) -> None:
         image_path = self._output_dir / "images" / split / f"{frame_id}.jpg"
         label_path = self._output_dir / "labels" / split / f"{frame_id}.txt"
+        metadata_path = self._output_dir / "metadata" / split / f"{frame_id}.json"
         Image.fromarray(truth.camera_sample.rgb).save(
             image_path,
             format="JPEG",
@@ -796,7 +1048,29 @@ class IsaacYoloDatasetCollector:
             optimize=True,
         )
         label_path.write_text(
-            "" if decision.label is None else decision.label.yolo_line(),
+            "".join(
+                decision.label.yolo_line()
+                for obj, decision in decisions
+                if decision.label is not None
+                and (obj is None or obj.shape == CUBE_CLASS_NAME)
+            ),
+            encoding="utf-8",
+        )
+        metadata_path.write_text(
+            json.dumps(
+                self._metadata_record(
+                    split=split,
+                    frame_id=frame_id,
+                    plan=plan,
+                    truth=truth,
+                    decisions=decisions,
+                ),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n",
             encoding="utf-8",
         )
 
@@ -852,6 +1126,28 @@ class IsaacYoloDatasetCollector:
                 "--scene-seed, then collect into a new output directory"
             )
         self._write_dataset_yaml()
+        if self._cube_protocol:
+            # Import lazily to keep the simulator-neutral module graph small.
+            from training.yolo.dataset import CubeDatasetValidator
+
+            try:
+                report = CubeDatasetValidator().validate(
+                    self._output_dir / "data.yaml"
+                )
+                report.write_statistics()
+            except (OSError, ValueError) as exc:
+                raise IsaacDatasetCollectionError(
+                    f"cube-v1 final dataset validation could not run: {exc}"
+                ) from exc
+            if not report.ok:
+                rendered = ", ".join(
+                    dict.fromkeys(issue.code for issue in report.errors)
+                )
+                raise IsaacDatasetCollectionError(
+                    "cube-v1 final dataset validation failed closed: "
+                    + rendered
+                    + "; inspect statistics.json and collect into a new output directory"
+                )
 
     def _manifest_record(
         self,
@@ -860,9 +1156,11 @@ class IsaacYoloDatasetCollector:
         frame_id: str,
         plan: EpisodeRandomization,
         truth: OracleFrameTruth,
-        decision: ProjectionDecision,
+        decisions: Sequence[tuple[OracleObjectTruth | None, ProjectionDecision]],
     ) -> dict[str, Any]:
-        label = decision.label
+        primary_decision = decisions[0][1]
+        label = primary_decision.label
+        objects = self._metadata_objects(truth, decisions)
         return {
             "schema_version": 1,
             "oracle_label_generation": True,
@@ -885,14 +1183,70 @@ class IsaacYoloDatasetCollector:
                 "position_world_m": list(truth.target_position_world_m),
                 "orientation_world_wxyz": list(truth.target_orientation_world_wxyz or ()),
             },
-            "visibility": decision.visibility,
-            "occlusion_ratio": decision.occlusion_ratio,
+            "visibility": primary_decision.visibility,
+            "occlusion_ratio": primary_decision.occlusion_ratio,
             "class_id": self._class_id,
             "bbox_xyxy_px": None if label is None else list(label.bbox_xyxy_px),
-            "raw_bbox_area_px": decision.raw_area_px,
-            "clipped_bbox_area_px": decision.clipped_area_px,
+            "raw_bbox_area_px": primary_decision.raw_area_px,
+            "clipped_bbox_area_px": primary_decision.clipped_area_px,
+            "objects": objects,
             "randomization": plan.to_manifest_dict(),
         }
+
+    def _metadata_record(
+        self,
+        *,
+        split: str,
+        frame_id: str,
+        plan: EpisodeRandomization,
+        truth: OracleFrameTruth,
+        decisions: Sequence[tuple[OracleObjectTruth | None, ProjectionDecision]],
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "split": split,
+            "scene_seed": plan.key.scene_seed,
+            "episode_id": plan.key.episode_id,
+            "trajectory_id": plan.key.trajectory_id,
+            "frame_id": frame_id,
+            "objects": self._metadata_objects(truth, decisions),
+        }
+
+    def _metadata_objects(
+        self,
+        truth: OracleFrameTruth,
+        decisions: Sequence[tuple[OracleObjectTruth | None, ProjectionDecision]],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for obj, decision in decisions:
+            if obj is None:
+                if truth.target_position_world_m is None:
+                    continue
+                shape = self._class_names[self._class_id]
+                object_id = "legacy_target"
+                color_name = "unknown"
+                is_positive = True
+            else:
+                shape = obj.shape
+                object_id = obj.object_id
+                color_name = obj.color_name
+                is_positive = obj.shape == CUBE_CLASS_NAME
+            label = decision.label
+            records.append(
+                {
+                    "object_id": object_id,
+                    "shape": shape,
+                    "color_name": color_name,
+                    "detector_class_id": self._class_id if is_positive else None,
+                    "detector_class_name": self._class_names[self._class_id]
+                    if is_positive
+                    else None,
+                    "bbox": None if label is None else list(label.bbox_xyxy_px),
+                    "visibility": decision.visibility,
+                    "occlusion_ratio": decision.occlusion_ratio,
+                }
+            )
+        return records
 
 
 __all__ = [
@@ -906,11 +1260,13 @@ __all__ = [
     "IsaacDatasetCollectionError",
     "IsaacYoloDatasetCollector",
     "OracleFrameTruth",
+    "OracleObjectTruth",
     "ProjectedYoloLabel",
     "ProjectionDecision",
     "RandomizationBounds",
     "estimate_depth_visibility",
     "project_oracle_bbox",
+    "project_oracle_object_bbox",
     "require_oracle_label_acknowledgements",
     "split_for_episode",
 ]

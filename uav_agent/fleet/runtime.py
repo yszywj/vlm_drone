@@ -95,6 +95,207 @@ _STARTABLE_ASSIGNMENT_STATES = frozenset(
     }
 )
 
+_ADDITIVE_PERCEPTION_METRICS = frozenset(
+    {
+        "oracle_visible_frames",
+        "oracle_total_frames",
+        "yolo_requests",
+        "yolo_successful_responses",
+        "yolo_timeouts",
+        "yolo_response_errors",
+        "yolo_stale_results",
+        "yolo_dropped_frames",
+        "detections_total",
+        "candidates_total",
+        "candidates_rejected",
+        "candidates_confirmed",
+        "track_id_switches",
+        "track_fragmentations",
+        "target_visible_frames",
+        "target_total_frames",
+        "target_lost_count",
+        "reacquire_attempts",
+        "reacquire_successes",
+        "depth_resolution_failures",
+        "qwen_attribute_fallback_count",
+        "yolo_latency_sample_count",
+        "position_measurement_age_count",
+        "position_error_sample_count",
+        "velocity_error_sample_count",
+        "attribute_evidence_log_errors",
+        "observations_total",
+        "evidence_match",
+        "evidence_mismatch",
+        "evidence_pending",
+        "evidence_unsupported",
+        "semantic_match",
+        "semantic_mismatch",
+        "semantic_pending",
+        "qwen_fallback_required",
+        "tracker_epoch_resets",
+        "candidate_epoch_resets",
+        "color_observations",
+        "color_matches",
+        "color_mismatches",
+        "color_pending",
+        "qwen_attribute_fallback_required",
+    }
+)
+
+
+def _merge_perception_metric_segments(
+    segments: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    """Merge bounded metrics across assignment-scoped runtime replacements."""
+
+    if not segments:
+        return {}
+    normalized = [dict(segment) for segment in segments]
+    modes = {
+        str(segment.get("mode", "legacy")) for segment in normalized
+    }
+    backends = {
+        str(segment.get("backend", "unknown")) for segment in normalized
+    }
+    result: dict[str, object] = {
+        "mode": str(normalized[-1].get("mode", "legacy")),
+        "backend": str(normalized[-1].get("backend", "unknown")),
+        "perception_segment_count": len(normalized),
+        "mode_transition_detected": len(modes) > 1 or len(backends) > 1,
+    }
+    keys = set().union(*(segment.keys() for segment in normalized))
+    keys.difference_update({"mode", "backend"})
+    for key in sorted(keys):
+        values = [segment.get(key) for segment in normalized]
+        if key in _ADDITIVE_PERCEPTION_METRICS:
+            numeric = [
+                value
+                for value in values
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and isfinite(float(value))
+            ]
+            result[key] = sum(numeric) if numeric else 0
+            continue
+        for value in reversed(values):
+            if value is not None:
+                result[key] = value
+                break
+        else:
+            result[key] = None
+
+    def weighted_mean(
+        value_key: str,
+        weight_key: str,
+    ) -> float | None:
+        numerator = 0.0
+        denominator = 0.0
+        for segment in normalized:
+            value = segment.get(value_key)
+            weight = segment.get(weight_key)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and isfinite(float(value))
+                and isinstance(weight, (int, float))
+                and not isinstance(weight, bool)
+                and isfinite(float(weight))
+                and float(weight) > 0.0
+            ):
+                numerator += float(value) * float(weight)
+                denominator += float(weight)
+        return None if denominator == 0.0 else numerator / denominator
+
+    def combined_rmse(value_key: str, count_key: str) -> float | None:
+        squared_sum = 0.0
+        count = 0.0
+        for segment in normalized:
+            value = segment.get(value_key)
+            sample_count = segment.get(count_key)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and isfinite(float(value))
+                and isinstance(sample_count, (int, float))
+                and not isinstance(sample_count, bool)
+                and isfinite(float(sample_count))
+                and float(sample_count) > 0.0
+            ):
+                squared_sum += float(value) ** 2 * float(sample_count)
+                count += float(sample_count)
+        return None if count == 0.0 else (squared_sum / count) ** 0.5
+
+    latency_mean = weighted_mean(
+        "yolo_inference_latency_ms_mean",
+        "yolo_latency_sample_count",
+    )
+    if "yolo_inference_latency_ms_mean" in keys:
+        result["yolo_inference_latency_ms_mean"] = latency_mean
+    age_mean = weighted_mean(
+        "position_measurement_age_mean",
+        "position_measurement_age_count",
+    )
+    if "position_measurement_age_mean" in keys:
+        result["position_measurement_age_mean"] = age_mean
+    for value_key, count_key in (
+        ("position_rmse_m", "position_error_sample_count"),
+        ("velocity_rmse_mps", "velocity_error_sample_count"),
+    ):
+        if value_key in keys:
+            combined = combined_rmse(value_key, count_key)
+            if combined is not None:
+                result[value_key] = combined
+
+    latency_p95 = [
+        float(segment["yolo_inference_latency_ms_p95"])
+        for segment in normalized
+        if isinstance(segment.get("yolo_inference_latency_ms_p95"), (int, float))
+        and not isinstance(segment.get("yolo_inference_latency_ms_p95"), bool)
+        and isfinite(float(segment["yolo_inference_latency_ms_p95"]))
+    ]
+    if "yolo_inference_latency_ms_p95" in keys:
+        result["yolo_inference_latency_ms_p95"] = (
+            None if not latency_p95 else max(latency_p95)
+        )
+    first_visible = [
+        float(segment["time_to_first_oracle_visibility_s"])
+        for segment in normalized
+        if isinstance(
+            segment.get("time_to_first_oracle_visibility_s"),
+            (int, float),
+        )
+        and not isinstance(
+            segment.get("time_to_first_oracle_visibility_s"),
+            bool,
+        )
+        and isfinite(float(segment["time_to_first_oracle_visibility_s"]))
+    ]
+    if "time_to_first_oracle_visibility_s" in keys:
+        result["time_to_first_oracle_visibility_s"] = (
+            None if not first_visible else min(first_visible)
+        )
+    oracle_total = result.get("oracle_total_frames")
+    oracle_visible = result.get("oracle_visible_frames")
+    if isinstance(oracle_total, (int, float)) and isinstance(
+        oracle_visible,
+        (int, float),
+    ):
+        result["oracle_visible_ratio"] = (
+            0.0 if float(oracle_total) == 0.0
+            else float(oracle_visible) / float(oracle_total)
+        )
+    target_total = result.get("target_total_frames")
+    target_visible = result.get("target_visible_frames")
+    if isinstance(target_total, (int, float)) and isinstance(
+        target_visible,
+        (int, float),
+    ):
+        result["target_visible_ratio"] = (
+            0.0 if float(target_total) == 0.0
+            else float(target_visible) / float(target_total)
+        )
+    return result
+
 
 @dataclass(frozen=True, slots=True)
 class AssignmentRuntimeRecord:
@@ -522,6 +723,9 @@ class FleetMissionRuntime:
                 self._precomputed_start_inputs[uav_id] = raw_value
         self._world_context_factory = world_context_factory
         self._perceptions = {} if perceptions is None else dict(perceptions)
+        self._retired_perception_metric_segments: dict[
+            str, list[dict[str, object]]
+        ] = {}
         if set(self._perceptions) - set(self.agents):
             raise FleetRuntimeError("perceptions contains an unknown UAV")
         self._planned_routes: dict[str, tuple[tuple[float, float, float], ...]] = {}
@@ -1002,7 +1206,7 @@ class FleetMissionRuntime:
             raise FleetRuntimeError("repaired assignment has no trusted start input")
         self.agents[uav_id] = agent
         if perception is not None:
-            self._perceptions[uav_id] = perception
+            self._install_perception(uav_id, perception)
         if planned_route is not None:
             validated = FleetUavPose(
                 uav_id=uav_id,
@@ -1412,13 +1616,26 @@ class FleetMissionRuntime:
         self._assignment_requiredness = staged_requiredness
         self._plan = new_plan
         self._request = new_request
+        # A cross-UAV handoff transfers target authority away from the failed
+        # vehicle.  Remove and close its assignment-scoped provider before
+        # publishing the replacement provider so an old Oracle evaluator
+        # binding or YOLO stream cannot remain usable after replan.
+        for item in replacements:
+            source_uav_id = current_records[
+                item.assignment_id
+            ].assignment.uav_id
+            replacement_uav_id = proposed_by_source[
+                item.assignment_id
+            ].uav_id
+            if source_uav_id != replacement_uav_id:
+                self._retire_perception(source_uav_id)
         for item in replacements:
             assignment = proposed_by_source[item.assignment_id]
             uav_id = assignment.uav_id
             self.agents[uav_id] = item.agent
             self._agent_start_inputs[uav_id] = item.start_input
             if item.perception is not None:
-                self._perceptions[uav_id] = item.perception
+                self._install_perception(uav_id, item.perception)
             if item.planned_route:
                 self._planned_routes[uav_id] = item.planned_route
                 self._route_progress[uav_id] = 0
@@ -1438,6 +1655,7 @@ class FleetMissionRuntime:
             # Logging is not part of flight authority and cannot roll back an
             # already validated/published Fleet plan.
             pass
+
         write_plan = self._runtime_plan_log_method()
         if callable(write_plan):
             try:
@@ -1445,6 +1663,60 @@ class FleetMissionRuntime:
             except Exception:
                 pass
         return tuple(sorted(replacement_ids))
+
+    def _install_perception(self, uav_id: str, perception: object) -> None:
+        """Publish one provider and retire the previous assignment binding."""
+
+        previous = self._perceptions.get(uav_id)
+        self._perceptions[uav_id] = perception
+        if previous is None or previous is perception:
+            return
+        self._close_perception_binding(uav_id, previous)
+
+    def _retire_perception(self, uav_id: str) -> None:
+        """Remove target authority from a UAV during cross-UAV handoff."""
+
+        previous = self._perceptions.pop(uav_id, None)
+        if previous is None:
+            return
+        self._close_perception_binding(uav_id, previous)
+
+    def _close_perception_binding(
+        self,
+        uav_id: str,
+        perception: object,
+    ) -> None:
+        """Best-effort cleanup that never masks the trusted replan result."""
+
+        try:
+            segment = self._perception_metric_segment(perception)
+            self._retired_perception_metric_segments.setdefault(
+                uav_id,
+                [],
+            ).append(segment)
+        except Exception as exc:
+            try:
+                self._event(
+                    "PERCEPTION_METRICS_SNAPSHOT_FAILED",
+                    uav_id=uav_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+        close = getattr(perception, "close", None)
+        if not callable(close):
+            return
+        try:
+            close()
+        except Exception as exc:
+            try:
+                self._event(
+                    "PERCEPTION_CLEANUP_FAILED",
+                    uav_id=uav_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
 
     def _cancel_landing_overrides(
         self,
@@ -1572,6 +1844,27 @@ class FleetMissionRuntime:
     def close(self) -> None:
         if self._closed:
             return
+        seen_perceptions: set[int] = set()
+        for uav_id, perception in self._perceptions.items():
+            identity = id(perception)
+            if identity in seen_perceptions:
+                continue
+            seen_perceptions.add(identity)
+            close_perception = getattr(perception, "close", None)
+            if callable(close_perception):
+                try:
+                    close_perception()
+                except Exception as exc:
+                    # Cleanup is observational and must never replace the
+                    # mission's primary terminal result.
+                    try:
+                        self._event(
+                            "PERCEPTION_CLEANUP_FAILED",
+                            uav_id=uav_id,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    except Exception:
+                        pass
         for agent in self.agents.values():
             close = getattr(agent, "close", None)
             if callable(close):
@@ -1611,6 +1904,41 @@ class FleetMissionRuntime:
             events=tuple(self._events),
             last_error=self._last_error,
         )
+
+    def perception_metrics_snapshot(self) -> dict[str, dict[str, object]]:
+        """Return bounded scalar provider diagnostics, never retained frames."""
+
+        result: dict[str, dict[str, object]] = {}
+        uav_ids = set(self._retired_perception_metric_segments).union(
+            self._perceptions
+        )
+        for uav_id in sorted(uav_ids):
+            segments = list(
+                self._retired_perception_metric_segments.get(uav_id, ())
+            )
+            current = self._perceptions.get(uav_id)
+            if current is not None:
+                segments.append(self._perception_metric_segment(current))
+            result[uav_id] = _merge_perception_metric_segments(segments)
+        return result
+
+    @staticmethod
+    def _perception_metric_segment(perception: object) -> dict[str, object]:
+        metrics_method = getattr(perception, "metrics", None)
+        raw_metrics = metrics_method() if callable(metrics_method) else {}
+        if not isinstance(raw_metrics, Mapping):
+            raise FleetRuntimeError("perception metrics must be a mapping")
+        return {
+            "mode": _enum_text(getattr(perception, "mode", "legacy")).lower(),
+            "backend": str(
+                getattr(
+                    perception,
+                    "backend_name",
+                    getattr(perception, "target_perception_backend", "unknown"),
+                )
+            ),
+            **dict(raw_metrics),
+        }
 
     def _make_request(
         self,
@@ -1757,6 +2085,7 @@ class FleetMissionRuntime:
 
     def _start_agent(self, uav_id: str, assignment: FleetAssignment) -> None:
         agent = self.agents[uav_id]
+        self._reset_target_perception_runtime(uav_id, assignment)
         focused, context = self._agent_start_inputs[uav_id]
         start_assignment = getattr(agent, "start_assignment", None)
         if callable(start_assignment):
@@ -1780,6 +2109,30 @@ class FleetMissionRuntime:
             start(focused, context)
         else:
             start(focused)
+
+    def _reset_target_perception_runtime(
+        self,
+        uav_id: str,
+        assignment: FleetAssignment,
+    ) -> None:
+        """Bind a unified provider to exactly the Assignment being started."""
+
+        perception = self._perceptions.get(uav_id)
+        reset = getattr(perception, "reset", None)
+        mode = _enum_text(getattr(perception, "mode", ""))
+        if mode.lower() not in {"oracle", "yolo"}:
+            return
+        if not callable(reset):
+            raise FleetRuntimeError("target perception runtime must provide reset()")
+        if self._request is None:
+            raise FleetRuntimeError("target perception reset requires Fleet request")
+        reset(
+            mission_id=self._request.fleet_mission_id,
+            assignment_id=assignment.assignment_id,
+            uav_id=uav_id,
+            target_alias=assignment.target_alias,
+            target_spec=assignment.target_spec,
+        )
 
     def _advance_environment(self) -> object | None:
         barrier_method = getattr(self.environment, "step_fleet_barrier", None)
@@ -1871,10 +2224,53 @@ class FleetMissionRuntime:
             observations = barrier.get("agent_observations")
         elif barrier is not None:
             observations = getattr(barrier, "agent_observations", None)
-        if isinstance(observations, Mapping) and uav_id in observations:
-            return observations[uav_id]
         perception = self._perceptions.get(uav_id)
         if perception is not None:
+            provider_mode = _enum_text(getattr(perception, "mode", "")).lower()
+            if provider_mode in {"oracle", "yolo"}:
+                runtime_observe = getattr(perception, "observe", None)
+                if not callable(runtime_observe):
+                    raise TypeError(
+                        "target perception runtime must provide observe()"
+                    )
+                input_getter = getattr(
+                    self.environment,
+                    "get_target_perception_input",
+                    None,
+                )
+                if callable(input_getter):
+                    synchronized = input_getter(uav_id)
+                    base_observation = getattr(
+                        synchronized,
+                        "base_observation",
+                        None,
+                    )
+                    camera_sample = getattr(synchronized, "camera_sample", None)
+                else:
+                    raw_getter = getattr(
+                        self.environment,
+                        "get_skill_observation",
+                        None,
+                    )
+                    if not callable(raw_getter):
+                        raise FleetRuntimeError(
+                            "target perception runtime requires agent observation API"
+                        )
+                    base_observation = raw_getter(
+                        uav_id,
+                        include_oracle=False,
+                    )
+                    camera_sample = None
+                manager = getattr(self.agents[uav_id], "target_manager", None)
+                if manager is None:
+                    raise FleetRuntimeError(
+                        "MissionAgent must expose target_manager to perception runtime"
+                    )
+                return runtime_observe(
+                    base_observation=base_observation,
+                    camera_sample=camera_sample,
+                    target_manager=manager,
+                )
             inner_backend = getattr(perception, "backend", perception)
             if assignment.assignment_id in self._non_target_assignment_ids:
                 if getattr(inner_backend, "target_id", None) is not None:
@@ -1911,6 +2307,8 @@ class FleetMissionRuntime:
                     raise FleetRuntimeError("vision perception requires agent observation API")
                 source = raw_getter(uav_id)
             return observe(source)
+        if isinstance(observations, Mapping) and uav_id in observations:
+            return observations[uav_id]
         getter = getattr(self.environment, "get_agent_observation", None)
         if callable(getter):
             return getter(uav_id)

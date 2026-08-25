@@ -941,17 +941,6 @@ class SearchSkill(Skill):
             "visited_viewpoints": tuple(self._visited_viewpoints),
             "search_exhausted_reason": None,
         }
-        if estimate.source == "oracle_evaluation" and estimate.position_world_m is not None:
-            # Stable result-key compatibility for evaluator regression reports;
-            # the values still come from the neutral estimate above.
-            data["oracle_target_pose"] = {
-                "x": estimate.position_world_m[0],
-                "y": estimate.position_world_m[1],
-                "z": estimate.position_world_m[2],
-                "yaw": 0.0,
-            }
-            if estimate.velocity_world_mps is not None:
-                data["oracle_target_velocity_mps"] = estimate.velocity_world_mps
         self._reported_phase = SearchPhase.TARGET_LOCKED
         self._set_feedback(
             self._overall_progress(),

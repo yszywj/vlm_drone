@@ -12,6 +12,7 @@ import re
 from threading import RLock
 
 from common.ids import validate_mission_id, validate_routing_id, validate_uav_id
+from fleet.strict_json import strict_json_object_loads
 
 
 _FORBIDDEN_LOG_KEYS = frozenset(
@@ -332,7 +333,15 @@ class FleetMissionLogger:
         if path.exists():
             self._validate_regular_stream(path)
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload = strict_json_object_loads(path.read_text(encoding="utf-8"))
+                if set(payload) != {
+                    "schema_version",
+                    "generation",
+                    "dropped_records",
+                    "untracked_dropped_record_count",
+                    "truncated_streams",
+                } or payload.get("schema_version") != 1:
+                    raise ValueError("invalid fleet logger storage sidecar schema")
                 dropped = payload.get("dropped_records", {})
                 truncated = payload.get("truncated_streams", [])
                 if not isinstance(dropped, dict) or not isinstance(truncated, list):

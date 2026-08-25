@@ -5,7 +5,10 @@ import json
 
 import pytest
 
-from experiments.fleet_result_recorder import FleetResultRecorder
+from experiments.fleet_result_recorder import (
+    FleetResultRecorder,
+    ResultRecorderError,
+)
 from experiments.planning_audit_logger import prompt_sha256
 from experiments.schemas import (
     GoalResultRecord,
@@ -18,6 +21,27 @@ from experiments.schemas import (
 def _rows(path):
     with path.open(encoding="utf-8", newline="") as stream:
         return list(csv.DictReader(stream))
+
+
+def _attribute_evidence(**updates):
+    payload = {
+        "timestamp_s": 12.4,
+        "uav_id": "uav_a",
+        "assignment_id": "assignment_x",
+        "candidate_id": "candidate_x",
+        "tracker_id": "track_3",
+        "attribute_name": "color",
+        "expected_value": "red",
+        "observed_value": "red",
+        "decision": "MATCH",
+        "confidence": 0.83,
+        "observation_count": 4,
+        "duration_s": 0.6,
+        "valid_sample_ratio": 0.71,
+        "source": "hsv_depth_mask",
+    }
+    payload.update(updates)
+    return payload
 
 
 def test_recorder_persists_typed_scalar_results_and_exact_1hz_samples(tmp_path) -> None:
@@ -140,3 +164,116 @@ def test_result_payload_contract_rejects_forbidden_data(tmp_path, payload) -> No
             plan_version=1,
             plan=payload,
         )
+
+
+def test_oracle_mode_rejects_attribute_evidence_without_creating_stream(
+    tmp_path,
+) -> None:
+    recorder = FleetResultRecorder(tmp_path, fleet_mission_id="fleet_oracle")
+    path = tmp_path / "agents/uav_a/attribute_evidence.jsonl"
+
+    with pytest.raises(ResultRecorderError, match="only.*yolo"):
+        recorder.record_attribute_evidence(
+            "uav_a",
+            _attribute_evidence(),
+            target_perception_mode="oracle",
+        )
+
+    assert not path.exists()
+    assert not path.parent.exists()
+
+
+def test_yolo_attribute_evidence_persists_only_bounded_scalars(tmp_path) -> None:
+    recorder = FleetResultRecorder(tmp_path, fleet_mission_id="fleet_yolo")
+    assert recorder.record_attribute_evidence(
+        "uav_a",
+        _attribute_evidence(reason_code="temporal_color_stable"),
+        target_perception_mode="yolo",
+    )
+
+    path = tmp_path / "agents/uav_a/attribute_evidence.jsonl"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["schema_version"] == 1
+    assert record["decision"] == "MATCH"
+    assert record["reason_code"] == "temporal_color_stable"
+    assert all(
+        value is None or isinstance(value, (str, bool, int, float))
+        for value in record.values()
+    )
+    assert set(record).issubset(
+        {
+            "schema_version",
+            "timestamp_s",
+            "mission_id",
+            "uav_id",
+            "assignment_id",
+            "candidate_id",
+            "tracker_id",
+            "attribute_name",
+            "expected_value",
+            "observed_value",
+            "decision",
+            "confidence",
+            "observation_count",
+            "duration_s",
+            "valid_sample_ratio",
+            "source",
+            "reason_code",
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "forbidden_field",
+    ("camera_rgb", "rgb", "depth", "crop", "unknown_field"),
+)
+def test_yolo_attribute_evidence_rejects_media_and_unknown_fields(
+    tmp_path,
+    forbidden_field,
+) -> None:
+    recorder = FleetResultRecorder(tmp_path, fleet_mission_id="fleet_yolo")
+    with pytest.raises(ValueError, match="unknown fields"):
+        recorder.record_attribute_evidence(
+            "uav_a",
+            _attribute_evidence(**{forbidden_field: [[1, 2, 3]]}),
+            target_perception_mode="yolo",
+        )
+    assert not (tmp_path / "agents/uav_a/attribute_evidence.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("observed_value", {"pixels": [1, 2, 3]}),
+        ("source", ["hsv", "crop"]),
+        ("tracker_id", {"track": 3}),
+        ("confidence", True),
+        ("source", "data:image/png;base64,AAAA"),
+    ),
+)
+def test_yolo_attribute_evidence_rejects_non_scalar_or_encoded_values(
+    tmp_path,
+    field,
+    value,
+) -> None:
+    recorder = FleetResultRecorder(tmp_path, fleet_mission_id="fleet_yolo")
+    with pytest.raises((TypeError, ValueError)):
+        recorder.record_attribute_evidence(
+            "uav_a",
+            _attribute_evidence(**{field: value}),
+            target_perception_mode="yolo",
+        )
+    assert not (tmp_path / "agents/uav_a/attribute_evidence.jsonl").exists()
+
+
+def test_collision_count_tracks_distinct_breach_episodes_not_frames(tmp_path) -> None:
+    recorder = FleetResultRecorder(tmp_path, fleet_mission_id="fleet_collisions")
+
+    recorder.observe_safety_snapshot(collision=False)
+    recorder.observe_safety_snapshot(collision=True)
+    recorder.observe_safety_snapshot(collision=True)
+    assert recorder.collision_count == 1
+
+    recorder.observe_safety_snapshot(collision=False)
+    recorder.observe_safety_snapshot(collision=True)
+    assert recorder.collision_count == 2

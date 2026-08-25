@@ -10,7 +10,7 @@ passes Oracle fields to the verifier.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 import json
@@ -296,7 +296,9 @@ class _PendingReview:
     bound_candidate_frame_ref: FrameRef | None = None
 
 
-_REVIEWABLE_SKILL_NAMES = frozenset({"GOTO", "SEARCH", "INSPECT", "TRACK"})
+_REVIEWABLE_SKILL_NAMES = frozenset(
+    {"GOTO", "SEARCH", "INSPECT", "TRACK", "REACQUIRE"}
+)
 
 # SEARCH reviews about target identity must be grounded in a detector/tracker
 # candidate.  Runtime obstacle/progress events remain independently reviewable
@@ -356,6 +358,7 @@ class VisualReviewCoordinator:
         min_search_candidate_duration_s: float = 0.5,
         max_search_candidate_center_jump: float = 0.25,
         candidate_mismatch_threshold: int = 2,
+        candidate_review_eligibility: Callable[[str], bool] | None = None,
         debug_model_responses: bool | None = None,
     ) -> None:
         self._uav_id = validate_uav_id(uav_id)
@@ -399,6 +402,10 @@ class VisualReviewCoordinator:
             raise TypeError("debug_model_responses must be bool or None")
         if not isinstance(require_stable_search_candidate, bool):
             raise TypeError("require_stable_search_candidate must be bool")
+        if candidate_review_eligibility is not None and not callable(
+            candidate_review_eligibility
+        ):
+            raise TypeError("candidate_review_eligibility must be callable or None")
 
         self._review_timeout_s = _positive_finite(review_timeout_s, "review_timeout_s")
         self._max_result_age_s = _positive_finite(max_result_age_s, "max_result_age_s")
@@ -448,6 +455,7 @@ class VisualReviewCoordinator:
             candidate_mismatch_threshold,
             "candidate_mismatch_threshold",
         )
+        self._candidate_review_eligibility = candidate_review_eligibility
         self._debug_model_responses = (
             _debug_visual_review_from_environment()
             if debug_model_responses is None
@@ -802,14 +810,18 @@ class VisualReviewCoordinator:
 
         event = self._next_event_for_route(mission, version, now)
         bound_search_candidate: CandidateSnapshot | None = None
+        candidate_review_skill = active_skill in {
+            SkillName.SEARCH,
+            SkillName.REACQUIRE,
+        }
         if (
-            active_skill is SkillName.SEARCH
+            candidate_review_skill
             and self._require_stable_search_candidate
             and (event is None or event.event_type in _SEARCH_TARGET_REVIEW_EVENTS)
         ):
             bound_search_candidate = self._stable_search_candidate(now)
         if (
-            active_skill is SkillName.SEARCH
+            candidate_review_skill
             and self._require_stable_search_candidate
             and (event is None or event.event_type in _SEARCH_TARGET_REVIEW_EVENTS)
             and bound_search_candidate is None
@@ -1148,6 +1160,11 @@ class VisualReviewCoordinator:
                 continue
             if candidate.source.casefold() == "qwen_vl" or is_privileged_oracle_source(
                 candidate.source
+            ):
+                continue
+            if (
+                self._candidate_review_eligibility is not None
+                and not self._candidate_review_eligibility(candidate.candidate_id)
             ):
                 continue
             if now - candidate.last_seen_timestamp_s > self._max_result_age_s:

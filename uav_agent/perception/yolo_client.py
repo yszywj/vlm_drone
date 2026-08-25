@@ -44,6 +44,7 @@ class YoloClientResponseError(YoloClientError):
 class YoloModelInfo:
     model_family: str
     class_names: tuple[tuple[int, str], ...]
+    model_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if self.model_family not in {"yolo", "yoloe"}:
@@ -61,6 +62,14 @@ class YoloModelInfo:
         if len({index for index, _ in names}) != len(names):
             raise ValueError("class_names contains duplicate IDs")
         object.__setattr__(self, "class_names", names)
+        if self.model_sha256 is not None:
+            if (
+                not isinstance(self.model_sha256, str)
+                or len(self.model_sha256) != 64
+                or any(character not in "0123456789abcdefABCDEF" for character in self.model_sha256)
+            ):
+                raise ValueError("model_sha256 must be a 64-character hexadecimal digest")
+            object.__setattr__(self, "model_sha256", self.model_sha256.lower())
 
     @property
     def names(self) -> dict[int, str]:
@@ -135,7 +144,11 @@ class YoloServiceClient:
         else:
             raise YoloClientResponseError("model-info has no class names")
         try:
-            return YoloModelInfo(str(family), names)  # type: ignore[arg-type]
+            return YoloModelInfo(
+                str(family),
+                names,  # type: ignore[arg-type]
+                payload.get("model_sha256"),  # type: ignore[arg-type]
+            )
         except (TypeError, ValueError) as exc:
             raise YoloClientResponseError(f"invalid model-info response: {exc}") from exc
 

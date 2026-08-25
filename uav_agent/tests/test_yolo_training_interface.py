@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -26,6 +27,7 @@ from training.yolo.trainer import (  # noqa: E402
     UltralyticsTrainingBackend,
     YoloTrainingError,
     YoloTrainingBackend,
+    _block_ultralytics_downloads,
 )
 
 
@@ -483,6 +485,179 @@ class YoloTrainingInterfaceTest(unittest.TestCase):
             self.assertTrue(
                 any("incompatible checkpoint" in message for message in preflight.diagnostics)
             )
+
+    def test_training_architecture_preflight_reports_runtime_mismatch(self) -> None:
+        backend = UltralyticsTrainingBackend()
+        checkpoint = SimpleNamespace(
+            model=SimpleNamespace(
+                yaml={
+                    "yaml_file": "yolo26s.yaml",
+                    "channels": 3,
+                    "backbone": [],
+                    "head": [],
+                }
+            )
+        )
+
+        class RejectingDetectionModel:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                raise TypeError("SPPF constructor mismatch")
+
+        real_import = __import__
+
+        def fake_import(name: str) -> object:
+            if name == "ultralytics.nn.tasks":
+                return SimpleNamespace(DetectionModel=RejectingDetectionModel)
+            if name == "ultralytics":
+                return SimpleNamespace(__version__="8.3.222")
+            if name == "torch":
+                return SimpleNamespace(__version__="2.7.0+cu126")
+            return real_import(name)
+
+        with patch(
+            "training.yolo.trainer.importlib.import_module",
+            side_effect=fake_import,
+        ):
+            with self.assertRaisesRegex(
+                YoloTrainingError,
+                r"runtime=8\.3\.222.*YOLO26 requires ultralytics>=8\.4\.0",
+            ):
+                backend._validate_training_architecture(
+                    checkpoint,
+                    model_path=Path("/models/yolo26s.pt"),
+                    model_family="yolo",
+                    task="detect",
+                    class_count=1,
+                )
+
+    def test_ultralytics_download_guard_blocks_and_restores_boundary(self) -> None:
+        calls: list[str] = []
+
+        def original_download(*args: object, **kwargs: object) -> None:
+            calls.append("original")
+
+        downloads = SimpleNamespace(safe_download=original_download)
+        with patch(
+            "training.yolo.trainer.importlib.import_module",
+            return_value=downloads,
+        ):
+            with _block_ultralytics_downloads(enabled=True):
+                self.assertEqual(os.environ["YOLO_OFFLINE"], "true")
+                self.assertEqual(os.environ["YOLO_AUTOINSTALL"], "false")
+                with self.assertRaisesRegex(
+                    ConnectionError, "automatic Ultralytics download is disabled"
+                ):
+                    downloads.safe_download(url="https://example.invalid/model.pt")
+            downloads.safe_download()
+
+        self.assertEqual(calls, ["original"])
+
+    def test_training_failure_removes_only_safe_bootstrap_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_path, data_yaml = self._inputs(root)
+            run_dir = root / "outputs" / "failed-bootstrap"
+
+            class FailingModel:
+                def train(inner_self, **kwargs: object) -> object:
+                    (run_dir / "weights").mkdir(parents=True)
+                    (run_dir / "args.yaml").write_text(
+                        yaml.safe_dump(
+                            {
+                                "task": "detect",
+                                "mode": "train",
+                                "model": str(model_path),
+                                "data": kwargs["data"],
+                                "project": kwargs["project"],
+                                "name": kwargs["name"],
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    raise RuntimeError("SPPF constructor mismatch")
+
+            config = YoloTrainConfig(
+                base_model_path=model_path,
+                dataset_yaml=data_yaml,
+                device="cpu",
+                project_dir=root / "outputs",
+                run_name="failed-bootstrap",
+            )
+            backend = UltralyticsTrainingBackend(
+                model_factory=lambda path, family, task: FailingModel()
+            )
+            with self.assertRaisesRegex(
+                YoloTrainingError, "removed incomplete run directory"
+            ):
+                backend.train(config)
+            self.assertFalse(run_dir.exists())
+
+    def test_training_retry_removes_matching_stale_bootstrap_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_path, data_yaml = self._inputs(root)
+            run_dir = root / "outputs" / "retry-bootstrap"
+            (run_dir / "weights").mkdir(parents=True)
+            (run_dir / "args.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "task": "detect",
+                        "mode": "train",
+                        "model": str(model_path),
+                        "data": str(data_yaml),
+                        "project": str(root / "outputs"),
+                        "name": "retry-bootstrap",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake = _FakeModel(run_dir)
+            config = YoloTrainConfig(
+                base_model_path=model_path,
+                dataset_yaml=data_yaml,
+                epochs=1,
+                imgsz=64,
+                batch=1,
+                device="cpu",
+                workers=0,
+                project_dir=root / "outputs",
+                run_name="retry-bootstrap",
+            )
+
+            result = UltralyticsTrainingBackend(
+                model_factory=lambda path, family, task: fake
+            ).train(config)
+
+            self.assertTrue(result.best_model_path.is_file())
+            self.assertTrue(result.model_manifest_path.is_file())
+
+    def test_training_failure_preserves_partial_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model_path, data_yaml = self._inputs(root)
+            run_dir = root / "outputs" / "partial-run"
+
+            class PartiallyTrainedModel:
+                def train(inner_self, **kwargs: object) -> object:
+                    weights = run_dir / "weights"
+                    weights.mkdir(parents=True)
+                    (weights / "last.pt").write_bytes(b"resumable")
+                    raise RuntimeError("training interrupted")
+
+            config = YoloTrainConfig(
+                base_model_path=model_path,
+                dataset_yaml=data_yaml,
+                device="cpu",
+                project_dir=root / "outputs",
+                run_name="partial-run",
+            )
+            backend = UltralyticsTrainingBackend(
+                model_factory=lambda path, family, task: PartiallyTrainedModel()
+            )
+            with self.assertRaisesRegex(YoloTrainingError, "training interrupted"):
+                backend.train(config)
+
+            self.assertEqual((run_dir / "weights" / "last.pt").read_bytes(), b"resumable")
 
     def test_modules_do_not_import_isaac(self) -> None:
         source = "\n".join(

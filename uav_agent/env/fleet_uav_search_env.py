@@ -96,6 +96,8 @@ class FleetPoseSnapshot:
 class FleetUavSearchEnv:
     """Own a fleet scene, synchronized caches, and deterministic agent ticks."""
 
+    _MAX_CAMERA_RENDER_CATCHUP_STEPS = 12
+
     def __init__(
         self,
         config: AppConfig,
@@ -128,6 +130,11 @@ class FleetUavSearchEnv:
             4.0 * self._camera_publish_period_s,
         )
         self._camera_sync_wait_started_s: float | None = None
+        # A Camera reset/invalidation can leave renderer metadata one or more
+        # frames behind World.current_time while its annotators refill.  This
+        # explicit warm-up epoch may withhold such a stale frame; publication
+        # always requires exact world/Camera timestamp agreement.
+        self._camera_warmup_pending = False
         self._fleet_pose_snapshot: FleetPoseSnapshot | None = None
         self._tick_index = 0
         self._last_tick_order: tuple[str, ...] = ()
@@ -388,6 +395,41 @@ class FleetUavSearchEnv:
             ).copy(),
         )
 
+    def get_target_perception_input(self, uav_id: str) -> object:
+        """Return one atomic, production-safe RGB-D perception input.
+
+        Both values are projected from the same published Fleet Camera batch.
+        This method deliberately never touches the evaluator-frame cache.
+        """
+
+        from perception.runtime_bridge import SynchronizedTargetPerceptionInput
+        from skills.types import Observation
+
+        normalized = self._known_uav_id(uav_id)
+        agent = self.get_agent_observation(normalized)
+        camera_sample = getattr(agent, "camera_sample", None)
+        if camera_sample is None:
+            raise RuntimeError(
+                f"no synchronized RGB-D CameraSample is available for {normalized!r}"
+            )
+        base = Observation(
+            uav_id=normalized,
+            timestamp=float(agent.camera_timestamp_s),
+            uav_pose=agent.uav_state,
+            uav_velocity=np.asarray(agent.uav_velocity_mps).copy(),
+            camera_rgb=np.asarray(camera_sample.rgb).copy(),
+            camera_position_m=np.asarray(
+                camera_sample.camera_position_world_m
+            ).copy(),
+            camera_orientation_wxyz=np.asarray(
+                camera_sample.camera_orientation_world_wxyz
+            ).copy(),
+        )
+        return SynchronizedTargetPerceptionInput(
+            base_observation=base,
+            camera_sample=camera_sample,
+        )
+
     def get_evaluator_frame(self, uav_id: str, target_id: str) -> object:
         normalized_uav = self._known_uav_id(uav_id)
         normalized_target = self._known_target_id(target_id)
@@ -493,18 +535,11 @@ class FleetUavSearchEnv:
             for target_id in self.target_ids
         }
         samples = self._capture_camera_batch(simulation_timestamp_s)
-        # When a new synchronized Camera batch exists, its unmodified render
-        # timestamp is the canonical timestamp for both pixels and poses.
-        # Isaac's NEW_FRAME callback reports the render that immediately
-        # precedes World.current_time, so one bounded rendering_dt lag is valid.
-        barrier_timestamp_s = (
-            simulation_timestamp_s
-            if not samples
-            else float(next(iter(samples.values())).timestamp_s)
-        )
+        # The bounded frozen-world drain makes any published Camera batch's
+        # timestamp equal to this authoritative simulation pose barrier.
         snapshot = FleetPoseSnapshot(
             tick_index=self._tick_index,
-            timestamp_s=barrier_timestamp_s,
+            timestamp_s=simulation_timestamp_s,
             uav_states=uav_states,
             uav_velocities_mps=uav_velocities_mps,
             target_states=target_states,
@@ -525,18 +560,7 @@ class FleetUavSearchEnv:
         """
 
         samples = self._capture_camera_batch(snapshot.timestamp_s)
-        observation_snapshot = snapshot
-        if samples:
-            camera_timestamp_s = float(next(iter(samples.values())).timestamp_s)
-            if camera_timestamp_s != snapshot.timestamp_s:
-                observation_snapshot = FleetPoseSnapshot(
-                    tick_index=snapshot.tick_index,
-                    timestamp_s=camera_timestamp_s,
-                    uav_states=snapshot.uav_states,
-                    uav_velocities_mps=snapshot.uav_velocities_mps,
-                    target_states=snapshot.target_states,
-                )
-        return self._publish_observation_batch(observation_snapshot, samples)
+        return self._publish_observation_batch(snapshot, samples)
 
     def _capture_camera_batch(
         self,
@@ -544,54 +568,150 @@ class FleetUavSearchEnv:
     ) -> dict[str, object]:
         """Return a complete new same-render Camera batch or no batch.
 
-        Isaac Cameras acquire every renderer frame so their per-product clocks
-        remain phase aligned.  This method atomically downsamples that stream to
-        CameraConfig.frequency_hz.  Warm-up is withheld with a bounded watchdog;
-        different renderer timestamps or frame IDs fail closed instead of being
-        relabelled as one Fleet timestamp.
+        Isaac Cameras acquire every renderer frame.  This method atomically
+        downsamples that stream to CameraConfig.frequency_hz, drains temporary
+        per-RenderProduct skew without advancing physics, and publishes only a
+        complete batch at the current simulation timestamp.  Warm-up uses a
+        bounded watchdog and no renderer timestamp is ever relabelled.
         """
 
         from env.camera_types import CameraFrameNotReady
 
-        metadata: dict[str, tuple[float, tuple[int, int] | None]] = {}
-        for uav_id in self.uav_ids:
-            sensor = self._require_camera_sensor(uav_id)
-            get_metadata = getattr(sensor, "get_render_metadata", None)
-            if not callable(get_metadata):
-                raise TypeError("every Fleet Camera must provide get_render_metadata()")
-            try:
-                timestamp_s, render_frame_id = get_metadata()
-            except CameraFrameNotReady as exc:
-                return self._withhold_camera_batch(
-                    simulation_timestamp_s,
-                    f"{uav_id}: {exc}",
-                )
-            metadata[uav_id] = (float(timestamp_s), render_frame_id)
+        rendering_dt_s = self.config.simulation.rendering_dt_s
+        tolerance_s = max(1e-7, rendering_dt_s * 1e-5)
 
-        # After the first published batch, renderer metadata is sufficient to
-        # reject cross-Camera skew and to skip expensive RGB/depth copies on
-        # the five intervening 60 Hz frames of a configured 10 Hz Camera.
+        # Public delivery cadence belongs to the simulation clock, not to the
+        # asynchronously completed Camera cache.  Basing this decision on a
+        # three-tick-stale Camera timestamp silently reduces a configured
+        # 10 Hz stream to roughly 6--7 Hz.
         if self._last_camera_timestamps_s:
-            camera_timestamp_s = self._validate_same_camera_render(
-                metadata,
-                source="metadata",
-            )
-            self._validate_camera_world_lag(
-                camera_timestamp_s,
-                simulation_timestamp_s,
-            )
-            last_timestamp_s = next(iter(self._last_camera_timestamps_s.values()))
-            cadence_tolerance_s = max(
-                1e-9,
-                self.config.simulation.rendering_dt_s * 1e-6,
-            )
+            published_timestamps = set(self._last_camera_timestamps_s.values())
+            if len(published_timestamps) != 1:
+                raise RuntimeError(
+                    "Fleet Camera publication history has inconsistent timestamps"
+                )
+            last_timestamp_s = next(iter(published_timestamps))
+            if simulation_timestamp_s < last_timestamp_s - tolerance_s:
+                raise RuntimeError(
+                    "Fleet simulation timestamp moved behind the last published "
+                    "Camera frame"
+                )
             if (
-                camera_timestamp_s - last_timestamp_s + cadence_tolerance_s
+                simulation_timestamp_s - last_timestamp_s + tolerance_s
                 < self._camera_publish_period_s
             ):
                 self._camera_sync_wait_started_s = None
                 return {}
 
+        world = self.world
+        render = getattr(world, "render", None)
+        can_drain_renderer = callable(render)
+        previous_metadata_timestamps: dict[str, float] = {}
+        metadata: dict[str, tuple[float, tuple[int, int] | None]] | None = None
+        not_ready_reason: str | None = None
+
+        # Isaac's RenderProducts complete independently.  Do not reject a
+        # transient cross-Camera skew before giving the frozen-world drain a
+        # chance to catch every product up to the same simulation timestamp.
+        for attempt in range(self._MAX_CAMERA_RENDER_CATCHUP_STEPS + 1):
+            candidate: dict[str, tuple[float, tuple[int, int] | None]] = {}
+            not_ready_reason = None
+            for uav_id in self.uav_ids:
+                sensor = self._require_camera_sensor(uav_id)
+                get_metadata = getattr(sensor, "get_render_metadata", None)
+                if not callable(get_metadata):
+                    raise TypeError(
+                        "every Fleet Camera must provide get_render_metadata()"
+                    )
+                try:
+                    timestamp_s, render_frame_id = get_metadata()
+                except CameraFrameNotReady as exc:
+                    not_ready_reason = f"{uav_id}: {exc}"
+                    break
+                timestamp = float(timestamp_s)
+                if timestamp > simulation_timestamp_s + tolerance_s:
+                    self._validate_camera_world_lag(
+                        timestamp,
+                        simulation_timestamp_s,
+                    )
+                previous_timestamp_s = previous_metadata_timestamps.get(uav_id)
+                if (
+                    previous_timestamp_s is not None
+                    and timestamp < previous_timestamp_s - tolerance_s
+                ):
+                    raise RuntimeError(
+                        "Fleet Camera renderer timestamp moved backwards while "
+                        "draining the render pipeline: "
+                        f"uav={uav_id!r}, previous={previous_timestamp_s!r}, "
+                        f"current={timestamp!r}"
+                    )
+                published_timestamp_s = self._last_camera_timestamps_s.get(uav_id)
+                if (
+                    published_timestamp_s is not None
+                    and timestamp < published_timestamp_s - tolerance_s
+                ):
+                    raise RuntimeError(
+                        "Fleet Camera renderer timestamp moved behind its last "
+                        f"publication: uav={uav_id!r}, "
+                        f"last={published_timestamp_s!r}, current={timestamp!r}"
+                    )
+                previous_metadata_timestamps[uav_id] = timestamp
+                candidate[uav_id] = (timestamp, render_frame_id)
+
+            if not_ready_reason is None and all(
+                abs(simulation_timestamp_s - value[0]) <= tolerance_s
+                for value in candidate.values()
+            ):
+                metadata = candidate
+                break
+
+            if attempt >= self._MAX_CAMERA_RENDER_CATCHUP_STEPS or not can_drain_renderer:
+                if self._camera_warmup_pending or not_ready_reason is not None:
+                    reason = not_ready_reason or (
+                        "reset Camera frame is still stale: "
+                        f"world={simulation_timestamp_s!r}, "
+                        f"camera_by_uav="
+                        f"{ {key: value[0] for key, value in candidate.items()}!r}"
+                    )
+                    return self._withhold_camera_batch(
+                        simulation_timestamp_s,
+                        reason,
+                    )
+                if candidate and len({value[0] for value in candidate.values()}) != 1:
+                    self._validate_same_camera_render(candidate, source="metadata")
+                stale_timestamp_s = (
+                    min(value[0] for value in candidate.values())
+                    if candidate
+                    else float("nan")
+                )
+                self._validate_camera_world_lag(
+                    stale_timestamp_s,
+                    simulation_timestamp_s,
+                )
+                raise RuntimeError("Fleet Camera synchronization failed")  # pragma: no cover
+
+            assert callable(render)
+            render()
+            rendered_world_timestamp_s = self._simulation_timestamp_s(world)
+            if abs(rendered_world_timestamp_s - simulation_timestamp_s) > tolerance_s:
+                raise RuntimeError(
+                    "World.render() advanced simulation time while synchronizing "
+                    "the Fleet Camera barrier"
+                )
+
+        if metadata is None:  # pragma: no cover - loop exits above or returns/raises
+            raise RuntimeError("Fleet Camera synchronization produced no metadata")
+        camera_timestamp_s = self._validate_same_camera_render(
+            metadata,
+            source="metadata",
+        )
+        self._validate_camera_world_lag(
+            camera_timestamp_s,
+            simulation_timestamp_s,
+        )
+
+        # The frame is due and satisfies the renderer barrier; copy its RGB-D
+        # payload atomically only now.
         samples: dict[str, object] = {}
         for uav_id in self.uav_ids:
             try:
@@ -637,6 +757,7 @@ class FleetUavSearchEnv:
                 "only part of the Fleet Camera batch is new",
             )
         self._camera_sync_wait_started_s = None
+        self._camera_warmup_pending = False
         return samples
 
     def _withhold_camera_batch(
@@ -655,8 +776,8 @@ class FleetUavSearchEnv:
             )
         return {}
 
-    @staticmethod
     def _validate_same_camera_render(
+        self,
         metadata: Mapping[str, tuple[float, tuple[int, int] | None]],
         *,
         source: str,
@@ -664,7 +785,11 @@ class FleetUavSearchEnv:
         if not metadata:
             raise RuntimeError("Fleet Camera batch cannot be empty")
         timestamps = tuple(value[0] for value in metadata.values())
-        if len(set(timestamps)) != 1:
+        tolerance_s = max(
+            1e-7,
+            self.config.simulation.rendering_dt_s * 1e-5,
+        )
+        if max(timestamps) - min(timestamps) > tolerance_s:
             raise RuntimeError(
                 f"fleet Camera {source} are not from the same render timestamp: "
                 f"{sorted(timestamps)!r}"
@@ -688,13 +813,15 @@ class FleetUavSearchEnv:
         simulation_timestamp_s: float,
     ) -> None:
         lag_s = float(simulation_timestamp_s) - float(camera_timestamp_s)
-        rendering_dt_s = self.config.simulation.rendering_dt_s
-        tolerance_s = max(1e-9, rendering_dt_s * 1e-6)
-        if lag_s < -tolerance_s or lag_s > rendering_dt_s + tolerance_s:
+        tolerance_s = max(
+            1e-7,
+            self.config.simulation.rendering_dt_s * 1e-5,
+        )
+        if abs(lag_s) > tolerance_s:
             raise RuntimeError(
                 "Fleet Camera timestamp is outside the current renderer barrier: "
                 f"world={simulation_timestamp_s!r}, camera={camera_timestamp_s!r}, "
-                f"lag={lag_s!r}, allowed=[0, {rendering_dt_s!r}]"
+                f"lag={lag_s!r}, allowed_absolute_error={tolerance_s!r}"
             )
 
     def _publish_observation_batch(
@@ -709,7 +836,14 @@ class FleetUavSearchEnv:
         if set(samples) != set(self.uav_ids):
             raise RuntimeError("Camera observation batch must cover every UAV")
         timestamps = {float(sample.timestamp_s) for sample in samples.values()}
-        if timestamps != {float(snapshot.timestamp_s)}:
+        timestamp_tolerance_s = max(
+            1e-7,
+            self.config.simulation.rendering_dt_s * 1e-5,
+        )
+        if any(
+            abs(timestamp - float(snapshot.timestamp_s)) > timestamp_tolerance_s
+            for timestamp in timestamps
+        ):
             raise RuntimeError(
                 "Camera observation batch timestamp does not match FleetPoseSnapshot"
             )
@@ -807,6 +941,7 @@ class FleetUavSearchEnv:
         self.latest_evaluator_frames.clear()
         self._last_camera_timestamps_s.clear()
         self._camera_sync_wait_started_s = None
+        self._camera_warmup_pending = True
         for sensor in self.camera_sensors.values():
             sensor.invalidate_frame()
 

@@ -17,7 +17,12 @@ from statistics import fmean
 from threading import RLock
 from time import monotonic, sleep
 
-from common.ids import generate_routing_id, validate_mission_id, validate_uav_id
+from common.ids import (
+    generate_routing_id,
+    validate_mission_id,
+    validate_routing_id,
+    validate_uav_id,
+)
 from common.target_estimate import TargetEstimate
 from configs.schema import TargetPerceptionConfig
 from env.camera_types import CameraSample
@@ -69,6 +74,7 @@ from perception.visual_evidence import (
     UltralyticsShortTrackEvidenceBuilder,
     VisualEvidenceError,
 )
+from perception.semantic_fusion import AttributeSemanticVerificationPending
 from runtime.frame_store import FrameRef, FrameStore
 from target import TargetLifecycle, TargetManager
 from target.types import TargetSpec
@@ -127,6 +133,7 @@ class TargetPerceptionMetrics:
     reacquire_attempts: int = 0
     reacquire_successes: int = 0
     depth_resolution_failures: int = 0
+    qwen_attribute_fallback_count: int = 0
     _latencies_ms: list[float] = field(default_factory=list, repr=False)
     _measurement_ages_s: list[float] = field(default_factory=list, repr=False)
     _position_squared_errors: list[float] = field(default_factory=list, repr=False)
@@ -194,6 +201,13 @@ class TargetPerceptionMetrics:
             "reacquire_attempts": self.reacquire_attempts,
             "reacquire_successes": self.reacquire_successes,
             "depth_resolution_failures": self.depth_resolution_failures,
+            "qwen_attribute_fallback_count": self.qwen_attribute_fallback_count,
+            "target_visible_frames": self.target_visible_frames,
+            "target_total_frames": self.target_total_frames,
+            "yolo_latency_sample_count": len(self._latencies_ms),
+            "position_measurement_age_count": len(self._measurement_ages_s),
+            "position_error_sample_count": len(self._position_squared_errors),
+            "velocity_error_sample_count": len(self._velocity_squared_errors),
             "position_measurement_age_mean": _mean_or_none(self._measurement_ages_s),
             "position_rmse_m": _rmse_or_none(self._position_squared_errors),
             "velocity_rmse_mps": _rmse_or_none(self._velocity_squared_errors),
@@ -246,7 +260,13 @@ class TargetPerceptionCoordinator:
             request_timeout_s=config.yolo_service.request_timeout_s,
             jpeg_quality=config.yolo_service.jpeg_quality,
         )
-        self._frame_store = frame_store or FrameStore()
+        if frame_store is not None and not isinstance(frame_store, FrameStore):
+            raise TypeError("frame_store must be a FrameStore or None")
+        # FrameStore implements __len__, so a newly created, intentionally
+        # shared store is falsey while empty.  An ``or FrameStore()`` fallback
+        # would silently detach the RGB-D semantic provider from the
+        # coordinator on every fresh runtime.
+        self._frame_store = FrameStore() if frame_store is None else frame_store
         if candidate_bank is not None and not isinstance(candidate_bank, CandidateBank):
             raise TypeError("candidate_bank must be a CandidateBank or None")
         self._provided_candidate_bank = candidate_bank
@@ -311,6 +331,7 @@ class TargetPerceptionCoordinator:
         self._debug_image_writer = debug_image_writer
         self._mission_id: str | None = None
         self._uav_id: str | None = None
+        self._target_alias: str | None = None
         self._stream_id: str | None = None
         self._candidate_bank: CandidateBank | None = None
         self._frame_sequence = 0
@@ -323,6 +344,7 @@ class TargetPerceptionCoordinator:
         self._latest_confirmed_estimate: TargetEstimate | None = None
         self._latest_confirmed_frame_ref: FrameRef | None = None
         self._track_snapshots: dict[str, list[ShortTrackEvidence]] = {}
+        self._tracker_id_by_candidate: dict[str, int] = {}
         self._locked_tracker_id: int | None = None
         self._estimator_tracker_id: int | None = None
         self._last_observed_tracker_id: int | None = None
@@ -348,9 +370,108 @@ class TargetPerceptionCoordinator:
     def frame_store(self) -> FrameStore:
         return self._frame_store
 
-    def reset(self, *, mission_id: str, uav_id: str) -> None:
+    @property
+    def candidate_bank(self) -> CandidateBank | None:
+        return self._candidate_bank or self._provided_candidate_bank
+
+    def qwen_fallback_required(self, candidate_id: str) -> bool:
+        candidate = validate_routing_id(candidate_id, "candidate_id")
+        required = getattr(self._semantic_provider, "requires_qwen", None)
+        if callable(required) and bool(required(candidate)):
+            return True
+        # Reacquiring under a new BoT-SORT ID is an identity question even
+        # when class and colour are deterministic.  Expose that condition to
+        # the shared visual scheduler so it can request one low-frequency,
+        # candidate-bound review with the retained verified reference.
+        with self._lock:
+            tracker_id = self._tracker_id_by_candidate.get(candidate)
+            return bool(
+                self._config.confirmation.require_qwen_for_reacquire_new_track_id
+                and self._expected_reacquire_target_id is not None
+                and self._locked_tracker_id is not None
+                and tracker_id is not None
+                and tracker_id != self._locked_tracker_id
+            )
+
+    def runtime_metrics(self) -> Mapping[str, object]:
+        """Return bounded detector and semantic-provider scalar diagnostics."""
+
+        result: dict[str, object] = dict(self.metrics.to_dict())
+        provider_metrics = getattr(self._semantic_provider, "metrics", None)
+        if provider_metrics is not None:
+            extra_value = (
+                provider_metrics()
+                if callable(provider_metrics)
+                else provider_metrics
+            )
+            to_dict = getattr(extra_value, "to_dict", None)
+            extra = to_dict() if callable(to_dict) else extra_value
+            if not isinstance(extra, Mapping):
+                raise TypeError("semantic provider metrics must be a mapping")
+            extra = dict(extra)
+            aliases = {
+                "color_observations": "observations_total",
+                "color_matches": "evidence_match",
+                "color_mismatches": "evidence_mismatch",
+                "color_pending": "evidence_pending",
+                "qwen_attribute_fallback_required": "qwen_fallback_required",
+            }
+            for public_name, internal_name in aliases.items():
+                if internal_name in extra:
+                    extra[public_name] = extra[internal_name]
+            overlap = set(result).intersection(extra)
+            if overlap:
+                raise ValueError(
+                    "semantic provider metrics collide with coordinator metrics: "
+                    + ", ".join(sorted(overlap))
+                )
+            result.update(extra)
+        return result
+
+    def attribute_evidence_records(self) -> tuple[object, ...]:
+        """Return the provider's bounded scalar evidence snapshot, if any."""
+
+        records = getattr(self._semantic_provider, "evidence_records", None)
+        if not callable(records):
+            return ()
+        values = tuple(records())
+        if len(values) > 10_000:
+            raise ValueError("semantic provider returned unbounded evidence records")
+        return values
+
+    def drain_attribute_evidence_records(self) -> tuple[object, ...]:
+        """Atomically consume the provider's bounded scalar evidence records."""
+
+        drain = getattr(self._semantic_provider, "drain_evidence_records", None)
+        if not callable(drain):
+            return ()
+        values = tuple(drain())
+        if len(values) > 10_000:
+            raise ValueError("semantic provider returned unbounded evidence records")
+        return values
+
+    def reset(
+        self,
+        *,
+        mission_id: str,
+        uav_id: str,
+        assignment_id: str | None = None,
+        target_alias: str | None = None,
+    ) -> None:
         mission = validate_mission_id(mission_id)
         uav = validate_uav_id(uav_id)
+        assignment = (
+            None
+            if assignment_id is None
+            else validate_routing_id(assignment_id, "assignment_id")
+        )
+        routed_target = (
+            None
+            if target_alias is None
+            else validate_routing_id(target_alias, "target_alias")
+        )
+        if routed_target is not None and assignment is None:
+            raise ValueError("target_alias requires assignment_id")
         with self._lock:
             self._ensure_open()
             previous_mission = self._mission_id
@@ -366,6 +487,7 @@ class TargetPerceptionCoordinator:
             # have all succeeded.
             self._mission_id = None
             self._uav_id = None
+            self._target_alias = None
             self._stream_id = None
             self._candidate_bank = None
             self._fatal_error = None
@@ -423,6 +545,7 @@ class TargetPerceptionCoordinator:
             self._ensure_open()
             self._mission_id = mission
             self._uav_id = uav
+            self._target_alias = routed_target
             self._stream_id = f"{mission}:{uav}"
             self._model_names = model_names
             if self._provided_candidate_bank is not None:
@@ -437,6 +560,7 @@ class TargetPerceptionCoordinator:
             self._latest_confirmed_frame_ref = None
             self._track_evidence.reset()
             self._track_snapshots.clear()
+            self._tracker_id_by_candidate.clear()
             self._locked_tracker_id = None
             self._estimator_tracker_id = None
             self._last_observed_tracker_id = None
@@ -447,6 +571,13 @@ class TargetPerceptionCoordinator:
             self._fatal_error = None
             self._consecutive_availability_failures = 0
             self._estimator.reset()
+            semantic_reset = getattr(self._semantic_provider, "reset", None)
+            if assignment is not None and callable(semantic_reset):
+                semantic_reset(
+                    mission_id=mission,
+                    uav_id=uav,
+                    assignment_id=assignment,
+                )
 
     def submit_frame(
         self,
@@ -591,6 +722,7 @@ class TargetPerceptionCoordinator:
             self._estimator.reset()
             self._track_evidence.reset()
             self._track_snapshots.clear()
+            self._target_alias = None
             if uav is not None:
                 self._frame_store.clear(uav_id=uav)
             self._closed = True
@@ -611,6 +743,9 @@ class TargetPerceptionCoordinator:
                 self._last_error = _safe_error("yolo_cleanup_reset_failed", exc)
         if self._owns_executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
+        close_semantic = getattr(self._semantic_provider, "close", None)
+        if callable(close_semantic):
+            close_semantic()
 
     def _launch(self, submission: _Submission) -> None:
         rgb = self._frame_store.get_frame(submission.frame_ref)
@@ -776,12 +911,20 @@ class TargetPerceptionCoordinator:
         if starts_new_evidence_epoch:
             self._track_evidence.reset(candidate.candidate_id)
             self._track_snapshots.pop(candidate.candidate_id, None)
+            semantic_reset_candidate = getattr(
+                self._semantic_provider,
+                "reset_candidate",
+                None,
+            )
+            if callable(semantic_reset_candidate):
+                semantic_reset_candidate(candidate.candidate_id)
         track = self._track_evidence.update(
             candidate_id=candidate.candidate_id,
             timestamp_s=timestamp_s,
             detection=detection,
         )
         snapshots = self._track_snapshots.setdefault(candidate.candidate_id, [])
+        self._tracker_id_by_candidate[candidate.candidate_id] = detection.track_id
         snapshots.append(track)
         del snapshots[:-32]
         position = self._resolve_position(
@@ -1001,6 +1144,7 @@ class TargetPerceptionCoordinator:
                 return False, None
         logical_target_id = (
             self._expected_reacquire_target_id
+            or self._target_alias
             or _logical_target_id(target_spec)
         )
         is_new_reacquire_track = (
@@ -1056,6 +1200,13 @@ class TargetPerceptionCoordinator:
                     candidate.candidate_id,
                     timestamp_s=confirmation_track.timestamp_s,
                 )
+            semantic_reject = getattr(
+                self._semantic_provider,
+                "reject_candidate",
+                None,
+            )
+            if callable(semantic_reject):
+                semantic_reject(candidate.candidate_id)
             return False, None
         if result.decision is ConfirmationDecision.CONFIRMED:
             self.metrics.candidates_confirmed += 1
@@ -1081,18 +1232,36 @@ class TargetPerceptionCoordinator:
         timestamp_s: float,
     ) -> SemanticVerification | None:
         if self._semantic_provider is not None:
-            supplied = self._semantic_provider(
-                candidate, target_spec, detection, timestamp_s
-            )
+            try:
+                supplied = self._semantic_provider(
+                    candidate, target_spec, detection, timestamp_s
+                )
+            except AttributeSemanticVerificationPending:
+                # Insufficient deterministic evidence is neither a mismatch
+                # nor permission to ask Qwen on every frame.
+                return None
+            except SemanticVerificationRequiresQwen:
+                # Unsupported or persistently ambiguous attributes may use
+                # the already-routed, asynchronous Qwen gate below.
+                supplied = None
             if supplied is not None and (
                 self._config.confirmation.mode != "qwen_required"
                 or supplied.verifier == "qwen_vl"
             ):
                 return supplied
-        review = self._latest_visual_review(candidate)
+        # A typed Qwen review may influence the control path only when the
+        # deterministic provider explicitly declares that this candidate is
+        # unsupported or persistently ambiguous.  In particular, a review
+        # that happens to arrive during the normal multi-frame RGB-D warm-up
+        # cannot short-circuit the color verifier.
+        allow_qwen_fallback = (
+            self._semantic_provider is None
+            or self.qwen_fallback_required(candidate.candidate_id)
+        )
+        review = self._latest_visual_review(candidate) if allow_qwen_fallback else None
         if review is not None:
             try:
-                return self._qwen_semantic_adapter.from_review(
+                verification = self._qwen_semantic_adapter.from_review(
                     candidate_id=candidate.candidate_id,
                     target_spec=target_spec,
                     review=review,
@@ -1101,10 +1270,27 @@ class TargetPerceptionCoordinator:
                         review.observation_timestamp_s,
                     ),
                 )
+                if self.qwen_fallback_required(candidate.candidate_id):
+                    self.metrics.qwen_attribute_fallback_count += 1
+                    clear_requirement = getattr(
+                        self._semantic_provider,
+                        "clear_qwen_requirement",
+                        None,
+                    )
+                    if callable(clear_requirement):
+                        clear_requirement(candidate.candidate_id)
+                return verification
             except (QwenEvidencePending, VisualEvidenceError, ValueError):
                 # A stale/misaligned typed review remains pending.  It is never
                 # converted into class-only approval or an Oracle fallback.
                 pass
+        if self._semantic_provider is not None:
+            # The configured provider owns semantic authority for this
+            # runtime.  ``None`` means its temporal evidence is still pending
+            # (or an authorised Qwen fallback has not arrived); falling
+            # through to the legacy class-only verifier would silently bypass
+            # RGB-D attributes.
+            return None
         if self._config.confirmation.mode == "qwen_required":
             return None
         if self._config.detector.model_family == "yolo":

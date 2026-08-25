@@ -86,7 +86,71 @@ export QWEN_MODEL_PATH="$PWD/models/initial_model/Qwen3-VL-4B-Instruct"
 
 根目录 `/models/` 按重量级权重处理并由 `.gitignore` 忽略；`uav_agent/models/` 是 OpenAI-compatible 客户端源码，必须跟踪。公共的 `configs/__init__.py`、`configs/schema.py`、`configs/loader.py` 和 `configs/default.yaml` 同样必须跟踪；只有 `configs/local.yaml` 和 `configs/private/` 被忽略。
 
-## Oracle 与 YOLO 目标感知运行手册
+## 双目标感知模式：Oracle 与 YOLO
+
+Fleet 目标任务现在使用显式的双模式协议：
+
+- `--target-perception-mode oracle`：Isaac GT 只经 assignment-scoped `OraclePerception` 形成 `TargetEstimate`。它仍受 Camera 可见性约束，只用于架构调试、理想能力上界、回归、专家轨迹和标签生成；不是生产视觉，结果会标记为 privileged upper bound。必须同时给出 `--acknowledge-privileged-oracle`，Qwen Vision 只允许 `shadow`。
+- `--target-perception-mode yolo`：每架 UAV 使用独立 loopback worker，执行单类 `cube` YOLO、BoT-SORT、同步 RGB-D 颜色确认、Depth 三维定位和 Kalman 估计；结果标记为 production vision。Gate 模式还必须给出 `--acknowledge-vision-gate`。
+
+“不启用 YOLO”对于含 SEARCH / INSPECT / TRACK / REACQUIRE 的任务明确表示选择 Oracle，并不表示 `disabled`。`disabled` 只保留给起飞、纯导航、悬停、返航和降落等完全无目标任务。YOLO 不可用时绝不自动切换 Oracle。
+
+两种模式使用同一场景、UAV、Camera、目标运动、Fleet、搜索和 Planner 参数；`configs/multi_uav_oracle.yaml` 与 `configs/multi_uav_cube_yolo.yaml` 只在目标感知配置及实验名上不同。两种模式也共用相同的 MissionAgent、Skill、任务完成判定和通用结果指标。
+
+双机 Oracle 上界任务不连接 8011/8012，也不创建 detector、tracker、CandidateBank 或颜色验证器：
+
+```bash
+./python.sh scripts/run_fleet_mission.py \
+  --config configs/multi_uav_oracle.yaml \
+  --target-perception-mode oracle \
+  --mission-interpreter llm \
+  --fleet-planner llm \
+  --local-planner dynamic_llm \
+  --planning-contract v3 \
+  --runtime-program linear \
+  --adapter-config configs/adapters.json \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen3-VL-4B-Instruct \
+  --api-key EMPTY \
+  --acknowledge-privileged-oracle \
+  --enable-qwen-vision \
+  --vision-review-mode shadow \
+  --headless \
+  --max-sim-time 300 \
+  --instruction "无人机A前往世界坐标20,30附近15米范围搜索并跟踪目标i20秒；无人机B前往世界坐标-25,10附近12米范围搜索并跟踪目标j20秒；完成后分别返回各自起点降落"
+```
+
+双机 YOLO 任务要求操作者预先训练一个 `names: {0: cube}` 的本地权重，并在 8011、8012 各启动一个独立 worker。启动 Isaac 前可单独执行只读检查；该检查只访问每个 worker 的 `/health` 和 `/v1/model-info`，并验证 ready、`model_family=yolo`、唯一类别 `0=cube` 及记录模型 SHA：
+
+```bash
+./python.sh scripts/check_fleet_yolo_services.py \
+  --config configs/multi_uav_cube_yolo.yaml
+```
+
+服务检查通过后，生产闭环命令为：
+
+```bash
+./python.sh scripts/run_fleet_mission.py \
+  --config configs/multi_uav_cube_yolo.yaml \
+  --target-perception-mode yolo \
+  --mission-interpreter llm \
+  --fleet-planner llm \
+  --local-planner dynamic_llm \
+  --planning-contract v3 \
+  --runtime-program linear \
+  --adapter-config configs/adapters.json \
+  --base-url http://127.0.0.1:8000/v1 \
+  --model Qwen3-VL-4B-Instruct \
+  --api-key EMPTY \
+  --enable-qwen-vision \
+  --vision-review-mode gate \
+  --acknowledge-vision-gate \
+  --headless \
+  --max-sim-time 300 \
+  --instruction "无人机A前往世界坐标20,30附近15米范围搜索并跟踪目标i20秒；无人机B前往世界坐标-25,10附近12米范围搜索并跟踪目标j20秒；完成后分别返回各自起点降落"
+```
+
+若不需要 Qwen 属性兜底，可移除三个 Qwen Vision gate 参数；多帧 RGB-D 颜色明确时，运行时本来就不会发起 Qwen 候选审查。`target_i`、`target_j` 始终只是 Assignment 路由 ID：普通 YOLO 只请求同一个 `cube` class，red/blue 由独立、同帧 RGB-D 时序证据确认。Qwen 仅可在长期模糊、不支持属性或新 tracker 重获时低频介入，不能提供三维位置、速度或控制量。
 
 ### 运行边界与三个独立环境
 
@@ -103,7 +167,7 @@ export QWEN_MODEL_PATH="$PWD/models/initial_model/Qwen3-VL-4B-Instruct"
 三个重量级运行时必须隔离：
 
 - `r_isaac_sim` 来自 `environment.yml`，使用 Python 3.11 和 Isaac Sim 5.1.0.0，负责仿真、相机、Agent 和控制；不要在其中安装训练版 Torch/Ultralytics。
-- `yolo_perception` 来自 `environment-yolo.yml`，真实 `yolo26s.pt` 冒烟使用的直接 pin 是 Python 3.11、PyTorch 2.7.0 + CUDA 12.6、Torchvision 0.22.0、Ultralytics 8.3.222、LAP 0.5.13、ONNX 1.22.0、FastAPI 0.115.7、Uvicorn 0.29.0、OpenCV-headless 4.11.0、Pillow 11.3.0 和 NumPy 1.26.0，负责 YOLO 推理、BoT-SORT、训练与 ONNX 导出。`requirements/yolo.lock` 是精确的直接依赖 pin，不冒充带 hash 的完整传递 lock；需要逐字节复现时，应在目标 GPU 主机验收后归档 `python -m pip freeze --all` 和对应 wheelhouse。
+- `yolo_perception` 来自 `environment-yolo.yml`，真实 `yolo26s.pt` 冒烟使用的直接 pin 是 Python 3.11、PyTorch 2.7.0 + CUDA 12.6、Torchvision 0.22.0、Ultralytics 8.4.0、LAP 0.5.13、ONNX 1.22.0、FastAPI 0.115.7、Uvicorn 0.29.0、OpenCV-headless 4.11.0、Pillow 11.3.0 和 NumPy 1.26.0，负责 YOLO 推理、BoT-SORT、训练与 ONNX 导出。YOLO26 使用 8.4.0 引入的扩展 SPPF/C3k2 结构；权重中自报的旧版本字段不能作为运行时兼容 pin。`requirements/yolo.lock` 是精确的直接依赖 pin，不冒充带 hash 的完整传递 lock；需要逐字节复现时，应在目标 GPU 主机验收后归档 `python -m pip freeze --all` 和对应 wheelhouse。
 - Qwen/vLLM 使用第三个独立环境和 `127.0.0.1:8000`；YOLO 服务默认使用 `127.0.0.1:8011`。只有选择 `dynamic_llm` 或启用 Qwen 语义审查时才需要 Qwen 服务。
 
 Conda 文件不会安装 NVIDIA driver。CUDA 12.6 版 Torch 要求主机 driver 与该 CUDA runtime 兼容；先用 `nvidia-smi` 检查实际 driver/GPU，再按服务器的兼容矩阵选择 wheel。`CUDA_VISIBLE_DEVICES=1` 后，该进程内唯一可见的卡编号仍是 `--device 0`。单卡机器可改用自己的映射，或在明确接受性能差异时使用 `--device cpu`。
@@ -161,7 +225,7 @@ CUDA_VISIBLE_DEVICES=0 \
 
 ### 命令组 2：普通 YOLO26 + BoT-SORT 生产路径
 
-普通 YOLO 是闭集检测器，只能从加载后 `model.names` 中精确选择类别。`person`、`car` 等可经 `configs/yolo/class_aliases.yaml` 的封闭别名映射；“moving”会被解析为时序约束，不能冒充类别。未训练的“红色立方体”会明确返回 `UNSUPPORTED_TARGET_CATEGORY`，而不是放宽成任意类别。
+普通 YOLO 是闭集检测器，只能从加载后 `model.names` 中精确选择类别。本项目的双机 Cube 模式要求模型只报告 `cube`；`target_i` / `target_j` 只是路由 ID，red / blue 由独立 RGB-D 属性证据确认，颜色不会进入 YOLO `TargetQuery`。通用 COCO `yolo26s.pt` 不包含可用的 `cube` 类，不能直接用于该闭环，也不能通过模糊别名放宽成任意类别。
 
 终端 A 启动单 worker、loopback-only 服务。模型路径只在这里出现；Qwen 占用 8000 时不会冲突：
 
@@ -255,20 +319,21 @@ CUDA_VISIBLE_DEVICES=0 \
 
 ### 命令组 4：Isaac 标注、数据检查、训练、验证与导出
 
-采集器与任务执行脚本完全分离。它在 Isaac 环境中使用同一原子帧的同步 RGB-D、相机投影和仿真真值生成 YOLO 标签；投影框内必须存在与目标真值深度一致的像素，更近的像素计为遮挡。深度缺失、无效或无法证明目标已经渲染时按 fail-closed 不生成正标签。固定简单场景只渲染 `red_cube`，脚本会拒绝用任意别的 `--class-name` 伪标。最终按 scene/episode/trajectory 分组后的 `train`、`val`、`test` 必须都非空，并且实际输出必须同时包含可见正样本、部分遮挡正样本和负样本；计划中的类别不算采集成功。任一条件不满足时采集器会提示增加 episode/sample 数或更换 seed，并要求用新输出目录重采。两个显式 privileged 开关仅授权标签生成，不能流入 `MissionAgent`：
+采集器与任务执行脚本完全分离。Cube v1 数据将 red / blue / green / yellow / gray 等所有立方体统一标为 class 0 `cube`，颜色只写入标量 metadata；`target_i` / `target_j` 不进入标签。一张图允许 0～3 个 cube，所有可见 cube 都必须标注，同时保留球、圆柱、长方体和彩色背景块等 hard negatives。它使用同一原子帧的同步 RGB-D、相机投影和仿真真值生成标签，并按真实 rendered bounds 计算 bbox。最终按 scene/episode/trajectory 分组后的 `train`、`val`、`test` 必须覆盖正负样本、red/blue cube、部分遮挡和多 cube 图像。两个显式 privileged 开关仅授权标签生成，不能流入 `MissionAgent`：
 
 ```bash
 cd /home/amax/ry/vlm_drones/uav_agent
 ./python.sh scripts/collect_yolo_dataset.py \
   --config configs/default.yaml \
-  --output /home/amax/ry/vlm_drones/datasets/perception/uav_target_v1 \
+  --collection-config configs/yolo/collect_cube.yaml \
+  --output /home/amax/ry/vlm_drones/datasets/perception/cube_v1 \
   --scene-seed 42 \
   --max-samples 2000 \
   --max-episodes 100 \
   --frames-per-episode 20 \
   --sample-hz 2 \
   --class-id 0 \
-  --class-name red_cube \
+  --class-name cube \
   --oracle-label-generation \
   --acknowledge-privileged-oracle \
   --headless
@@ -277,15 +342,15 @@ cd /home/amax/ry/vlm_drones/uav_agent
 训练侧只在 `yolo_perception` 环境中运行，不导入 Isaac Sim。数据检查要求 `train`、`val`、`test` 三个 split 都存在且数据集至少含一个正标注，并只读检查图像、标签、归一化框、重复样本、跨 split 哈希泄漏和类别分布，再执行 dry-run：
 
 ```bash
-export DATA_YAML=/home/amax/ry/vlm_drones/datasets/perception/uav_target_v1/data.yaml
+export DATA_YAML=/home/amax/ry/vlm_drones/datasets/perception/cube_v1/data.yaml
 export YOLO26_MODEL=/home/amax/ry/vlm_drones/models/initial_model/yolo26s.pt
 
 conda run -n yolo_perception \
-python scripts/check_yolo_dataset.py --data "$DATA_YAML" --task detect
+python scripts/check_yolo_dataset.py --data "$DATA_YAML" --task detect --protocol cube-v1
 
 conda run -n yolo_perception \
 python scripts/train_yolo.py \
-  --config configs/yolo/train_yolo26s.yaml \
+  --config configs/yolo/train_yolo26s_cube.yaml \
   --model "$YOLO26_MODEL" \
   --data "$DATA_YAML" \
   --device 0 \
@@ -297,17 +362,17 @@ python scripts/train_yolo.py \
 ```bash
 conda run -n yolo_perception \
 python scripts/train_yolo.py \
-  --config configs/yolo/train_yolo26s.yaml \
+  --config configs/yolo/train_yolo26s_cube.yaml \
   --model "$YOLO26_MODEL" \
   --data "$DATA_YAML" \
   --device 0 \
   --epochs 100 \
   --imgsz 960 \
   --batch 16 \
-  --run-name yolo26s_uav_target_v1
+  --run-name yolo26s_cube_v1
 
-export TRAINED_MODEL=/home/amax/ry/vlm_drones/outputs/perception/yolo/yolo26s_uav_target_v1/weights/best.pt
-export VALIDATION_REPORT=/home/amax/ry/vlm_drones/outputs/perception/yolo/yolo26s_uav_target_v1/validation_report.json
+export TRAINED_MODEL=/home/amax/ry/vlm_drones/outputs/perception/yolo/yolo26s_cube_v1/weights/best.pt
+export VALIDATION_REPORT=/home/amax/ry/vlm_drones/outputs/perception/yolo/yolo26s_cube_v1/validation_report.json
 
 conda run -n yolo_perception \
 python scripts/validate_yolo.py \
@@ -330,7 +395,7 @@ ONNX 导出固定使用环境中的 `onnx==1.22.0` 并关闭 graph simplify，�
 
 每次生产任务结束会在终端输出有界 `TargetPerceptionMetrics`，包括请求/成功/超时/过期/丢帧、延迟、检测与候选确认、track 切换/碎片、可见率/丢失/重获、深度失败与测量年龄。`position_rmse_m` 和 `velocity_rmse_mps` 只允许 evaluator 侧在显式真值评测中填写，真值不得回流到控制；普通生产运行应保持为空。默认不保存连续图片或视频。只有显式设置 `debug_images.enabled: true` 时，生产 YOLO 路径才会在 mission run 目录的 `debug_images/target_perception/` 中保存代表帧；全局数量严格受 `max_images_per_run` 限制，并且 `first_detection`、`first_candidate`、`confirmation_success`、`candidate_rejected`、`target_lost`、`reacquire_success` 每类最多一张。每张图标注 bbox、class/class ID、confidence、track ID、candidate ID、confirmed、三维世界位置和 measurement age；`run_manifest.json` 只汇总实际图片的 count/bytes。该写图器不在 Oracle evaluation 路径创建，并会额外拒绝任何 Oracle source。
 
-当前限制：服务第一版每进程只允许一个活跃 `mission_id:uav_id` stream，并在任务开始/结束时 reset BoT-SORT；多 UAV 应各用独立 worker。仓库的简单 Isaac 场景目标是立方体，未微调的闭集 `yolo26s.pt` 不包含 `red_cube` 类，因此闭集生产成功验收必须换成 `person`/`car` 场景资产，或先训练自定义 `red_cube` 权重；不能用 Oracle 掩盖这一限制。YOLOE 路径还要求操作者自行提供兼容的本地 YOLOE 权重。新 tracker ID 的重获不会仅凭类别继承身份；它需要实际发给 Qwen 的已确认历史参考帧和通过 gate 的 typed identity review，缺任一项都继续待审。Isaac 深度提供当前三维估计上界；真实相机、PX4/Pegasus/MAVSDK/ROS 2 的同步 RGB-D 与外参适配仍属于后续硬件集成。
+当前限制：服务第一版每进程只允许一个活跃 `mission_id:uav_id` stream，并在任务开始/结束时 reset BoT-SORT；双机配置固定使用 8011 / 8012 两个独立 worker。通用闭集 `yolo26s.pt` 没有 `cube`，生产成功验收必须由操作者自行训练并提供单类 Cube 权重，不能用 Oracle 掩盖这一限制。YOLOE 路径继续保留并要求操作者自行提供兼容权重。新 tracker ID 的重获不会仅凭类别继承身份；它需要确定性属性证据或通过 gate 的新鲜 typed identity review。Isaac 深度提供当前三维估计上界；真实相机、PX4/Pegasus/MAVSDK/ROS 2 的同步 RGB-D 与外参适配仍属于后续硬件集成。
 
 ## Stage 1A / 1B：MissionAgent + 可替换目标感知
 
@@ -409,7 +474,7 @@ ReID + temporal identity consistency
 TargetManager.LOCKED → TRACKING
 ```
 
-`CandidateConfirmationCoordinator` 只接受带有限 timestamp、confidence、一致 candidate id、合法时间顺序和可实现轨迹时长的类型化 evidence；任一明确否定会清除 SEARCH 候选并回到 `SEARCHING`，REACQUIRE 候选被否定时则恢复原 target id 与 last-seen 状态并回到 `REACQUIRING`。证据不足时保持 `CANDIDATE`，短轨迹、语义、ReID 和时序一致性全部通过才写入非 Oracle 的 `confirmed_vision` lock。裸 `TargetManager.lock()` / `mark_reacquired()` 会拒绝直接调用，避免绕过 coordinator。生产模式下，`MissionAgent` 的 SEARCH/REACQUIRE→TRACK 转换要求这个 lock 已存在且 target id 匹配；它不会再把 Skill 成功结果直接伪造成 `confidence=1.0` 的 Oracle lock。当前 Oracle profile 只保留名称明确的 evaluator shortcut，以便已有 Ideal Skills 回归。
+`CandidateConfirmationCoordinator` 只接受带有限 timestamp、confidence、一致 candidate id、合法时间顺序和可实现轨迹时长的类型化 evidence；任一明确否定会清除 SEARCH 候选并回到 `SEARCHING`，REACQUIRE 候选被否定时则恢复原 target id 与 last-seen 状态并回到 `REACQUIRING`。证据不足时保持 `CANDIDATE`，短轨迹、语义、ReID 和时序一致性全部通过才写入非 Oracle 的 `confirmed_vision` lock。裸 `TargetManager.lock()` / `mark_reacquired()` 会拒绝直接调用，避免绕过 coordinator。`MissionAgent` 的 SEARCH/REACQUIRE→TRACK 转换在两种模式下都只验证 provider 已提交的 `LOCKED` 状态和 target id；它不会按模式直接锁定，也不会把 Skill 成功结果伪造成 `confidence=1.0` 的 Oracle lock。Oracle 的特权 shortcut 完全封装在明确标记且已确认授权的 evaluator provider 内。
 
 ## 本地 Qwen OpenAI-compatible 服务
 

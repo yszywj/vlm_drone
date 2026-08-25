@@ -280,6 +280,61 @@ class RunManagerTest(unittest.TestCase):
                         [item.id for item in config.targets],
                     )
 
+    def test_update_manifest_metadata_persists_dual_mode_fields_atomically(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            manager = self.create_run(Path(temporary))
+            metadata = {
+                "target_perception_mode": "oracle",
+                "runtime_profile": "oracle_evaluation",
+                "backend_by_uav": {
+                    "uav_a": "oracle_evaluation",
+                    "uav_b": "oracle_evaluation",
+                },
+                "privileged_perception": True,
+                "oracle_acknowledged": True,
+                "qwen_vision_mode": "shadow",
+                "upper_bound_result": True,
+                "production_vision_result": False,
+            }
+
+            manager.update_manifest_metadata(metadata)
+
+            persisted = yaml.safe_load(
+                manager.paths.manifest.read_text(encoding="utf-8")
+            )
+            for key, value in metadata.items():
+                self.assertEqual(persisted[key], value)
+                self.assertEqual(manager.manifest[key], value)
+            defensive = manager.manifest
+            defensive["backend_by_uav"]["uav_a"] = "tampered"
+            self.assertEqual(
+                manager.manifest["backend_by_uav"]["uav_a"],
+                "oracle_evaluation",
+            )
+            before = manager.paths.manifest.read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "lifecycle fields"):
+                manager.update_manifest_metadata(
+                    {"status": "completed", "target_perception_mode": "yolo"}
+                )
+            self.assertEqual(manager.paths.manifest.read_bytes(), before)
+            self.assertEqual(manager.manifest["target_perception_mode"], "oracle")
+
+            with self.assertRaises(SensitiveDataError):
+                manager.update_manifest_metadata(
+                    {"backend_by_uav": {"uav_a": "oracle"}, "api_key": "secret"}
+                )
+            self.assertEqual(manager.paths.manifest.read_bytes(), before)
+            self.assertFalse(list(manager.paths.run_dir.rglob("*.tmp")))
+
+            manager.complete()
+            with self.assertRaises(InvalidRunStateError):
+                manager.update_manifest_metadata(
+                    {"target_perception_mode": "yolo"}
+                )
+
     def test_lifecycle_updates_manifest_and_exit_code_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manager = self.create_run(Path(temporary))

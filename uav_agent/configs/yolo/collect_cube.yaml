@@ -1,0 +1,45 @@
+schema_version: 1
+
+# This file is a public, non-secret protocol contract. Isaac ground truth is
+# still gated by both explicit CLI acknowledgements in collect_yolo_dataset.py.
+detector_class:
+  id: 0
+  name: cube
+
+scene_inventory:
+  cube_count:
+    min: 0
+    max: 3
+  cube_colors:
+    - red
+    - blue
+    - green
+    - yellow
+    - gray
+  hard_negatives:
+    - red_sphere
+    - blue_sphere
+    - red_cylinder
+    - blue_cylinder
+    - cuboid
+    - colored_background_block
+    - partial_noncube
+
+labels:
+  format: yolo_detect
+  label_every_visible_cube: true
+  non_cube_class_id: null
+  use_rendered_object_dimensions: true
+
+metadata:
+  schema_version: 1
+  directory: metadata
+  store_rgb: false
+  store_depth: false
+
+split:
+  grouping_keys:
+    - episode_id
+    - trajectory_id
+  require_train_val_test: true
+

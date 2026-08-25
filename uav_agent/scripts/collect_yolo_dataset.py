@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from math import ceil, cos, isfinite, pi, radians, sin, tan
 import os
 from pathlib import Path
 import random
 import sys
-from typing import Sequence
+import traceback
+from typing import Protocol, Sequence
 
 import numpy as np
 
@@ -27,10 +29,21 @@ from training.yolo.isaac_collector import (  # noqa: E402
     EpisodeRandomization,
     IsaacDatasetCollectionError,
     IsaacYoloDatasetCollector,
+    OracleObjectTruth,
     OracleFrameTruth,
     RandomizationBounds,
     estimate_depth_visibility,
     require_oracle_label_acknowledgements,
+)
+from training.yolo.collection_scene import (  # noqa: E402
+    CUBE_CLASS_ID,
+    CUBE_CLASS_NAME,
+    CollectionSceneObject,
+    CubeCollectionProtocol,
+    build_cube_v1_scene_inventory,
+    load_cube_collection_protocol,
+    transformed_local_bounds_corners,
+    validate_scene_inventory,
 )
 
 
@@ -58,6 +71,12 @@ def _nonnegative_int(value: str) -> int:
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="unified Isaac scene YAML")
+    parser.add_argument(
+        "--collection-config",
+        type=Path,
+        default=PROJECT_ROOT / "configs" / "yolo" / "collect_cube.yaml",
+        help="strict public cube-v1 collection protocol",
+    )
     parser.add_argument("--output", required=True, help="new/replaceable dataset directory")
     parser.add_argument("--scene-seed", type=_nonnegative_int, default=42)
     parser.add_argument("--max-samples", type=_positive_int, default=2_000)
@@ -65,11 +84,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--frames-per-episode", type=_positive_int, default=20)
     parser.add_argument("--sample-hz", type=_positive_float, default=2.0)
     parser.add_argument("--min-bbox-area-px", type=_positive_float, default=16.0)
-    parser.add_argument("--class-id", type=_nonnegative_int, default=0)
+    parser.add_argument("--class-id", type=_nonnegative_int, default=CUBE_CLASS_ID)
     parser.add_argument(
         "--class-name",
-        default="red_cube",
-        help="fixed simple-scene target semantic; currently only red_cube is valid",
+        default=CUBE_CLASS_NAME,
+        help="closed-set detector class; cube-v1 requires exactly 'cube'",
     )
     parser.add_argument(
         "--oracle-label-generation",
@@ -86,6 +105,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="validate flags/config without importing or starting Isaac Sim",
     )
+    parser.add_argument(
+        "--gpu-device",
+        type=_nonnegative_int,
+        default=0,
+        help="physical GPU index for Isaac rendering and physics (default: 0)",
+    )
     display = parser.add_mutually_exclusive_group()
     display.add_argument("--headless", dest="headless", action="store_true")
     display.add_argument("--no-headless", dest="headless", action="store_false")
@@ -93,18 +118,223 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-class _SimpleSceneCollectionAdapter:
-    """Late-bound adapter for the repository's simple Isaac scene.
+class _CollectionSceneDriver(Protocol):
+    """Late-bound rendered-scene operations used by the formal adapter."""
 
-    The adapter uses simulator projection of the eight rendered Target-box
-    corners.  Target motion is integrated at physics rate with a bounded turn
-    rate; direction targets change only at the configured episode interval.
+    def install(self, objects: Sequence[CollectionSceneObject]) -> None: ...
+
+    def update_pose(self, obj: CollectionSceneObject) -> None: ...
+
+    def rendered_geometry(
+        self,
+        obj: CollectionSceneObject,
+    ) -> tuple[CollectionSceneObject, np.ndarray]: ...
+
+
+class _UsdCubeV1SceneDriver:
+    """Render the complete cube-v1 inventory under one reusable USD scope.
+
+    All Isaac/USD imports are deliberately inside methods reached only after
+    ``SimulationApp`` exists.  The legacy scene target is always hidden, so it
+    can never become an unenumerated positive cube in a collected image.
     """
 
-    def __init__(self, environment: object, simulation_app: object, config: object) -> None:
+    _ROOT_PATH = "/World/CubeV1Collection"
+    _COLOR_RGB = {
+        "red": (0.92, 0.18, 0.08),
+        "blue": (0.08, 0.28, 0.92),
+        "green": (0.08, 0.78, 0.28),
+        "yellow": (0.92, 0.72, 0.08),
+        "gray": (0.48, 0.48, 0.48),
+    }
+
+    def __init__(self, environment: object) -> None:
+        self._environment = environment
+        self._roots: dict[str, object] = {}
+        self._active_ids: set[str] = set()
+
+    def install(self, objects: Sequence[CollectionSceneObject]) -> None:
+        from pxr import UsdGeom
+
+        validate_scene_inventory(objects)
+        self._hide_legacy_target()
+        self._hide_mission_obstacles()
+        for root in self._roots.values():
+            UsdGeom.Imageable(root).MakeInvisible()
+        active: set[str] = set()
+        for obj in objects:
+            root = self._ensure_object(obj)
+            self._set_pose_and_appearance(root, obj)
+            UsdGeom.Imageable(root).MakeVisible()
+            active.add(obj.object_id)
+        self._active_ids = active
+
+    def update_pose(self, obj: CollectionSceneObject) -> None:
+        if obj.object_id not in self._active_ids:
+            raise RuntimeError(f"collection object is not active: {obj.object_id}")
+        root = self._roots[obj.object_id]
+        self._set_pose_and_appearance(root, obj)
+
+    def rendered_geometry(
+        self,
+        obj: CollectionSceneObject,
+    ) -> tuple[CollectionSceneObject, np.ndarray]:
+        """Read local USD bounds and transform their eight oriented corners."""
+
+        from pxr import Gf, Usd, UsdGeom
+
+        if obj.object_id not in self._active_ids:
+            raise RuntimeError(f"collection object is not active: {obj.object_id}")
+        root = self._roots[obj.object_id]
+        body = root.GetStage().GetPrimAtPath(f"{root.GetPath()}/Body")
+        if not body.IsValid() or not body.IsA(UsdGeom.Boundable):
+            raise RuntimeError(
+                f"collection object Body is not boundable: {obj.object_id}"
+            )
+        cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+            useExtentsHint=True,
+        )
+        # The root owns the randomized translate/rotate/scale while Body owns
+        # the unit primitive.  ComputeLocalBound(root) already folds the root
+        # transform into an aligned descendant box; multiplying that result by
+        # root-to-world again applies the pose twice and loses orientation.
+        # Start from Body's untransformed bound, then apply its complete world
+        # transform exactly once.
+        local_bound = cache.ComputeUntransformedBound(body)
+        local_range = local_bound.GetRange()
+        local_matrix = local_bound.GetMatrix()
+        world_matrix = UsdGeom.XformCache(Usd.TimeCode.Default()).GetLocalToWorldTransform(
+            body
+        )
+
+        def transform(point: tuple[float, float, float]) -> tuple[float, float, float]:
+            local = local_matrix.Transform(Gf.Vec3d(*point))
+            world = world_matrix.Transform(local)
+            return tuple(float(value) for value in world)
+
+        corners, dimensions = transformed_local_bounds_corners(
+            tuple(float(value) for value in local_range.GetMin()),
+            tuple(float(value) for value in local_range.GetMax()),
+            transform,
+        )
+        center = tuple(float(value) for value in np.mean(corners, axis=0))
+        rendered = replace(
+            obj,
+            position_world_m=center,
+            dimensions_xyz_m=dimensions,
+        )
+        return rendered, corners
+
+    def _stage(self) -> object:
+        scene = getattr(self._environment, "scene", None)
+        target = getattr(scene, "target", None)
+        prim = getattr(target, "prim", None)
+        if prim is None:
+            raise RuntimeError("Isaac collection scene target prim is unavailable")
+        return prim.GetStage()
+
+    def _hide_legacy_target(self) -> None:
+        from pxr import UsdGeom
+
+        scene = getattr(self._environment, "scene", None)
+        target = getattr(scene, "target", None)
+        prim = getattr(target, "prim", None)
+        if prim is None:
+            raise RuntimeError("Isaac legacy target prim is unavailable")
+        UsdGeom.Imageable(prim).MakeInvisible()
+
+    def _hide_mission_obstacles(self) -> None:
+        """Exclude non-protocol mission geometry from cube-v1 RGB frames."""
+
+        from pxr import UsdGeom
+
+        obstacle_root = self._stage().GetPrimAtPath("/World/Obstacles")
+        if obstacle_root.IsValid():
+            # cube-v1 supplies its own complete, metadata-enumerated hard
+            # negatives.  Mission obstacles are neither part of that catalog
+            # nor safe to leave as unrecorded occluders/near-cube examples.
+            UsdGeom.Imageable(obstacle_root).MakeInvisible()
+
+    def _ensure_object(self, obj: CollectionSceneObject) -> object:
+        from pxr import UsdGeom
+
+        existing = self._roots.get(obj.object_id)
+        if existing is not None:
+            return existing
+        stage = self._stage()
+        safe_name = "".join(
+            character if character.isalnum() or character == "_" else "_"
+            for character in obj.object_id
+        )
+        root_path = f"{self._ROOT_PATH}/{safe_name}"
+        root = UsdGeom.Xform.Define(stage, root_path).GetPrim()
+        body_path = f"{root_path}/Body"
+        if obj.shape == "sphere":
+            body = UsdGeom.Sphere.Define(stage, body_path)
+            body.CreateRadiusAttr(0.5)
+        elif obj.shape == "cylinder":
+            body = UsdGeom.Cylinder.Define(stage, body_path)
+            body.CreateRadiusAttr(0.5)
+            body.CreateHeightAttr(1.0)
+            body.CreateAxisAttr(UsdGeom.Tokens.z)
+        else:
+            body = UsdGeom.Cube.Define(stage, body_path)
+            body.CreateSizeAttr(1.0)
+        self._roots[obj.object_id] = root
+        return root
+
+    def _set_pose_and_appearance(
+        self,
+        root: object,
+        obj: CollectionSceneObject,
+    ) -> None:
+        from math import atan2, degrees
+        from pxr import Gf, UsdGeom
+
+        xform = UsdGeom.XformCommonAPI(root)
+        xform.SetTranslate(Gf.Vec3d(*obj.position_world_m))
+        w, _x, _y, z = obj.orientation_world_wxyz
+        yaw_deg = degrees(2.0 * atan2(float(z), float(w)))
+        xform.SetRotate(
+            Gf.Vec3f(0.0, 0.0, yaw_deg),
+            UsdGeom.XformCommonAPI.RotationOrderXYZ,
+        )
+        xform.SetScale(Gf.Vec3f(*obj.dimensions_xyz_m))
+        body = root.GetStage().GetPrimAtPath(f"{root.GetPath()}/Body")
+        gprim = UsdGeom.Gprim(body)
+        color = self._COLOR_RGB[obj.color_name]
+        gprim.CreateDisplayColorAttr([Gf.Vec3f(*color)])
+
+
+class _SimpleSceneCollectionAdapter:
+    """Formal cube-v1 adapter for the repository's simple Isaac scene.
+
+    A reusable collection-only USD scope replaces the hidden legacy target.
+    The inventory is protocol-planned (0--3 cubes plus seven hard negatives),
+    and every rendered object is enumerated from its real oriented USD bounds.
+    Cube motion is integrated at physics rate with a bounded turn rate;
+    direction targets change only at the configured episode interval.
+    """
+
+    def __init__(
+        self,
+        environment: object,
+        simulation_app: object,
+        config: object,
+        *,
+        protocol: CubeCollectionProtocol | None = None,
+        scene_driver: _CollectionSceneDriver | None = None,
+    ) -> None:
         self._environment = environment
         self._simulation_app = simulation_app
         self._config = config
+        self._protocol = protocol or load_cube_collection_protocol(
+            PROJECT_ROOT / "configs" / "yolo" / "collect_cube.yaml"
+        )
+        self._scene_driver = scene_driver
+        self._scene_objects: tuple[CollectionSceneObject, ...] = ()
         self._plan: EpisodeRandomization | None = None
         self._target_position = np.zeros(3, dtype=np.float64)
         self._target_heading_rad = 0.0
@@ -113,9 +343,11 @@ class _SimpleSceneCollectionAdapter:
         self._elapsed_s = 0.0
         self._next_turn_s = float("inf")
         self._rng = random.Random(0)
+        self._sample_barrier_timestamp_s: float | None = None
 
     def begin_episode(self, randomization: EpisodeRandomization) -> None:
         self._plan = randomization
+        self._sample_barrier_timestamp_s = None
         self._rng = random.Random(
             (randomization.key.scene_seed << 32)
             ^ int(randomization.key.episode_id.rsplit("_", 1)[-1])
@@ -146,16 +378,32 @@ class _SimpleSceneCollectionAdapter:
 
         # Freeze the scene's legacy random-walk controller.  This collection
         # adapter supplies the smooth, turn-rate-limited trajectory instead.
+        # The legacy target is hidden and must remain at its configured safe
+        # spawn; resetting it to the randomized collection anchor would apply
+        # mission obstacle checks to an object that is not part of the dataset.
         target_motion = self._environment._require_target_motion()
         target_motion.reset(
-            position_m=self._target_position,
-            yaw_rad=self._target_heading_rad,
             seed=randomization.key.scene_seed,
             mode="STATIC",
         )
-        self._set_target_visibility(randomization.sample_kind != "negative")
-        self._set_target_scale(self._target_scale)
-        self._configure_occluder(randomization.sample_kind == "partial_occlusion")
+        try:
+            episode_index = int(randomization.key.episode_id.rsplit("_", 1)[-1])
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError(
+                "cube-v1 episode_id must end in a numeric episode index"
+            ) from exc
+        inventory = build_cube_v1_scene_inventory(
+            self._protocol,
+            scene_seed=randomization.key.scene_seed,
+            episode_index=episode_index,
+            sample_kind=randomization.sample_kind,
+            anchor_position_world_m=self._target_position,
+            target_scale=self._target_scale,
+        )
+        if randomization.sample_kind == "partial_occlusion":
+            inventory = self._place_partial_noncube_occluder(inventory, randomization)
+        self._scene_objects = inventory
+        self._require_scene_driver().install(inventory)
         self._apply_render_randomization(randomization)
         self._set_camera_view(
             pitch_deg=randomization.camera_pitch_deg,
@@ -169,7 +417,10 @@ class _SimpleSceneCollectionAdapter:
         new_frame = False
         for _ in range(steps):
             self._advance_smooth_target(dt_s, plan)
-            new_frame = bool(self._environment.step()) or new_frame
+            # A frame from an earlier step cannot be paired with the USD
+            # geometry at the end of this sampling interval.  Only the final
+            # dynamics barrier determines whether capture is ready.
+            new_frame = bool(self._environment.step())
         # Annotators often need extra render frames after an episode reset.
         warmup_limit = ceil(
             (1.0 / float(self._config.camera.frequency_hz)) / dt_s
@@ -186,50 +437,108 @@ class _SimpleSceneCollectionAdapter:
         if not new_frame:
             raise RuntimeError("Isaac Camera did not produce a synchronized RGB-D sample")
 
+        # Record the exact world/Camera publication barrier.  The fleet
+        # environment already enforces this invariant; repeating the check at
+        # the privileged-label boundary prevents stale RGB-D from ever being
+        # combined with newer Oracle geometry after future adapter changes.
+        sample = self._environment.get_camera_sample()
+        world_timestamp_s = self._current_world_timestamp_s()
+        self._validate_sample_world_barrier(sample, world_timestamp_s)
+        self._sample_barrier_timestamp_s = world_timestamp_s
+
     def capture_oracle_frame(self, frame_id: str) -> OracleFrameTruth:
         del frame_id
-        plan = self._require_plan()
+        self._require_plan()
         sample = self._environment.get_camera_sample()
-        if plan.sample_kind == "negative":
-            return OracleFrameTruth(
-                camera_sample=sample,
-                target_position_world_m=None,
-                target_orientation_world_wxyz=None,
-                projected_target_pixels_uv=None,
-                projected_target_depth_m=None,
-                occlusion_ratio=None,
+        world_timestamp_s = self._current_world_timestamp_s()
+        expected_timestamp_s = getattr(self, "_sample_barrier_timestamp_s", None)
+        if expected_timestamp_s is None:
+            raise RuntimeError(
+                "advance_to_next_sample() must publish a fresh Camera frame before capture"
             )
-        evaluator = self._environment.get_evaluator_frame()
-        target_position = np.asarray(evaluator.target_position_m, dtype=np.float64)
-        target_orientation = np.asarray(
-            evaluator.target_orientation_wxyz,
-            dtype=np.float64,
-        )
-        corners = self._target_world_corners(
-            target_position,
-            target_orientation,
-            self._target_scale,
-        )
-        projection = self._environment.world_to_image(corners)
-        # This is the same atomic CameraSample that supplied RGB.  A projected
-        # box alone cannot prove visibility: nearer depth pixels identify the
-        # collection-only screen, while absent/invalid depth fails closed.
-        depth_visibility = estimate_depth_visibility(
-            sample,
-            projection.pixels_uv,
-            projection.depth_m,
-        )
-        occlusion_ratio = depth_visibility.occlusion_ratio
+        tolerance_s = self._camera_barrier_tolerance_s()
+        if abs(world_timestamp_s - expected_timestamp_s) > tolerance_s:
+            raise RuntimeError(
+                "Isaac world advanced after the synchronized Camera sample and before "
+                "Oracle geometry capture"
+            )
+        self._validate_sample_world_barrier(sample, world_timestamp_s)
+        driver = self._require_scene_driver()
+        objects: list[OracleObjectTruth] = []
+        for planned in self._scene_objects:
+            rendered, corners = driver.rendered_geometry(planned)
+            projection = self._environment.world_to_image(corners)
+            # RGB and depth come from this same atomic CameraSample.  A box
+            # projection alone cannot prove visibility; depth fails closed.
+            depth_visibility = estimate_depth_visibility(
+                sample,
+                projection.pixels_uv,
+                projection.depth_m,
+            )
+            objects.append(
+                OracleObjectTruth(
+                    object_id=rendered.object_id,
+                    shape=rendered.shape,
+                    color_name=rendered.color_name,
+                    position_world_m=rendered.position_world_m,
+                    orientation_world_wxyz=rendered.orientation_world_wxyz,
+                    dimensions_xyz_m=rendered.dimensions_xyz_m,
+                    projected_pixels_uv=projection.pixels_uv,
+                    projected_depth_m=projection.depth_m,
+                    occlusion_ratio=depth_visibility.occlusion_ratio,
+                )
+            )
         return OracleFrameTruth(
             camera_sample=sample,
-            target_position_world_m=tuple(float(value) for value in target_position),
-            target_orientation_world_wxyz=tuple(
-                float(value) for value in target_orientation
-            ),
-            projected_target_pixels_uv=projection.pixels_uv,
-            projected_target_depth_m=projection.depth_m,
-            occlusion_ratio=occlusion_ratio,
+            objects=tuple(objects),
         )
+
+    def _current_world_timestamp_s(self) -> float:
+        world = getattr(self._environment, "world", None)
+        timestamp = getattr(world, "current_time", None)
+        if (
+            isinstance(timestamp, bool)
+            or not isinstance(timestamp, (int, float, np.number))
+            or not isfinite(float(timestamp))
+            or float(timestamp) < 0.0
+        ):
+            raise RuntimeError(
+                "Isaac collection requires a finite non-negative World.current_time"
+            )
+        return float(timestamp)
+
+    def _camera_barrier_tolerance_s(self) -> float:
+        rendering_dt_s = getattr(self._config.simulation, "rendering_dt_s", None)
+        if (
+            isinstance(rendering_dt_s, bool)
+            or not isinstance(rendering_dt_s, (int, float, np.number))
+            or not isfinite(float(rendering_dt_s))
+            or float(rendering_dt_s) <= 0.0
+        ):
+            rendering_dt_s = float(self._config.simulation.physics_dt_s)
+        return max(1e-7, float(rendering_dt_s) * 1e-5)
+
+    def _validate_sample_world_barrier(
+        self,
+        sample: object,
+        world_timestamp_s: float,
+    ) -> None:
+        sample_timestamp_s = getattr(sample, "timestamp_s", None)
+        if (
+            isinstance(sample_timestamp_s, bool)
+            or not isinstance(sample_timestamp_s, (int, float, np.number))
+            or not isfinite(float(sample_timestamp_s))
+        ):
+            raise RuntimeError("Isaac Camera sample has an invalid timestamp")
+        lag_s = float(world_timestamp_s) - float(sample_timestamp_s)
+        tolerance_s = self._camera_barrier_tolerance_s()
+        if abs(lag_s) > tolerance_s:
+            raise RuntimeError(
+                "Isaac collection Camera sample is outside the Oracle geometry "
+                "barrier: "
+                f"world={world_timestamp_s!r}, camera={float(sample_timestamp_s)!r}, "
+                f"lag={lag_s!r}, allowed_absolute_error={tolerance_s!r}"
+            )
 
     def _advance_smooth_target(
         self,
@@ -261,20 +570,31 @@ class _SimpleSceneCollectionAdapter:
                 )
                 candidate[axis] = np.clip(candidate[axis], low[axis], high[axis])
         candidate[2] = np.clip(candidate[2], low[2], high[2])
-        try:
-            self._environment.set_target_pose(
-                candidate,
-                (
-                    cos(self._target_heading_rad / 2.0),
-                    0.0,
-                    0.0,
-                    sin(self._target_heading_rad / 2.0),
+        delta = candidate - self._target_position
+        orientation = (
+            cos(self._target_heading_rad / 2.0),
+            0.0,
+            0.0,
+            sin(self._target_heading_rad / 2.0),
+        )
+        updated: list[CollectionSceneObject] = []
+        driver = self._require_scene_driver()
+        for obj in self._scene_objects:
+            if obj.shape != CUBE_CLASS_NAME:
+                updated.append(obj)
+                continue
+            moved = replace(
+                obj,
+                position_world_m=tuple(
+                    float(value)
+                    for value in np.asarray(obj.position_world_m, dtype=np.float64) + delta
                 ),
+                orientation_world_wxyz=orientation,
             )
-            self._target_position = candidate
-        except ValueError:
-            # A reflected smooth turn avoids an obstacle without teleporting.
-            self._target_heading_rad += pi
+            driver.update_pose(moved)
+            updated.append(moved)
+        self._scene_objects = tuple(updated)
+        self._target_position = candidate
 
     def _set_camera_view(self, *, pitch_deg: float, horizontal_fov_deg: float) -> None:
         sensor = self._environment.scene.camera_sensor
@@ -290,48 +610,18 @@ class _SimpleSceneCollectionAdapter:
         camera.set_focal_length(aperture / (2.0 * tan(radians(horizontal_fov_deg) / 2.0)))
         sensor.invalidate_frame()
 
-    def _set_target_visibility(self, visible: bool) -> None:
-        # Imported only after SimulationApp in main().
-        from pxr import UsdGeom
+    def _place_partial_noncube_occluder(
+        self,
+        objects: Sequence[CollectionSceneObject],
+        plan: EpisodeRandomization,
+    ) -> tuple[CollectionSceneObject, ...]:
+        """Move the catalogued non-cube screen between Camera and a cube."""
 
-        imageable = UsdGeom.Imageable(self._environment.scene.target.prim)
-        imageable.MakeVisible() if visible else imageable.MakeInvisible()
-
-    def _set_target_scale(self, scale: float) -> None:
-        # Scale the rendered body; the projected GT corners use the same value.
-        from pxr import Gf, UsdGeom
-
-        stage = self._environment.scene.target.prim.GetStage()
-        target_root_path = str(self._environment.scene.target.prim.GetPath())
-        body = stage.GetPrimAtPath(f"{target_root_path}/Body")
-        xformable = UsdGeom.Xformable(body)
-        for operation in xformable.GetOrderedXformOps():
-            if operation.GetOpType() == UsdGeom.XformOp.TypeScale:
-                operation.Set(Gf.Vec3d(0.6 * scale, 0.6 * scale, 1.0 * scale))
-                return
-        xformable.AddScaleOp().Set(
-            Gf.Vec3d(0.6 * scale, 0.6 * scale, 1.0 * scale)
-        )
-
-    def _configure_occluder(self, enabled: bool) -> None:
-        """Place a non-colliding screen between Camera and Target when requested."""
-
-        from math import atan2, degrees
-        from pxr import Gf, UsdGeom
-
-        stage = self._environment.scene.target.prim.GetStage()
-        cube = UsdGeom.Cube.Get(stage, "/World/CollectionOnlyOccluder")
-        if not cube:
-            cube = UsdGeom.Cube.Define(stage, "/World/CollectionOnlyOccluder")
-            cube.CreateSizeAttr(1.0)
-            cube.CreateDisplayColorAttr([Gf.Vec3f(0.12, 0.12, 0.12)])
-        imageable = UsdGeom.Imageable(cube.GetPrim())
-        if not enabled:
-            imageable.MakeInvisible()
-            return
-        plan = self._require_plan()
+        cubes = tuple(obj for obj in objects if obj.shape == CUBE_CLASS_NAME)
+        if not cubes:
+            raise RuntimeError("partial_occlusion scene must contain a cube")
         uav = np.asarray(plan.uav_position_world_m, dtype=np.float64)
-        target = self._target_position
+        target = np.asarray(cubes[0].position_world_m, dtype=np.float64)
         direction = target - uav
         norm_xy = float(np.linalg.norm(direction[:2]))
         if norm_xy <= 1e-6:
@@ -340,26 +630,31 @@ class _SimpleSceneCollectionAdapter:
         unit_xy = direction[:2] / norm_xy
         center = target.copy()
         center[:2] -= 0.8 * unit_xy
-        xform = UsdGeom.XformCommonAPI(cube.GetPrim())
-        xform.SetTranslate(Gf.Vec3d(*[float(value) for value in center]))
-        xform.SetRotate(
-            Gf.Vec3f(0.0, 0.0, degrees(atan2(unit_xy[1], unit_xy[0]))),
-            UsdGeom.XformCommonAPI.RotationOrderXYZ,
-        )
-        xform.SetScale(
-            Gf.Vec3f(
-                0.08,
-                float(0.28 * self._target_scale),
-                float(0.70 * self._target_scale),
+        yaw = float(np.arctan2(unit_xy[1], unit_xy[0]))
+        adjusted = tuple(
+            replace(
+                obj,
+                position_world_m=tuple(float(value) for value in center),
+                orientation_world_wxyz=(cos(yaw / 2.0), 0.0, 0.0, sin(yaw / 2.0)),
+                dimensions_xyz_m=(
+                    0.12,
+                    float(0.60 * self._target_scale),
+                    float(1.15 * self._target_scale),
+                ),
             )
+            if obj.shape == "partial_noncube"
+            else obj
+            for obj in objects
         )
-        imageable.MakeVisible()
+        validate_scene_inventory(adjusted)
+        return adjusted
 
     def _apply_render_randomization(self, plan: EpisodeRandomization) -> None:
         """Apply bounded lighting, background/material, and blur variants."""
 
         import carb
-        from pxr import Gf, UsdGeom, UsdLux
+        import carb.settings
+        from pxr import Gf, UsdLux
 
         stage = self._environment.scene.target.prim.GetStage()
         dome = UsdLux.DomeLight.Get(stage, "/World/Lights/Dome")
@@ -373,14 +668,9 @@ class _SimpleSceneCollectionAdapter:
             (0.08, 0.28, 0.92),
             (0.08, 0.78, 0.28),
             (0.92, 0.72, 0.08),
-            (0.72, 0.12, 0.82),
+            (0.48, 0.48, 0.48),
             (0.08, 0.72, 0.78),
         )
-        target_color = palette[plan.material_variant % len(palette)]
-        target_root_path = str(self._environment.scene.target.prim.GetPath())
-        target_body = UsdGeom.Gprim.Get(stage, f"{target_root_path}/Body")
-        if target_body:
-            target_body.GetDisplayColorAttr().Set([Gf.Vec3f(*target_color)])
         if dome:
             background_color = palette[plan.background_variant % len(palette)]
             # Keep illumination desaturated so appearance changes without
@@ -398,31 +688,10 @@ class _SimpleSceneCollectionAdapter:
             float(plan.motion_blur_strength),
         )
 
-    @staticmethod
-    def _target_world_corners(
-        position: np.ndarray,
-        orientation_wxyz: np.ndarray,
-        scale: float,
-    ) -> np.ndarray:
-        half_extent = np.asarray([0.3, 0.3, 0.5], dtype=np.float64) * scale
-        local = np.asarray(
-            [
-                [sx * half_extent[0], sy * half_extent[1], sz * half_extent[2]]
-                for sx in (-1.0, 1.0)
-                for sy in (-1.0, 1.0)
-                for sz in (-1.0, 1.0)
-            ]
-        )
-        w, x, y, z = orientation_wxyz / np.linalg.norm(orientation_wxyz)
-        rotation = np.asarray(
-            [
-                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-            ],
-            dtype=np.float64,
-        )
-        return local @ rotation.T + position
+    def _require_scene_driver(self) -> _CollectionSceneDriver:
+        if self._scene_driver is None:
+            self._scene_driver = _UsdCubeV1SceneDriver(self._environment)
+        return self._scene_driver
 
     def _require_plan(self) -> EpisodeRandomization:
         if self._plan is None:
@@ -457,15 +726,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     except IsaacDatasetCollectionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if args.class_name.strip() != "red_cube":
+    try:
+        collection_protocol = load_cube_collection_protocol(args.collection_config)
+    except (OSError, ValueError) as exc:
+        print(f"collection protocol error: {exc}", file=sys.stderr)
+        return 2
+    if args.class_name.strip() != CUBE_CLASS_NAME:
         print(
-            "error: this collector renders a fixed red cube; --class-name must be "
-            "exactly red_cube to prevent semantic mislabelling",
+            "error: cube-v1 is a single closed-set class; --class-name must be "
+            "exactly cube (colour belongs only in metadata)",
             file=sys.stderr,
         )
         return 2
-    if args.class_id != 0:
-        print("error: one --class-name is configured, so --class-id must be 0", file=sys.stderr)
+    if args.class_id != CUBE_CLASS_ID:
+        print("error: cube-v1 requires --class-id 0", file=sys.stderr)
         return 2
     try:
         config = load_config(args.config)
@@ -501,7 +775,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     # No Isaac-backed module is imported before this point.
     from isaacsim import SimulationApp
 
-    simulation_app = SimulationApp({"headless": bool(args.headless)})
+    simulation_app = SimulationApp(
+        {
+            "headless": bool(args.headless),
+            "active_gpu": args.gpu_device,
+            "physics_gpu": args.gpu_device,
+            # DLSS adds a multi-frame post-processing queue.  Isaac Camera
+            # annotators then report pixels from several renderer ticks behind
+            # World.current_time, which cannot be paired atomically with the
+            # Oracle geometry used for labels.  Synthetic training images need
+            # the raw renderer output, so disable temporal anti-aliasing here.
+            "anti_aliasing": 0,
+            # Isaac 5.1 Camera RenderProducts inherit a USD schema fallback of
+            # ``dlss`` which otherwise overrides ``anti_aliasing=0``.  These
+            # bounded startup settings mirror NVIDIA's SyntheticData sensor
+            # tests and make raw, non-temporal rendering effective per product.
+            "extra_args": [
+                "--/rtx/post/aa/op=0",
+                "--/rtx-defaults/post/aa/op=0",
+                "--/rtx-transient/post/aa/limitedOps=false",
+                "--/app/hydra/renderSettings/useUsdAttributes=false",
+                "--/app/hydra/renderSettings/useFabricAttributes=false",
+            ],
+            # A 640x480 collection render does not benefit from spanning every
+            # server GPU, and doing so can interfere with model/training jobs.
+            "multi_gpu": False,
+            # Full extension teardown can hang for minutes in Isaac Sim 5.1;
+            # failures are flushed above before the bounded fast shutdown.
+            "fast_shutdown": True,
+        }
+    )
     environment = None
     try:
         from env.simple_uav_search_env import SimpleUavSearchEnv
@@ -519,9 +822,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             scene_seed=args.scene_seed,
             oracle_label_generation=args.oracle_label_generation,
             acknowledge_privileged_oracle=args.acknowledge_privileged_oracle,
+            cube_protocol=True,
         )
         summary = collector.collect(
-            _SimpleSceneCollectionAdapter(environment, simulation_app, config)
+            _SimpleSceneCollectionAdapter(
+                environment,
+                simulation_app,
+                config,
+                protocol=collection_protocol,
+            )
         )
         print(
             "Isaac YOLO collection complete: "
@@ -533,9 +842,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"split_counts={dict(summary.split_counts)}")
         print(f"manifest={summary.manifest_path}")
         return 0
+    except IsaacDatasetCollectionError as exc:
+        print(f"Isaac YOLO collection failed closed: {exc}", file=sys.stderr)
+        sys.stderr.flush()
+        return 2
     except KeyboardInterrupt:
         print("Isaac YOLO collection interrupted", file=sys.stderr)
+        sys.stderr.flush()
         return 130
+    except Exception as exc:
+        # Print the actionable Python failure *before* SimulationApp.close().
+        # Kit's native shutdown can terminate/redirect logging before the
+        # interpreter gets a chance to render an uncaught traceback, which used
+        # to leave users with only unrelated Camera/Fabric/DLSS warnings.
+        print(
+            "Isaac YOLO collection crashed before completion: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        return 2
     finally:
         try:
             if environment is not None:

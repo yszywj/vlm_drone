@@ -288,18 +288,14 @@ def test_camera_batch_rejects_cross_camera_render_skew_without_publication() -> 
     assert environment._last_camera_timestamps_s == {}
 
 
-def test_camera_batch_accepts_one_renderer_tick_world_lag_without_relabelling() -> None:
+def test_camera_batch_rejects_even_one_renderer_tick_world_lag() -> None:
     environment, snapshot = _camera_batch_environment(1.183333395048976, 1.183333395048976)
 
-    assert environment._refresh_all_observations(snapshot) == 2
-    assert {
-        observation.camera_timestamp_s
-        for observation in environment.latest_agent_observations.values()
-    } == {1.183333395048976}
-    assert environment._last_camera_timestamps_s == {
-        "uav_a": 1.183333395048976,
-        "uav_b": 1.183333395048976,
-    }
+    with pytest.raises(RuntimeError, match="outside the current renderer barrier"):
+        environment._refresh_all_observations(snapshot)
+
+    assert environment.latest_agent_observations == {}
+    assert environment._last_camera_timestamps_s == {}
 
 
 def test_camera_batch_rejects_more_than_one_renderer_tick_world_lag() -> None:
@@ -311,6 +307,27 @@ def test_camera_batch_rejects_more_than_one_renderer_tick_world_lag() -> None:
     assert environment.latest_agent_observations == {}
     assert environment.latest_evaluator_frames == {}
     assert environment._last_camera_timestamps_s == {}
+
+
+def test_camera_batch_withholds_stale_reset_frame_until_renderer_catches_up() -> None:
+    environment, snapshot = _camera_batch_environment(1.16, 1.16)
+    environment._camera_warmup_pending = True
+
+    assert environment._refresh_all_observations(snapshot) == 0
+    assert environment.latest_agent_observations == {}
+    assert environment.latest_evaluator_frames == {}
+    assert environment._camera_warmup_pending is True
+
+    current_timestamp_s = 1.2
+    for sensor in environment.camera_sensors.values():
+        sensor.sample = replace(sensor.sample, timestamp_s=current_timestamp_s)
+
+    assert environment._refresh_all_observations(snapshot) == 2
+    assert environment._last_camera_timestamps_s == {
+        "uav_a": current_timestamp_s,
+        "uav_b": current_timestamp_s,
+    }
+    assert environment._camera_warmup_pending is False
 
 
 def test_camera_batch_rejects_cross_camera_render_id_even_at_same_timestamp() -> None:
@@ -330,9 +347,7 @@ def test_camera_batch_rejects_cross_camera_render_id_even_at_same_timestamp() ->
 def test_camera_batch_uses_one_shared_software_delivery_cadence() -> None:
     environment, snapshot = _camera_batch_environment(1.0, 1.0)
 
-    assert environment._refresh_all_observations(
-        replace(snapshot, timestamp_s=1.0 + 1.0 / 60.0)
-    ) == 2
+    assert environment._refresh_all_observations(replace(snapshot, timestamp_s=1.0)) == 2
 
     for sensor in environment.camera_sensors.values():
         sensor.sample = replace(sensor.sample, timestamp_s=1.0 + 1.0 / 60.0)
@@ -346,13 +361,113 @@ def test_camera_batch_uses_one_shared_software_delivery_cadence() -> None:
 
     for sensor in environment.camera_sensors.values():
         sensor.sample = replace(sensor.sample, timestamp_s=1.1)
-    assert environment._refresh_all_observations(
-        replace(snapshot, timestamp_s=1.1 + 1.0 / 60.0)
-    ) == 2
+    assert environment._refresh_all_observations(replace(snapshot, timestamp_s=1.1)) == 2
     assert environment._last_camera_timestamps_s == {
         "uav_a": 1.1,
         "uav_b": 1.1,
     }
+
+
+def test_non_due_intermediate_camera_frame_can_withhold_two_tick_pipeline_lag() -> None:
+    environment, snapshot = _camera_batch_environment(1.05, 1.05)
+    environment._last_camera_timestamps_s = {"uav_a": 1.0, "uav_b": 1.0}
+
+    assert environment._refresh_all_observations(
+        replace(snapshot, timestamp_s=1.05 + 2.0 / 60.0)
+    ) == 0
+    assert environment._last_camera_timestamps_s == {
+        "uav_a": 1.0,
+        "uav_b": 1.0,
+    }
+
+    for sensor in environment.camera_sensors.values():
+        sensor.sample = replace(sensor.sample, timestamp_s=1.1)
+    assert environment._refresh_all_observations(replace(snapshot, timestamp_s=1.1)) == 2
+
+
+def test_due_camera_batch_drains_renderer_without_advancing_world_or_poses() -> None:
+    environment, _ = _camera_batch_environment(0.15, 0.15)
+    # The cached renderer frame is only 0.05 s newer than the last published
+    # frame, but the world clock is a full 0.10 s newer and therefore due.
+    environment._last_camera_timestamps_s = {"uav_a": 0.1, "uav_b": 0.1}
+
+    class CatchupWorld:
+        current_time = 0.2
+
+        def __init__(self) -> None:
+            self.render_count = 0
+
+        def render(self) -> None:
+            self.render_count += 1
+            for sensor in environment.camera_sensors.values():
+                sensor.sample = replace(
+                    sensor.sample,
+                    timestamp_s=min(
+                        self.current_time,
+                        sensor.sample.timestamp_s + 1.0 / 60.0,
+                    ),
+                )
+
+    world = CatchupWorld()
+    environment.world = world
+
+    samples = environment._capture_camera_batch(world.current_time)
+
+    assert world.render_count == 3
+    assert all(sample.timestamp_s == pytest.approx(0.2) for sample in samples.values())
+    assert world.current_time == 0.2
+
+
+def test_due_camera_batch_drains_temporary_cross_product_skew() -> None:
+    environment, _ = _camera_batch_environment(0.15, 1.0 / 6.0)
+    environment._last_camera_timestamps_s = {"uav_a": 0.1, "uav_b": 0.1}
+
+    class SkewedCatchupWorld:
+        current_time = 0.2
+
+        def __init__(self) -> None:
+            self.render_count = 0
+
+        def render(self) -> None:
+            self.render_count += 1
+            for sensor in environment.camera_sensors.values():
+                sensor.sample = replace(
+                    sensor.sample,
+                    timestamp_s=min(
+                        self.current_time,
+                        sensor.sample.timestamp_s + 1.0 / 60.0,
+                    ),
+                )
+
+    world = SkewedCatchupWorld()
+    environment.world = world
+
+    samples = environment._capture_camera_batch(world.current_time)
+
+    assert world.render_count == 3
+    assert all(sample.timestamp_s == pytest.approx(0.2) for sample in samples.values())
+
+
+def test_due_camera_batch_rejects_pipeline_that_never_reaches_world_time() -> None:
+    environment, _ = _camera_batch_environment(0.18, 0.18)
+    environment._last_camera_timestamps_s = {"uav_a": 0.1, "uav_b": 0.1}
+
+    class StalledWorld:
+        current_time = 0.2
+
+        def __init__(self) -> None:
+            self.render_count = 0
+
+        def render(self) -> None:
+            self.render_count += 1
+
+    world = StalledWorld()
+    environment.world = world
+
+    with pytest.raises(RuntimeError, match="outside the current renderer barrier"):
+        environment._capture_camera_batch(world.current_time)
+
+    assert world.render_count == environment._MAX_CAMERA_RENDER_CATCHUP_STEPS
 
 
 def test_camera_batch_warmup_watchdog_fails_instead_of_hanging_forever() -> None:
@@ -460,6 +575,7 @@ def test_reset_clears_all_snapshot_camera_and_evaluator_caches() -> None:
     assert environment.latest_agent_observations == {}
     assert environment.latest_evaluator_frames == {}
     assert environment._last_camera_timestamps_s == {}
+    assert environment._camera_warmup_pending is True
     with pytest.raises(RuntimeError, match="no fleet pose snapshot"):
         environment.get_fleet_pose_snapshot()
     assert environment.last_tick_order == ()

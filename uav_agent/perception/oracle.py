@@ -118,22 +118,18 @@ class OraclePerception:
 
         try:
             timestamp_s = float(agent.camera_timestamp_s)
-            observation = Observation(
-                uav_id=self.uav_id,
-                timestamp=timestamp_s,
-                uav_pose=agent.uav_state,
-                uav_velocity=np.asarray(agent.uav_velocity_mps).copy(),
-                camera_rgb=np.asarray(agent.rgb).copy(),
-                camera_position_m=np.asarray(agent.camera_position_m).copy(),
-                camera_orientation_wxyz=np.asarray(
-                    agent.camera_orientation_wxyz
-                ).copy(),
-                target_estimate=TargetEstimate(
+            # Camera visibility is the privilege-release boundary.  The
+            # evaluator frame may retain off-FOV truth for scoring, but none of
+            # that target state is allowed to cross into the Agent
+            # Observation until the target is actually visible in this
+            # Camera sample.
+            estimate = (
+                TargetEstimate(
                     timestamp_s=timestamp_s,
                     target_id=self.target_id,
                     candidate_id=None,
                     tracker_id=None,
-                    visible=visible,
+                    visible=True,
                     confirmed=True,
                     predicted_only=False,
                     class_id=None,
@@ -150,11 +146,27 @@ class OraclePerception:
                     ),
                     measurement_age_s=0.0,
                     source="oracle_evaluation",
+                )
+                if visible
+                else None
+            )
+            observation = Observation(
+                uav_id=self.uav_id,
+                timestamp=timestamp_s,
+                uav_pose=agent.uav_state,
+                uav_velocity=np.asarray(agent.uav_velocity_mps).copy(),
+                camera_rgb=np.asarray(agent.rgb).copy(),
+                camera_position_m=np.asarray(agent.camera_position_m).copy(),
+                camera_orientation_wxyz=np.asarray(
+                    agent.camera_orientation_wxyz
+                ).copy(),
+                target_estimate=estimate,
+                oracle_target_id=self.target_id if visible else None,
+                oracle_target_visible=True if visible else None,
+                oracle_target_pose=target_state if visible else None,
+                oracle_target_velocity=(
+                    target_velocity.copy() if visible else None
                 ),
-                oracle_target_id=self.target_id,
-                oracle_target_visible=visible,
-                oracle_target_pose=target_state,
-                oracle_target_velocity=target_velocity.copy(),
             )
             observation.validate()
         except (AttributeError, TypeError, ValueError) as exc:

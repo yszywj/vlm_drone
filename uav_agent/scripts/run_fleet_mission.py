@@ -106,7 +106,13 @@ from models.adapter_registry import (  # noqa: E402
 from models.model_client_factory import ModelClientFactory  # noqa: E402
 from perception.factory import (  # noqa: E402
     TargetPerceptionConfigurationError,
+    preflight_fleet_yolo_services,
     validate_target_perception_preflight,
+)
+from perception.mode import (  # noqa: E402
+    ResolvedTargetPerceptionMode,
+    TargetPerceptionModeError,
+    resolve_target_perception_mode,
 )
 from planner.dynamic_llm_planner import DynamicLLMPlanner  # noqa: E402
 from planner.policy import PlannerLimits, PlannerPolicy  # noqa: E402
@@ -324,6 +330,7 @@ class PreparedFleetMission:
     planned_routes: Mapping[str, tuple[tuple[float, float, float], ...]]
     headless: bool
     vision_review_mode: str
+    resolved_target_perception_mode: ResolvedTargetPerceptionMode | None = None
     task_spec: FleetTaskSpecV1 | None = None
     fleet_request_v2: FleetMissionRequestV2 | None = None
     fleet_plan_v2: FleetMissionPlanV2 | None = None
@@ -392,6 +399,14 @@ class PreparedFleetMission:
             self.task_spec, FleetTaskSpecV1
         ):
             raise TypeError("task_spec must be FleetTaskSpecV1 or None")
+        if self.resolved_target_perception_mode is not None and not isinstance(
+            self.resolved_target_perception_mode,
+            ResolvedTargetPerceptionMode,
+        ):
+            raise TypeError(
+                "resolved_target_perception_mode must be "
+                "ResolvedTargetPerceptionMode or None"
+            )
         if self.fleet_request_v2 is not None and not isinstance(
             self.fleet_request_v2, FleetMissionRequestV2
         ):
@@ -456,6 +471,21 @@ class PreparedFleetMission:
             )
 
 
+class _StoreExplicitRuntimeProfile(argparse.Action):
+    """Remember whether the legacy profile flag was actually supplied."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, option_string
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_perception_runtime_profile_explicit", True)
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -508,13 +538,28 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--target-perception-mode",
+        choices=("oracle", "yolo"),
+        default=None,
+        help=(
+            "explicit target observation source; validates the YAML backend "
+            "and legacy runtime switches without changing them silently"
+        ),
+    )
+    parser.add_argument(
         "--perception-runtime-profile",
         choices=("production", "oracle_evaluation"),
         default="production",
+        action=_StoreExplicitRuntimeProfile,
     )
     parser.add_argument(
         "--acknowledge-privileged-oracle",
         action="store_true",
+    )
+    parser.add_argument(
+        "--acknowledge-vision-gate",
+        action="store_true",
+        help="explicitly allow Qwen visual decisions to gate YOLO candidates",
     )
     parser.add_argument("--debug-visualization", action="store_true")
     headless = parser.add_mutually_exclusive_group()
@@ -528,6 +573,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=_PROJECT_ROOT / "logs/fleet_missions",
     )
     parser.add_argument("--no-summary-figures", action="store_true")
+    parser.set_defaults(_perception_runtime_profile_explicit=False)
     return parser
 
 
@@ -1419,6 +1465,33 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
         )
 
     config = load_config(args.config)
+    resolved_target_perception_mode: ResolvedTargetPerceptionMode | None = None
+    explicit_target_mode = getattr(args, "target_perception_mode", None)
+    if explicit_target_mode is not None:
+        supplied_legacy_profile = (
+            args.perception_runtime_profile
+            if bool(
+                getattr(args, "_perception_runtime_profile_explicit", False)
+            )
+            else None
+        )
+        try:
+            resolved_target_perception_mode = resolve_target_perception_mode(
+                explicit_target_mode,
+                runtime_profile=supplied_legacy_profile,
+                backend=config.target_perception.backend,
+                acknowledge_privileged_oracle=bool(
+                    args.acknowledge_privileged_oracle
+                ),
+            )
+        except (TargetPerceptionModeError, TypeError) as exc:
+            raise FleetLaunchConfigurationError(str(exc)) from exc
+        # The explicit mode owns the effective profile when the legacy switch
+        # was omitted.  The YAML backend remains untouched and was checked
+        # above.
+        args.perception_runtime_profile = (
+            resolved_target_perception_mode.runtime_profile.value.lower()
+        )
     resolved_headless = (
         bool(config.simulation.headless)
         if args.headless is None
@@ -1441,6 +1514,32 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
     if review_mode not in {"shadow", "gate"}:
         raise FleetLaunchConfigurationError(
             "vision review mode must be shadow or gate"
+        )
+    acknowledge_vision_gate = bool(
+        getattr(args, "acknowledge_vision_gate", False)
+    )
+    is_yolo_backend = (
+        not is_oracle
+        and config.target_perception.backend == "ultralytics_service"
+    )
+    if is_oracle and review_mode == "gate":
+        raise FleetLaunchConfigurationError(
+            "Oracle target perception permits Qwen vision only in shadow mode"
+        )
+    if review_mode == "gate" and not args.enable_qwen_vision:
+        raise FleetLaunchConfigurationError(
+            "vision-review-mode=gate requires --enable-qwen-vision"
+        )
+    if is_yolo_backend and review_mode == "gate" and not acknowledge_vision_gate:
+        raise FleetLaunchConfigurationError(
+            "YOLO vision-review-mode=gate requires --acknowledge-vision-gate"
+        )
+    if acknowledge_vision_gate and (
+        not is_yolo_backend
+        or review_mode != "gate"
+    ):
+        raise FleetLaunchConfigurationError(
+            "--acknowledge-vision-gate is valid only for YOLO gate mode"
         )
 
     registry = AdapterRegistry(args.adapter_config)
@@ -1931,6 +2030,7 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
         planned_routes=planned_routes,
         headless=resolved_headless,
         vision_review_mode=review_mode,
+        resolved_target_perception_mode=resolved_target_perception_mode,
         task_spec=task_spec,
         fleet_request_v2=request_v2,
         fleet_plan_v2=plan_v2,
@@ -2082,6 +2182,9 @@ def _build_visual_review_coordinator(
     manager: object,
     target_manager: object,
     worker: object,
+    candidate_bank: object | None = None,
+    frame_store: object | None = None,
+    candidate_review_eligibility: Callable[[str], bool] | None = None,
 ) -> object:
     from agents.visual_review_coordinator import VisualReviewCoordinator
     from perception import CandidateBank, QwenVLMVerifier, VisualReviewGate
@@ -2094,17 +2197,27 @@ def _build_visual_review_coordinator(
             "SEARCH": config.qwen_visual_review.search_interval_s,
             "INSPECT": config.qwen_visual_review.inspect_interval_s,
             "TRACK": config.qwen_visual_review.track_interval_s,
+            "REACQUIRE": config.qwen_visual_review.search_interval_s,
         }
     )
-    frame_store = FrameStore(
-        max_frames=config.frame_store.max_frames,
-        max_bytes=config.frame_store.max_bytes,
-        max_age_s=config.frame_store.max_age_s,
+    selected_frame_store = (
+        frame_store
+        if frame_store is not None
+        else FrameStore(
+            max_frames=config.frame_store.max_frames,
+            max_bytes=config.frame_store.max_bytes,
+            max_age_s=config.frame_store.max_age_s,
+        )
+    )
+    selected_candidate_bank = (
+        candidate_bank
+        if candidate_bank is not None
+        else CandidateBank(uav_id=uav_id)
     )
     return VisualReviewCoordinator(
         uav_id=uav_id,
         scheduler=scheduler,
-        frame_store=frame_store,
+        frame_store=selected_frame_store,
         worker=worker,
         verifier=QwenVLMVerifier(
             max_image_side_px=config.qwen_visual_review.max_image_side_px,
@@ -2116,7 +2229,7 @@ def _build_visual_review_coordinator(
         ),
         skill_manager=manager,
         target_manager=target_manager,
-        candidate_bank=CandidateBank(uav_id=uav_id),
+        candidate_bank=selected_candidate_bank,
         event_bus=MissionEventBus(max_events=256),
         review_timeout_s=config.qwen_visual_review.blocking_hover_timeout_s,
         max_result_age_s=config.frame_store.max_age_s,
@@ -2137,6 +2250,7 @@ def _build_visual_review_coordinator(
         min_search_candidate_duration_s=(
             config.target_perception.tracker.min_track_duration_s
         ),
+        candidate_review_eligibility=candidate_review_eligibility,
     )
 
 
@@ -2463,6 +2577,7 @@ def _write_prepared_logs(
     logger.write_run_manifest(
         {
             "schema_version": 1,
+            **_target_perception_result_metadata(prepared, args),
             "fleet_mission_id": prepared.request.fleet_mission_id,
             "original_instruction": prepared.request.original_instruction,
             "config_path": str(Path(args.config).expanduser().resolve()),
@@ -2766,6 +2881,22 @@ def _terminal_log_payload(
     )
     summary["original_instruction"] = prepared.request.original_instruction
     summary["planning_failures"] = dict(prepared.planning_failures)
+    summary.update(_target_perception_result_metadata(prepared))
+    if runtime is not None:
+        metrics_snapshot = getattr(runtime, "perception_metrics_snapshot", None)
+        if callable(metrics_snapshot):
+            summary["perception_by_uav"] = metrics_snapshot()
+    service_metadata = (
+        None
+        if prepared.preparation_context is None
+        else prepared.preparation_context.get("yolo_service_metadata")
+    )
+    if isinstance(service_metadata, Mapping):
+        summary["yolo_services_by_uav"] = {
+            str(key): dict(value)
+            for key, value in service_metadata.items()
+            if isinstance(value, Mapping)
+        }
     return tuple(rows), summary
 
 
@@ -3118,6 +3249,77 @@ def _finalize_bounded_results(
     collision_count = recorder.collision_count
     out_of_bounds_count = recorder.out_of_bounds_count
     emergency_landing_count = recorder.emergency_landing_count
+    latest_agent_metric_rows = getattr(recorder, "latest_agent_metric_rows", None)
+    agent_metric_rows = (
+        dict(latest_agent_metric_rows())
+        if callable(latest_agent_metric_rows)
+        else {}
+    )
+    runtime_envelope_metadata = getattr(
+        prepared,
+        "runtime_envelope_metadata",
+        None,
+    )
+    non_target_assignment_ids = frozenset(
+        getattr(runtime_envelope_metadata, "non_target_assignment_ids", ())
+    )
+    target_uav_ids = {
+        assignment.uav_id
+        for assignment in prepared.plan.assignments
+        if assignment.assignment_id
+        not in non_target_assignment_ids
+    }
+    target_uav_ids.update(
+        route[1] for route in runtime_goal_routes.values()
+    )
+    target_agent_rows = [
+        agent_metric_rows[uav_id]
+        for uav_id in sorted(target_uav_ids)
+        if uav_id in agent_metric_rows
+    ]
+
+    def optional_min(field_name: str) -> float | None:
+        values = [
+            float(row[field_name])
+            for row in target_agent_rows
+            if isinstance(row.get(field_name), (int, float))
+            and not isinstance(row.get(field_name), bool)
+        ]
+        return min(values) if values else None
+
+    valid_track_duration_s = sum(
+        float(row.get("valid_track_duration_s", 0.0) or 0.0)
+        for row in target_agent_rows
+    )
+    target_lost_count = sum(
+        int(row.get("target_lost_count", 0) or 0)
+        for row in target_agent_rows
+    )
+    reacquire_successes = sum(
+        int(row.get("target_reacquired_count", 0) or 0)
+        for row in target_agent_rows
+    )
+    perception_by_uav = enriched.get("perception_by_uav")
+    perception_reacquire_attempts = [
+        int(metrics.get("reacquire_attempts", 0) or 0)
+        for uav_id, metrics in (
+            perception_by_uav.items()
+            if isinstance(perception_by_uav, Mapping)
+            else ()
+        )
+        if uav_id in target_uav_ids
+        and isinstance(metrics, Mapping)
+        and isinstance(metrics.get("reacquire_attempts"), (int, float))
+        and not isinstance(metrics.get("reacquire_attempts"), bool)
+    ]
+    # Target-lost count was the original conservative proxy.  Prefer the
+    # provider's lifecycle counter whenever that metric is available, because
+    # one loss may legitimately cause multiple bounded REACQUIRE attempts.
+    reacquire_attempts = (
+        sum(perception_reacquire_attempts)
+        if perception_reacquire_attempts
+        else target_lost_count
+    )
     enriched.update(
         {
             "strict_success": strict_success,
@@ -3165,6 +3367,24 @@ def _finalize_bounded_results(
             "emergency_landing_count": emergency_landing_count,
             "minimum_inter_uav_distance_m": (
                 recorder.minimum_inter_uav_distance_m
+            ),
+            "search_success": bool(target_agent_rows)
+            and all(row.get("time_to_first_detection_s") is not None for row in target_agent_rows),
+            "time_to_first_detection_s": optional_min(
+                "time_to_first_detection_s"
+            ),
+            "time_to_lock_s": optional_min("time_to_first_lock_s"),
+            "valid_track_duration_s": valid_track_duration_s,
+            "target_lost_count": target_lost_count,
+            "reacquire_attempts": reacquire_attempts,
+            "reacquire_successes": reacquire_successes,
+            "return_success": bool(agent_metric_rows)
+            and all(bool(row.get("returned_home")) for row in agent_metric_rows.values()),
+            "landing_success": bool(agent_metric_rows)
+            and all(bool(row.get("landed")) for row in agent_metric_rows.values()),
+            "path_length_m": sum(
+                float(row.get("path_length_m", 0.0) or 0.0)
+                for row in agent_metric_rows.values()
             ),
             "mission_sim_time_s": mission_sim_time_s,
             "interpreter_schema_success": prepared.task_spec is not None
@@ -3676,6 +3896,7 @@ def run_prepared_fleet_mission(
         rows = _prepared_assignment_rows(prepared, status="FAILED")
         logger.write_assignments(rows)
         no_plan_summary = {
+                **_target_perception_result_metadata(prepared, args),
                 "status": "FAILED_NO_EXECUTABLE_PLAN",
                 "fleet_mission_id": prepared.request.fleet_mission_id,
                 "fleet_plan_version": prepared.plan.fleet_plan_version,
@@ -3753,6 +3974,29 @@ def run_prepared_fleet_mission(
     primary_error: BaseException | None = None
     primary_traceback = None
     try:
+        resolved_mode = prepared.resolved_target_perception_mode
+        if (
+            resolved_mode is not None
+            and resolved_mode.mode.value == "yolo"
+        ):
+            yolo_service_metadata = preflight_fleet_yolo_services(
+                prepared.config,
+                tuple(
+                    assignment.uav_id
+                    for assignment in prepared.plan.assignments
+                    if assignment.uav_id in prepared.compilations
+                ),
+            )
+            setattr(
+                args,
+                "_yolo_service_metadata",
+                {key: dict(value) for key, value in yolo_service_metadata.items()},
+            )
+            if prepared.preparation_context is not None:
+                prepared.preparation_context["yolo_service_metadata"] = {
+                    key: dict(value)
+                    for key, value in yolo_service_metadata.items()
+                }
         # FIRST ISAAC IMPORT.  All planning, validation, compilation, model
         # calls, perception preflight, Safety preflight, and initial logging
         # have completed above this line.
@@ -3773,7 +4017,10 @@ def run_prepared_fleet_mission(
         from fleet.model_request_broker import GlobalModelRequestBroker
         from fleet.runtime import FleetMissionRuntime, FleetStatus
         from fleet.target_registry import SharedTargetRegistry
-        from perception.factory import build_target_perception_backend
+        from perception.factory import (
+            build_target_perception_backend,
+            build_target_perception_runtime,
+        )
         from perception.vision_backend import DisabledTargetPerceptionBackend
         from perception.runtime import (
             GuardedPerceptionBackend,
@@ -3807,6 +4054,70 @@ def run_prepared_fleet_mission(
         agents: dict[str, object] = {}
         perceptions: dict[str, object] = {}
         clock = _FleetSimulationClock(environment)
+
+        def attribute_evidence_sink_for(uav_id: str) -> Callable[[object], None]:
+            def persist(evidence: object) -> None:
+                to_dict = getattr(evidence, "to_dict", None)
+                if not callable(to_dict):
+                    raise TypeError("attribute evidence must provide to_dict()")
+                row = dict(to_dict())
+                # Runtime provenance is enforced by the typed protocol but is
+                # intentionally not part of the public scalar JSONL schema.
+                row.pop("runtime_profile", None)
+                result_recorder.record_attribute_evidence(
+                    uav_id,
+                    row,
+                    target_perception_mode="yolo",
+                )
+
+            return persist
+
+        def yolo_visual_components(
+            perception: object,
+        ) -> tuple[object | None, object | None, Callable[[str], bool] | None]:
+            coordinator = getattr(perception, "coordinator", None)
+            if coordinator is None:
+                return None, None, None
+            eligibility = getattr(coordinator, "qwen_fallback_required", None)
+            return (
+                getattr(coordinator, "candidate_bank", None),
+                getattr(coordinator, "frame_store", None),
+                (
+                    eligibility
+                    if prepared.vision_review_mode == "gate"
+                    and callable(eligibility)
+                    else None
+                ),
+            )
+
+        def bind_yolo_visual_gate(
+            perception: object,
+            visual_coordinator: object | None,
+        ) -> None:
+            if visual_coordinator is None or prepared.vision_review_mode != "gate":
+                return
+            coordinator = getattr(perception, "coordinator", None)
+            if coordinator is None:
+                return
+            review_provider = getattr(
+                visual_coordinator,
+                "latest_candidate_review",
+                None,
+            )
+            reference_provider = getattr(
+                visual_coordinator,
+                "latest_candidate_review_reference_handles",
+                None,
+            )
+            bind = getattr(coordinator, "bind_visual_review_provider", None)
+            if not all(
+                callable(value)
+                for value in (review_provider, reference_provider, bind)
+            ):
+                raise FleetLaunchConfigurationError(
+                    "YOLO Qwen gate lacks a typed candidate evidence bridge"
+                )
+            bind(review_provider, reference_provider)
 
         # One Broker owns admission for the entire Fleet runtime.  Visual
         # clients remain isolated per UAV, but no AsyncModelWorker is exposed
@@ -3846,6 +4157,20 @@ def run_prepared_fleet_mission(
                 # alias to Oracle, detector/tracker, or target metrics.
                 runtime_perception = DisabledTargetPerceptionBackend(uav_id=uav_id)
                 backend_name = "disabled_non_target_assignment"
+            elif prepared.resolved_target_perception_mode is not None:
+                runtime_perception = build_target_perception_runtime(
+                    prepared.config,
+                    resolved_mode=prepared.resolved_target_perception_mode,
+                    environment=environment,
+                    uav_id=uav_id,
+                    attribute_evidence_sink=(
+                        attribute_evidence_sink_for(uav_id)
+                        if prepared.resolved_target_perception_mode.mode.value
+                        == "yolo"
+                        else None
+                    ),
+                )
+                backend_name = runtime_perception.backend_name
             elif profile is PerceptionRuntimeProfile.ORACLE_EVALUATION:
                 raw_perception = environment.make_oracle_perception(uav_id)
                 if (
@@ -3887,13 +4212,20 @@ def run_prepared_fleet_mission(
             target_manager = TargetManager()
             visual_coordinator = None
             if args.enable_qwen_vision and not is_non_target_assignment:
+                review_bank, review_store, review_eligibility = (
+                    yolo_visual_components(runtime_perception)
+                )
                 visual_coordinator = _build_visual_review_coordinator(
                     prepared=prepared,
                     uav_id=uav_id,
                     manager=manager,
                     target_manager=target_manager,
                     worker=brokered_visual_workers[uav_id],
+                    candidate_bank=review_bank,
+                    frame_store=review_store,
+                    candidate_review_eligibility=review_eligibility,
                 )
+                bind_yolo_visual_gate(runtime_perception, visual_coordinator)
                 visual_coordinators[uav_id] = visual_coordinator
                 visual_log_cursors[uav_id] = 0
             world_context = prepared.world_contexts[uav_id]
@@ -3965,6 +4297,20 @@ def run_prepared_fleet_mission(
                         uav_id=uav_id
                     )
                     backend_name = "disabled_non_target_assignment"
+                elif prepared.resolved_target_perception_mode is not None:
+                    runtime_perception = build_target_perception_runtime(
+                        prepared.config,
+                        resolved_mode=prepared.resolved_target_perception_mode,
+                        environment=environment,
+                        uav_id=uav_id,
+                        attribute_evidence_sink=(
+                            attribute_evidence_sink_for(uav_id)
+                            if prepared.resolved_target_perception_mode.mode.value
+                            == "yolo"
+                            else None
+                        ),
+                    )
+                    backend_name = runtime_perception.backend_name
                 elif profile is PerceptionRuntimeProfile.ORACLE_EVALUATION:
                     raw_perception = environment.make_oracle_perception(uav_id)
                     runtime_perception = GuardedPerceptionBackend(
@@ -4021,7 +4367,17 @@ def run_prepared_fleet_mission(
                     manager=manager,
                     target_manager=target_manager,
                     worker=worker,
+                    candidate_bank=(
+                        yolo_visual_components(runtime_perception)[0]
+                    ),
+                    frame_store=(
+                        yolo_visual_components(runtime_perception)[1]
+                    ),
+                    candidate_review_eligibility=(
+                        yolo_visual_components(runtime_perception)[2]
+                    ),
                 )
+                bind_yolo_visual_gate(runtime_perception, visual_coordinator)
                 visual_coordinators[uav_id] = visual_coordinator
                 visual_log_cursors[uav_id] = 0
             home_name = next(
@@ -4308,6 +4664,149 @@ def _initial_run_config(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def _target_perception_result_metadata(
+    prepared: PreparedFleetMission,
+    args: argparse.Namespace | None = None,
+) -> dict[str, object]:
+    """Return the shared scalar mode labels for every result surface."""
+
+    resolved = prepared.resolved_target_perception_mode
+    if resolved is not None:
+        mode = resolved.mode.value
+        profile = resolved.runtime_profile.value.lower()
+        privileged = resolved.privileged
+    else:
+        backend = prepared.config.target_perception.backend
+        profile = (
+            "oracle_evaluation"
+            if backend == "oracle_evaluation"
+            else "production"
+        )
+        mode = (
+            "oracle"
+            if backend == "oracle_evaluation"
+            else "yolo"
+            if backend == "ultralytics_service"
+            else "disabled"
+        )
+        privileged = profile == "oracle_evaluation"
+    non_target_ids = prepared.runtime_envelope_metadata.non_target_assignment_ids
+    backend_by_uav = {
+        assignment.uav_id: (
+            "disabled"
+            if assignment.assignment_id in non_target_ids
+            else prepared.config.target_perception.backend
+        )
+        for assignment in prepared.plan.assignments
+    }
+    qwen_enabled = (
+        bool(prepared.visual_clients)
+        if args is None
+        else bool(args.enable_qwen_vision)
+    )
+    qwen_mode = prepared.vision_review_mode if qwen_enabled else "disabled"
+    return {
+        "target_perception_mode": mode,
+        "runtime_profile": profile,
+        "backend_by_uav": dict(sorted(backend_by_uav.items())),
+        "privileged_perception": privileged,
+        "oracle_acknowledged": (
+            mode == "oracle"
+            if args is None
+            else bool(args.acknowledge_privileged_oracle)
+        ),
+        "qwen_vision_mode": qwen_mode,
+        "upper_bound_result": mode == "oracle",
+        "production_vision_result": mode == "yolo",
+        "target_perception_unused_components": (
+            [
+                "yolo_service",
+                "detector",
+                "tracker",
+                "geometry",
+                "state_estimator",
+                "confirmation",
+                "attributes",
+            ]
+            if mode == "oracle"
+            else []
+        ),
+    }
+
+
+def _initial_target_perception_result_metadata(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    """Best-effort mode labels available even when preparation fails.
+
+    This helper performs only local YAML parsing.  It deliberately never
+    contacts a model service or imports Isaac, and always returns the six
+    required result fields so a configuration/schema failure cannot leave a
+    misleading ``unknown`` report.
+    """
+
+    config = None
+    try:
+        config = load_config(args.config)
+    except Exception:
+        # The configuration error itself remains the primary preparation
+        # failure.  Result labelling must be observational and best effort.
+        pass
+
+    explicit_mode = getattr(args, "target_perception_mode", None)
+    if explicit_mode in {"oracle", "yolo"}:
+        mode = str(explicit_mode)
+        profile = "oracle_evaluation" if mode == "oracle" else "production"
+    else:
+        backend = (
+            None if config is None else config.target_perception.backend
+        )
+        mode = (
+            "oracle"
+            if backend == "oracle_evaluation"
+            else "yolo"
+            if backend == "ultralytics_service"
+            else "disabled"
+            if backend == "disabled"
+            else "unknown"
+        )
+        profile = str(
+            getattr(args, "perception_runtime_profile", "unknown")
+        )
+
+    backend_by_uav: dict[str, str] = {}
+    if config is not None:
+        backend_by_uav = {
+            item.id: config.target_perception.backend for item in config.uavs
+        }
+    qwen_enabled = bool(getattr(args, "enable_qwen_vision", False))
+    qwen_mode = (
+        str(
+            getattr(args, "vision_review_mode", None)
+            or (
+                "shadow"
+                if config is None
+                else config.qwen_visual_review.mode
+            )
+        )
+        if qwen_enabled
+        else "disabled"
+    )
+    privileged = mode == "oracle"
+    return {
+        "target_perception_mode": mode,
+        "runtime_profile": profile,
+        "backend_by_uav": dict(sorted(backend_by_uav.items())),
+        "privileged_perception": privileged,
+        "oracle_acknowledged": bool(
+            getattr(args, "acknowledge_privileged_oracle", False)
+        ),
+        "qwen_vision_mode": qwen_mode,
+        "upper_bound_result": privileged,
+        "production_vision_result": mode == "yolo",
+    }
+
+
 def _persist_failed_preparation_audit(
     recorder: FleetResultRecorder,
     args: argparse.Namespace,
@@ -4491,6 +4990,7 @@ def _record_preparation_failure(
     recorder.finalize(
         {
             "schema_version": 1,
+            **_initial_target_perception_result_metadata(args),
             "status": status,
             "stage": stage,
             "last_error": error,
@@ -4562,6 +5062,10 @@ def _ensure_runtime_failure_result(
         "goal_count": 0,
         "goals_completed": 0,
     }
+    if isinstance(prepared, PreparedFleetMission):
+        summary.update(_target_perception_result_metadata(prepared, args))
+    else:
+        summary.update(_initial_target_perception_result_metadata(args))
     recorder: FleetResultRecorder | None = None
     try:
         recorder = FleetResultRecorder(
@@ -4653,9 +5157,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         print(f"[Fleet] result_dir={run_manager.paths.run_dir}")
         try:
+            run_manager.update_manifest_metadata(
+                _initial_target_perception_result_metadata(args)
+            )
+        except Exception as exc:
+            return _record_preparation_failure(
+                run_manager,
+                args,
+                exc,
+                interrupted=False,
+            )
+        try:
             prepared = prepare_fleet_mission(args)
             if hasattr(prepared, "config"):
                 run_manager.update_resolved_config(prepared.config)
+                run_manager.update_manifest_metadata(
+                    _target_perception_result_metadata(prepared, args)
+                )
         except KeyboardInterrupt as exc:
             return _record_preparation_failure(
                 run_manager, args, exc, interrupted=True

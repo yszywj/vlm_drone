@@ -373,6 +373,17 @@ class MissionAgent:
     def uav_id(self) -> str:
         return self._uav_id
 
+    @property
+    def target_manager(self) -> TargetManager:
+        """Expose the backend-neutral lifecycle to a perception provider.
+
+        The provider can submit confirmation evidence through the existing
+        TargetManager API; it receives no planner, controller, or simulator
+        capability through this narrow property.
+        """
+
+        return self._target_manager
+
     def start(
         self,
         instruction: str,
@@ -1541,20 +1552,7 @@ class MissionAgent:
             if not isinstance(target_id, str) or not target_id.strip():
                 raise MissionAgentError("SEARCH transition has no active target_id")
             target_id = target_id.strip()
-            if (
-                self._perception_runtime_profile
-                is PerceptionRuntimeProfile.ORACLE_EVALUATION
-            ):
-                # Explicit Stage-0 expert/upper-bound bypass.  Production must
-                # arrive here only after the visual confirmation coordinator
-                # has already advanced CANDIDATE -> LOCKED.
-                self._target_manager.lock_oracle_from_search(
-                    target_id,
-                    timestamp_s=record.timestamp,
-                    confidence=1.0,
-                )
-            else:
-                self._require_production_visual_lock(target_id, "SEARCH")
+            self._require_perception_provider_lock(target_id, "SEARCH")
             # SEARCH may be followed by navigation or may be the last target
             # operation.  Lock immediately, but enter TRACKING only when the
             # planned successor is actually TRACK.
@@ -1588,17 +1586,7 @@ class MissionAgent:
             if not isinstance(target_id, str) or not target_id.strip():
                 raise MissionAgentError("REACQUIRE transition has no target_id")
             target_id = target_id.strip()
-            if (
-                self._perception_runtime_profile
-                is PerceptionRuntimeProfile.ORACLE_EVALUATION
-            ):
-                self._target_manager.mark_reacquired_oracle(
-                    target_id,
-                    timestamp_s=record.timestamp,
-                    confidence=1.0,
-                )
-            else:
-                self._require_production_visual_lock(target_id, "REACQUIRE")
+            self._require_perception_provider_lock(target_id, "REACQUIRE")
             self._target_manager.start_tracking(record.timestamp)
             return
 
@@ -1706,7 +1694,7 @@ class MissionAgent:
                 )
         raise MissionAgentError("TRACK transition step_id is not in TaskPlan")
 
-    def _require_production_visual_lock(
+    def _require_perception_provider_lock(
         self,
         target_id: str,
         skill_name: str,
@@ -1714,17 +1702,20 @@ class MissionAgent:
         snapshot = self._target_manager.snapshot()
         if snapshot.lifecycle is not TargetLifecycle.LOCKED:
             raise MissionAgentError(
-                f"production {skill_name}->TRACK requires prior visual "
-                "CANDIDATE confirmation and LOCKED state"
+                f"{skill_name} TARGET_FOUND requires the perception provider "
+                "to commit a LOCKED TargetManager state first"
             )
         if snapshot.target_id != target_id:
             raise MissionAgentError(
-                f"production {skill_name}->TRACK target_id does not match "
-                "the confirmed visual target"
+                f"{skill_name} TARGET_FOUND target_id does not match the "
+                "perception provider lock"
             )
         if (
-            snapshot.source is None
-            or is_privileged_oracle_source(snapshot.source)
+            self._perception_runtime_profile is PerceptionRuntimeProfile.PRODUCTION
+            and (
+                snapshot.source is None
+                or is_privileged_oracle_source(snapshot.source)
+            )
         ):
             raise MissionAgentError(
                 f"production {skill_name}->TRACK rejects an Oracle target lock"

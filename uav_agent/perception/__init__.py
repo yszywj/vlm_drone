@@ -27,6 +27,27 @@ from perception.class_aliases import (
     UnsupportedTargetCategory,
     compile_target_query,
 )
+from perception.attribute_types import (
+    ATTRIBUTE_SCHEMA_VERSION,
+    AttributeDecision,
+    AttributeEvidence,
+    AttributeObservation,
+    AttributeRequirement,
+    AttributeVerificationBundle,
+)
+from perception.attribute_verifier import (
+    AttributeFrameUnavailable,
+    AttributeRouteMismatch,
+    AttributeTimeError,
+    AttributeVerificationError,
+    AttributeVerificationRoute,
+    AttributeVerifier,
+)
+from perception.color_attribute_verifier import (
+    COLOR_EVIDENCE_SOURCE,
+    RgbdColorAttributeVerifier,
+    TemporalColorEvidenceAccumulator,
+)
 from perception.detector_tracker import DetectorTrackerPerception
 from perception.evaluation import (
     ISAAC_EVALUATOR_GROUND_TRUTH,
@@ -65,6 +86,12 @@ from perception.obstacle_types import (
     VisibleObstacle,
 )
 from perception.oracle import OraclePerception, OraclePerceptionError
+from perception.mode import (
+    ResolvedTargetPerceptionMode,
+    TargetPerceptionMode,
+    TargetPerceptionModeError,
+    resolve_target_perception_mode,
+)
 from perception.prompt_types import (
     DeterministicPromptCompiler,
     PromptBundle,
@@ -76,6 +103,16 @@ from perception.qwen_vlm_verifier import (
     VisualReviewInput,
 )
 from perception.reid_verifier import ReIDVerifier
+from perception.semantic_fusion import (
+    ATTRIBUTE_SEMANTIC_PENDING,
+    ATTRIBUTE_SEMANTIC_REQUIRES_QWEN,
+    DETERMINISTIC_ATTRIBUTE_VERIFIER,
+    AttributeSemanticProviderMetrics,
+    AttributeSemanticVerificationPending,
+    AttributeSemanticVerificationRequiresQwen,
+    DeterministicAttributeSemanticVerifier,
+    TemporalRgbdAttributeSemanticProvider,
+)
 from perception.target_debug_images import (
     BoundedTargetDebugImageWriter,
     TARGET_DEBUG_EVENTS,
@@ -145,6 +182,24 @@ from perception.visual_evidence import (
 )
 
 __all__ = [
+    "ATTRIBUTE_SCHEMA_VERSION",
+    "ATTRIBUTE_SEMANTIC_PENDING",
+    "ATTRIBUTE_SEMANTIC_REQUIRES_QWEN",
+    "AttributeDecision",
+    "AttributeEvidence",
+    "AttributeFrameUnavailable",
+    "AttributeObservation",
+    "AttributeRequirement",
+    "AttributeRouteMismatch",
+    "AttributeSemanticVerificationPending",
+    "AttributeSemanticVerificationRequiresQwen",
+    "AttributeSemanticProviderMetrics",
+    "AttributeTimeError",
+    "AttributeVerificationBundle",
+    "AttributeVerificationError",
+    "AttributeVerificationRoute",
+    "AttributeVerifier",
+    "COLOR_EVIDENCE_SOURCE",
     "CandidateBank",
     "CandidateLifecycle",
     "CandidateReviewRef",
@@ -162,6 +217,8 @@ __all__ = [
     "DetectorTrackerPerception",
     "ISAAC_EVALUATOR_GROUND_TRUTH",
     "DeterministicPromptCompiler",
+    "DeterministicAttributeSemanticVerifier",
+    "DETERMINISTIC_ATTRIBUTE_VERIFIER",
     "GuardedPerceptionBackend",
     "GroundingBackend",
     "GroundingBackendUnavailable",
@@ -181,6 +238,7 @@ __all__ = [
     "VisibleObstacle",
     "OraclePerception",
     "OraclePerceptionError",
+    "ResolvedTargetPerceptionMode",
     "OracleEvaluationCandidateResolver",
     "OracleEvaluationGrounder",
     "OraclePositionProvider",
@@ -193,6 +251,7 @@ __all__ = [
     "QwenVLMVerifier",
     "QwenVLGrounder",
     "ReIDVerifier",
+    "RgbdColorAttributeVerifier",
     "CompletedStepSummary",
     "CurrentStepSummary",
     "PlanProgressSummary",
@@ -218,6 +277,8 @@ __all__ = [
     "SemanticVerifierBackend",
     "ShortTrackEvidence",
     "TargetPromptAdapter",
+    "TargetPerceptionMode",
+    "TargetPerceptionModeError",
     "TargetEvaluationError",
     "TargetEvaluationMode",
     "TargetEstimateEvaluator",
@@ -247,6 +308,8 @@ __all__ = [
     "ReacquireIdentityRequiresQwen",
     "SemanticVerificationRequiresQwen",
     "TemporalTrackIdentityVerifier",
+    "TemporalColorEvidenceAccumulator",
+    "TemporalRgbdAttributeSemanticProvider",
     "TrackBoxObservation",
     "UNSUPPORTED_TARGET_CATEGORY",
     "UltralyticsGrounder",
@@ -259,4 +322,5 @@ __all__ = [
     "compile_target_query",
     "observation_contains_oracle_data",
     "validate_observation_access",
+    "resolve_target_perception_mode",
 ]

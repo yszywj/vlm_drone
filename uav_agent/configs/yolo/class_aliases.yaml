@@ -37,3 +37,13 @@ truck:
     - truck
     - lorry
     - 卡车
+cube:
+  aliases:
+    - cube
+    - a cube
+    - one cube
+    - cubic object
+    - 立方体
+    - 方块
+    - 一个立方体
+    - 一个方块

@@ -18,15 +18,19 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from common.ids import validate_uav_id
+from fleet.strict_json import strict_json_object_loads
 from .planning_audit_logger import PlanningAuditLogger, sanitize_persisted_payload
 from .schemas import (
     AGENT_METRIC_FIELDS,
+    ATTRIBUTE_EVIDENCE_FIELDS,
     FAILURE_CASE_FIELDS,
     FLEET_METRIC_FIELDS,
     GOAL_METRIC_FIELDS,
     SKILL_EXECUTION_FIELDS,
     STATE_SAMPLE_FIELDS,
     AgentMetricRecord,
+    AttributeEvidenceRecord,
     GoalResultRecord,
     SkillExecutionRecord,
     StateSampleRecord,
@@ -112,7 +116,15 @@ def _read_fleet_logger_storage_state(
     try:
         if path.stat().st_size > _MAX_FLEET_LOG_SIDECAR_BYTES:
             return {}, (), 0
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = strict_json_object_loads(path.read_text(encoding="utf-8"))
+        if set(payload) != {
+            "schema_version",
+            "generation",
+            "dropped_records",
+            "untracked_dropped_record_count",
+            "truncated_streams",
+        } or payload.get("schema_version") != 1:
+            return {}, (), 0
         dropped_raw = payload.get("dropped_records", {})
         truncated_raw = payload.get("truncated_streams", [])
         generation = payload.get("generation", 0)
@@ -466,10 +478,12 @@ class FleetResultRecorder:
         self._last_persisted_state_s: dict[str, float] = {}
         self._agent_accumulators: dict[str, _AgentAccumulator] = {}
         self._state_skipped = 0
-        self._collision_observed = False
+        self._collision_active = False
+        self._collision_count = 0
         self._out_of_bounds_uavs: set[str] = set()
         self._emergency_landing_uavs: set[str] = set()
         self._fleet_rows: list[dict[str, object]] = []
+        self._agent_rows: list[dict[str, object]] = []
         self._goal_rows: list[dict[str, object]] = []
         self._skill_rows: list[dict[str, object]] = []
         self._explicit_agent_ids: set[str] = set()
@@ -517,9 +531,20 @@ class FleetResultRecorder:
         persisted = self._store.append_csv("metrics/agent_metrics.csv", AGENT_METRIC_FIELDS, values)
         if persisted and values.get("uav_id"):
             self._explicit_agent_ids.add(str(values["uav_id"]))
+            self._agent_rows.append(values)
         return persisted
 
     log_agent_metrics = record_agent_metrics
+
+    def latest_agent_metric_rows(self) -> Mapping[str, Mapping[str, object]]:
+        """Return the newest scalar row for each UAV."""
+
+        latest: dict[str, Mapping[str, object]] = {}
+        for row in self._agent_rows:
+            uav_id = row.get("uav_id")
+            if isinstance(uav_id, str) and uav_id:
+                latest[uav_id] = dict(row)
+        return latest
 
     def record_goal_result(self, record: GoalResultRecord | Mapping[str, object]) -> bool:
         self._ensure_open()
@@ -587,7 +612,13 @@ class FleetResultRecorder:
         self._ensure_open()
         if not isinstance(collision, bool):
             raise TypeError("collision must be bool")
-        self._collision_observed = self._collision_observed or collision
+        # Count collision episodes, not frames.  The Fleet loop samples a
+        # separation breach every simulation tick, so summing ``True`` values
+        # would turn one sustained contact into hundreds of collisions while a
+        # latched boolean could never represent a later, distinct contact.
+        if collision and not self._collision_active:
+            self._collision_count += 1
+        self._collision_active = collision
         for values, destination, name in (
             (out_of_bounds_uav_ids, self._out_of_bounds_uavs, "out_of_bounds_uav_ids"),
             (
@@ -605,7 +636,7 @@ class FleetResultRecorder:
 
     @property
     def collision_count(self) -> int:
-        return int(self._collision_observed)
+        return self._collision_count
 
     @property
     def out_of_bounds_count(self) -> int:
@@ -626,6 +657,44 @@ class FleetResultRecorder:
         )
 
     log_failure = record_failure
+
+    def record_attribute_evidence(
+        self,
+        uav_id: str,
+        evidence: Mapping[str, object] | object,
+        *,
+        target_perception_mode: str,
+    ) -> bool:
+        """Persist one scalar-only YOLO attribute decision.
+
+        Oracle callers are rejected rather than producing a misleading empty
+        production stream.  Unknown fields are also rejected so image/crop or
+        depth-plane payloads cannot be smuggled into this dedicated record.
+        """
+
+        self._ensure_open()
+        normalized_uav = validate_uav_id(uav_id)
+        if target_perception_mode != "yolo":
+            raise ResultRecorderError(
+                "attribute evidence is applicable only to target_perception_mode=yolo"
+            )
+        values = _mapping(evidence)
+        values.setdefault("schema_version", 1)
+        record = AttributeEvidenceRecord.from_mapping(values)
+        if record.uav_id != normalized_uav:
+            raise ValueError("attribute evidence uav_id does not match stream route")
+        values = record.to_dict()
+        ordered = {
+            name: values[name]
+            for name in ATTRIBUTE_EVIDENCE_FIELDS
+            if name in values and values[name] is not None
+        }
+        return self._store.append_jsonl(
+            f"agents/{normalized_uav}/attribute_evidence.jsonl",
+            ordered,
+        )
+
+    log_attribute_evidence = record_attribute_evidence
 
     def agent_metric_snapshots(
         self,

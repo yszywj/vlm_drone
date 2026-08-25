@@ -77,6 +77,77 @@ def _truth(value: object) -> bool:
     return str(value).strip().casefold() in {"1", "true", "yes"}
 
 
+def _backend_summary(value: object) -> str:
+    if not isinstance(value, Mapping):
+        return _text(value)
+    rows = []
+    for raw_uav_id, backend in sorted(value.items(), key=lambda item: str(item[0])):
+        rows.append(f"{_text(raw_uav_id)}={_text(backend)}")
+    return ", ".join(rows) if rows else "—"
+
+
+_ORACLE_METRIC_NAMES: tuple[str, ...] = (
+    "oracle_visible_frames",
+    "oracle_total_frames",
+    "oracle_visible_ratio",
+    "time_to_first_oracle_visibility_s",
+    "target_lost_count",
+    "reacquire_attempts",
+)
+
+_YOLO_METRIC_NAMES: tuple[str, ...] = (
+    "yolo_requests",
+    "yolo_successful_responses",
+    "yolo_timeouts",
+    "yolo_stale_results",
+    "detections_total",
+    "candidates_total",
+    "candidates_confirmed",
+    "color_observations",
+    "color_matches",
+    "color_mismatches",
+    "color_pending",
+    "qwen_attribute_fallback_count",
+    "depth_resolution_failures",
+    "track_id_switches",
+    "target_visible_ratio",
+    "position_rmse_m",
+    "velocity_rmse_mps",
+)
+
+
+def _bounded_report_header(summary: Mapping[str, object]) -> list[str]:
+    """Render the mandatory mode labels, including in storage fallback reports."""
+
+    status = summary.get("status", summary.get("final_status", "UNKNOWN"))
+    mode = summary.get("target_perception_mode", "unknown")
+    lines = ["# Fleet mission report", ""]
+    if str(mode).strip().casefold() == "oracle":
+        lines.extend(
+            [
+                "## WARNING:",
+                "",
+                "This run used privileged Oracle target perception.",
+                "It is an upper-bound/regression result, not production visual performance.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            f"- Final status: **{_text(status)}**",
+            f"- Target perception: **{_text(mode)}**",
+            f"- Runtime profile: `{_text(summary.get('runtime_profile'))}`",
+            f"- Backend by UAV: {_backend_summary(summary.get('backend_by_uav'))}",
+            f"- Privileged perception: {_text(summary.get('privileged_perception'))}",
+            f"- Oracle acknowledged: {_text(summary.get('oracle_acknowledged'))}",
+            f"- Qwen vision mode: `{_text(summary.get('qwen_vision_mode'))}`",
+            f"- Upper-bound result: {_text(summary.get('upper_bound_result'))}",
+            f"- Production vision result: {_text(summary.get('production_vision_result'))}",
+        ]
+    )
+    return lines
+
+
 def _local_plan_steps(value: Mapping[str, object]) -> list[object]:
     """Return the authoritative bounded step list from a persisted local plan."""
 
@@ -192,12 +263,69 @@ class FleetReportGenerator:
         summary = context["summary"] if isinstance(context["summary"], Mapping) else {}
         status = summary.get("status", summary.get("final_status", "UNKNOWN"))
         mission_id = summary.get("fleet_mission_id", self.run_dir.name)
-        lines = [
-            "# Fleet mission report",
-            "",
+        mode = summary.get("target_perception_mode", "unknown")
+        lines = _bounded_report_header(summary)
+        lines.extend([
             f"- Mission: `{_text(mission_id)}`",
-            f"- Final status: **{_text(status)}**",
             "- Result contract: scalar/structured data only; no camera images, video, raw frames, prompts, or full observations.",
+            "",
+            "## Target perception metrics",
+            "",
+            "| UAV | Metric | Value |",
+            "|---|---|---:|",
+        ])
+        perception_by_uav = summary.get("perception_by_uav")
+        metric_names = (
+            _ORACLE_METRIC_NAMES
+            if str(mode).strip().casefold() == "oracle"
+            else _YOLO_METRIC_NAMES
+        )
+        metric_rows = 0
+        if isinstance(perception_by_uav, Mapping):
+            for raw_uav_id, raw_metrics in sorted(
+                perception_by_uav.items(), key=lambda item: str(item[0])
+            ):
+                if not isinstance(raw_metrics, Mapping):
+                    continue
+                for metric_name in metric_names:
+                    if metric_name not in raw_metrics:
+                        continue
+                    lines.append(
+                        f"| {_text(raw_uav_id)} | `{metric_name}` | "
+                        f"{_text(raw_metrics.get(metric_name))} |"
+                    )
+                    metric_rows += 1
+        if metric_rows == 0:
+            lines.append("| — | — | No target-perception metrics recorded |")
+
+        services = summary.get("yolo_services_by_uav")
+        if str(mode).strip().casefold() == "yolo":
+            lines.extend(
+                [
+                    "",
+                    "### YOLO services",
+                    "",
+                    "| UAV | URL | Model SHA256 | Model names |",
+                    "|---|---|---|---|",
+                ]
+            )
+            service_rows = 0
+            if isinstance(services, Mapping):
+                for raw_uav_id, raw_service in sorted(
+                    services.items(), key=lambda item: str(item[0])
+                ):
+                    if not isinstance(raw_service, Mapping):
+                        continue
+                    lines.append(
+                        f"| {_text(raw_uav_id)} | {_text(raw_service.get('url'))} | "
+                        f"{_text(raw_service.get('model_sha256'))} | "
+                        f"{_text(raw_service.get('model_names', raw_service.get('names')))} |"
+                    )
+                    service_rows += 1
+            if service_rows == 0:
+                lines.append("| — | — | — | No YOLO service metadata recorded |")
+
+        lines.extend([
             "",
             "## Original instruction",
             "",
@@ -205,7 +333,7 @@ class FleetReportGenerator:
             "",
             "## Qwen task interpretation",
             "",
-        ]
+        ])
         task_spec = context.get("task_spec")
         goals = task_spec.get("goals", []) if isinstance(task_spec, Mapping) else []
         ambiguities = task_spec.get("ambiguities", []) if isinstance(task_spec, Mapping) else []
@@ -344,9 +472,19 @@ class FleetReportGenerator:
         previous = path.stat().st_size if path.exists() else 0
         current_size = sum(item.stat().st_size for item in self.run_dir.rglob("*") if item.is_file())
         if current_size - previous + len(encoded) > self.max_run_bytes:
+            summary = (
+                context["summary"]
+                if isinstance(context["summary"], Mapping)
+                else {}
+            )
             encoded = (
-                f"# Fleet mission report\n\n- Final status: **{_text(context['summary'].get('status', 'UNKNOWN') if isinstance(context['summary'], Mapping) else 'UNKNOWN')}**\n"
-                "- Detail omitted because the bounded run storage limit was reached.\n"
+                "\n".join(
+                    [
+                        *_bounded_report_header(summary),
+                        "- Detail omitted because the bounded run storage limit was reached.",
+                    ]
+                )
+                + "\n"
             ).encode("utf-8")
         temporary = path.with_suffix(".md.tmp")
         try:

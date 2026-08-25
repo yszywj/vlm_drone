@@ -26,6 +26,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--data", type=Path, required=True, help="dataset data.yaml")
     parser.add_argument("--task", choices=("detect", "segment"), default="detect")
     parser.add_argument(
+        "--protocol",
+        choices=("generic", "cube-v1"),
+        default="cube-v1",
+        help="cube-v1 enforces class 0/cube, metadata, coverage, and grouped splits",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=None,
@@ -43,7 +49,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        report = YoloDatasetValidator(task=args.task).validate(args.data)
+        report = YoloDatasetValidator(
+            task=args.task,
+            protocol=args.protocol,
+        ).validate(args.data)
         statistics_path = report.write_statistics(args.output)
     except (OSError, RuntimeError, YoloDatasetError, ValueError) as exc:
         print(
@@ -63,4 +72,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

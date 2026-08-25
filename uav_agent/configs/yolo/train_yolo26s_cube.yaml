@@ -1,0 +1,21 @@
+model_family: yolo
+task: detect
+dataset_protocol: cube-v1
+base_model_path: null
+dataset_yaml: null
+
+epochs: 100
+imgsz: 960
+batch: 16
+device: 0
+workers: 8
+patience: 20
+seed: 42
+deterministic: true
+amp: true
+cache: false
+resume: false
+
+project_dir: ../outputs/perception/yolo
+run_name: yolo26s_cube
+

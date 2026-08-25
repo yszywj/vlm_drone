@@ -2,9 +2,12 @@
 
 from training.yolo.config import YoloTrainConfig, YoloTrainingConfigError
 from training.yolo.dataset import (
+    CubeDatasetValidator,
+    CubeYoloDatasetValidator,
     DatasetIssue,
     DatasetValidationReport,
     YoloDatasetValidator,
+    validate_cube_yolo_dataset,
 )
 from training.yolo.trainer import (
     ExportResult,
@@ -24,8 +27,10 @@ from training.yolo.isaac_collector import (
     IsaacDatasetCollectionError,
     IsaacYoloDatasetCollector,
     OracleFrameTruth,
+    OracleObjectTruth,
     RandomizationBounds,
     project_oracle_bbox,
+    project_oracle_object_bbox,
     require_oracle_label_acknowledgements,
     split_for_episode,
 )
@@ -33,6 +38,8 @@ from training.yolo.isaac_collector import (
 __all__ = [
     "DatasetIssue",
     "DatasetValidationReport",
+    "CubeDatasetValidator",
+    "CubeYoloDatasetValidator",
     "CollectionLimits",
     "CollectionSummary",
     "EpisodeKey",
@@ -45,14 +52,17 @@ __all__ = [
     "IsaacDatasetCollectionError",
     "IsaacYoloDatasetCollector",
     "OracleFrameTruth",
+    "OracleObjectTruth",
     "RandomizationBounds",
     "UltralyticsTrainingBackend",
     "ValidationResult",
     "YoloDatasetValidator",
+    "validate_cube_yolo_dataset",
     "YoloTrainConfig",
     "YoloTrainingBackend",
     "YoloTrainingConfigError",
     "project_oracle_bbox",
+    "project_oracle_object_bbox",
     "require_oracle_label_acknowledgements",
     "split_for_episode",
 ]

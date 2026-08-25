@@ -739,6 +739,37 @@ class RunManager:
             raise TypeError("resolved_config must be a mapping or dataclass configuration")
         _atomic_write_yaml(self.paths.resolved_config, plain_config)
 
+    def update_manifest_metadata(self, metadata: Mapping[str, Any]) -> None:
+        """Atomically add bounded run metadata without changing lifecycle keys."""
+
+        if self.status is not RunStatus.RUNNING:
+            raise InvalidRunStateError(
+                "manifest metadata can only be updated while the run is running"
+            )
+        plain = _to_plain_data(metadata, "manifest_metadata")
+        if not isinstance(plain, Mapping):
+            raise TypeError("metadata must be a mapping")
+        protected = {
+            "run_id",
+            "experiment_name",
+            "stage",
+            "status",
+            "start_time",
+            "end_time",
+            "exit_code",
+            "output_dir",
+        }
+        conflicts = sorted(protected.intersection(plain))
+        if conflicts:
+            raise ValueError(
+                "manifest metadata cannot replace lifecycle fields: "
+                + ", ".join(conflicts)
+            )
+        next_manifest = copy.deepcopy(self._manifest)
+        next_manifest.update(plain)
+        _atomic_write_yaml(self.paths.manifest, next_manifest)
+        self._manifest = next_manifest
+
     def record_exit_code(self, exit_code: int) -> None:
         if isinstance(exit_code, bool) or not isinstance(exit_code, int):
             raise TypeError("exit_code must be an integer")

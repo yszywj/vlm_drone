@@ -346,6 +346,37 @@ class FrameStore:
             view.setflags(write=False)
             return view
 
+    def get_camera_sample(self, ref: FrameRef) -> CameraSample | None:
+        """Atomically retrieve one synchronized RGB-D sample.
+
+        Both pixel channels and camera geometry are resolved under the same
+        lock.  The returned ``CameraSample`` owns immutable copies, so an
+        eviction immediately after this method returns cannot split RGB from
+        depth or alter the measurement.
+        """
+
+        if not isinstance(ref, FrameRef):
+            raise TypeError("ref must be a FrameRef")
+        with self._lock:
+            stored = self._frames.get((ref.uav_id, ref.frame_id))
+            if (
+                stored is None
+                or stored.ref != ref
+                or stored.camera_geometry is None
+            ):
+                return None
+            geometry = stored.camera_geometry
+            return CameraSample(
+                timestamp_s=geometry.timestamp_s,
+                rgb=stored.rgb,
+                depth_to_image_plane_m=stored.depth_to_image_plane_m,
+                camera_position_world_m=geometry.camera_position_world_m,
+                camera_orientation_world_wxyz=(
+                    geometry.camera_orientation_world_wxyz
+                ),
+                intrinsics=geometry.intrinsics,
+            )
+
     def get_depth(
         self,
         ref: FrameRef,

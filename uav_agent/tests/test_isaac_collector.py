@@ -14,9 +14,11 @@ from training.yolo.isaac_collector import (
     CollectionLimits,
     DepthVisibilityDecision,
     EpisodeKey,
+    EpisodeRandomizer,
     IsaacDatasetCollectionError,
     IsaacYoloDatasetCollector,
     OracleFrameTruth,
+    ProjectedYoloLabel,
     RandomizationBounds,
     estimate_depth_visibility,
     project_oracle_bbox,
@@ -136,6 +138,49 @@ class IsaacCollectorTest(unittest.TestCase):
         self.assertAlmostEqual(decision.label.width, 0.3)
         self.assertAlmostEqual(decision.label.height, 2.0 / 3.0)
 
+    def test_edge_clipped_label_rounding_stays_inside_image(self) -> None:
+        label = ProjectedYoloLabel(
+            class_id=0,
+            center_x=0.09947443450504969,
+            center_y=0.6984915,
+            width=0.198948868,
+            height=0.39255816,
+            bbox_xyxy_px=(0.0, 241.0, 127.32727616, 429.0),
+            raw_area_px=1.0,
+            clipped_area_px=1.0,
+            visibility="edge_clipped",
+        )
+
+        _class_id, center_x, center_y, width, height = label.yolo_line().split()
+        center_x_f = float(center_x)
+        center_y_f = float(center_y)
+        width_f = float(width)
+        height_f = float(height)
+
+        self.assertGreaterEqual(center_x_f - width_f / 2.0, 0.0)
+        self.assertLessEqual(center_x_f + width_f / 2.0, 1.0)
+        self.assertGreaterEqual(center_y_f - height_f / 2.0, 0.0)
+        self.assertLessEqual(center_y_f + height_f / 2.0, 1.0)
+
+    def test_label_serialization_rejects_a_real_out_of_frame_box(self) -> None:
+        label = ProjectedYoloLabel(
+            class_id=0,
+            center_x=0.1,
+            center_y=0.5,
+            width=0.4,
+            height=0.2,
+            bbox_xyxy_px=(-10.0, 10.0, 30.0, 20.0),
+            raw_area_px=400.0,
+            clipped_area_px=300.0,
+            visibility="edge_clipped",
+        )
+
+        with self.assertRaisesRegex(
+            IsaacDatasetCollectionError,
+            "extends outside",
+        ):
+            label.yolo_line()
+
     def test_fully_invisible_and_too_small_targets_do_not_get_labels(self) -> None:
         hidden = _positive_truth(occlusion_ratio=1.0)
         self.assertEqual(
@@ -249,6 +294,30 @@ class IsaacCollectorTest(unittest.TestCase):
         limits = CollectionLimits()
         key = EpisodeKey(7, "episode_1", "trajectory_1")
         self.assertEqual(split_for_episode(key, limits), split_for_episode(key, limits))
+
+    def test_episode_camera_yaw_faces_target_with_only_bounded_offset(self) -> None:
+        randomizer = EpisodeRandomizer(
+            RandomizationBounds(
+                uav_x_m=(-100.0, 100.0),
+                uav_y_m=(-100.0, 100.0),
+                target_x_m=(0.0, 0.0),
+                target_y_m=(0.0, 0.0),
+                target_camera_distance_m=(10.0, 10.0),
+            ),
+            scene_seed=42,
+        )
+
+        for episode_index in range(20):
+            plan = randomizer.plan(episode_index)
+            target = np.asarray(plan.target_position_world_m)
+            uav = np.asarray(plan.uav_position_world_m)
+            target_bearing_deg = float(
+                np.degrees(np.arctan2(target[1] - uav[1], target[0] - uav[0]))
+            )
+            yaw_error_deg = (
+                plan.uav_yaw_deg - target_bearing_deg + 180.0
+            ) % 360.0 - 180.0
+            self.assertLessEqual(abs(yaw_error_deg), 10.0 + 1e-9)
 
     def test_bounded_collection_writes_standard_labels_and_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

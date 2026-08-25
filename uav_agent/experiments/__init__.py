@@ -81,6 +81,7 @@ from .run_manager import (
 )
 from .schemas import (
     AGENT_METRIC_FIELDS,
+    ATTRIBUTE_EVIDENCE_FIELDS,
     BATCH_EPISODE_METRIC_FIELDS,
     EPISODE_METRIC_FIELDS,
     EVAL_METRIC_FIELDS,
@@ -91,11 +92,13 @@ from .schemas import (
     SKILL_EXECUTION_FIELDS,
     STATE_SAMPLE_FIELDS,
     AgentMetricRecord,
+    AttributeEvidenceRecord,
     TRAIN_METRIC_FIELDS,
     FailureReason,
     GoalResultRecord,
     MetricPhase,
     PlanningAttemptRecord,
+    PERCEPTION_RESULT_FIELDS,
     RecoveryActionRecord,
     RunStatus,
     StorageStatus,
@@ -145,7 +148,9 @@ from .terminal_logger import (
 
 __all__ = [
     "AGENT_METRIC_FIELDS",
+    "ATTRIBUTE_EVIDENCE_FIELDS",
     "AgentMetricRecord",
+    "AttributeEvidenceRecord",
     "BATCH_EPISODE_METRIC_FIELDS",
     "BestCheckpoint",
     "BestCheckpointRequiredError",
@@ -202,6 +207,7 @@ __all__ = [
     "OutputRootError",
     "PlotError",
     "PlanningAttemptRecord",
+    "PERCEPTION_RESULT_FIELDS",
     "PlanningAuditLogger",
     "QwenReviewLogRecord",
     "RUN_RESUMED_SEPARATOR",

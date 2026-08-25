@@ -20,6 +20,7 @@ _ALLOWED_KEYS = frozenset(
     {
         "model_family",
         "task",
+        "dataset_protocol",
         "base_model_path",
         "dataset_yaml",
         "epochs",
@@ -104,6 +105,7 @@ class YoloTrainConfig:
 
     model_family: str = "yolo"
     task: str = "detect"
+    dataset_protocol: str = "generic"
     base_model_path: Path | None = None
     dataset_yaml: Path | None = None
     epochs: int = 100
@@ -123,12 +125,20 @@ class YoloTrainConfig:
     def __post_init__(self) -> None:
         family = str(self.model_family).strip().lower()
         task = str(self.task).strip().lower()
+        dataset_protocol = str(self.dataset_protocol).strip().lower()
         if family not in {"yolo", "yoloe"}:
             raise YoloTrainingConfigError("model_family must be 'yolo' or 'yoloe'")
         if task not in {"detect", "segment"}:
             raise YoloTrainingConfigError("task must be 'detect' or 'segment'")
+        if dataset_protocol not in {"generic", "cube-v1"}:
+            raise YoloTrainingConfigError(
+                "dataset_protocol must be 'generic' or 'cube-v1'"
+            )
+        if dataset_protocol == "cube-v1" and task != "detect":
+            raise YoloTrainingConfigError("cube-v1 currently requires task 'detect'")
         object.__setattr__(self, "model_family", family)
         object.__setattr__(self, "task", task)
+        object.__setattr__(self, "dataset_protocol", dataset_protocol)
         object.__setattr__(
             self,
             "base_model_path",
@@ -248,4 +258,3 @@ def load_yolo_train_config(
             )
         raw.update({key: value for key, value in overrides.items() if value is not None})
     return YoloTrainConfig(**raw)
-

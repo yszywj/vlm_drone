@@ -7,7 +7,7 @@
 --extra-index-url https://download.pytorch.org/whl/cu126
 torch==2.7.0+cu126
 torchvision==0.22.0+cu126
-ultralytics==8.3.222
+ultralytics==8.4.0
 lap==0.5.13
 onnx==1.22.0
 fastapi==0.115.7

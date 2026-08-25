@@ -140,10 +140,14 @@ def test_export_and_tracker_dependencies_cover_all_yolo_environment_entries() ->
 
     assert "lap==0.5.13" in environment
     assert "onnx==1.22.0" in environment
+    assert "ultralytics==8.4.0" in environment
     assert "\nlap\n" in f"\n{requirements_in}"
     assert "\nonnx\n" in f"\n{requirements_in}"
+    assert "ultralytics>=8.4.0,<8.5" in requirements_in
     assert "lap==0.5.13" in direct_lock
     assert "onnx==1.22.0" in direct_lock
+    assert "ultralytics==8.4.0" in direct_lock
+    assert "ultralytics==8.3.222" not in environment + direct_lock
     assert "does not claim to be a hash-complete transitive lock" in direct_lock
     dependency_lines = [
         line.strip().removeprefix("- ").lower()

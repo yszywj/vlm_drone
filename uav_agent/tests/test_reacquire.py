@@ -417,7 +417,10 @@ class ReacquireSkillTest(unittest.TestCase):
         self.assertEqual(result["found_timestamp"], clock.now())
         self.assertEqual(result["predicted_position"], (5.0, 0.0, 0.5))
         self.assertIn("camera_pose", result)
-        self.assertIn("oracle_target_pose", result)
+        self.assertEqual(result["target_position_world_m"], (5.0, 0.0, 0.5))
+        self.assertEqual(result["target_velocity_world_mps"], (0.0, 0.0, 0.0))
+        self.assertNotIn("oracle_target_pose", result)
+        self.assertNotIn("oracle_target_velocity_mps", result)
 
     def test_timeout_is_the_only_normal_failure_and_stops_scan(self) -> None:
         uav = make_uav((0.0, 0.0, 5.0), max_yaw_rate=1.0)

@@ -305,9 +305,15 @@ class SearchSkillTest(unittest.TestCase):
             tuple(found_observation.camera_orientation_wxyz),
         )
         self.assertEqual(
-            result.data["oracle_target_pose"],
-            {"x": 0.0, "y": 0.0, "z": 0.5, "yaw": 0.0},
+            result.data["target_position_world_m"],
+            (0.0, 0.0, 0.5),
         )
+        self.assertEqual(
+            result.data["target_velocity_world_mps"],
+            (0.0, 0.0, 0.0),
+        )
+        self.assertNotIn("oracle_target_pose", result.data)
+        self.assertNotIn("oracle_target_velocity_mps", result.data)
         np.testing.assert_array_equal(uav.get_velocity(), np.zeros(3))
 
     def test_target_on_search_region_edge_is_found(self) -> None:

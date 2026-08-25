@@ -357,15 +357,6 @@ class ReacquireSkill(Skill):
             "completed_scans": self._completed_scans,
             "elapsed_time": elapsed,
         }
-        if estimate.source == "oracle_evaluation":
-            data["oracle_target_pose"] = {
-                "x": estimate.position_world_m[0],
-                "y": estimate.position_world_m[1],
-                "z": estimate.position_world_m[2],
-                "yaw": 0.0,
-            }
-            if estimate.velocity_world_mps is not None:
-                data["oracle_target_velocity_mps"] = estimate.velocity_world_mps
         self._set_feedback(
             min(1.0, elapsed / goal.timeout),
             "Requested confirmed target visible in Camera FOV",

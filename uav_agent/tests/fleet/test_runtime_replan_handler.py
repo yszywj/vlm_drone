@@ -391,6 +391,13 @@ def test_terminal_goal_metrics_follow_successful_runtime_reassignment() -> None:
         prepared,
         {
             "status": "SUCCEEDED",
+            "perception_by_uav": {
+                "uav_b": {
+                    "target_lost_count": 1,
+                    "reacquire_attempts": 3,
+                    "reacquire_successes": 1,
+                }
+            },
             "assignments": {
                 "assignment_runtime_replanned": {
                     "status": "SUCCEEDED",
@@ -405,6 +412,7 @@ def test_terminal_goal_metrics_follow_successful_runtime_reassignment() -> None:
     assert summary["goals_completed"] == 3
     assert summary["reassignment_count"] == 1
     assert summary["reassignments_succeeded"] == 1
+    assert summary["reacquire_attempts"] == 3
     assert {item.assignment_id for item in recorder.goals} == {
         "assignment_runtime_replanned"
     }

@@ -90,6 +90,14 @@ class YoloServiceClientConfig:
     max_result_age_s: float = 0.5
     jpeg_quality: int = 90
     max_inflight_per_uav: int = 1
+    per_uav_urls: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "per_uav_urls",
+            MappingProxyType(dict(self.per_uav_urls)),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +152,57 @@ class VisualConfirmationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TargetColorAttributeConfig:
+    """Bounded RGB-D color evidence settings for a target candidate."""
+
+    enabled: bool = True
+    method: str = "hsv_depth_mask"
+    supported_values: tuple[str, ...] = ("red", "blue")
+    roi_inset_ratio: float = 0.12
+    min_valid_pixel_ratio: float = 0.15
+    min_saturation: float = 0.25
+    min_value: float = 0.15
+    min_dominant_fraction: float = 0.55
+    min_score_margin: float = 0.15
+    depth_absolute_tolerance_m: float = 0.25
+    depth_relative_tolerance: float = 0.05
+    min_observations: int = 3
+    min_duration_s: float = 0.4
+    max_history_per_candidate: int = 16
+    hue_ranges_deg: Mapping[str, tuple[tuple[float, float], ...]] = field(
+        default_factory=lambda: {
+            "red": ((0.0, 20.0), (340.0, 360.0)),
+            "blue": ((190.0, 260.0),),
+        }
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "supported_values",
+            tuple(self.supported_values),
+        )
+        normalized = {
+            str(name): tuple(tuple(float(value) for value in interval) for interval in ranges)
+            for name, ranges in self.hue_ranges_deg.items()
+        }
+        object.__setattr__(self, "hue_ranges_deg", MappingProxyType(normalized))
+
+
+@dataclass(frozen=True, slots=True)
+class TargetAttributeConfig:
+    """Deterministic-first target attribute confirmation policy."""
+
+    enabled: bool = True
+    mode: str = "deterministic_then_qwen"
+    require_qwen_for_unsupported_attributes: bool = True
+    require_qwen_for_ambiguous_attributes: bool = True
+    color: TargetColorAttributeConfig = field(
+        default_factory=TargetColorAttributeConfig
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class TargetPerceptionConfig:
     """Independent target-perception backend and its bounded subcomponents."""
 
@@ -160,6 +219,7 @@ class TargetPerceptionConfig:
     confirmation: VisualConfirmationConfig = field(
         default_factory=VisualConfirmationConfig
     )
+    attributes: TargetAttributeConfig = field(default_factory=TargetAttributeConfig)
 
 
 @dataclass(frozen=True)
@@ -645,6 +705,8 @@ __all__ = [
     "ModelWorkerConfig",
     "ObstaclePerceptionConfig",
     "TargetDetectorConfig",
+    "TargetAttributeConfig",
+    "TargetColorAttributeConfig",
     "TargetGeometryConfig",
     "TargetPerceptionConfig",
     "TargetStateEstimatorConfig",

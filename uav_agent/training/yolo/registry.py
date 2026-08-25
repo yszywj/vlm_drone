@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from fleet.strict_json import strict_json_object_loads
+
 from training.yolo.config import YoloTrainConfig
 from training.yolo.dataset import DatasetValidationReport
 
@@ -155,8 +157,8 @@ def load_validation_gate(
             "export requires an explicit validation report produced by validate_yolo.py"
         )
     try:
-        raw = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raw = strict_json_object_loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
         raise ModelRegistryError(f"invalid validation report {report_path}: {exc}") from exc
     if not isinstance(raw, Mapping) or raw.get("passed") is not True:
         raise ModelRegistryError("model validation did not pass; export is blocked")
@@ -175,11 +177,21 @@ def load_validation_gate(
         "per_class",
         "small_target_metrics",
         "latency_ms",
+        "passed",
     }
     missing = sorted(required_fields - set(raw))
     if missing:
         raise ModelRegistryError(
             "validation report is incomplete; missing: " + ", ".join(missing)
+        )
+    # ValidationReport v1 historically omitted raw_metrics in hand-authored
+    # export gates.  Keep that field optional while retaining an exact
+    # top-level allow-list and strict JSON parsing.
+    allowed_fields = required_fields | {"raw_metrics"}
+    unknown = sorted(set(raw) - allowed_fields)
+    if unknown:
+        raise ModelRegistryError(
+            "validation report contains unknown fields: " + ", ".join(unknown)
         )
     if raw.get("schema_version") != 1:
         raise ModelRegistryError("unsupported validation report schema_version")
@@ -209,6 +221,8 @@ def load_validation_gate(
     for key in ("per_class", "small_target_metrics", "latency_ms"):
         if not isinstance(raw.get(key), Mapping):
             raise ModelRegistryError(f"validation report has invalid {key}")
+    if "raw_metrics" in raw and not isinstance(raw.get("raw_metrics"), Mapping):
+        raise ModelRegistryError("validation report has invalid raw_metrics")
     small_metrics = raw["small_target_metrics"]
     if small_metrics.get("available") is not True:
         raise ModelRegistryError(

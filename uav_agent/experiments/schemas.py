@@ -202,6 +202,11 @@ FLEET_METRIC_FIELDS: tuple[str, ...] = (
     "schema_version",
     "fleet_mission_id",
     "status",
+    "target_perception_mode",
+    "runtime_profile",
+    "privileged_perception",
+    "upper_bound_result",
+    "production_vision_result",
     "strict_success",
     "semantic_success",
     "execution_success",
@@ -223,6 +228,16 @@ FLEET_METRIC_FIELDS: tuple[str, ...] = (
     "out_of_bounds_count",
     "emergency_landing_count",
     "minimum_inter_uav_distance_m",
+    "search_success",
+    "time_to_first_detection_s",
+    "time_to_lock_s",
+    "valid_track_duration_s",
+    "target_lost_count",
+    "reacquire_attempts",
+    "reacquire_successes",
+    "return_success",
+    "landing_success",
+    "path_length_m",
     "mission_sim_time_s",
     "mission_wall_time_s",
     "interpreter_schema_success",
@@ -231,6 +246,43 @@ FLEET_METRIC_FIELDS: tuple[str, ...] = (
     "prompt_tokens",
     "completion_tokens",
     "model_latency_s",
+)
+
+
+# Scalar-only production visual identity evidence.  This is JSONL rather than
+# CSV so a future schema version can add bounded scalar reason codes without
+# creating any route for Camera, crop, depth-plane, or base64 persistence.
+ATTRIBUTE_EVIDENCE_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "timestamp_s",
+    "mission_id",
+    "uav_id",
+    "assignment_id",
+    "candidate_id",
+    "tracker_id",
+    "attribute_name",
+    "expected_value",
+    "observed_value",
+    "decision",
+    "confidence",
+    "observation_count",
+    "duration_s",
+    "valid_sample_ratio",
+    "source",
+    "reason_code",
+)
+
+
+# Required on manifest.yaml, summary.json, and report.md whenever a fleet run
+# declares a target-perception mode. ``backend_by_uav`` stays structured on
+# JSON/YAML surfaces and is intentionally not flattened into the fleet CSV.
+PERCEPTION_RESULT_FIELDS: tuple[str, ...] = (
+    "target_perception_mode",
+    "runtime_profile",
+    "backend_by_uav",
+    "privileged_perception",
+    "oracle_acknowledged",
+    "qwen_vision_mode",
 )
 
 
@@ -360,11 +412,144 @@ def _record_time(value: object, name: str, *, optional: bool = False) -> float |
     return normalized
 
 
+def _record_unit_interval(value: object, name: str) -> float:
+    normalized = _record_time(value, name)
+    assert normalized is not None
+    if normalized > 1.0:
+        raise ValueError(f"{name} must be within [0, 1]")
+    return normalized
+
+
+def _record_positive_count(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
 class _FleetRecord:
     """Small convenience API shared by immutable fleet records."""
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class AttributeEvidenceRecord(_FleetRecord):
+    """One scalar-only production attribute-evidence result row."""
+
+    timestamp_s: float
+    uav_id: str
+    assignment_id: str
+    candidate_id: str
+    tracker_id: str | int
+    attribute_name: str
+    expected_value: str
+    observed_value: str | None
+    decision: str
+    confidence: float
+    observation_count: int
+    duration_s: float
+    valid_sample_ratio: float
+    source: str
+    mission_id: str | None = None
+    reason_code: str | None = None
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("attribute evidence schema_version must be exactly 1")
+        object.__setattr__(
+            self,
+            "timestamp_s",
+            _record_time(self.timestamp_s, "timestamp_s"),
+        )
+        for name in (
+            "uav_id",
+            "assignment_id",
+            "candidate_id",
+            "attribute_name",
+            "expected_value",
+            "source",
+        ):
+            object.__setattr__(self, name, _record_text(getattr(self, name), name))
+        object.__setattr__(
+            self,
+            "mission_id",
+            _record_text(self.mission_id, "mission_id", optional=True),
+        )
+        object.__setattr__(
+            self,
+            "reason_code",
+            _record_text(self.reason_code, "reason_code", optional=True),
+        )
+        object.__setattr__(
+            self,
+            "observed_value",
+            _record_text(self.observed_value, "observed_value", optional=True),
+        )
+        tracker_id = self.tracker_id
+        if isinstance(tracker_id, bool) or not isinstance(tracker_id, (str, int)):
+            raise TypeError("tracker_id must be a scalar string or integer")
+        if isinstance(tracker_id, int):
+            if tracker_id < 0:
+                raise ValueError("tracker_id integer must be non-negative")
+        else:
+            object.__setattr__(
+                self,
+                "tracker_id",
+                _record_text(tracker_id, "tracker_id"),
+            )
+        decision = _record_text(self.decision, "decision")
+        assert decision is not None
+        normalized_decision = decision.upper()
+        if normalized_decision not in {
+            "MATCH",
+            "MISMATCH",
+            "PENDING",
+            "UNSUPPORTED",
+        }:
+            raise ValueError(
+                "decision must be MATCH, MISMATCH, PENDING, or UNSUPPORTED"
+            )
+        object.__setattr__(self, "decision", normalized_decision)
+        object.__setattr__(
+            self,
+            "confidence",
+            _record_unit_interval(self.confidence, "confidence"),
+        )
+        object.__setattr__(
+            self,
+            "observation_count",
+            _record_positive_count(self.observation_count, "observation_count"),
+        )
+        object.__setattr__(
+            self,
+            "duration_s",
+            _record_time(self.duration_s, "duration_s"),
+        )
+        object.__setattr__(
+            self,
+            "valid_sample_ratio",
+            _record_unit_interval(self.valid_sample_ratio, "valid_sample_ratio"),
+        )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "AttributeEvidenceRecord":
+        if not isinstance(value, Mapping):
+            raise TypeError("attribute evidence must be a mapping")
+        raw = dict(value)
+        unknown = sorted(set(raw) - set(ATTRIBUTE_EVIDENCE_FIELDS))
+        if unknown:
+            raise ValueError(
+                "attribute evidence contains unknown fields: " + ", ".join(unknown)
+            )
+        required = set(ATTRIBUTE_EVIDENCE_FIELDS) - {"mission_id", "reason_code"}
+        missing = sorted(required - set(raw))
+        if missing:
+            raise ValueError(
+                "attribute evidence is missing required fields: " + ", ".join(missing)
+            )
+        return cls(**raw)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,6 +737,8 @@ class StateSampleRecord(_FleetRecord):
 
 __all__ = [
     "AGENT_METRIC_FIELDS",
+    "ATTRIBUTE_EVIDENCE_FIELDS",
+    "AttributeEvidenceRecord",
     "AgentMetricRecord",
     "BATCH_EPISODE_METRIC_FIELDS",
     "EPISODE_METRIC_FIELDS",
@@ -564,6 +751,7 @@ __all__ = [
     "GoalResultRecord",
     "MetricPhase",
     "PlanningAttemptRecord",
+    "PERCEPTION_RESULT_FIELDS",
     "RecoveryActionRecord",
     "RunStatus",
     "SKILL_EXECUTION_FIELDS",

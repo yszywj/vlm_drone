@@ -36,6 +36,8 @@ from configs.schema import (
     StorageConfig,
     SimulationConfig,
     TargetDetectorConfig,
+    TargetAttributeConfig,
+    TargetColorAttributeConfig,
     TargetAppearanceConfig,
     TargetConfig,
     TargetGeometryConfig,
@@ -215,6 +217,7 @@ def _strict_nested_block(
     name: str,
     path: str,
     expected_keys: frozenset[str],
+    optional_keys: frozenset[str] = frozenset(),
 ) -> Mapping[str, Any] | None:
     """Validate an optional nested block without accepting partial schemas."""
 
@@ -224,7 +227,7 @@ def _strict_nested_block(
     if any(not isinstance(key, str) for key in raw):
         raise ConfigError(f"{path}.{name} keys must be strings")
     missing = sorted(expected_keys - set(raw))
-    unknown = sorted(set(raw) - expected_keys)
+    unknown = sorted(set(raw) - expected_keys - optional_keys)
     if missing:
         raise ConfigError(
             f"{path}.{name} is missing required keys: " + ", ".join(missing)
@@ -842,6 +845,7 @@ def load_config(path: str | Path) -> AppConfig:
                 "geometry",
                 "state_estimator",
                 "confirmation",
+                "attributes",
             }
         )
         unknown = sorted(set(target_perception_raw) - allowed_target_perception_keys)
@@ -877,6 +881,7 @@ def load_config(path: str | Path) -> AppConfig:
                     "max_inflight_per_uav",
                 }
             ),
+            frozenset({"per_uav_urls"}),
         )
         if service_raw is None:
             yolo_service = _DEFAULT_TARGET_PERCEPTION_CONFIG.yolo_service
@@ -896,6 +901,32 @@ def load_config(path: str | Path) -> AppConfig:
                 raise ConfigError(
                     "target_perception.yolo_service.max_inflight_per_uav must be exactly 1"
                 )
+            per_uav_urls_raw = service_raw.get("per_uav_urls", {})
+            per_uav_urls_mapping = _mapping(
+                per_uav_urls_raw,
+                "target_perception.yolo_service.per_uav_urls",
+            )
+            per_uav_urls: dict[str, str] = {}
+            for raw_uav_id, raw_url in per_uav_urls_mapping.items():
+                parsed_uav_id = _uav_id(
+                    raw_uav_id,
+                    "target_perception.yolo_service.per_uav_urls key",
+                )
+                if parsed_uav_id not in uav_ids:
+                    raise ConfigError(
+                        "target_perception.yolo_service.per_uav_urls contains "
+                        f"unknown UAV {parsed_uav_id!r}"
+                    )
+                try:
+                    parsed_url = validate_loopback_http_url(
+                        raw_url,
+                        "target_perception.yolo_service.per_uav_urls."
+                        f"{parsed_uav_id}",
+                    )
+                except ValueError as exc:
+                    raise ConfigError(str(exc)) from exc
+                per_uav_urls[parsed_uav_id] = parsed_url
+
             yolo_service = YoloServiceClientConfig(
                 url=url,
                 request_timeout_s=_bounded_positive_number(
@@ -914,7 +945,30 @@ def load_config(path: str | Path) -> AppConfig:
                     95,
                 ),
                 max_inflight_per_uav=inflight,
+                per_uav_urls=per_uav_urls,
             )
+
+        if backend == "ultralytics_service" and len(uav_ids) > 1:
+            configured_ids = set(yolo_service.per_uav_urls)
+            active_ids = set(uav_ids)
+            if configured_ids != active_ids:
+                missing_ids = sorted(active_ids - configured_ids)
+                extra_ids = sorted(configured_ids - active_ids)
+                details: list[str] = []
+                if missing_ids:
+                    details.append("missing " + ", ".join(missing_ids))
+                if extra_ids:
+                    details.append("unknown " + ", ".join(extra_ids))
+                raise ConfigError(
+                    "multi-UAV ultralytics_service requires one per_uav_urls "
+                    "entry for every active UAV (" + "; ".join(details) + ")"
+                )
+            urls = tuple(yolo_service.per_uav_urls.values())
+            if len(urls) != len(set(urls)):
+                raise ConfigError(
+                    "parallel UAVs must use distinct target_perception."
+                    "yolo_service.per_uav_urls"
+                )
 
         detector_raw = _strict_nested_block(
             target_perception_raw,
@@ -1133,7 +1187,11 @@ def load_config(path: str | Path) -> AppConfig:
                 confirmation_raw["mode"],
                 "target_perception.confirmation.mode",
             )
-            if confirmation_mode not in {"class_track_or_qwen", "qwen_required"}:
+            if confirmation_mode not in {
+                "class_track_or_qwen",
+                "class_track_attribute_or_qwen",
+                "qwen_required",
+            }:
                 raise ConfigError("unsupported target_perception.confirmation.mode")
             confirmation = VisualConfirmationConfig(
                 mode=confirmation_mode,
@@ -1147,6 +1205,225 @@ def load_config(path: str | Path) -> AppConfig:
                 ),
             )
 
+        attributes_raw = _strict_nested_block(
+            target_perception_raw,
+            "attributes",
+            "target_perception",
+            frozenset(
+                {
+                    "enabled",
+                    "mode",
+                    "require_qwen_for_unsupported_attributes",
+                    "require_qwen_for_ambiguous_attributes",
+                    "color",
+                }
+            ),
+        )
+        if attributes_raw is None:
+            attributes = _DEFAULT_TARGET_PERCEPTION_CONFIG.attributes
+        else:
+            attributes_mode = _non_empty_string(
+                attributes_raw["mode"], "target_perception.attributes.mode"
+            )
+            if attributes_mode != "deterministic_then_qwen":
+                raise ConfigError(
+                    "target_perception.attributes.mode must be "
+                    "deterministic_then_qwen"
+                )
+            color_raw = _mapping(
+                attributes_raw["color"], "target_perception.attributes.color"
+            )
+            color_keys = frozenset(
+                {
+                    "enabled",
+                    "method",
+                    "supported_values",
+                    "roi_inset_ratio",
+                    "min_valid_pixel_ratio",
+                    "min_saturation",
+                    "min_value",
+                    "min_dominant_fraction",
+                    "min_score_margin",
+                    "depth_absolute_tolerance_m",
+                    "depth_relative_tolerance",
+                    "min_observations",
+                    "min_duration_s",
+                    "max_history_per_candidate",
+                    "hue_ranges_deg",
+                }
+            )
+            missing_color = sorted(color_keys - set(color_raw))
+            unknown_color = sorted(set(color_raw) - color_keys)
+            if missing_color:
+                raise ConfigError(
+                    "target_perception.attributes.color is missing required keys: "
+                    + ", ".join(missing_color)
+                )
+            if unknown_color:
+                raise ConfigError(
+                    "target_perception.attributes.color contains unknown keys: "
+                    + ", ".join(unknown_color)
+                )
+            color_method = _non_empty_string(
+                color_raw["method"], "target_perception.attributes.color.method"
+            )
+            if color_method != "hsv_depth_mask":
+                raise ConfigError(
+                    "target_perception.attributes.color.method must be "
+                    "hsv_depth_mask"
+                )
+            supported_raw = color_raw["supported_values"]
+            if isinstance(supported_raw, (str, bytes)) or not isinstance(
+                supported_raw, Sequence
+            ):
+                raise ConfigError(
+                    "target_perception.attributes.color.supported_values must "
+                    "be a sequence"
+                )
+            supported_values = tuple(
+                _non_empty_string(
+                    value,
+                    "target_perception.attributes.color.supported_values",
+                ).casefold()
+                for value in supported_raw
+            )
+            if not supported_values:
+                raise ConfigError(
+                    "target_perception.attributes.color.supported_values must "
+                    "not be empty"
+                )
+            if len(supported_values) != len(set(supported_values)):
+                raise ConfigError(
+                    "target_perception.attributes.color.supported_values must "
+                    "be unique"
+                )
+
+            hue_raw = _mapping(
+                color_raw["hue_ranges_deg"],
+                "target_perception.attributes.color.hue_ranges_deg",
+            )
+            if set(hue_raw) != set(supported_values):
+                raise ConfigError(
+                    "target_perception.attributes.color.hue_ranges_deg must "
+                    "exactly cover supported_values"
+                )
+            hue_ranges: dict[str, tuple[tuple[float, float], ...]] = {}
+            for color_name in supported_values:
+                raw_ranges = hue_raw[color_name]
+                if isinstance(raw_ranges, (str, bytes)) or not isinstance(
+                    raw_ranges, Sequence
+                ) or not raw_ranges:
+                    raise ConfigError(
+                        "target_perception.attributes.color.hue_ranges_deg."
+                        f"{color_name} must be a non-empty sequence"
+                    )
+                parsed_ranges: list[tuple[float, float]] = []
+                for index, raw_range in enumerate(raw_ranges):
+                    path = (
+                        "target_perception.attributes.color.hue_ranges_deg."
+                        f"{color_name}[{index}]"
+                    )
+                    if isinstance(raw_range, (str, bytes)) or not isinstance(
+                        raw_range, Sequence
+                    ) or len(raw_range) != 2:
+                        raise ConfigError(f"{path} must contain two numbers")
+                    lower = _finite_number(raw_range[0], f"{path}[0]")
+                    upper = _finite_number(raw_range[1], f"{path}[1]")
+                    if not 0.0 <= lower < upper <= 360.0:
+                        raise ConfigError(
+                            f"{path} must satisfy 0 <= lower < upper <= 360"
+                        )
+                    parsed_ranges.append((lower, upper))
+                hue_ranges[color_name] = tuple(parsed_ranges)
+
+            fractions: dict[str, float] = {}
+            for field_name in (
+                "roi_inset_ratio",
+                "min_valid_pixel_ratio",
+                "min_saturation",
+                "min_value",
+                "min_dominant_fraction",
+                "min_score_margin",
+                "depth_relative_tolerance",
+            ):
+                value = _finite_number(
+                    color_raw[field_name],
+                    f"target_perception.attributes.color.{field_name}",
+                )
+                if not 0.0 <= value <= 1.0:
+                    raise ConfigError(
+                        f"target_perception.attributes.color.{field_name} "
+                        "must be in [0, 1]"
+                    )
+                fractions[field_name] = value
+            if fractions["roi_inset_ratio"] >= 0.5:
+                raise ConfigError(
+                    "target_perception.attributes.color.roi_inset_ratio must "
+                    "be less than 0.5"
+                )
+
+            color = TargetColorAttributeConfig(
+                enabled=_boolean(
+                    color_raw["enabled"],
+                    "target_perception.attributes.color.enabled",
+                ),
+                method=color_method,
+                supported_values=supported_values,
+                roi_inset_ratio=fractions["roi_inset_ratio"],
+                min_valid_pixel_ratio=fractions["min_valid_pixel_ratio"],
+                min_saturation=fractions["min_saturation"],
+                min_value=fractions["min_value"],
+                min_dominant_fraction=fractions["min_dominant_fraction"],
+                min_score_margin=fractions["min_score_margin"],
+                depth_absolute_tolerance_m=_bounded_positive_number(
+                    color_raw["depth_absolute_tolerance_m"],
+                    "target_perception.attributes.color."
+                    "depth_absolute_tolerance_m",
+                    1_000.0,
+                ),
+                depth_relative_tolerance=fractions["depth_relative_tolerance"],
+                min_observations=_bounded_positive_integer(
+                    color_raw["min_observations"],
+                    "target_perception.attributes.color.min_observations",
+                    1_000,
+                ),
+                min_duration_s=_bounded_positive_number(
+                    color_raw["min_duration_s"],
+                    "target_perception.attributes.color.min_duration_s",
+                    3_600.0,
+                ),
+                max_history_per_candidate=_bounded_positive_integer(
+                    color_raw["max_history_per_candidate"],
+                    "target_perception.attributes.color."
+                    "max_history_per_candidate",
+                    4_096,
+                ),
+                hue_ranges_deg=hue_ranges,
+            )
+            if color.min_observations > color.max_history_per_candidate:
+                raise ConfigError(
+                    "target_perception.attributes.color.min_observations must "
+                    "not exceed max_history_per_candidate"
+                )
+            attributes = TargetAttributeConfig(
+                enabled=_boolean(
+                    attributes_raw["enabled"],
+                    "target_perception.attributes.enabled",
+                ),
+                mode=attributes_mode,
+                require_qwen_for_unsupported_attributes=_boolean(
+                    attributes_raw["require_qwen_for_unsupported_attributes"],
+                    "target_perception.attributes."
+                    "require_qwen_for_unsupported_attributes",
+                ),
+                require_qwen_for_ambiguous_attributes=_boolean(
+                    attributes_raw["require_qwen_for_ambiguous_attributes"],
+                    "target_perception.attributes."
+                    "require_qwen_for_ambiguous_attributes",
+                ),
+                color=color,
+            )
+
         target_perception = TargetPerceptionConfig(
             backend=backend,
             yolo_service=yolo_service,
@@ -1155,6 +1432,7 @@ def load_config(path: str | Path) -> AppConfig:
             geometry=geometry,
             state_estimator=state_estimator,
             confirmation=confirmation,
+            attributes=attributes,
         )
 
     targets = tuple(

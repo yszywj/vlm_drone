@@ -81,16 +81,16 @@ def build_target_catalog(config: "AppConfig") -> dict[str, TargetSpec]:
     result: dict[str, TargetSpec] = {}
     for target in config.targets:
         appearance = target.appearance
-        alias = target.semantic_alias or target.id
-        hard = (
-            f"color={appearance.color_name}",
-            f"shape={appearance.shape}",
-        )
-        description = f"{appearance.color_name} {appearance.shape.lower()} {alias}"
+        # ``target.id``/``semantic_alias`` are Fleet routing identifiers, not
+        # visual appearance.  Ordinary closed-set YOLO detects one category
+        # (``cube``); deterministic RGB-D evidence proves the colour identity.
+        # Do not duplicate the category as ``shape=CUBE`` in hard attributes.
+        category = appearance.shape.strip().lower()
+        description = f"{appearance.color_name.strip().lower()} {category}"
         result[target.id] = TargetSpec(
             original_description=description,
-            category=appearance.shape.lower(),
-            hard_attributes=hard,
+            category=category,
+            hard_attributes=(f"color={appearance.color_name.strip().lower()}",),
             immutable_identity_summary=description,
         )
     return result

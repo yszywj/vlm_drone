@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 import importlib
 import math
@@ -10,6 +12,8 @@ from pathlib import Path
 import shutil
 import time
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
+
+import yaml
 
 from training.yolo.config import YoloTrainConfig, YoloTrainingConfigError
 from training.yolo.dataset import DatasetValidationReport, YoloDatasetValidator
@@ -249,6 +253,56 @@ def _result_metrics(result: Any) -> dict[str, Any]:
     return {}
 
 
+@contextmanager
+def _block_ultralytics_downloads(*, enabled: bool):
+    """Reject framework-initiated downloads while using explicit local inputs.
+
+    Ultralytics' CUDA AMP check otherwise downloads a separate reference model
+    even when the requested training checkpoint and dataset are both local.  The
+    project deliberately has no implicit network/model fallback, so replace the
+    download boundary for the duration of the framework call.  ``check_amp``
+    handles ``ConnectionError`` by retaining the requested AMP setting after its
+    normal GPU compatibility blacklist check.
+    """
+
+    if not enabled:
+        yield
+        return
+    downloads = importlib.import_module("ultralytics.utils.downloads")
+    original_safe_download = getattr(downloads, "safe_download", None)
+    if original_safe_download is None:
+        raise YoloTrainingError(
+            "installed Ultralytics has no controllable download boundary"
+        )
+    previous_offline = os.environ.get("YOLO_OFFLINE")
+    previous_autoinstall = os.environ.get("YOLO_AUTOINSTALL")
+
+    def reject_download(*args: Any, **kwargs: Any) -> None:
+        target = kwargs.get("url") or kwargs.get("file") or (
+            args[0] if args else "remote asset"
+        )
+        raise ConnectionError(
+            f"automatic Ultralytics download is disabled: {target}; "
+            "provide every model and dataset as an explicit local path"
+        )
+
+    os.environ["YOLO_OFFLINE"] = "true"
+    os.environ["YOLO_AUTOINSTALL"] = "false"
+    setattr(downloads, "safe_download", reject_download)
+    try:
+        yield
+    finally:
+        setattr(downloads, "safe_download", original_safe_download)
+        if previous_offline is None:
+            os.environ.pop("YOLO_OFFLINE", None)
+        else:
+            os.environ["YOLO_OFFLINE"] = previous_offline
+        if previous_autoinstall is None:
+            os.environ.pop("YOLO_AUTOINSTALL", None)
+        else:
+            os.environ["YOLO_AUTOINSTALL"] = previous_autoinstall
+
+
 class UltralyticsTrainingBackend:
     """Ultralytics adapter. Importing this module never imports Ultralytics."""
 
@@ -312,6 +366,61 @@ class UltralyticsTrainingBackend:
         except Exception as exc:
             raise YoloTrainingError(f"cannot load model checkpoint {path}: {exc}") from exc
 
+    def _validate_training_architecture(
+        self,
+        model: Any,
+        *,
+        model_path: Path,
+        model_family: str,
+        task: str,
+        class_count: int,
+    ) -> None:
+        """Rebuild the dataset-specific model before Ultralytics creates a run.
+
+        Loading a ``.pt`` checkpoint only unpickles its existing module graph.  During
+        training Ultralytics rebuilds that graph from the embedded YAML so it can
+        replace ``nc``.  Those are different compatibility checks: an old runtime can
+        load a YOLO26 checkpoint for inference and still fail later while rebuilding
+        its expanded SPPF/C3k2 layers.  Mirror the rebuild in preflight so ``--dry-run``
+        catches the mismatch without leaving an ``args.yaml`` bootstrap directory.
+        """
+
+        if self._model_factory is not None:
+            return
+        family = _normalized_model_family(model_family)
+        if family != "yolo" or task != "detect":
+            return
+        inner_model = getattr(model, "model", None)
+        model_yaml = getattr(inner_model, "yaml", None)
+        if not isinstance(model_yaml, Mapping):
+            raise YoloTrainingError(
+                f"cannot inspect training architecture in checkpoint {model_path}"
+            )
+        try:
+            tasks = importlib.import_module("ultralytics.nn.tasks")
+            detection_model = getattr(tasks, "DetectionModel")
+            channels = model_yaml.get("channels", 3)
+            detection_model(
+                deepcopy(dict(model_yaml)),
+                ch=channels,
+                nc=class_count,
+                verbose=False,
+            )
+        except Exception as exc:
+            ultralytics_version, _ = self._versions()
+            yaml_file = str(model_yaml.get("yaml_file", "")).lower()
+            yolo26_hint = (
+                "; YOLO26 requires ultralytics>=8.4.0"
+                if "yolo26" in yaml_file or model_path.stem.lower().startswith("yolo26")
+                else ""
+            )
+            raise YoloTrainingError(
+                "installed Ultralytics cannot rebuild the checkpoint architecture "
+                f"for {class_count} dataset class(es) "
+                f"(runtime={ultralytics_version}, checkpoint={model_path}){yolo26_hint}: "
+                f"{exc}"
+            ) from exc
+
     def preflight(self, config: YoloTrainConfig) -> TrainingPreflight:
         diagnostics: list[str] = []
         report: DatasetValidationReport | None = None
@@ -321,14 +430,25 @@ class UltralyticsTrainingBackend:
             assert config.base_model_path is not None
             assert config.dataset_yaml is not None
             model_hash = sha256_file(config.base_model_path)
-            report = YoloDatasetValidator(task=config.task).validate(config.dataset_yaml)
+            report = YoloDatasetValidator(
+                task=config.task,
+                protocol=config.dataset_protocol,
+            ).validate(config.dataset_yaml)
             if not report.ok:
                 diagnostics.extend(
                     f"dataset:{issue.code}: {issue.message} ({issue.path or '-'})"
                     for issue in report.errors
                 )
             model_source = config.resume or config.base_model_path
-            self._create_model(model_source, config.model_family, config.task)
+            model = self._create_model(model_source, config.model_family, config.task)
+            if report.ok:
+                self._validate_training_architecture(
+                    model,
+                    model_path=model_source,
+                    model_family=config.model_family,
+                    task=config.task,
+                    class_count=len(report.class_names),
+                )
         except (
             YoloTrainingConfigError,
             YoloTrainingError,
@@ -386,6 +506,14 @@ class UltralyticsTrainingBackend:
         )
 
     def train(self, config: YoloTrainConfig) -> TrainingResult:
+        # Ultralytics creates ``args.yaml`` and an empty ``weights`` directory
+        # before it finishes constructing the task-specific model.  A model
+        # construction error can therefore leave a run that has no checkpoint
+        # or metrics, while the normal preflight quite correctly refuses to
+        # overwrite any existing run directory.  Remove only that recognizable
+        # bootstrap state; completed or partially trained runs remain protected.
+        if config.resume is None:
+            self._remove_retryable_bootstrap_run(config, allow_empty=False)
         preflight = self.preflight(config)
         if not preflight.ok or preflight.dataset_report is None:
             raise YoloTrainingError(
@@ -420,10 +548,26 @@ class UltralyticsTrainingBackend:
         }
         if config.resume is not None:
             kwargs["resume"] = True
+        run_dir_existed_before_train = config.run_dir.exists()
         try:
-            train_result = model.train(**kwargs)
+            with _block_ultralytics_downloads(enabled=self._model_factory is None):
+                train_result = model.train(**kwargs)
         except Exception as exc:  # concrete framework boundary
-            raise YoloTrainingError(f"Ultralytics training failed: {exc}") from exc
+            cleaned = False
+            if config.resume is None and not run_dir_existed_before_train:
+                cleaned = self._remove_retryable_bootstrap_run(
+                    config,
+                    allow_empty=True,
+                )
+            cleanup_note = (
+                f"; removed incomplete run directory {config.run_dir} so this "
+                "run_name can be retried"
+                if cleaned
+                else ""
+            )
+            raise YoloTrainingError(
+                f"Ultralytics training failed: {exc}{cleanup_note}"
+            ) from exc
         elapsed = time.perf_counter() - start
         finished_at = utc_now_iso()
         run_dir = Path(getattr(train_result, "save_dir", config.run_dir)).resolve()
@@ -464,6 +608,104 @@ class UltralyticsTrainingBackend:
             elapsed_s=elapsed,
             metrics=metrics,
         )
+
+    @staticmethod
+    def _remove_retryable_bootstrap_run(
+        config: YoloTrainConfig,
+        *,
+        allow_empty: bool,
+    ) -> bool:
+        """Remove only a failed Ultralytics bootstrap directory.
+
+        A retryable directory is the exact configured run directory and either
+        is empty (only when the current call observed it being created) or
+        contains a matching Ultralytics ``args.yaml`` plus an optional empty
+        ``weights`` directory.  Any checkpoint, metrics, figure, unknown file,
+        symlink, or unexpected subdirectory makes the directory non-retryable.
+        """
+
+        run_dir = config.run_dir.expanduser()
+        project_dir = config.project_dir.expanduser()
+        if not run_dir.exists() or not run_dir.is_dir() or run_dir.is_symlink():
+            return False
+        try:
+            resolved_run = run_dir.resolve(strict=True)
+            resolved_project = project_dir.resolve(strict=True)
+        except OSError:
+            return False
+        if resolved_run.parent != resolved_project:
+            return False
+
+        files: list[Path] = []
+        allowed_directories = {Path("weights")}
+        try:
+            for item in resolved_run.rglob("*"):
+                relative = item.relative_to(resolved_run)
+                if item.is_symlink():
+                    return False
+                if item.is_dir():
+                    if relative not in allowed_directories:
+                        return False
+                elif item.is_file():
+                    files.append(relative)
+                else:
+                    return False
+        except OSError:
+            return False
+
+        if not files:
+            if not allow_empty:
+                return False
+        elif files == [Path("args.yaml")]:
+            if not UltralyticsTrainingBackend._bootstrap_args_match(
+                resolved_run / "args.yaml",
+                config,
+            ):
+                return False
+        else:
+            return False
+
+        try:
+            shutil.rmtree(resolved_run)
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _bootstrap_args_match(args_path: Path, config: YoloTrainConfig) -> bool:
+        """Verify that ``args.yaml`` belongs to the requested training run."""
+
+        try:
+            payload = yaml.safe_load(args_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            return False
+        if not isinstance(payload, Mapping):
+            return False
+        model_source = config.resume or config.base_model_path
+        if model_source is None or config.dataset_yaml is None:
+            return False
+        if payload.get("mode") != "train" or payload.get("task") != config.task:
+            return False
+        if payload.get("name") != config.run_name:
+            return False
+
+        expected_paths = {
+            "project": config.project_dir,
+            "data": config.dataset_yaml,
+            "model": model_source,
+        }
+        for key, expected in expected_paths.items():
+            actual = payload.get(key)
+            if not isinstance(actual, (str, os.PathLike)):
+                return False
+            try:
+                actual_path = Path(actual).expanduser().resolve()
+                expected_path = expected.expanduser().resolve()
+                if actual_path != expected_path:
+                    return False
+            except OSError:
+                return False
+        return True
 
     @staticmethod
     def _prune_intermediate_checkpoints(weights_dir: Path) -> None:

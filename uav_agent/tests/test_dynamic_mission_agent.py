@@ -3,8 +3,9 @@
 The tests exercise the real validator, safety supervisor, SkillManager, and
 TargetManager with deterministic Skills.  They intentionally do not import
 Isaac Sim, connect to a model service, or use image/oracle ground-truth data.
-The explicit ORACLE_EVALUATION runtime profile only authorizes the Stage-0
-SEARCH/REACQUIRE result shortcut used by these scripted Skills.
+The explicit ORACLE_EVALUATION runtime profile authorizes the test fixture
+that models an Oracle provider committing TargetManager before MissionAgent
+consumes SEARCH/REACQUIRE results.
 """
 
 from __future__ import annotations
@@ -113,6 +114,10 @@ class ScriptedSkill(Skill):
 
     def _on_start(self, goal: SkillGoal, context: SkillContext) -> None:
         del goal, context
+
+    @property
+    def next_outcome(self) -> ScriptedOutcome | None:
+        return None if not self._outcomes else self._outcomes[0]
 
     def _on_tick(self, observation: Observation) -> None:
         del observation
@@ -242,12 +247,14 @@ class Harness:
     target: TargetManager
     clock: ManualClock
     context: PlannerWorldContext
+    skills: dict[SkillName, ScriptedSkill]
 
     def start(self) -> None:
         self.agent.start("execute the bounded mission", self.context)
 
     def tick(self, timestamp: float):
         self.clock.set(timestamp)
+        self._commit_oracle_provider_lock(timestamp)
         return self.agent.tick(
             Observation(
                 uav_id="uav_1",
@@ -257,6 +264,37 @@ class Harness:
                 camera_rgb=np.zeros((8, 8, 3), dtype=np.uint8),
             )
         )
+
+    def _commit_oracle_provider_lock(self, timestamp: float) -> None:
+        active = self.manager.active_name
+        if active not in {SkillName.SEARCH, SkillName.REACQUIRE}:
+            return
+        outcome = self.skills[active].next_outcome
+        if (
+            outcome is None
+            or outcome.status is not SkillStatus.SUCCEEDED
+            or outcome.code is not SkillResultCode.TARGET_FOUND
+        ):
+            return
+        target_id = outcome.data.get("target_id")
+        if not isinstance(target_id, str) or not target_id.strip():
+            return
+        provider_values = {
+            "timestamp_s": timestamp,
+            "confidence": 1.0,
+            "last_seen_position": (1.0, 2.0, 0.5),
+            "last_seen_velocity": (0.0, 0.0, 0.0),
+        }
+        if self.target.lifecycle is TargetLifecycle.SEARCHING:
+            self.target.lock_oracle_from_search(
+                target_id.strip(),
+                **provider_values,
+            )
+        elif self.target.lifecycle is TargetLifecycle.REACQUIRING:
+            self.target.mark_reacquired_oracle(
+                target_id.strip(),
+                **provider_values,
+            )
 
 
 def make_harness(
@@ -270,10 +308,11 @@ def make_harness(
     configured = default_outcomes()
     if outcome_overrides is not None:
         configured.update(outcome_overrides)
-    registry = {
+    scripted_skills = {
         name: ScriptedSkill(*outcomes)
         for name, outcomes in configured.items()
     }
+    registry: dict[SkillName, Skill] = dict(scripted_skills)
     # Supervisory HOVER is an internal runtime transition rather than a
     # planner step, so keep the real continuously-commanded implementation in
     # this otherwise deterministic registry.
@@ -314,7 +353,7 @@ def make_harness(
         acknowledge_privileged_oracle=True,
         runtime_program=runtime_program,
     )
-    return Harness(agent, planner, manager, target, clock, context)
+    return Harness(agent, planner, manager, target, clock, context, scripted_skills)
 
 
 def run_to_terminal(harness: Harness, *, start_at: int = 1):

@@ -73,6 +73,7 @@ from perception.grounding import (
     YOLOEGrounder,
 )
 from perception.ideal_obstacle_perception import IdealObstaclePerception
+from perception.measurement import TargetMeasurement
 from perception.obstacle_types import (
     CAMERA_COORDINATE_FRAME,
     CameraGeometry,
@@ -85,7 +86,6 @@ from perception.obstacle_types import (
     ObstacleSpec,
     VisibleObstacle,
 )
-from perception.oracle import OraclePerception, OraclePerceptionError
 from perception.mode import (
     ResolvedTargetPerceptionMode,
     TargetPerceptionMode,
@@ -119,6 +119,7 @@ from perception.target_debug_images import (
     TargetDebugAnnotation,
     TargetDebugImageStats,
 )
+from perception.target_query import ALLOWED_TARGET_QUERY_FIELDS, TargetQuerySpec
 from perception.runtime import (
     GuardedPerceptionBackend,
     PerceptionBoundaryError,
@@ -180,6 +181,19 @@ from perception.visual_evidence import (
     UltralyticsShortTrackEvidenceBuilder,
     VisualEvidenceError,
 )
+
+
+def __getattr__(name: str) -> object:
+    """Load privileged Oracle symbols only for an explicit Oracle import."""
+
+    if name in {"OraclePerception", "OraclePerceptionError"}:
+        from perception.oracle import OraclePerception, OraclePerceptionError
+
+        return {
+            "OraclePerception": OraclePerception,
+            "OraclePerceptionError": OraclePerceptionError,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "ATTRIBUTE_SCHEMA_VERSION",
@@ -270,6 +284,8 @@ __all__ = [
     "TARGET_DEBUG_EVENTS",
     "TargetDebugAnnotation",
     "TargetDebugImageStats",
+    "TargetQuerySpec",
+    "ALLOWED_TARGET_QUERY_FIELDS",
     "TaskProgressAssessment",
     "QwenVisualReview",
     "ReviewDisposition",
@@ -283,6 +299,7 @@ __all__ = [
     "TargetEvaluationMode",
     "TargetEstimateEvaluator",
     "TargetGroundTruth",
+    "TargetMeasurement",
     "CandidateResolutionUnavailable",
     "CandidateResolver",
     "LearnedGrounder",

@@ -12,6 +12,10 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
+import numpy as np
+
+from env.uav_controller import UAVState
+from skills.types import Observation
 from scripts.run_dynamic_visual_mission import (
     LaunchConfigurationError,
     TestInjectionSpec,
@@ -19,6 +23,7 @@ from scripts.run_dynamic_visual_mission import (
     _best_effort_production_failure_land,
     _build_initial_spatial_resolver,
     _create_logging_runtime,
+    _preflight_dynamic_target_geometry,
     _route_debug_records,
     _run_until_terminal,
     build_argument_parser,
@@ -52,6 +57,37 @@ def _args(*extra: str) -> argparse.Namespace:
 
 
 class DynamicVisualMissionScriptTest(unittest.TestCase):
+    def test_temporal_preflight_dispatch_precedes_first_isaac_import(self) -> None:
+        from unittest.mock import patch
+
+        config = object()
+        receipt = {"dry_run": "passed"}
+        with patch(
+            "perception.factory.preflight_temporal_ray_depth",
+            return_value=receipt,
+        ) as preflight:
+            self.assertIsNone(
+                _preflight_dynamic_target_geometry(
+                    config,
+                    backend_name="oracle_evaluation",
+                )
+            )
+            preflight.assert_not_called()
+            self.assertIs(
+                _preflight_dynamic_target_geometry(
+                    config,
+                    backend_name="ultralytics_service",
+                ),
+                receipt,
+            )
+            preflight.assert_called_once_with(config)
+
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertLess(
+            source.index("temporal_model_metadata = _preflight_dynamic_target_geometry("),
+            source.index("from isaacsim import SimulationApp"),
+        )
+
     def test_unexpected_production_failure_ticks_oracle_free_cancel_and_land(self) -> None:
         running = SimpleNamespace(
             status=SimpleNamespace(value="RUNNING"),
@@ -165,19 +201,22 @@ class DynamicVisualMissionScriptTest(unittest.TestCase):
         class Coordinator:
             def __init__(self) -> None:
                 self.submit_count = 0
+                self.submission = None
 
             def submit_frame(self, **kwargs):
-                del kwargs
+                self.submission = kwargs
                 self.submit_count += 1
                 raise TargetQueryUnsupported("unsupported category 'red cube'")
 
             def poll(self, **kwargs):  # pragma: no cover - fail-fast assertion
                 raise AssertionError(kwargs)
 
-        observation = SimpleNamespace(
+        observation = Observation(
+            uav_id="uav_1",
             timestamp=1.0,
-            uav_pose=SimpleNamespace(x=0.0, y=0.0, z=1.0),
-            uav_velocity=(0.0, 0.0, 0.0),
+            uav_pose=UAVState(0.0, 0.0, 1.0, 0.25),
+            uav_velocity=np.asarray((1.0, 2.0, 3.0)),
+            camera_rgb=np.zeros((4, 4, 3), dtype=np.uint8),
         )
         agent = Agent()
         coordinator = Coordinator()
@@ -216,6 +255,14 @@ class DynamicVisualMissionScriptTest(unittest.TestCase):
         self.assertIs(result.snapshot, terminal)
         self.assertEqual(agent.cancel_count, 1)
         self.assertEqual(coordinator.submit_count, 1)
+        self.assertEqual(
+            coordinator.submission["uav_linear_velocity_world_mps"],
+            (1.0, 2.0, 3.0),
+        )
+        self.assertEqual(
+            coordinator.submission["uav_angular_velocity_body_radps"],
+            (0.0, 0.0, 0.0),
+        )
         self.assertIn("action=CANCEL_AND_LAND", stderr.getvalue())
 
     def test_route_debug_records_include_rejected_proposals_before_registry(self) -> None:

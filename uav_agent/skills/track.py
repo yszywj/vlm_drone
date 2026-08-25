@@ -1,4 +1,4 @@
-"""Ideal Oracle-backed TRACK Skill with bounded kinematic following."""
+"""Backend-neutral TRACK Skill consuming a confirmed ``TargetEstimate``."""
 
 from __future__ import annotations
 

@@ -12,9 +12,11 @@ from env.uav_controller import UAVState
 from perception.factory import (
     TargetPerceptionConfigurationError,
     TargetPerceptionUnavailableError,
+    build_target_candidate_resolver,
     build_target_perception_backend,
     validate_target_perception_preflight,
 )
+from perception.depth_geometry import DepthCandidateResolver
 from perception.runtime import GuardedPerceptionBackend, PerceptionRuntimeProfile
 from perception.vision_backend import (
     DisabledTargetPerceptionBackend,
@@ -22,6 +24,7 @@ from perception.vision_backend import (
 )
 from skills.types import SkillName
 from skills.types import Observation
+from runtime.frame_store import FrameStore
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,6 +83,15 @@ class TargetPerceptionFactoryTest(unittest.TestCase):
         validate_target_perception_preflight("disabled", (SkillName.TAKEOFF, SkillName.LAND))
         with self.assertRaises(TargetPerceptionUnavailableError):
             validate_target_perception_preflight("disabled", (SkillName.SEARCH,))
+
+    def test_geometry_resolver_factory_honors_isaac_depth_mode(self) -> None:
+        store = FrameStore(max_frames=2, max_bytes=4096, max_age_s=1.0)
+        resolver = build_target_candidate_resolver(
+            self.config.target_perception,
+            frame_store=store,
+        )
+        self.assertIsInstance(resolver, DepthCandidateResolver)
+        self.assertIs(resolver._frame_store, store)
 
     def test_vision_backend_rejects_oracle_source_aliases(self) -> None:
         backend = VisionPerceptionBackend(

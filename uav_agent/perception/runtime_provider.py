@@ -26,6 +26,8 @@ from perception.runtime_bridge import (
     CoordinatedVisionPerceptionBackend,
     SynchronizedTargetPerceptionInput,
 )
+from perception.production_boundary import validate_production_estimate_source
+from perception.target_query import TargetQuerySpec
 from skills.types import Observation
 from target.target_manager import TargetManager
 from target.types import TargetLifecycle, TargetSpec
@@ -46,8 +48,7 @@ class TargetPerceptionRuntime(Protocol):
         mission_id: str,
         assignment_id: str,
         uav_id: str,
-        target_alias: str,
-        target_spec: TargetSpec,
+        target_query: TargetQuerySpec,
     ) -> None: ...
 
     def observe(
@@ -346,6 +347,8 @@ class YoloTargetPerceptionRuntime:
         uav_id: str,
         bridge: CoordinatedVisionPerceptionBackend,
         attribute_evidence_sink: Callable[[object], None] | None = None,
+        candidate_transition_sink: Callable[[object], None] | None = None,
+        detector_class_resolver: Callable[[str], tuple[int, str]] | None = None,
     ) -> None:
         self._uav_id = validate_uav_id(uav_id)
         if not isinstance(bridge, CoordinatedVisionPerceptionBackend):
@@ -356,9 +359,20 @@ class YoloTargetPerceptionRuntime:
             attribute_evidence_sink
         ):
             raise TypeError("attribute_evidence_sink must be callable or None")
+        if candidate_transition_sink is not None and not callable(
+            candidate_transition_sink
+        ):
+            raise TypeError("candidate_transition_sink must be callable or None")
+        if detector_class_resolver is not None and not callable(
+            detector_class_resolver
+        ):
+            raise TypeError("detector_class_resolver must be callable or None")
         self._bridge = bridge
         self._attribute_evidence_sink = attribute_evidence_sink
+        self._candidate_transition_sink = candidate_transition_sink
+        self._detector_class_resolver = detector_class_resolver
         self._attribute_evidence_log_errors = 0
+        self._candidate_transition_log_errors = 0
         self._assignment_id: str | None = None
         self._target_alias: str | None = None
         self._closed = False
@@ -383,17 +397,42 @@ class YoloTargetPerceptionRuntime:
     def coordinator(self) -> object:
         return self._bridge.coordinator
 
+    def resolve_detector_class(self, category: str) -> tuple[int, str]:
+        """Resolve one user-supplied semantic category, never scene truth."""
+
+        if not isinstance(category, str) or not category.strip():
+            raise ValueError("target category must be a non-empty string")
+        if self._detector_class_resolver is None:
+            # Structural test doubles do not carry configuration.  Real
+            # runtimes built by the production factory always inject the
+            # audited exact-alias resolver.
+            return 0, category.strip()
+        value = self._detector_class_resolver(category.strip())
+        if (
+            not isinstance(value, tuple)
+            or len(value) != 2
+            or isinstance(value[0], bool)
+            or not isinstance(value[0], int)
+            or value[0] < 0
+            or not isinstance(value[1], str)
+            or not value[1].strip()
+        ):
+            raise TypeError(
+                "detector_class_resolver must return (non-negative int, name)"
+            )
+        return int(value[0]), value[1].strip()
+
     def reset(
         self,
         *,
         mission_id: str,
         assignment_id: str,
         uav_id: str,
-        target_alias: str,
-        target_spec: TargetSpec,
+        target_query: TargetQuerySpec,
     ) -> None:
         if self._closed:
             raise RuntimeError("YOLO perception runtime is closed")
+        self._flush_candidate_transitions()
         # Any rebind attempt retires the previous Assignment immediately.
         # Validation or service-handshake failure cannot revive it.
         self._assignment_id = None
@@ -401,16 +440,15 @@ class YoloTargetPerceptionRuntime:
         mission = validate_mission_id(mission_id)
         assignment = validate_routing_id(assignment_id, "assignment_id")
         routed_uav = validate_uav_id(uav_id)
-        target = validate_routing_id(target_alias, "target_alias")
         if routed_uav != self._uav_id:
             raise ValueError("YOLO reset uav_id does not match runtime")
-        if not isinstance(target_spec, TargetSpec):
-            raise TypeError("target_spec must be a TargetSpec")
+        if not isinstance(target_query, TargetQuerySpec):
+            raise TypeError("target_query must be a TargetQuerySpec")
+        target = validate_routing_id(target_query.target_alias, "target_alias")
         self._bridge.reset(
             mission_id=mission,
-            target_spec=target_spec,
+            target_query=target_query,
             assignment_id=assignment,
-            target_alias=target,
         )
         self._assignment_id = assignment
         self._target_alias = target
@@ -444,9 +482,11 @@ class YoloTargetPerceptionRuntime:
         if observation.uav_id != self._uav_id:
             raise PermissionError("YOLO output is routed to another UAV")
         self._flush_attribute_evidence()
+        self._flush_candidate_transitions()
         estimate = observation.target_estimate
         if estimate is None:
             return observation
+        validate_production_estimate_source(estimate.source)
         assert self._target_alias is not None
         # Provisional candidates deliberately have no stable target_id. Once
         # the coordinator marks an estimate confirmed, its routed identity
@@ -465,6 +505,7 @@ class YoloTargetPerceptionRuntime:
         return {
             **dict(self._bridge.metrics()),
             "attribute_evidence_log_errors": self._attribute_evidence_log_errors,
+            "candidate_transition_log_errors": self._candidate_transition_log_errors,
         }
 
     def _flush_attribute_evidence(self) -> None:
@@ -482,9 +523,22 @@ class YoloTargetPerceptionRuntime:
                 # flight-control authority.
                 self._attribute_evidence_log_errors += 1
 
+    def _flush_candidate_transitions(self) -> None:
+        sink = self._candidate_transition_sink
+        if sink is None:
+            return
+        for value in self._bridge.drain_candidate_transition_records():
+            try:
+                sink(value)
+            except Exception:
+                # Result persistence is observational and cannot acquire
+                # flight-control authority or terminate the mission.
+                self._candidate_transition_log_errors += 1
+
     def close(self) -> None:
         if self._closed:
             return
+        self._flush_candidate_transitions()
         self._closed = True
         self._bridge.close()
 

@@ -7,14 +7,32 @@ state.  Only trusted world-position measurements enter this estimator.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from math import isfinite
 from numbers import Real
 
 import numpy as np
 
+from perception.measurement import TargetMeasurement
+
 
 class TargetStateMeasurementRejected(RuntimeError):
     """Raised when innovation gating rejects a discontinuous measurement."""
+
+
+class TargetStateUpdateOutcome(str, Enum):
+    """Most recent externally visible estimator outcome."""
+
+    MEASUREMENT_ACCEPTED = "measurement_accepted"
+    MEASUREMENT_REJECTED = "measurement_rejected"
+    PREDICTED_ONLY = "predicted_only"
+
+
+@dataclass(frozen=True, slots=True)
+class TargetStateEstimatorStatistics:
+    measurements_accepted: int
+    measurements_rejected: int
+    predicted_only_outputs: int
 
 
 def _finite(value: object, field_name: str) -> float:
@@ -154,6 +172,10 @@ class TargetStateEstimator:
         self._covariance: np.ndarray | None = None
         self._timestamp_s: float | None = None
         self._measurement_timestamp_s: float | None = None
+        self._measurements_accepted = 0
+        self._measurements_rejected = 0
+        self._predicted_only_outputs = 0
+        self._last_outcome: TargetStateUpdateOutcome | None = None
 
     @property
     def is_initialized(self) -> bool:
@@ -163,6 +185,18 @@ class TargetStateEstimator:
     def max_prediction_age_s(self) -> float:
         return self._max_prediction_age_s
 
+    @property
+    def last_outcome(self) -> TargetStateUpdateOutcome | None:
+        return self._last_outcome
+
+    @property
+    def statistics(self) -> TargetStateEstimatorStatistics:
+        return TargetStateEstimatorStatistics(
+            measurements_accepted=self._measurements_accepted,
+            measurements_rejected=self._measurements_rejected,
+            predicted_only_outputs=self._predicted_only_outputs,
+        )
+
     def reset(self) -> None:
         """Discard state on task/target/tracker identity changes."""
 
@@ -170,38 +204,89 @@ class TargetStateEstimator:
         self._covariance = None
         self._timestamp_s = None
         self._measurement_timestamp_s = None
+        self._last_outcome = None
 
     def update(
         self,
+        measurement: TargetMeasurement | None = None,
         *,
-        timestamp_s: float,
-        position_world_m: tuple[float, float, float],
-        confidence: float,
+        timestamp_s: float | None = None,
+        position_world_m: tuple[float, float, float] | None = None,
+        confidence: float | None = None,
     ) -> FilteredTargetState:
-        timestamp = _finite(timestamp_s, "timestamp_s")
+        """Accept a typed measurement or the temporary legacy keyword form.
+
+        The typed form consumes its full world-frame covariance.  The legacy
+        form remains available for callers not yet migrated and derives the
+        old isotropic covariance from ``measurement_noise / confidence``.
+        """
+
+        if measurement is not None:
+            if not isinstance(measurement, TargetMeasurement):
+                raise TypeError("measurement must be a TargetMeasurement")
+            if any(
+                value is not None
+                for value in (timestamp_s, position_world_m, confidence)
+            ):
+                raise TypeError(
+                    "typed measurement cannot be combined with legacy update fields"
+                )
+            timestamp = measurement.timestamp_s
+            measurement_position = _position(measurement.position_world_m)
+            measurement_covariance = np.asarray(
+                measurement.covariance_world_m2,
+                dtype=np.float64,
+            )
+            if not np.all(np.isfinite(measurement_covariance)):
+                raise ValueError("measurement covariance must be finite")
+            if not np.allclose(
+                measurement_covariance,
+                measurement_covariance.T,
+                rtol=0.0,
+                atol=1e-9,
+            ):
+                raise ValueError("measurement covariance must be symmetric")
+            if float(np.min(np.linalg.eigvalsh(measurement_covariance))) < -1e-9:
+                raise ValueError(
+                    "measurement covariance must be positive semidefinite"
+                )
+            if float(np.trace(measurement_covariance)) <= 1e-12:
+                raise ValueError(
+                    "measurement covariance must contain positive uncertainty"
+                )
+        else:
+            if timestamp_s is None or position_world_m is None or confidence is None:
+                raise TypeError(
+                    "update requires TargetMeasurement or all legacy fields"
+                )
+            timestamp = _finite(timestamp_s, "timestamp_s")
+            measurement_position = _position(position_world_m)
+            normalized_confidence = _finite(confidence, "confidence")
+            if not 0.0 <= normalized_confidence <= 1.0:
+                raise ValueError("confidence must be between zero and one")
+            effective_confidence = max(normalized_confidence, 0.05)
+            measurement_covariance = (
+                np.eye(3, dtype=np.float64)
+                * self._measurement_noise
+                / effective_confidence
+            )
         if timestamp < 0.0:
             raise ValueError("timestamp_s must be non-negative")
-        measurement_position = _position(position_world_m)
-        normalized_confidence = _finite(confidence, "confidence")
-        if not 0.0 <= normalized_confidence <= 1.0:
-            raise ValueError("confidence must be between zero and one")
 
         if self._state is None:
             self._state = np.concatenate(
                 [measurement_position, np.zeros(3, dtype=np.float64)]
             )
-            self._covariance = np.diag(
-                [
-                    self._measurement_noise,
-                    self._measurement_noise,
-                    self._measurement_noise,
-                    self._initial_velocity_variance,
-                    self._initial_velocity_variance,
-                    self._initial_velocity_variance,
-                ]
-            ).astype(np.float64)
+            self._covariance = np.zeros((6, 6), dtype=np.float64)
+            self._covariance[:3, :3] = measurement_covariance
+            self._covariance[3:, 3:] = (
+                np.eye(3, dtype=np.float64)
+                * self._initial_velocity_variance
+            )
             self._timestamp_s = timestamp
             self._measurement_timestamp_s = timestamp
+            self._measurements_accepted += 1
+            self._last_outcome = TargetStateUpdateOutcome.MEASUREMENT_ACCEPTED
             return self._snapshot(
                 state=self._state,
                 covariance=self._covariance,
@@ -221,12 +306,6 @@ class TargetStateEstimator:
         )
         innovation = measurement_position - predicted_state[:3]
         euclidean_jump = float(np.linalg.norm(innovation))
-        effective_confidence = max(normalized_confidence, 0.05)
-        measurement_covariance = (
-            np.eye(3, dtype=np.float64)
-            * self._measurement_noise
-            / effective_confidence
-        )
         innovation_covariance = (
             self._H @ predicted_covariance @ self._H.T
             + measurement_covariance
@@ -239,6 +318,8 @@ class TargetStateEstimator:
             euclidean_jump > self._max_position_jump_m
             or mahalanobis_squared > self._innovation_gate_sigma**2
         ):
+            self._measurements_rejected += 1
+            self._last_outcome = TargetStateUpdateOutcome.MEASUREMENT_REJECTED
             raise TargetStateMeasurementRejected(
                 "world-position innovation rejected "
                 f"(jump_m={euclidean_jump:.3f}, "
@@ -268,6 +349,8 @@ class TargetStateEstimator:
         self._covariance = updated_covariance
         self._timestamp_s = timestamp
         self._measurement_timestamp_s = timestamp
+        self._measurements_accepted += 1
+        self._last_outcome = TargetStateUpdateOutcome.MEASUREMENT_ACCEPTED
         return self._snapshot(
             state=updated_state,
             covariance=updated_covariance,
@@ -297,12 +380,16 @@ class TargetStateEstimator:
             self._covariance,
             dt,
         )
-        return self._snapshot(
+        snapshot = self._snapshot(
             state=state,
             covariance=covariance,
             timestamp_s=timestamp,
             predicted_only=measurement_age > 0.0,
         )
+        if snapshot.predicted_only:
+            self._predicted_only_outputs += 1
+            self._last_outcome = TargetStateUpdateOutcome.PREDICTED_ONLY
+        return snapshot
 
     def _predict_arrays(
         self,
@@ -363,5 +450,7 @@ class TargetStateEstimator:
 __all__ = [
     "FilteredTargetState",
     "TargetStateEstimator",
+    "TargetStateEstimatorStatistics",
     "TargetStateMeasurementRejected",
+    "TargetStateUpdateOutcome",
 ]

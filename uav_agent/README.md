@@ -90,8 +90,17 @@ export QWEN_MODEL_PATH="$PWD/models/initial_model/Qwen3-VL-4B-Instruct"
 
 Fleet 目标任务现在使用显式的双模式协议：
 
+生产部署、时序几何和无真值泄露的审计说明分别见：
+
+- [YOLO 生产运行手册](docs/yolo_production_runtime.md)
+- [时序射线深度估计器](docs/temporal_ray_depth_estimator.md)
+- [感知信息边界](docs/perception_information_boundary.md)
+- [生产调用链指标与候选日志语义](docs/perception_runtime_evidence.md)
+
+当前单机生产配置使用已晋级的 `temporal_ray_depth` Stage B v2 checkpoint（SHA256 `2a8acd63347a568a4e5588cfc335979709958f7859617405841062af679e023c`），并保留 `isaac_depth` 作为确定性 baseline/fallback。真实 YOLO + Isaac temporal smoke 已在 [20260825-194528 run summary](logs/fleet_missions/runs/fleet_mission/20260825-194528_fleet_mission_seed0_nogit/summary.json) 中完成：`strict_success=true`，267 次时序测量成功、15 次显式 RGB-D fallback、0 次时序非法输出；SEARCH 确认 red cube 后完成 20 s TRACK、返回起点和 LAND，且 `privileged_perception=false`、exit code 0。确认边沿证据见同一 run 的 [target_perception_transitions.jsonl](logs/fleet_missions/runs/fleet_mission/20260825-194528_fleet_mission_seed0_nogit/agents/uav_1/target_perception_transitions.jsonl)。最终 temporal 配置还完成了 seed 101/211/307/401/503 的真实五次评估，[聚合结果](logs/yolo_fixed_seed_eval/task9_temporal_5seeds/summary.json) 为 5/5 `strict_success=true`，检测、颜色确认、3D、SEARCH、20 s TRACK 和 LAND 的阶段成功率均为 1.0。此前 [20260825-185911 baseline](logs/fleet_missions/runs/fleet_mission/20260825-185911_fleet_mission_seed0_nogit/summary.json) 与原始 `isaac_depth` 固定-seed 批次仍作为独立回归证据保留，详见 [YOLO 生产运行手册](docs/yolo_production_runtime.md)。
+
 - `--target-perception-mode oracle`：Isaac GT 只经 assignment-scoped `OraclePerception` 形成 `TargetEstimate`。它仍受 Camera 可见性约束，只用于架构调试、理想能力上界、回归、专家轨迹和标签生成；不是生产视觉，结果会标记为 privileged upper bound。必须同时给出 `--acknowledge-privileged-oracle`，Qwen Vision 只允许 `shadow`。
-- `--target-perception-mode yolo`：每架 UAV 使用独立 loopback worker，执行单类 `cube` YOLO、BoT-SORT、同步 RGB-D 颜色确认、Depth 三维定位和 Kalman 估计；结果标记为 production vision。Gate 模式还必须给出 `--acknowledge-vision-gate`。
+- `--target-perception-mode yolo`：每架 UAV 使用独立 loopback worker，执行单类 `cube` YOLO、BoT-SORT、同步 RGB-D 颜色确认、已晋级的时序射线深度（或显式 deterministic RGB-D fallback）和 Kalman 估计；结果标记为 production vision。Gate 模式还必须给出 `--acknowledge-vision-gate`。
 
 “不启用 YOLO”对于含 SEARCH / INSPECT / TRACK / REACQUIRE 的任务明确表示选择 Oracle，并不表示 `disabled`。`disabled` 只保留给起飞、纯导航、悬停、返航和降落等完全无目标任务。YOLO 不可用时绝不自动切换 Oracle。
 

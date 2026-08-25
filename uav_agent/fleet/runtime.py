@@ -43,6 +43,7 @@ from fleet.types import (
     FleetUavCapability,
 )
 from fleet.world_belief import AgentFleetSummary, FleetWorldBelief
+from perception.target_query import TargetQuerySpec
 
 
 class FleetRuntimeError(RuntimeError):
@@ -99,6 +100,9 @@ _ADDITIVE_PERCEPTION_METRICS = frozenset(
     {
         "oracle_visible_frames",
         "oracle_total_frames",
+        "camera_frames_received",
+        "yolo_requests_submitted",
+        "yolo_results_received",
         "yolo_requests",
         "yolo_successful_responses",
         "yolo_timeouts",
@@ -106,6 +110,10 @@ _ADDITIVE_PERCEPTION_METRICS = frozenset(
         "yolo_stale_results",
         "yolo_dropped_frames",
         "detections_total",
+        "tracked_detections_total",
+        "candidate_created",
+        "candidate_confirmed",
+        "candidate_rejected",
         "candidates_total",
         "candidates_rejected",
         "candidates_confirmed",
@@ -117,6 +125,17 @@ _ADDITIVE_PERCEPTION_METRICS = frozenset(
         "reacquire_attempts",
         "reacquire_successes",
         "depth_resolution_failures",
+        "depth_resolution_attempts",
+        "depth_resolution_successes",
+        "measurement_created",
+        "measurement_rejected",
+        "kalman_updates_accepted",
+        "kalman_updates_rejected",
+        "position_world_outputs",
+        "predicted_only_outputs",
+        "search_target_found",
+        "track_visible_updates",
+        "track_predicted_updates",
         "qwen_attribute_fallback_count",
         "yolo_latency_sample_count",
         "position_measurement_age_count",
@@ -139,6 +158,8 @@ _ADDITIVE_PERCEPTION_METRICS = frozenset(
         "color_mismatches",
         "color_pending",
         "qwen_attribute_fallback_required",
+        "attribute_confirmed",
+        "attribute_ambiguous",
     }
 )
 
@@ -2126,6 +2147,35 @@ class FleetMissionRuntime:
             raise FleetRuntimeError("target perception runtime must provide reset()")
         if self._request is None:
             raise FleetRuntimeError("target perception reset requires Fleet request")
+        if mode.lower() == "yolo":
+            # The Fleet layer owns complete Assignment semantics.  Production
+            # perception receives only this closed projection; notably the
+            # SEARCH region and simulator target configuration are absent.
+            resolve_detector_class = getattr(
+                perception,
+                "resolve_detector_class",
+                None,
+            )
+            if not callable(resolve_detector_class):
+                raise FleetRuntimeError(
+                    "YOLO perception runtime must resolve audited detector classes"
+                )
+            detector_class_id, detector_class_name = resolve_detector_class(
+                assignment.target_spec.category
+            )
+            query = TargetQuerySpec.from_assignment_semantics(
+                target_alias=assignment.target_alias,
+                target_spec=assignment.target_spec,
+                detector_class_id=detector_class_id,
+                detector_class_name=detector_class_name,
+            )
+            reset(
+                mission_id=self._request.fleet_mission_id,
+                assignment_id=assignment.assignment_id,
+                uav_id=uav_id,
+                target_query=query,
+            )
+            return
         reset(
             mission_id=self._request.fleet_mission_id,
             assignment_id=assignment.assignment_id,

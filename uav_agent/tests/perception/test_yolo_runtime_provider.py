@@ -15,6 +15,7 @@ from perception.mode import TargetPerceptionMode, resolve_target_perception_mode
 from perception.runtime import PerceptionBoundaryError
 from perception.runtime_bridge import CoordinatedVisionPerceptionBackend
 from perception.runtime_provider import TargetPerceptionRuntime, YoloTargetPerceptionRuntime
+from perception.target_query import TargetQuerySpec
 from skills.types import Observation
 from target import TargetManager, TargetSpec
 
@@ -73,16 +74,26 @@ def _estimate(
     )
 
 
+def _query(spec: TargetSpec, alias: str = "target_i") -> TargetQuerySpec:
+    return TargetQuerySpec.from_assignment_semantics(
+        target_alias=alias,
+        target_spec=spec,
+        detector_class_id=0,
+        detector_class_name="cube",
+    )
+
+
 class _Bridge(CoordinatedVisionPerceptionBackend):
     """Small structural double that still satisfies the concrete guard."""
 
     def __init__(self, uav_id: str, *, source: str = "yolo26_botsort") -> None:
         self._test_uav_id = uav_id
         self.source = source
-        self.reset_calls: list[tuple[str, TargetSpec, str]] = []
+        self.reset_calls: list[tuple[str, TargetQuerySpec]] = []
         self._target_alias = None
         self.inputs: list[object] = []
         self.attribute_records: list[object] = []
+        self.candidate_transition_records: list[object] = []
         self.closed = 0
 
     @property
@@ -93,13 +104,12 @@ class _Bridge(CoordinatedVisionPerceptionBackend):
         self,
         *,
         mission_id: str,
-        target_spec: TargetSpec,
+        target_query: TargetQuerySpec,
         assignment_id: str | None = None,
-        target_alias: str,
     ) -> None:
         del assignment_id
-        self._target_alias = target_alias
-        self.reset_calls.append((mission_id, target_spec, target_alias))
+        self._target_alias = target_query.target_alias
+        self.reset_calls.append((mission_id, target_query))
 
     def observe(self, synchronized_input, *, target_manager: TargetManager) -> Observation:
         assert isinstance(target_manager, TargetManager)
@@ -121,6 +131,11 @@ class _Bridge(CoordinatedVisionPerceptionBackend):
         self.attribute_records.clear()
         return values
 
+    def drain_candidate_transition_records(self) -> tuple[object, ...]:
+        values = tuple(self.candidate_transition_records)
+        self.candidate_transition_records.clear()
+        return values
+
     def close(self) -> None:
         self.closed += 1
 
@@ -135,8 +150,7 @@ def test_yolo_runtime_uses_atomic_rgbd_and_maps_logical_target_alias() -> None:
         mission_id="mission_1",
         assignment_id="assignment_1",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec),
     )
 
     observed = runtime.observe(
@@ -148,7 +162,7 @@ def test_yolo_runtime_uses_atomic_rgbd_and_maps_logical_target_alias() -> None:
     assert isinstance(runtime, TargetPerceptionRuntime)
     assert runtime.mode is TargetPerceptionMode.YOLO
     assert runtime.backend_name == "ultralytics_service"
-    assert bridge.reset_calls == [("mission_1", spec, "target_i")]
+    assert bridge.reset_calls == [("mission_1", _query(spec))]
     assert len(bridge.inputs) == 1
     synchronized = bridge.inputs[0]
     assert synchronized.camera_sample is sample
@@ -173,8 +187,7 @@ def test_yolo_runtime_requires_synchronized_camera_sample() -> None:
         mission_id="mission_1",
         assignment_id="assignment_1",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec),
     )
     sample = _sample()
 
@@ -222,8 +235,7 @@ def test_yolo_runtime_rejects_oracle_input_and_oracle_bridge_output() -> None:
         mission_id="mission_1",
         assignment_id="assignment_1",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec),
     )
     privileged_base = replace(
         _base(sample),
@@ -248,8 +260,7 @@ def test_yolo_runtime_rejects_oracle_input_and_oracle_bridge_output() -> None:
         mission_id="mission_1",
         assignment_id="assignment_1",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec),
     )
     with pytest.raises(PerceptionBoundaryError, match="Oracle"):
         malicious.observe(
@@ -291,8 +302,7 @@ def test_yolo_runtime_rejects_bridge_target_outside_active_assignment() -> None:
         mission_id="mission_1",
         assignment_id="assignment_1",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec),
     )
 
     with pytest.raises(PermissionError, match="active Assignment"):
@@ -335,8 +345,7 @@ def test_yolo_runtime_rejects_unconfirmed_stable_target_claim() -> None:
         mission_id="mission_1",
         assignment_id="assignment_1",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec),
     )
 
     with pytest.raises(PermissionError, match="unconfirmed.*stable target ID"):
@@ -394,8 +403,7 @@ def test_yolo_runtime_drains_each_attribute_record_exactly_once() -> None:
         mission_id="mission_1",
         assignment_id="assignment_1",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec),
     )
 
     first = object()
@@ -419,3 +427,42 @@ def test_yolo_runtime_drains_each_attribute_record_exactly_once() -> None:
     assert bridge.attribute_records == []
     assert runtime.metrics()["attribute_evidence_log_errors"] == 0
     runtime.close()
+
+
+def test_yolo_runtime_drains_candidate_transitions_on_observe_reset_and_close() -> None:
+    bridge = _Bridge("uav_a")
+    persisted: list[object] = []
+    runtime = YoloTargetPerceptionRuntime(
+        uav_id="uav_a",
+        bridge=bridge,
+        candidate_transition_sink=persisted.append,
+    )
+    spec = TargetSpec("red cube", category="cube")
+    runtime.reset(
+        mission_id="mission_1",
+        assignment_id="assignment_1",
+        uav_id="uav_a",
+        target_query=_query(spec),
+    )
+
+    first, second, third = object(), object(), object()
+    bridge.candidate_transition_records.append(first)
+    sample = _sample(2.0)
+    runtime.observe(
+        base_observation=_base(sample),
+        camera_sample=sample,
+        target_manager=TargetManager(),
+    )
+    bridge.candidate_transition_records.append(second)
+    runtime.reset(
+        mission_id="mission_1",
+        assignment_id="assignment_2",
+        uav_id="uav_a",
+        target_query=_query(spec),
+    )
+    bridge.candidate_transition_records.append(third)
+    runtime.close()
+
+    assert persisted == [first, second, third]
+    assert bridge.candidate_transition_records == []
+    assert runtime.metrics()["candidate_transition_log_errors"] == 0

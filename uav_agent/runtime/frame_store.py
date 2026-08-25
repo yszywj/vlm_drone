@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from math import isfinite
 from numbers import Real
 from threading import RLock
+from typing import Sequence
 
 import numpy as np
 
@@ -33,6 +34,31 @@ def _positive_integer(value: object, field_name: str) -> int:
     if value <= 0:
         raise ValueError(f"{field_name} must be greater than zero")
     return value
+
+
+def _finite_vector3(
+    value: Sequence[float] | np.ndarray,
+    field_name: str,
+) -> tuple[float, float, float]:
+    if isinstance(value, (str, bytes)):
+        raise TypeError(f"{field_name} must contain three finite numbers")
+    try:
+        components = tuple(value)
+    except TypeError:
+        raise TypeError(
+            f"{field_name} must contain three finite numbers"
+        ) from None
+    if len(components) != 3:
+        raise ValueError(f"{field_name} must contain three finite numbers")
+    normalized: list[float] = []
+    for component in components:
+        if isinstance(component, bool) or not isinstance(component, Real):
+            raise TypeError(f"{field_name} must contain three finite numbers")
+        number = float(component)
+        if not isfinite(number):
+            raise ValueError(f"{field_name} must contain three finite numbers")
+        normalized.append(number)
+    return normalized[0], normalized[1], normalized[2]
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +111,44 @@ class FrameCameraGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class FrameUavSelfMotion:
+    """Agent-visible UAV motion synchronized with one camera frame.
+
+    These values come from the vehicle/Observation side of the production
+    boundary.  They are deliberately separate from camera-pose finite
+    differences so a temporal model cannot silently train on one feature
+    meaning and receive another at deployment.
+    """
+
+    linear_velocity_world_mps: tuple[float, float, float]
+    angular_velocity_body_radps: tuple[float, float, float]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "linear_velocity_world_mps",
+            _finite_vector3(
+                self.linear_velocity_world_mps,
+                "uav_linear_velocity_world_mps",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "angular_velocity_body_radps",
+            _finite_vector3(
+                self.angular_velocity_body_radps,
+                "uav_angular_velocity_body_radps",
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _StoredFrame:
     ref: FrameRef
     rgb: np.ndarray
     depth_to_image_plane_m: np.ndarray | None
     camera_geometry: FrameCameraGeometry | None
+    uav_self_motion: FrameUavSelfMotion | None
     byte_count: int
     sequence: int
 
@@ -184,6 +243,8 @@ class FrameStore:
         intrinsics: CameraIntrinsics | None = None,
         camera_position_world_m: tuple[float, float, float] | None = None,
         camera_orientation_world_wxyz: tuple[float, float, float, float] | None = None,
+        uav_linear_velocity_world_mps: Sequence[float] | np.ndarray | None = None,
+        uav_angular_velocity_body_radps: Sequence[float] | np.ndarray | None = None,
     ) -> FrameRef:
         """Store one frame and evict the oldest entries as needed.
 
@@ -207,6 +268,17 @@ class FrameStore:
             )
         if depth_to_image_plane_m is not None and not has_geometry:
             raise ValueError("depth_to_image_plane_m requires camera geometry")
+        motion_values = (
+            uav_linear_velocity_world_mps,
+            uav_angular_velocity_body_radps,
+        )
+        has_self_motion = any(value is not None for value in motion_values)
+        if has_self_motion and not all(value is not None for value in motion_values):
+            raise ValueError(
+                "UAV linear and angular velocity must be supplied together"
+            )
+        if has_self_motion and not has_geometry:
+            raise ValueError("UAV self-motion requires synchronized camera geometry")
 
         camera_sample: CameraSample | None = None
         if has_geometry:
@@ -268,6 +340,7 @@ class FrameStore:
             stored_rgb.setflags(write=False)
             stored_depth: np.ndarray | None = None
             stored_geometry: FrameCameraGeometry | None = None
+            stored_self_motion: FrameUavSelfMotion | None = None
             if camera_sample is not None:
                 if normalized_depth is not None:
                     stored_depth = np.ascontiguousarray(normalized_depth).copy()
@@ -280,12 +353,24 @@ class FrameStore:
                         camera_sample.camera_orientation_world_wxyz
                     ),
                 )
+                if has_self_motion:
+                    assert uav_linear_velocity_world_mps is not None
+                    assert uav_angular_velocity_body_radps is not None
+                    stored_self_motion = FrameUavSelfMotion(
+                        linear_velocity_world_mps=tuple(
+                            uav_linear_velocity_world_mps
+                        ),
+                        angular_velocity_body_radps=tuple(
+                            uav_angular_velocity_body_radps
+                        ),
+                    )
             self._sequence += 1
             self._frames[key] = _StoredFrame(
                 ref=ref,
                 rgb=stored_rgb,
                 depth_to_image_plane_m=stored_depth,
                 camera_geometry=stored_geometry,
+                uav_self_motion=stored_self_motion,
                 byte_count=byte_count,
                 sequence=self._sequence,
             )
@@ -305,6 +390,8 @@ class FrameStore:
         uav_id: str,
         frame_id: str,
         sample: CameraSample,
+        uav_linear_velocity_world_mps: Sequence[float] | np.ndarray | None = None,
+        uav_angular_velocity_body_radps: Sequence[float] | np.ndarray | None = None,
     ) -> FrameRef:
         """Store all channels from one already-synchronized camera sample."""
 
@@ -319,6 +406,8 @@ class FrameStore:
             intrinsics=sample.intrinsics,
             camera_position_world_m=sample.camera_position_world_m,
             camera_orientation_world_wxyz=sample.camera_orientation_world_wxyz,
+            uav_linear_velocity_world_mps=uav_linear_velocity_world_mps,
+            uav_angular_velocity_body_radps=uav_angular_velocity_body_radps,
         )
 
     # Explicit long name for call sites where ``sample`` might be ambiguous.
@@ -375,6 +464,57 @@ class FrameStore:
                     geometry.camera_orientation_world_wxyz
                 ),
                 intrinsics=geometry.intrinsics,
+            )
+
+    def get_uav_self_motion(self, ref: FrameRef) -> FrameUavSelfMotion | None:
+        """Return UAV self-motion captured atomically with ``ref``."""
+
+        if not isinstance(ref, FrameRef):
+            raise TypeError("ref must be a FrameRef")
+        with self._lock:
+            stored = self._frames.get((ref.uav_id, ref.frame_id))
+            if stored is None or stored.ref != ref:
+                return None
+            return stored.uav_self_motion
+
+    def get_temporal_inputs(
+        self,
+        ref: FrameRef,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        FrameCameraGeometry,
+        FrameUavSelfMotion,
+    ] | None:
+        """Atomically borrow one complete temporal-model sensor input.
+
+        Returned image arrays are read-only views owned by this bounded store
+        and are valid for immediate inference preprocessing only.  A missing
+        depth, pose, or UAV self-motion component rejects the entire sample;
+        channels are never assembled across different frame generations.
+        """
+
+        if not isinstance(ref, FrameRef):
+            raise TypeError("ref must be a FrameRef")
+        with self._lock:
+            stored = self._frames.get((ref.uav_id, ref.frame_id))
+            if (
+                stored is None
+                or stored.ref != ref
+                or stored.depth_to_image_plane_m is None
+                or stored.camera_geometry is None
+                or stored.uav_self_motion is None
+            ):
+                return None
+            rgb = stored.rgb.view()
+            depth = stored.depth_to_image_plane_m.view()
+            rgb.setflags(write=False)
+            depth.setflags(write=False)
+            return (
+                rgb,
+                depth,
+                stored.camera_geometry,
+                stored.uav_self_motion,
             )
 
     def get_depth(
@@ -574,4 +714,5 @@ __all__ = [
     "FrameCameraGeometry",
     "FrameRef",
     "FrameStore",
+    "FrameUavSelfMotion",
 ]

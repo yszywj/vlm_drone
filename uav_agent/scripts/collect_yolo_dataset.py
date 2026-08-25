@@ -326,6 +326,7 @@ class _SimpleSceneCollectionAdapter:
         *,
         protocol: CubeCollectionProtocol | None = None,
         scene_driver: _CollectionSceneDriver | None = None,
+        crossing_trajectories: bool = False,
     ) -> None:
         self._environment = environment
         self._simulation_app = simulation_app
@@ -334,7 +335,11 @@ class _SimpleSceneCollectionAdapter:
             PROJECT_ROOT / "configs" / "yolo" / "collect_cube.yaml"
         )
         self._scene_driver = scene_driver
+        if not isinstance(crossing_trajectories, bool):
+            raise TypeError("crossing_trajectories must be bool")
+        self._crossing_trajectories = crossing_trajectories
         self._scene_objects: tuple[CollectionSceneObject, ...] = ()
+        self._object_velocities_mps: dict[str, tuple[float, float, float]] = {}
         self._plan: EpisodeRandomization | None = None
         self._target_position = np.zeros(3, dtype=np.float64)
         self._target_heading_rad = 0.0
@@ -403,6 +408,48 @@ class _SimpleSceneCollectionAdapter:
         if randomization.sample_kind == "partial_occlusion":
             inventory = self._place_partial_noncube_occluder(inventory, randomization)
         self._scene_objects = inventory
+        cubes = [item for item in inventory if item.shape == CUBE_CLASS_NAME]
+        if self._crossing_trajectories and len(cubes) >= 2:
+            crossing_axis = (
+                np.asarray(cubes[1].position_world_m, dtype=np.float64)
+                - np.asarray(cubes[0].position_world_m, dtype=np.float64)
+            )
+            crossing_axis[2] = 0.0
+            crossing_axis /= max(float(np.linalg.norm(crossing_axis)), 1e-12)
+            self._target_heading_rad = float(
+                np.arctan2(crossing_axis[1], crossing_axis[0])
+            )
+            self._desired_heading_rad = self._target_heading_rad
+            separation_m = float(
+                np.linalg.norm(
+                    np.asarray(cubes[1].position_world_m, dtype=np.float64)
+                    - np.asarray(cubes[0].position_world_m, dtype=np.float64)
+                )
+            )
+            crossing_time_s = separation_m / max(
+                2.0 * randomization.target_speed_mps,
+                1e-6,
+            )
+            self._next_turn_s = max(self._next_turn_s, crossing_time_s + 0.5)
+        initial_velocity = randomization.target_speed_mps * np.asarray(
+            [cos(self._target_heading_rad), sin(self._target_heading_rad), 0.0],
+            dtype=np.float64,
+        )
+        self._object_velocities_mps = {
+            item.object_id: (0.0, 0.0, 0.0) for item in inventory
+        }
+        for slot, cube in enumerate(cubes):
+            velocity = initial_velocity.copy()
+            if self._crossing_trajectories and slot == 1:
+                velocity *= -1.0
+            elif self._crossing_trajectories and slot >= 2:
+                velocity = np.asarray(
+                    [-initial_velocity[1], initial_velocity[0], 0.0],
+                    dtype=np.float64,
+                )
+            self._object_velocities_mps[cube.object_id] = tuple(
+                float(value) for value in velocity
+            )
         self._require_scene_driver().install(inventory)
         self._apply_render_randomization(randomization)
         self._set_camera_view(
@@ -468,6 +515,18 @@ class _SimpleSceneCollectionAdapter:
         for planned in self._scene_objects:
             rendered, corners = driver.rendered_geometry(planned)
             projection = self._environment.world_to_image(corners)
+            center_projection = self._environment.world_to_image(
+                np.asarray([rendered.position_world_m], dtype=np.float64)
+            )
+            center_pixels = np.asarray(center_projection.pixels_uv, dtype=np.float64)
+            center_pixel = (
+                tuple(float(value) for value in center_pixels[0])
+                if center_pixels.shape == (1, 2)
+                else tuple(
+                    float(value)
+                    for value in np.mean(projection.pixels_uv, axis=0)
+                )
+            )
             # RGB and depth come from this same atomic CameraSample.  A box
             # projection alone cannot prove visibility; depth fails closed.
             depth_visibility = estimate_depth_visibility(
@@ -485,6 +544,11 @@ class _SimpleSceneCollectionAdapter:
                     dimensions_xyz_m=rendered.dimensions_xyz_m,
                     projected_pixels_uv=projection.pixels_uv,
                     projected_depth_m=projection.depth_m,
+                    velocity_world_mps=self._object_velocities_mps.get(
+                        rendered.object_id,
+                        (0.0, 0.0, 0.0),
+                    ),
+                    center_pixel_uv=center_pixel,
                     occlusion_ratio=depth_visibility.occlusion_ratio,
                 )
             )
@@ -579,20 +643,53 @@ class _SimpleSceneCollectionAdapter:
         )
         updated: list[CollectionSceneObject] = []
         driver = self._require_scene_driver()
+        cube_slot = 0
         for obj in self._scene_objects:
             if obj.shape != CUBE_CLASS_NAME:
                 updated.append(obj)
                 continue
+            if not self._crossing_trajectories or cube_slot == 0:
+                moved_position = (
+                    np.asarray(obj.position_world_m, dtype=np.float64) + delta
+                )
+                moved_velocity = delta / dt_s
+                moved_orientation = orientation
+            else:
+                moved_velocity = np.asarray(
+                    self._object_velocities_mps.get(obj.object_id, (0.0, 0.0, 0.0)),
+                    dtype=np.float64,
+                )
+                moved_position = (
+                    np.asarray(obj.position_world_m, dtype=np.float64)
+                    + moved_velocity * dt_s
+                )
+                for axis in (0, 1):
+                    if moved_position[axis] < low[axis] or moved_position[axis] > high[axis]:
+                        moved_velocity[axis] *= -1.0
+                        moved_position[axis] = np.clip(
+                            moved_position[axis], low[axis], high[axis]
+                        )
+                moved_position[2] = np.clip(moved_position[2], low[2], high[2])
+                moved_heading = float(np.arctan2(moved_velocity[1], moved_velocity[0]))
+                moved_orientation = (
+                    cos(moved_heading / 2.0),
+                    0.0,
+                    0.0,
+                    sin(moved_heading / 2.0),
+                )
             moved = replace(
                 obj,
                 position_world_m=tuple(
-                    float(value)
-                    for value in np.asarray(obj.position_world_m, dtype=np.float64) + delta
+                    float(value) for value in moved_position
                 ),
-                orientation_world_wxyz=orientation,
+                orientation_world_wxyz=moved_orientation,
             )
             driver.update_pose(moved)
             updated.append(moved)
+            self._object_velocities_mps[obj.object_id] = tuple(
+                float(value) for value in moved_velocity
+            )
+            cube_slot += 1
         self._scene_objects = tuple(updated)
         self._target_position = candidate
 

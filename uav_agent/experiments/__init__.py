@@ -91,6 +91,7 @@ from .schemas import (
     GOAL_METRIC_FIELDS,
     SKILL_EXECUTION_FIELDS,
     STATE_SAMPLE_FIELDS,
+    TARGET_PERCEPTION_TRANSITION_FIELDS,
     AgentMetricRecord,
     AttributeEvidenceRecord,
     TRAIN_METRIC_FIELDS,
@@ -104,6 +105,7 @@ from .schemas import (
     StorageStatus,
     SkillExecutionRecord,
     StateSampleRecord,
+    TargetPerceptionTransitionRecord,
     ValidationFindingRecord,
 )
 from .planning_audit_logger import (
@@ -149,8 +151,10 @@ from .terminal_logger import (
 __all__ = [
     "AGENT_METRIC_FIELDS",
     "ATTRIBUTE_EVIDENCE_FIELDS",
+    "TARGET_PERCEPTION_TRANSITION_FIELDS",
     "AgentMetricRecord",
     "AttributeEvidenceRecord",
+    "TargetPerceptionTransitionRecord",
     "BATCH_EPISODE_METRIC_FIELDS",
     "BestCheckpoint",
     "BestCheckpointRequiredError",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -21,6 +22,7 @@ from perception.runtime_bridge import (
 )
 from perception.runtime_provider import YoloTargetPerceptionRuntime
 from perception.target_perception_coordinator import TargetPerceptionCoordinator
+from perception.target_query import TargetQuerySpec
 from perception.vision_backend import VisionPerceptionBackend
 from perception.yolo_client import YoloClientUnavailable, YoloModelInfo
 from scripts import check_fleet_yolo_services
@@ -29,6 +31,18 @@ from target import TargetManager, TargetSpec
 
 
 ROOT = Path(__file__).resolve().parents[2]
+TRAINED_MODEL_SHA256 = (
+    "895de7caa8af200c12f343c72e3a726ffae65e4d96d2092decaf96ef4558de07"
+)
+
+
+def _query(spec: TargetSpec, alias: str) -> TargetQuerySpec:
+    return TargetQuerySpec.from_assignment_semantics(
+        target_alias=alias,
+        target_spec=spec,
+        detector_class_id=0,
+        detector_class_name="cube",
+    )
 
 
 def _sample(timestamp_s: float, *, fill: int = 0) -> CameraSample:
@@ -43,12 +57,18 @@ def _sample(timestamp_s: float, *, fill: int = 0) -> CameraSample:
     )
 
 
-def _base(sample: CameraSample, uav_id: str) -> Observation:
+def _base(
+    sample: CameraSample,
+    uav_id: str,
+    *,
+    yaw_rad: float = 0.0,
+    velocity: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> Observation:
     return Observation(
         uav_id=uav_id,
         timestamp=sample.timestamp_s,
-        uav_pose=UAVState(0.0, 0.0, 3.0, 0.0),
-        uav_velocity=np.zeros(3, dtype=float),
+        uav_pose=UAVState(0.0, 0.0, 3.0, yaw_rad),
+        uav_velocity=np.asarray(velocity, dtype=float),
         camera_rgb=np.asarray(sample.rgb).copy(),
         camera_position_m=np.asarray(sample.camera_position_world_m),
         camera_orientation_wxyz=np.asarray(
@@ -90,7 +110,10 @@ class _Coordinator(TargetPerceptionCoordinator):
         self.estimate = estimate
         self.events: list[str] = []
         self.reset_calls: list[tuple[str, str, str]] = []
-        self.submissions: list[tuple[CameraSample, TargetSpec]] = []
+        self.submissions: list[CameraSample] = []
+        self.self_motion: list[
+            tuple[tuple[float, float, float], tuple[float, float, float]]
+        ] = []
         self.closed = 0
         self.target_alias: str | None = None
         self.fail_reset = False
@@ -103,9 +126,11 @@ class _Coordinator(TargetPerceptionCoordinator):
         uav_id: str,
         assignment_id: str | None = None,
         target_alias: str | None = None,
+        target_query: TargetQuerySpec | None = None,
     ) -> None:
         del assignment_id
-        assert target_alias is not None
+        assert target_query is not None
+        target_alias = target_query.target_alias
         self.reset_calls.append((mission_id, uav_id, target_alias))
         if self.fail_reset:
             raise RuntimeError("injected reset handshake failure")
@@ -121,10 +146,20 @@ class _Coordinator(TargetPerceptionCoordinator):
         )
 
     def submit_frame(
-        self, *, camera_sample: CameraSample, target_spec: TargetSpec
+        self,
+        *,
+        camera_sample: CameraSample,
+        uav_linear_velocity_world_mps,
+        uav_angular_velocity_body_radps,
     ) -> bool:
         self.events.append("submit")
-        self.submissions.append((camera_sample, target_spec))
+        self.submissions.append(camera_sample)
+        self.self_motion.append(
+            (
+                tuple(uav_linear_velocity_world_mps),
+                tuple(uav_angular_velocity_body_radps),
+            )
+        )
         return True
 
     def close(self) -> None:
@@ -164,8 +199,7 @@ def test_bridge_polls_before_submit_and_submits_each_camera_batch_once() -> None
         mission_id="mission_1",
         assignment_id="assignment_a",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec, "target_i"),
     )
     sample = _sample(1.0)
     manager = TargetManager()
@@ -183,9 +217,8 @@ def test_bridge_polls_before_submit_and_submits_each_camera_batch_once() -> None
 
     assert coordinator.events == ["poll", "submit", "poll"]
     assert len(coordinator.submissions) == 1
-    submitted_sample, submitted_spec = coordinator.submissions[0]
-    assert submitted_sample is sample
-    assert submitted_spec is spec
+    assert coordinator.submissions[0] is sample
+    assert coordinator.self_motion == [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
     assert runtime.metrics()["frames_submitted"] == 1
     assert runtime.metrics()["attribute_evidence_log_errors"] == 0
 
@@ -197,6 +230,50 @@ def test_bridge_polls_before_submit_and_submits_each_camera_batch_once() -> None
             target_manager=manager,
         )
     assert coordinator.events == ["poll", "submit", "poll"]
+
+
+def test_bridge_submits_synchronized_uav_self_motion_with_wrapped_yaw_rate() -> None:
+    config = load_config(ROOT / "configs/multi_uav_cube_yolo.yaml")
+    runtime, coordinator = _runtime(config, uav_id="uav_a", estimate=None)
+    spec = TargetSpec("red cube", category="cube")
+    runtime.reset(
+        mission_id="mission_motion",
+        assignment_id="assignment_motion",
+        uav_id="uav_a",
+        target_query=_query(spec, "target_i"),
+    )
+    first = _sample(1.0)
+    second = _sample(1.5)
+    runtime.observe(
+        base_observation=_base(
+            first,
+            "uav_a",
+            yaw_rad=3.10,
+            velocity=(1.0, 2.0, 3.0),
+        ),
+        camera_sample=first,
+        target_manager=TargetManager(),
+    )
+    runtime.observe(
+        base_observation=_base(
+            second,
+            "uav_a",
+            yaw_rad=-3.10,
+            velocity=(4.0, 5.0, 6.0),
+        ),
+        camera_sample=second,
+        target_manager=TargetManager(),
+    )
+
+    assert coordinator.self_motion[0] == (
+        (1.0, 2.0, 3.0),
+        (0.0, 0.0, 0.0),
+    )
+    assert coordinator.self_motion[1][0] == (4.0, 5.0, 6.0)
+    assert coordinator.self_motion[1][1][:2] == (0.0, 0.0)
+    assert coordinator.self_motion[1][1][2] == pytest.approx(
+        (2.0 * np.pi - 6.2) / 0.5
+    )
 
 
 def test_two_uavs_keep_same_tracker_id_in_independent_runtimes() -> None:
@@ -215,15 +292,13 @@ def test_two_uavs_keep_same_tracker_id_in_independent_runtimes() -> None:
         mission_id="mission_1",
         assignment_id="assignment_a",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec_a,
+        target_query=_query(spec_a, "target_i"),
     )
     runtime_b.reset(
         mission_id="mission_1",
         assignment_id="assignment_b",
         uav_id="uav_b",
-        target_alias="target_j",
-        target_spec=spec_b,
+        target_query=_query(spec_b, "target_j"),
     )
 
     observed_a = runtime_a.observe(
@@ -245,8 +320,8 @@ def test_two_uavs_keep_same_tracker_id_in_independent_runtimes() -> None:
     assert observed_b.target_estimate.target_id == "target_j"
     assert coordinator_a.reset_calls == [("mission_1", "uav_a", "target_i")]
     assert coordinator_b.reset_calls == [("mission_1", "uav_b", "target_j")]
-    assert coordinator_a.submissions[0][1] is spec_a
-    assert coordinator_b.submissions[0][1] is spec_b
+    assert coordinator_a.submissions[0] is sample
+    assert coordinator_b.submissions[0] is sample
 
 
 def test_failed_yolo_rebind_invalidates_old_runtime_and_bridge_route() -> None:
@@ -263,8 +338,7 @@ def test_failed_yolo_rebind_invalidates_old_runtime_and_bridge_route() -> None:
         mission_id="mission_1",
         assignment_id="assignment_a",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=original,
+        target_query=_query(original, "target_i"),
     )
     assert runtime.target_id == "target_i"
     assert runtime._bridge.target_alias == "target_i"  # noqa: SLF001
@@ -275,8 +349,7 @@ def test_failed_yolo_rebind_invalidates_old_runtime_and_bridge_route() -> None:
             mission_id="mission_1",
             assignment_id="assignment_b",
             uav_id="uav_a",
-            target_alias="target_j",
-            target_spec=replacement,
+            target_query=_query(replacement, "target_j"),
         )
 
     assert runtime.target_id is None
@@ -297,11 +370,13 @@ class _Service:
         ready: bool = True,
         family: str = "yolo",
         names: tuple[tuple[int, str], ...] = ((0, "cube"),),
+        model_sha256: str = TRAINED_MODEL_SHA256,
     ) -> None:
         self.url = url
         self.ready = ready
         self.family = family
         self.names = names
+        self.model_sha256 = model_sha256
         self.calls: list[str] = []
 
     def health(self) -> dict[str, object]:
@@ -317,7 +392,7 @@ class _Service:
         return YoloModelInfo(
             self.family,
             self.names,
-            "ab" * 32,
+            self.model_sha256,
         )
 
 
@@ -326,7 +401,7 @@ def test_preflight_checks_both_isolated_workers_and_records_sha() -> None:
     services: dict[str, _Service] = {}
 
     def factory(*, base_url: str, request_timeout_s: float, jpeg_quality: int):
-        assert request_timeout_s == 0.5
+        assert request_timeout_s == 5.0
         assert jpeg_quality == 90
         service = _Service(base_url)
         services[base_url] = service
@@ -344,7 +419,7 @@ def test_preflight_checks_both_isolated_workers_and_records_sha() -> None:
     }
     assert all(service.calls == ["health", "model_info"] for service in services.values())
     assert result["uav_a"]["model_names"] == {0: "cube"}
-    assert result["uav_b"]["model_sha256"] == "ab" * 32
+    assert result["uav_b"]["model_sha256"] == TRAINED_MODEL_SHA256
 
 
 def test_single_uav_preflight_uses_default_url() -> None:
@@ -354,6 +429,16 @@ def test_single_uav_preflight_uses_default_url() -> None:
         target_perception=replace(
             config.target_perception,
             backend="ultralytics_service",
+            detector=replace(
+                config.target_perception.detector,
+                expected_model_family="yolo",
+                expected_model_names={0: "cube"},
+                expected_model_sha256=TRAINED_MODEL_SHA256,
+            ),
+            confirmation=replace(
+                config.target_perception.confirmation,
+                mode="class_track_attribute_or_qwen",
+            ),
             yolo_service=replace(
                 config.target_perception.yolo_service,
                 url="http://127.0.0.1:8019",
@@ -375,6 +460,84 @@ def test_single_uav_preflight_uses_default_url() -> None:
     )
     assert seen_urls == ["http://127.0.0.1:8019"]
     assert result[uav_id]["url"] == "http://127.0.0.1:8019"
+
+
+def test_production_yolo_preflight_rejects_unpinned_model_contract() -> None:
+    config = load_config(ROOT / "configs/default.yaml")
+    unpinned = replace(
+        config,
+        target_perception=replace(
+            config.target_perception,
+            backend="ultralytics_service",
+            confirmation=replace(
+                config.target_perception.confirmation,
+                mode="class_track_attribute_or_qwen",
+            ),
+        ),
+    )
+    factory_called = False
+
+    def forbidden_factory(**kwargs):
+        nonlocal factory_called
+        factory_called = True
+        raise AssertionError(kwargs)
+
+    with pytest.raises(
+        TargetPerceptionConfigurationError,
+        match="explicit trained-model identity contract",
+    ):
+        preflight_fleet_yolo_services(
+            unpinned,
+            (unpinned.uavs[0].id,),
+            client_factory=forbidden_factory,
+        )
+    assert factory_called is False
+
+
+def test_production_yolo_preflight_rejects_legacy_confirmation_before_io_or_isaac(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(ROOT / "configs/yolo/runtime_yolo26.yaml")
+    legacy_confirmation = replace(
+        config,
+        target_perception=replace(
+            config.target_perception,
+            confirmation=replace(
+                config.target_perception.confirmation,
+                mode="class_track_or_qwen",
+            ),
+        ),
+    )
+    factory_calls: list[dict[str, object]] = []
+    isaac_imports: list[str] = []
+    original_import = builtins.__import__
+
+    def forbidden_factory(**kwargs):
+        factory_calls.append(dict(kwargs))
+        raise AssertionError("legacy confirmation reached the YOLO worker boundary")
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "isaacsim" or name.startswith("isaacsim."):
+            isaac_imports.append(name)
+            raise AssertionError("legacy confirmation crossed the Isaac boundary")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    with pytest.raises(TargetPerceptionConfigurationError) as raised:
+        preflight_fleet_yolo_services(
+            legacy_confirmation,
+            ("uav_1",),
+            client_factory=forbidden_factory,
+        )
+
+    message = str(raised.value)
+    assert (
+        "target_perception.confirmation.mode="
+        "'class_track_attribute_or_qwen'" in message
+    )
+    assert "actual_confirmation_mode='class_track_or_qwen'" in message
+    assert factory_calls == []
+    assert isaac_imports == []
 
 
 @pytest.mark.parametrize(
@@ -413,6 +576,22 @@ def test_preflight_fails_closed_without_oracle_fallback() -> None:
             ("uav_a",),
             client_factory=lambda **kwargs: Offline(),
         )
+
+
+def test_preflight_rejects_wrong_checkpoint_with_complete_diagnostic() -> None:
+    config = load_config(ROOT / "configs/multi_uav_cube_yolo.yaml")
+    service = _Service("unused", model_sha256="0" * 64)
+    with pytest.raises(TargetPerceptionConfigurationError) as raised:
+        preflight_fleet_yolo_services(
+            config,
+            ("uav_a",),
+            client_factory=lambda **kwargs: service,
+        )
+    message = str(raised.value)
+    assert "worker_url=http://127.0.0.1:8011" in message
+    assert f"expected_model_sha256='{TRAINED_MODEL_SHA256}'" in message
+    assert f"actual_model_sha256='{'0' * 64}'" in message
+    assert "actual_model_names={0: 'cube'}" in message
 
 
 def test_preflight_rejects_duplicate_resolved_worker_url(

@@ -13,6 +13,7 @@ from fleet.runtime import (
 from fleet.scripted_planner import ScriptedFleetPlanner
 from perception.mode import TargetPerceptionMode
 from perception.runtime_provider import YoloTargetPerceptionRuntime
+from perception.target_query import TargetQuerySpec
 from target import TargetSpec
 from tests.fleet.test_fleet_runtime import _FakeAgent, _FakeEnvironment, _request
 from tests.perception.test_yolo_runtime_provider import _Bridge
@@ -67,6 +68,15 @@ class _AssignmentScopedOracleRuntime:
 def _single_target_request():
     request = _request()
     return replace(request, target_requests=(request.target_requests[0],))
+
+
+def _query(assignment) -> TargetQuerySpec:
+    return TargetQuerySpec.from_assignment_semantics(
+        target_alias=assignment.target_alias,
+        target_spec=assignment.target_spec,
+        detector_class_id=0,
+        detector_class_name=assignment.target_spec.category,
+    )
 
 
 def test_cross_uav_oracle_replan_retires_old_binding_and_resets_new_one() -> None:
@@ -173,7 +183,7 @@ def test_same_uav_yolo_replan_closes_old_runtime_and_resets_new_stream() -> None
     plan = runtime.start(request.original_instruction, request=request)
     assignment = plan.assignments[0]
     assert old_bridge.reset_calls == [
-        (request.fleet_mission_id, assignment.target_spec, "target_i")
+        (request.fleet_mission_id, _query(assignment))
     ]
 
     runtime.assignments.update(
@@ -200,7 +210,7 @@ def test_same_uav_yolo_replan_closes_old_runtime_and_resets_new_stream() -> None
     assert new_bridge.reset_calls == []
     runtime._start_pending_ready_assignments()  # noqa: SLF001
     assert new_bridge.reset_calls == [
-        (request.fleet_mission_id, assignment.target_spec, "target_i")
+        (request.fleet_mission_id, _query(assignment))
     ]
     assert new_runtime.target_id == "target_i"
     assert new_runtime._assignment_id == assignment.assignment_id  # noqa: SLF001

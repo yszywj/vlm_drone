@@ -15,6 +15,8 @@ from numbers import Real
 from pathlib import Path
 from threading import RLock
 
+import numpy as np
+
 from runtime.frame_store import FrameRef, FrameStore
 
 
@@ -44,6 +46,8 @@ class TargetDebugAnnotation:
     position_world_m: tuple[float, float, float] | None
     measurement_age_s: float | None
     source: str
+    sampled_pixel_uv: tuple[float, float] | None = None
+    raw_depth_m: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.confirmed, bool):
@@ -70,6 +74,14 @@ class TargetDebugAnnotation:
             _finite(self.measurement_age_s, "measurement_age_s") < 0.0
         ):
             raise ValueError("measurement_age_s must be non-negative")
+        if self.sampled_pixel_uv is not None:
+            if len(self.sampled_pixel_uv) != 2:
+                raise ValueError("sampled_pixel_uv must contain exactly 2 values")
+            for index, value in enumerate(self.sampled_pixel_uv):
+                if _finite(value, f"sampled_pixel_uv[{index}]") < 0.0:
+                    raise ValueError("sampled_pixel_uv components must be non-negative")
+        if self.raw_depth_m is not None and _finite(self.raw_depth_m, "raw_depth_m") <= 0.0:
+            raise ValueError("raw_depth_m must be positive")
         if self.position_world_m is not None:
             if len(self.position_world_m) != 3:
                 raise ValueError("position_world_m must contain exactly 3 values")
@@ -108,6 +120,12 @@ class TargetDebugAnnotation:
             if self.measurement_age_s is None
             else f"{self.measurement_age_s:.3f}s"
         )
+        sample = (
+            "N/A"
+            if self.sampled_pixel_uv is None
+            else "(" + ", ".join(f"{value:.1f}" for value in self.sampled_pixel_uv) + ")"
+        )
+        raw_depth = "N/A" if self.raw_depth_m is None else f"{self.raw_depth_m:.3f}m"
         return (
             f"event={event}",
             f"class={category} class_id={class_id} confidence={confidence}",
@@ -115,6 +133,7 @@ class TargetDebugAnnotation:
             f"confirmed={str(self.confirmed).lower()}",
             f"position_world_m={position}",
             f"measurement_age={age}",
+            f"sampled_pixel_uv={sample} raw_depth={raw_depth}",
         )
 
 
@@ -199,9 +218,10 @@ class BoundedTargetDebugImageWriter:
             rgb = frame_store.get_frame(frame_ref)
             if rgb is None:
                 return False
+            depth = frame_store.get_depth(frame_ref, copy=False)
             temporary: Path | None = None
             try:
-                payload = _annotated_jpeg(rgb, event, annotation)
+                payload = _annotated_jpeg(rgb, depth, event, annotation)
                 self._output_dir.mkdir(parents=True, exist_ok=True)
                 destination = self._output_dir / f"{self._count + 1:02d}_{event}.jpg"
                 if destination.exists():
@@ -225,10 +245,45 @@ class BoundedTargetDebugImageWriter:
             return True
 
 
-def _annotated_jpeg(rgb, event: str, annotation: TargetDebugAnnotation) -> bytes:
+def _annotated_jpeg(
+    rgb: np.ndarray,
+    depth: np.ndarray | None,
+    event: str,
+    annotation: TargetDebugAnnotation,
+) -> bytes:
     from PIL import Image, ImageDraw
 
     image = Image.fromarray(rgb)
+    # The bounded debug image visualizes the same depth cluster represented by
+    # the measurement without persisting a depth array.  Pixels near the raw
+    # sampled depth are overlaid only inside the detector bbox.
+    if (
+        depth is not None
+        and annotation.raw_depth_m is not None
+        and annotation.bbox_xyxy_normalized is not None
+        and depth.shape == rgb.shape[:2]
+    ):
+        x1n, y1n, x2n, y2n = annotation.bbox_xyxy_normalized
+        height, width = depth.shape
+        x1 = max(0, min(width - 1, int(np.floor(x1n * width))))
+        y1 = max(0, min(height - 1, int(np.floor(y1n * height))))
+        x2 = max(x1 + 1, min(width, int(np.ceil(x2n * width))))
+        y2 = max(y1 + 1, min(height, int(np.ceil(y2n * height))))
+        tolerance = max(0.15, 0.05 * annotation.raw_depth_m)
+        mask = np.zeros(depth.shape, dtype=bool)
+        patch = depth[y1:y2, x1:x2]
+        mask[y1:y2, x1:x2] = (
+            np.isfinite(patch)
+            & (patch > 0.0)
+            & (np.abs(patch - annotation.raw_depth_m) <= tolerance)
+        )
+        if np.any(mask):
+            pixels = np.asarray(image).copy()
+            pixels[mask] = (
+                0.45 * pixels[mask].astype(np.float32)
+                + 0.55 * np.asarray((32, 255, 96), dtype=np.float32)
+            ).astype(np.uint8)
+            image = Image.fromarray(pixels)
     draw = ImageDraw.Draw(image)
     width, height = image.size
     bbox = annotation.bbox_xyxy_normalized
@@ -243,6 +298,14 @@ def _annotated_jpeg(rgb, event: str, annotation: TargetDebugAnnotation) -> bytes
             ),
             outline=(255, 32, 32),
             width=max(1, min(width, height) // 160 + 1),
+        )
+    if annotation.sampled_pixel_uv is not None:
+        u, v = annotation.sampled_pixel_uv
+        radius = max(2, min(width, height) // 120)
+        draw.ellipse(
+            (round(u) - radius, round(v) - radius, round(u) + radius, round(v) + radius),
+            outline=(255, 255, 0),
+            width=max(1, radius // 2),
         )
     lines = annotation.label_lines(event)
     line_height = 12

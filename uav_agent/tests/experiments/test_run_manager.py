@@ -11,6 +11,7 @@ from unittest import mock
 import yaml
 
 from configs.loader import load_config
+from configs.schema import TargetDetectorConfig
 from experiments.run_manager import (
     FORBIDDEN_ARTIFACT_DIRECTORIES,
     InsufficientDiskSpaceError,
@@ -206,6 +207,33 @@ class RunManagerTest(unittest.TestCase):
             )
             self.assertTrue(manager.paths.resolved_config.is_file())
 
+    def test_only_declared_config_fields_may_persist_integer_mapping_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.assertRaisesRegex(TypeError, "mapping keys must be strings"):
+                self.create_run(
+                    root,
+                    resolved_config={"untrusted_names": {0: "cube"}},
+                )
+
+            manager = self.create_run(root)
+            manager.update_resolved_config(
+                {
+                    "detector": TargetDetectorConfig(
+                        expected_model_family="yolo",
+                        expected_model_names={0: "cube"},
+                        expected_model_sha256="ab" * 32,
+                    )
+                }
+            )
+            persisted = yaml.safe_load(
+                manager.paths.resolved_config.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                persisted["detector"]["expected_model_names"],
+                {0: "cube"},
+            )
+
     def test_update_resolved_config_is_validated_and_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manager = self.create_run(Path(temporary))
@@ -240,6 +268,7 @@ class RunManagerTest(unittest.TestCase):
         config_paths = (
             PROJECT_ROOT / "configs" / "default.yaml",
             PROJECT_ROOT / "configs" / "multi_uav_demo.yaml",
+            PROJECT_ROOT / "configs" / "yolo" / "runtime_yolo26.yaml",
         )
         with tempfile.TemporaryDirectory() as temporary:
             for index, config_path in enumerate(config_paths):

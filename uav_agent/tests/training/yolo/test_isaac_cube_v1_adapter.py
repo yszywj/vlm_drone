@@ -502,3 +502,60 @@ def test_adapter_waits_for_fresh_frame_after_last_planned_step_is_stale() -> Non
         rendered_cube.position_world_m[0] - initial_cube_x,
         truth.camera_sample.timestamp_s * plan.target_speed_mps,
     )
+
+
+def test_target_state_crossing_profile_moves_two_cubes_toward_each_other() -> None:
+    environment = _FakeEnvironment()
+    driver = _FakeSceneDriver()
+    config = SimpleNamespace(
+        simulation=SimpleNamespace(physics_dt_s=0.1),
+        camera=SimpleNamespace(frequency_hz=10.0),
+        target=SimpleNamespace(
+            motion=SimpleNamespace(
+                region=SimpleNamespace(
+                    min_xyz_m=(-20.0, -20.0, 0.2),
+                    max_xyz_m=(20.0, 20.0, 5.0),
+                )
+            )
+        ),
+    )
+    adapter = _SimpleSceneCollectionAdapter(
+        environment,
+        SimpleNamespace(is_running=lambda: True),
+        config,
+        protocol=_protocol(),
+        scene_driver=driver,
+        crossing_trajectories=True,
+    )
+    adapter._apply_render_randomization = lambda _plan: None
+    adapter._set_camera_view = lambda **_kwargs: None
+    plan = replace(
+        EpisodeRandomizer(RandomizationBounds(), scene_seed=23).plan(1),
+        sample_kind="partial_occlusion",
+        target_position_world_m=(0.0, 0.0, 1.0),
+        target_speed_mps=1.0,
+        target_direction_change_interval_s=100.0,
+    )
+    adapter.begin_episode(plan)
+    initial = {
+        item.object_id: np.asarray(item.position_world_m)
+        for item in driver.installed
+        if item.object_id in {"cube_0", "cube_1"}
+    }
+    initial_distance = float(np.linalg.norm(initial["cube_1"] - initial["cube_0"]))
+
+    adapter.advance_to_next_sample(0.2)
+    truth = adapter.capture_oracle_frame("frame_1")
+    cubes = {item.object_id: item for item in truth.objects if item.shape == "cube"}
+    final_distance = float(
+        np.linalg.norm(
+            np.asarray(cubes["cube_1"].position_world_m)
+            - np.asarray(cubes["cube_0"].position_world_m)
+        )
+    )
+
+    assert final_distance < initial_distance
+    assert np.dot(
+        cubes["cube_0"].velocity_world_mps,
+        cubes["cube_1"].velocity_world_mps,
+    ) < 0.0

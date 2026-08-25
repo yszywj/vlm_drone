@@ -407,6 +407,8 @@ class OracleObjectTruth:
     dimensions_xyz_m: tuple[float, float, float]
     projected_pixels_uv: np.ndarray
     projected_depth_m: np.ndarray
+    velocity_world_mps: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    center_pixel_uv: tuple[float, float] | None = None
     occlusion_ratio: float | None = None
 
     def __post_init__(self) -> None:
@@ -429,6 +431,21 @@ class OracleObjectTruth:
             raise ValueError("projected object depths must have shape (N,)")
         object.__setattr__(self, "projected_pixels_uv", pixels)
         object.__setattr__(self, "projected_depth_m", depths)
+        velocity = tuple(
+            _finite(value, f"velocity_world_mps[{index}]")
+            for index, value in enumerate(self.velocity_world_mps)
+        )
+        if len(velocity) != 3:
+            raise ValueError("velocity_world_mps must contain three values")
+        object.__setattr__(self, "velocity_world_mps", velocity)
+        if self.center_pixel_uv is not None:
+            if len(self.center_pixel_uv) != 2:
+                raise ValueError("center_pixel_uv must contain two values")
+            center = tuple(
+                _finite(value, f"center_pixel_uv[{index}]")
+                for index, value in enumerate(self.center_pixel_uv)
+            )
+            object.__setattr__(self, "center_pixel_uv", center)
         if self.occlusion_ratio is not None:
             ratio = _finite(self.occlusion_ratio, "occlusion_ratio")
             if not 0.0 <= ratio <= 1.0:

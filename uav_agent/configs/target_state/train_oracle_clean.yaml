@@ -1,0 +1,35 @@
+dataset_root: /home/amax/ry/vlm_drones/datasets/target_state_v1
+output_dir: /home/amax/ry/vlm_drones/outputs/trained_models/target_state
+initial_checkpoint_path: null
+stage: oracle_clean
+history_size: 6
+max_history_age_s: 2.0
+roi_size_px: 128
+geometry_input_dim: 25
+roi_feature_dim: 96
+geometry_feature_dim: 64
+hidden_dim: 128
+gru_layers: 2
+epochs: 30
+batch_size: 16
+learning_rate: 0.0003
+weight_decay: 0.0001
+num_workers: 4
+seed: 42
+device: cuda:0
+run_name: temporal_ray_depth_oracle_clean_v1
+camera_convention: camera_optical_x_right_y_down_z_forward
+coordinate_convention: world_flu_x_forward_y_left_z_up
+save_figures: 3
+validation_interval: 1
+promotion_p95_max_ratio: 1.05
+promotion_min_covariance_correlation: 0.1
+maximum_depth_m: 200.0
+minimum_depth_m: 0.2
+require_dataset_manifest: true
+loss_weights:
+  depth: 1.0
+  position_3d: 2.0
+  reprojection: 0.5
+  gaussian_nll: 0.25
+  validity_bce: 0.5

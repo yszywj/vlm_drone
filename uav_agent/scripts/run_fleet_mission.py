@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from hashlib import sha256
 import json
 from math import cos, dist, radians, sin
+import os
 from pathlib import Path
 import re
 import sys
@@ -107,12 +108,16 @@ from models.model_client_factory import ModelClientFactory  # noqa: E402
 from perception.factory import (  # noqa: E402
     TargetPerceptionConfigurationError,
     preflight_fleet_yolo_services,
+    preflight_temporal_ray_depth,
     validate_target_perception_preflight,
 )
 from perception.mode import (  # noqa: E402
     ResolvedTargetPerceptionMode,
     TargetPerceptionModeError,
     resolve_target_perception_mode,
+)
+from perception.production_boundary import (  # noqa: E402
+    build_target_perception_startup_audit,
 )
 from planner.dynamic_llm_planner import DynamicLLMPlanner  # noqa: E402
 from planner.policy import PlannerLimits, PlannerPolicy  # noqa: E402
@@ -128,6 +133,28 @@ DEFAULT_INSTRUCTION = (
     "无人机B前往世界坐标负二十五、十附近十二米范围搜索并跟踪目标j二十秒；"
     "完成后分别返回各自起点降落"
 )
+
+
+def _simulation_app_launch_config(*, headless: bool) -> dict[str, bool]:
+    """Return the Fleet-owned Kit lifecycle policy.
+
+    Fleet must regain control after ``SimulationApp.close()`` so RunManager
+    can durably record the terminal exit code. Isaac's fast shutdown exits the
+    interpreter from inside Kit and is therefore invalid for this entrypoint.
+    """
+
+    if not isinstance(headless, bool):
+        raise TypeError("headless must be a bool")
+    # A fleet mission owns exactly one renderer process.  Isaac's default
+    # multi-GPU renderer opens every visible device even for a 320x240 camera;
+    # after several sequential Kit lifecycles this has caused a later episode
+    # to stall on its first rendered frame.  Detector workers are isolated
+    # processes and may still be assigned a different GPU explicitly.
+    return {
+        "headless": headless,
+        "fast_shutdown": False,
+        "multi_gpu": False,
+    }
 
 
 class FleetLaunchConfigurationError(ValueError):
@@ -542,8 +569,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=("oracle", "yolo"),
         default=None,
         help=(
-            "explicit target observation source; validates the YAML backend "
-            "and legacy runtime switches without changing them silently"
+            "target observation source; an explicit value validates the YAML "
+            "backend and legacy runtime switches, while an omitted value "
+            "automatically selects strict yolo mode for an "
+            "ultralytics_service backend"
         ),
     )
     parser.add_argument(
@@ -1467,7 +1496,20 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
     config = load_config(args.config)
     resolved_target_perception_mode: ResolvedTargetPerceptionMode | None = None
     explicit_target_mode = getattr(args, "target_perception_mode", None)
-    if explicit_target_mode is not None:
+    # A YOLO production YAML is itself an unambiguous request for the strict
+    # YOLO runtime.  Do not leave it on the legacy ``None`` branch merely
+    # because the redundant CLI selector was omitted: that branch does not
+    # perform the mandatory worker/model and temporal-checkpoint preflights.
+    # Explicit CLI values still take precedence and are checked against the
+    # YAML below; disabled and legacy Oracle configurations retain their
+    # existing compatibility behavior.
+    requested_target_mode = explicit_target_mode
+    if (
+        requested_target_mode is None
+        and config.target_perception.backend == "ultralytics_service"
+    ):
+        requested_target_mode = "yolo"
+    if requested_target_mode is not None:
         supplied_legacy_profile = (
             args.perception_runtime_profile
             if bool(
@@ -1477,7 +1519,7 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
         )
         try:
             resolved_target_perception_mode = resolve_target_perception_mode(
-                explicit_target_mode,
+                requested_target_mode,
                 runtime_profile=supplied_legacy_profile,
                 backend=config.target_perception.backend,
                 acknowledge_privileged_oracle=bool(
@@ -2755,6 +2797,37 @@ def _apply_terminal_outcome(
     summary["interrupted"] = interrupted
 
 
+def _retain_yolo_service_metadata(
+    prepared: PreparedFleetMission,
+    service_metadata: Mapping[str, Mapping[str, object]],
+) -> None:
+    """Retain preflight-verified worker identity for every planner mode."""
+
+    preparation_context = prepared.preparation_context
+    if preparation_context is None:
+        preparation_context = {}
+        object.__setattr__(
+            prepared,
+            "preparation_context",
+            preparation_context,
+        )
+    retained: dict[str, dict[str, object]] = {}
+    for key, value in service_metadata.items():
+        service = dict(value)
+        # The worker protocol uses integer detector class IDs, while the
+        # experiment-record schema deliberately requires JSON object keys to
+        # already be strings.  Normalize at this boundary so a successful
+        # mission cannot fail during terminal summary serialization.
+        model_names = service.get("model_names")
+        if isinstance(model_names, Mapping):
+            service["model_names"] = {
+                str(class_id): class_name
+                for class_id, class_name in model_names.items()
+            }
+        retained[str(key)] = service
+    preparation_context["yolo_service_metadata"] = retained
+
+
 def _terminal_log_payload(
     prepared: PreparedFleetMission,
     runtime: object | None,
@@ -3982,27 +4055,80 @@ def run_prepared_fleet_mission(
             yolo_service_metadata = preflight_fleet_yolo_services(
                 prepared.config,
                 tuple(
-                    assignment.uav_id
-                    for assignment in prepared.plan.assignments
-                    if assignment.uav_id in prepared.compilations
+                    dict.fromkeys(
+                        assignment.uav_id
+                        for assignment in prepared.plan.assignments
+                        if assignment.uav_id in prepared.compilations
+                    )
                 ),
             )
+            temporal_model_metadata = preflight_temporal_ray_depth(
+                prepared.config
+            )
+            if temporal_model_metadata is not None:
+                print(
+                    "[Fleet] temporal_ray_depth_preflight="
+                    + json.dumps(
+                        temporal_model_metadata,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
             setattr(
                 args,
                 "_yolo_service_metadata",
                 {key: dict(value) for key, value in yolo_service_metadata.items()},
             )
-            if prepared.preparation_context is not None:
-                prepared.preparation_context["yolo_service_metadata"] = {
-                    key: dict(value)
-                    for key, value in yolo_service_metadata.items()
-                }
+            startup_audit = build_target_perception_startup_audit(
+                runtime_profile=resolved_mode.runtime_profile,
+                target_perception_mode=resolved_mode.mode.value,
+                backend_by_uav={
+                    uav_id: prepared.config.target_perception.backend
+                    for uav_id in yolo_service_metadata
+                },
+                privileged=resolved_mode.privileged,
+                yolo_model_sha256_by_uav={
+                    uav_id: str(metadata["model_sha256"])
+                    for uav_id, metadata in yolo_service_metadata.items()
+                },
+                temporal_model_sha256=(
+                    None
+                    if temporal_model_metadata is None
+                    else str(temporal_model_metadata["checkpoint_sha256"])
+                ),
+            )
+            print(
+                "[Fleet] target_perception_startup_audit="
+                + json.dumps(
+                    startup_audit,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+            # Scripted preparation historically left ``preparation_context``
+            # unset, while the LLM path created it for model-call auditing.
+            # YOLO service identity is runtime evidence, not planner-specific
+            # state, so retain it for every planning mode.  Without this the
+            # preflight was enforced correctly but the final summary/report
+            # misleadingly claimed that no service metadata was recorded.
+            _retain_yolo_service_metadata(prepared, yolo_service_metadata)
         # FIRST ISAAC IMPORT.  All planning, validation, compilation, model
         # calls, perception preflight, Safety preflight, and initial logging
         # have completed above this line.
         from isaacsim import SimulationApp
 
-        simulation_app = SimulationApp({"headless": prepared.headless})
+        # Isaac's default ``fast_shutdown=True`` terminates the Python process
+        # from ``SimulationApp.close()``.  The Fleet entrypoint still has to
+        # finalize RunManager status/exit_code after Kit releases its
+        # resources, so this long-lived experiment runner requires graceful
+        # extension shutdown.
+        simulation_app = SimulationApp(
+            _simulation_app_launch_config(headless=prepared.headless)
+        )
         if args.debug_visualization:
             from isaacsim.core.utils.extensions import enable_extension
 
@@ -4019,8 +4145,10 @@ def run_prepared_fleet_mission(
         from fleet.target_registry import SharedTargetRegistry
         from perception.factory import (
             build_target_perception_backend,
-            build_target_perception_runtime,
+            build_oracle_target_perception_runtime,
+            build_yolo_target_perception_runtime,
         )
+        from perception.target_debug_images import BoundedTargetDebugImageWriter
         from perception.vision_backend import DisabledTargetPerceptionBackend
         from perception.runtime import (
             GuardedPerceptionBackend,
@@ -4067,6 +4195,18 @@ def run_prepared_fleet_mission(
                 result_recorder.record_attribute_evidence(
                     uav_id,
                     row,
+                    target_perception_mode="yolo",
+                )
+
+            return persist
+
+        def candidate_transition_sink_for(
+            uav_id: str,
+        ) -> Callable[[object], None]:
+            def persist(transition: object) -> None:
+                result_recorder.record_target_perception_transition(
+                    uav_id,
+                    transition,
                     target_perception_mode="yolo",
                 )
 
@@ -4158,18 +4298,21 @@ def run_prepared_fleet_mission(
                 runtime_perception = DisabledTargetPerceptionBackend(uav_id=uav_id)
                 backend_name = "disabled_non_target_assignment"
             elif prepared.resolved_target_perception_mode is not None:
-                runtime_perception = build_target_perception_runtime(
-                    prepared.config,
-                    resolved_mode=prepared.resolved_target_perception_mode,
-                    environment=environment,
-                    uav_id=uav_id,
-                    attribute_evidence_sink=(
-                        attribute_evidence_sink_for(uav_id)
-                        if prepared.resolved_target_perception_mode.mode.value
-                        == "yolo"
-                        else None
-                    ),
-                )
+                if prepared.resolved_target_perception_mode.mode.value == "yolo":
+                    runtime_perception = build_yolo_target_perception_runtime(
+                        prepared.config,
+                        resolved_mode=prepared.resolved_target_perception_mode,
+                        uav_id=uav_id,
+                        attribute_evidence_sink=attribute_evidence_sink_for(uav_id),
+                        candidate_transition_sink=candidate_transition_sink_for(uav_id),
+                    )
+                else:
+                    runtime_perception = build_oracle_target_perception_runtime(
+                        prepared.config,
+                        resolved_mode=prepared.resolved_target_perception_mode,
+                        environment=environment,
+                        uav_id=uav_id,
+                    )
                 backend_name = runtime_perception.backend_name
             elif profile is PerceptionRuntimeProfile.ORACLE_EVALUATION:
                 raw_perception = environment.make_oracle_perception(uav_id)
@@ -4193,6 +4336,33 @@ def run_prepared_fleet_mission(
                 )
                 runtime_perception = raw_perception
                 backend_name = prepared.config.target_perception.backend
+            if (
+                backend_name == "ultralytics_service"
+                and prepared.config.debug_images.enabled
+            ):
+                coordinator = getattr(runtime_perception, "coordinator", None)
+                bind_debug_writer = getattr(
+                    coordinator,
+                    "bind_debug_image_writer",
+                    None,
+                )
+                if not callable(bind_debug_writer):
+                    raise FleetLaunchConfigurationError(
+                        "production YOLO debug output requires a coordinator "
+                        "debug-image binding"
+                    )
+                bind_debug_writer(
+                    BoundedTargetDebugImageWriter(
+                        logger.run_dir
+                        / "debug_images"
+                        / "target_perception"
+                        / uav_id,
+                        enabled=True,
+                        max_images_per_run=(
+                            prepared.config.debug_images.max_images_per_run
+                        ),
+                    )
+                )
             context = environment.make_skill_context(
                 uav_id,
                 clock,
@@ -4298,18 +4468,21 @@ def run_prepared_fleet_mission(
                     )
                     backend_name = "disabled_non_target_assignment"
                 elif prepared.resolved_target_perception_mode is not None:
-                    runtime_perception = build_target_perception_runtime(
-                        prepared.config,
-                        resolved_mode=prepared.resolved_target_perception_mode,
-                        environment=environment,
-                        uav_id=uav_id,
-                        attribute_evidence_sink=(
-                            attribute_evidence_sink_for(uav_id)
-                            if prepared.resolved_target_perception_mode.mode.value
-                            == "yolo"
-                            else None
-                        ),
-                    )
+                    if prepared.resolved_target_perception_mode.mode.value == "yolo":
+                        runtime_perception = build_yolo_target_perception_runtime(
+                            prepared.config,
+                            resolved_mode=prepared.resolved_target_perception_mode,
+                            uav_id=uav_id,
+                            attribute_evidence_sink=attribute_evidence_sink_for(uav_id),
+                            candidate_transition_sink=candidate_transition_sink_for(uav_id),
+                        )
+                    else:
+                        runtime_perception = build_oracle_target_perception_runtime(
+                            prepared.config,
+                            resolved_mode=prepared.resolved_target_perception_mode,
+                            environment=environment,
+                            uav_id=uav_id,
+                        )
                     backend_name = runtime_perception.backend_name
                 elif profile is PerceptionRuntimeProfile.ORACLE_EVALUATION:
                     raw_perception = environment.make_oracle_perception(uav_id)
@@ -5227,4 +5400,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _terminal_exit_code = main()
+    # Isaac/Kit 5.1 can segfault while CPython garbage-collects extension
+    # objects *after* a complete graceful shutdown. At this point every Fleet
+    # resource is closed and RunManager has durably written the terminal
+    # manifest/exit code, so bypass only the redundant interpreter teardown.
+    # This also preserves the real mission exit code for conda/shell callers.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_terminal_exit_code)

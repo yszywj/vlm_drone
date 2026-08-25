@@ -27,6 +27,38 @@ def _sample(timestamp_s: float, value: int = 1) -> CameraSample:
 
 
 class FrameStoreDepthTest(unittest.TestCase):
+    def test_uav_self_motion_is_synchronized_and_all_or_none(self) -> None:
+        store = FrameStore(max_frames=2, max_bytes=10_000, max_age_s=10.0)
+        camera = _sample(1.0)
+        ref = store.add_sample(
+            uav_id="uav_1",
+            frame_id="frame_motion",
+            sample=camera,
+            uav_linear_velocity_world_mps=(1.0, 2.0, 3.0),
+            uav_angular_velocity_body_radps=(0.1, 0.2, 0.3),
+        )
+
+        motion = store.get_uav_self_motion(ref)
+        self.assertIsNotNone(motion)
+        assert motion is not None
+        self.assertEqual(motion.linear_velocity_world_mps, (1.0, 2.0, 3.0))
+        self.assertEqual(motion.angular_velocity_body_radps, (0.1, 0.2, 0.3))
+        synchronized = store.get_temporal_inputs(ref)
+        self.assertIsNotNone(synchronized)
+        assert synchronized is not None
+        rgb, depth, geometry, synchronized_motion = synchronized
+        self.assertFalse(rgb.flags.writeable)
+        self.assertFalse(depth.flags.writeable)
+        self.assertEqual(geometry.timestamp_s, ref.timestamp_s)
+        self.assertEqual(synchronized_motion, motion)
+        with self.assertRaisesRegex(ValueError, "supplied together"):
+            store.add_sample(
+                uav_id="uav_1",
+                frame_id="frame_bad",
+                sample=_sample(2.0),
+                uav_linear_velocity_world_mps=(1.0, 2.0, 3.0),
+            )
+
     def test_rgb_depth_and_geometry_share_one_reference(self) -> None:
         store = FrameStore(max_frames=2, max_bytes=100, max_age_s=10.0)
         sample = _sample(1.0)

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import json
+from io import BytesIO
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 import numpy as np
 
 from perception.yolo_client import (
+    YoloClientRequestTimeout,
     YoloClientResponseError,
+    YoloClientStreamBusy,
+    YoloModelInfo,
     YoloServiceClient,
     encode_rgb_jpeg,
+    validate_yolo_model_identity,
 )
 from yolo_service.protocol import TargetQuery, TrackRequest
 
@@ -89,6 +96,44 @@ class YoloClientTest(unittest.TestCase):
                 request(), np.zeros((2, 2, 3), dtype=np.uint8)
             )
 
+    def test_transport_timeout_preserves_unknown_remote_completion(self) -> None:
+        def transport(method, url, body, headers, timeout):
+            del method, url, body, headers, timeout
+            raise TimeoutError("client deadline")
+
+        with self.assertRaises(YoloClientRequestTimeout):
+            YoloServiceClient(transport=transport).track(
+                request(), np.zeros((2, 2, 3), dtype=np.uint8)
+            )
+
+    @patch("perception.yolo_client._DIRECT_LOOPBACK_OPENER.open")
+    def test_http_stream_busy_is_typed_as_transient_backpressure(
+        self,
+        mocked_open,
+    ) -> None:
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "STREAM_BUSY",
+                    "message": "only one inference may be active",
+                }
+            }
+        ).encode("utf-8")
+        mocked_open.side_effect = HTTPError(
+            "http://127.0.0.1:8011/v1/track",
+            409,
+            "Conflict",
+            None,
+            BytesIO(body),
+        )
+
+        with self.assertRaises(YoloClientStreamBusy) as raised:
+            YoloServiceClient().track(
+                request(), np.zeros((2, 2, 3), dtype=np.uint8)
+            )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.error_code, "STREAM_BUSY")
+
     def test_rgb_encoder_does_not_swap_channels(self) -> None:
         from PIL import Image
         from io import BytesIO
@@ -98,6 +143,30 @@ class YoloClientTest(unittest.TestCase):
         decoded = np.asarray(Image.open(BytesIO(encode_rgb_jpeg(rgb))))
         self.assertGreater(float(decoded[:, :, 0].mean()), 240.0)
         self.assertLess(float(decoded[:, :, 2].mean()), 15.0)
+
+    def test_model_identity_mismatch_reports_complete_audit_context(self) -> None:
+        with self.assertRaises(YoloClientResponseError) as raised:
+            validate_yolo_model_identity(
+                YoloModelInfo("yolo", ((0, "person"),), "b" * 64),
+                expected_model_family="yolo",
+                expected_model_names={0: "cube"},
+                expected_model_sha256="a" * 64,
+                worker_url="http://127.0.0.1:8011",
+            )
+        message = str(raised.exception)
+        self.assertIn("worker_url=http://127.0.0.1:8011", message)
+        self.assertIn("expected_model_sha256='" + "a" * 64 + "'", message)
+        self.assertIn("actual_model_sha256='" + "b" * 64 + "'", message)
+        self.assertIn("actual_model_names={0: 'person'}", message)
+
+    def test_model_identity_accepts_exact_configured_worker(self) -> None:
+        validate_yolo_model_identity(
+            YoloModelInfo("yolo", ((0, "cube"),), "a" * 64),
+            expected_model_family="yolo",
+            expected_model_names={0: "cube"},
+            expected_model_sha256="a" * 64,
+            worker_url="http://127.0.0.1:8011",
+        )
 
 
 if __name__ == "__main__":

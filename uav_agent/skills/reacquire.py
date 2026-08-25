@@ -1,4 +1,4 @@
-"""Ideal REACQUIRE Skill using frozen constant-velocity prediction."""
+"""Backend-neutral REACQUIRE Skill using a visual last-seen estimate."""
 
 from __future__ import annotations
 

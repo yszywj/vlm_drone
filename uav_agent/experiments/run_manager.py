@@ -264,6 +264,7 @@ def _to_plain_data(
     *,
     _active_ids: set[int] | None = None,
     _depth: int = 0,
+    _allow_integer_mapping_keys: bool = False,
 ) -> Any:
     """Convert small config values to deterministic YAML-safe primitives."""
 
@@ -281,7 +282,13 @@ def _to_plain_data(
             raise ValueError(f"{path} contains a recursive configuration reference")
         active_ids.add(container_id)
     try:
-        return _to_plain_data_inner(value, path, active_ids, _depth)
+        return _to_plain_data_inner(
+            value,
+            path,
+            active_ids,
+            _depth,
+            _allow_integer_mapping_keys,
+        )
     finally:
         if is_container:
             active_ids.remove(container_id)
@@ -292,6 +299,7 @@ def _to_plain_data_inner(
     path: str,
     active_ids: set[int],
     depth: int,
+    allow_integer_mapping_keys: bool,
 ) -> Any:
     if is_dataclass(value) and not isinstance(value, type):
         result: dict[str, Any] = {}
@@ -311,14 +319,26 @@ def _to_plain_data_inner(
                 f"{path}.{field.name}",
                 _active_ids=active_ids,
                 _depth=depth + 1,
+                _allow_integer_mapping_keys=(
+                    field.metadata.get(
+                        "run_manager_allow_integer_mapping_keys"
+                    )
+                    is True
+                ),
             )
         return result
     if isinstance(value, Mapping):
         result = {}
         for raw_key, item in value.items():
-            if not isinstance(raw_key, str):
+            integer_key = (
+                allow_integer_mapping_keys
+                and not isinstance(raw_key, bool)
+                and isinstance(raw_key, int)
+                and raw_key >= 0
+            )
+            if not isinstance(raw_key, str) and not integer_key:
                 raise TypeError(f"{path} mapping keys must be strings")
-            if _is_sensitive_key(raw_key):
+            if isinstance(raw_key, str) and _is_sensitive_key(raw_key):
                 raise SensitiveDataError(f"refusing to persist sensitive field: {path}.{raw_key}")
             result[raw_key] = _to_plain_data(
                 item,

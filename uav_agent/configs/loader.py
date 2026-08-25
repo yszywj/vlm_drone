@@ -41,6 +41,7 @@ from configs.schema import (
     TargetAppearanceConfig,
     TargetConfig,
     TargetGeometryConfig,
+    TemporalRayDepthConfig,
     TargetMotionConfig,
     TargetPerceptionConfig,
     TargetRegionConfig,
@@ -982,6 +983,13 @@ def load_config(path: str | Path) -> AppConfig:
                     "class_aliases_path",
                 }
             ),
+            optional_keys=frozenset(
+                {
+                    "expected_model_family",
+                    "expected_model_names",
+                    "expected_model_sha256",
+                }
+            ),
         )
         if detector_raw is None:
             detector = _DEFAULT_TARGET_PERCEPTION_CONFIG.detector
@@ -1015,6 +1023,77 @@ def load_config(path: str | Path) -> AppConfig:
                 raise ConfigError(
                     "target_perception.detector.confidence_threshold must be in (0, 1]"
                 )
+            expected_family_raw = detector_raw.get("expected_model_family")
+            expected_family = (
+                None
+                if expected_family_raw is None
+                else _non_empty_string(
+                    expected_family_raw,
+                    "target_perception.detector.expected_model_family",
+                )
+            )
+            if (
+                expected_family is not None
+                and expected_family not in {"yolo", "yoloe"}
+            ):
+                raise ConfigError(
+                    "target_perception.detector.expected_model_family must be yolo or yoloe"
+                )
+            if expected_family is not None and expected_family != model_family:
+                raise ConfigError(
+                    "target_perception.detector.expected_model_family must match "
+                    "model_family"
+                )
+            expected_names_raw = _mapping(
+                detector_raw.get("expected_model_names", {}),
+                "target_perception.detector.expected_model_names",
+            )
+            expected_names: dict[int, str] = {}
+            for raw_class_id, raw_class_name in expected_names_raw.items():
+                if (
+                    isinstance(raw_class_id, bool)
+                    or not isinstance(raw_class_id, int)
+                    or raw_class_id < 0
+                ):
+                    raise ConfigError(
+                        "target_perception.detector.expected_model_names keys "
+                        "must be non-negative integers"
+                    )
+                expected_names[int(raw_class_id)] = _non_empty_string(
+                    raw_class_name,
+                    "target_perception.detector.expected_model_names."
+                    f"{raw_class_id}",
+                )
+            digest_raw = detector_raw.get("expected_model_sha256")
+            expected_digest = (
+                None
+                if digest_raw is None
+                else _non_empty_string(
+                    digest_raw,
+                    "target_perception.detector.expected_model_sha256",
+                ).lower()
+            )
+            if expected_digest is not None and (
+                len(expected_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in expected_digest
+                )
+            ):
+                raise ConfigError(
+                    "target_perception.detector.expected_model_sha256 must be "
+                    "a 64-character hexadecimal digest"
+                )
+            if expected_digest is not None and not expected_names:
+                raise ConfigError(
+                    "target_perception.detector.expected_model_sha256 requires "
+                    "expected_model_names"
+                )
+            if expected_digest is not None and expected_family is None:
+                raise ConfigError(
+                    "target_perception.detector.expected_model_sha256 requires "
+                    "expected_model_family"
+                )
             detector = TargetDetectorConfig(
                 model_family=model_family,
                 proposal_mode=proposal_mode,
@@ -1023,6 +1102,9 @@ def load_config(path: str | Path) -> AppConfig:
                     detector_raw["class_aliases_path"],
                     "target_perception.detector.class_aliases_path",
                 ),
+                expected_model_family=expected_family,
+                expected_model_names=expected_names,
+                expected_model_sha256=expected_digest,
             )
 
         tracker_raw = _strict_nested_block(
@@ -1067,6 +1149,7 @@ def load_config(path: str | Path) -> AppConfig:
                     "max_measurement_age_s",
                 }
             ),
+            optional_keys=frozenset({"temporal_ray_depth"}),
         )
         if geometry_raw is None:
             geometry = _DEFAULT_TARGET_PERCEPTION_CONFIG.geometry
@@ -1074,9 +1157,10 @@ def load_config(path: str | Path) -> AppConfig:
             geometry_mode = _non_empty_string(
                 geometry_raw["mode"], "target_perception.geometry.mode"
             )
-            if geometry_mode not in {"isaac_depth", "disabled"}:
+            if geometry_mode not in {"isaac_depth", "temporal_ray_depth", "disabled"}:
                 raise ConfigError(
-                    "target_perception.geometry.mode must be isaac_depth or disabled"
+                    "target_perception.geometry.mode must be isaac_depth, "
+                    "temporal_ray_depth, or disabled"
                 )
             depth_anchor = _non_empty_string(
                 geometry_raw["depth_anchor"],
@@ -1086,6 +1170,7 @@ def load_config(path: str | Path) -> AppConfig:
                 "bbox_center",
                 "bbox_bottom_center",
                 "bbox_patch_median",
+                "foreground_cluster_median",
                 "mask_median",
             }:
                 raise ConfigError("unsupported target_perception.geometry.depth_anchor")
@@ -1106,6 +1191,123 @@ def load_config(path: str | Path) -> AppConfig:
                 raise ConfigError(
                     "target_perception.geometry.max_depth_m must exceed min_depth_m"
                 )
+            temporal_raw = _strict_nested_block(
+                geometry_raw,
+                "temporal_ray_depth",
+                "target_perception.geometry",
+                frozenset(
+                    {
+                        "checkpoint_path", "expected_sha256",
+                        "history_size", "max_history_age_s", "roi_size_px",
+                        "use_rgb", "use_depth", "deterministic_fallback",
+                    }
+                ),
+                optional_keys=frozenset({"manifest_path", "device"}),
+            )
+            temporal = TemporalRayDepthConfig()
+            if temporal_raw is not None:
+                raw_checkpoint = temporal_raw["checkpoint_path"]
+                raw_digest = temporal_raw["expected_sha256"]
+                raw_manifest = temporal_raw.get("manifest_path")
+                inactive_artifact = (
+                    raw_checkpoint is None
+                    and raw_digest is None
+                    and raw_manifest is None
+                )
+                if inactive_artifact:
+                    checkpoint_path = None
+                    expected_sha256 = None
+                    manifest_path = None
+                else:
+                    checkpoint_path = _non_empty_string(
+                        raw_checkpoint,
+                        "target_perception.geometry.temporal_ray_depth.checkpoint_path",
+                    )
+                    expected_sha256 = _non_empty_string(
+                        raw_digest,
+                        "target_perception.geometry.temporal_ray_depth.expected_sha256",
+                    ).casefold()
+                    if len(expected_sha256) != 64 or any(
+                        character not in "0123456789abcdef" for character in expected_sha256
+                    ):
+                        raise ConfigError(
+                            "target_perception.geometry.temporal_ray_depth.expected_sha256 "
+                            "must be a 64-character hexadecimal digest"
+                        )
+                    manifest_path = (
+                        None
+                        if raw_manifest is None
+                        else _non_empty_string(
+                            raw_manifest,
+                            "target_perception.geometry.temporal_ray_depth.manifest_path",
+                        )
+                    )
+                history_size = _bounded_positive_integer(
+                    temporal_raw["history_size"],
+                    "target_perception.geometry.temporal_ray_depth.history_size",
+                    8,
+                )
+                if history_size < 4:
+                    raise ConfigError(
+                        "target_perception.geometry.temporal_ray_depth.history_size "
+                        "must be within [4, 8]"
+                    )
+                roi_size = _bounded_positive_integer(
+                    temporal_raw["roi_size_px"],
+                    "target_perception.geometry.temporal_ray_depth.roi_size_px",
+                    512,
+                )
+                if roi_size < 32:
+                    raise ConfigError(
+                        "target_perception.geometry.temporal_ray_depth.roi_size_px "
+                        "must be within [32, 512]"
+                    )
+                use_rgb = _boolean(
+                    temporal_raw["use_rgb"],
+                    "target_perception.geometry.temporal_ray_depth.use_rgb",
+                )
+                use_depth = _boolean(
+                    temporal_raw["use_depth"],
+                    "target_perception.geometry.temporal_ray_depth.use_depth",
+                )
+                if not use_rgb and not use_depth:
+                    raise ConfigError(
+                        "temporal_ray_depth requires at least one of use_rgb/use_depth"
+                    )
+                temporal = TemporalRayDepthConfig(
+                    checkpoint_path=checkpoint_path,
+                    expected_sha256=expected_sha256,
+                    manifest_path=manifest_path,
+                    history_size=history_size,
+                    max_history_age_s=_bounded_positive_number(
+                        temporal_raw["max_history_age_s"],
+                        "target_perception.geometry.temporal_ray_depth.max_history_age_s",
+                        30.0,
+                    ),
+                    roi_size_px=roi_size,
+                    use_rgb=use_rgb,
+                    use_depth=use_depth,
+                    deterministic_fallback=_boolean(
+                        temporal_raw["deterministic_fallback"],
+                        "target_perception.geometry.temporal_ray_depth.deterministic_fallback",
+                    ),
+                    device=_non_empty_string(
+                        temporal_raw.get("device", "cpu"),
+                        "target_perception.geometry.temporal_ray_depth.device",
+                    ),
+                )
+                if inactive_artifact and temporal != TemporalRayDepthConfig():
+                    raise ConfigError(
+                        "inactive temporal_ray_depth block must match the exact "
+                        "serialized default values"
+                    )
+            if geometry_mode == "temporal_ray_depth" and (
+                temporal_raw is None or temporal.checkpoint_path is None
+            ):
+                raise ConfigError(
+                    "target_perception.geometry.mode=temporal_ray_depth requires "
+                    "the complete temporal_ray_depth block"
+                )
             geometry = TargetGeometryConfig(
                 mode=geometry_mode,
                 depth_anchor=depth_anchor,
@@ -1117,6 +1319,7 @@ def load_config(path: str | Path) -> AppConfig:
                     "target_perception.geometry.max_measurement_age_s",
                     30.0,
                 ),
+                temporal_ray_depth=temporal,
             )
 
         estimator_raw = _strict_nested_block(

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import Future
+from contextlib import redirect_stdout
 from dataclasses import replace
+from io import StringIO
+import json
 from pathlib import Path
 from time import monotonic
 import unittest
@@ -11,6 +14,8 @@ import numpy as np
 from configs.loader import load_config
 from env.camera_types import CameraIntrinsics, CameraSample
 from perception.candidate_bank import CandidateBank
+from perception.grounding import CandidateResolutionUnavailable
+from perception.semantic_fusion import DETERMINISTIC_ATTRIBUTE_VERIFIER
 from perception.target_perception_coordinator import (
     TargetPerceptionCoordinator,
     TargetPerceptionError,
@@ -18,9 +23,10 @@ from perception.target_perception_coordinator import (
 )
 from perception.target_state_estimator import TargetStateEstimator
 from perception.types import SemanticVerification
-from perception.yolo_client import YoloClientResponseError, YoloModelInfo
 from perception.yolo_client import (
+    YoloClientRequestTimeout,
     YoloClientResponseError,
+    YoloClientStreamBusy,
     YoloClientUnavailable,
     YoloModelInfo,
 )
@@ -50,6 +56,27 @@ class InlineExecutor:
         except Exception as exc:
             future.set_exception(exc)
         return future
+
+
+class ManualExecutor:
+    """Deterministic single-worker executor for lifecycle race tests."""
+
+    def __init__(self) -> None:
+        self.tasks: list[tuple[Future, object, tuple[object, ...]]] = []
+
+    def submit(self, function, *args):
+        future = Future()
+        self.tasks.append((future, function, args))
+        return future
+
+    def run_next(self) -> None:
+        future, function, args = self.tasks.pop(0)
+        if future.cancelled():
+            return
+        try:
+            future.set_result(function(*args))
+        except Exception as exc:
+            future.set_exception(exc)
 
 
 class FakeClient:
@@ -105,6 +132,14 @@ class FakeClient:
         )
 
 
+class UnavailableResolver:
+    def __init__(self, reason: str = "foreground_depth_cluster_empty") -> None:
+        self.reason = reason
+
+    def resolve(self, candidate, *, timestamp_s: float):
+        raise CandidateResolutionUnavailable(self.reason)
+
+
 def sample(timestamp_s: float, *, depth_m: float = 10.0) -> CameraSample:
     intrinsics = CameraIntrinsics(10.0, 10.0, 9.5, 9.5, 20, 20)
     return CameraSample(
@@ -152,6 +187,120 @@ class TargetPerceptionCoordinatorTest(unittest.TestCase):
         self.assertEqual(coordinator.metrics.candidates_confirmed, 1)
         coordinator.close()
         self.assertEqual(client.reset_calls, ["mission_1:uav_1", "mission_1:uav_1"])
+
+    def test_runtime_evidence_metrics_and_candidate_logs_are_bounded(self) -> None:
+        client = FakeClient()
+        coordinator = self.make_coordinator(client)
+        manager = TargetManager()
+        spec = TargetSpec("a person", category="person")
+        manager.start_search(spec, 0.0)
+
+        output = StringIO()
+        with redirect_stdout(output):
+            coordinator.reset(
+                mission_id="mission_metrics",
+                uav_id="uav_metrics",
+                assignment_id="assignment_metrics",
+            )
+            for timestamp in (0.0, 0.3, 0.6):
+                coordinator.submit_frame(
+                    camera_sample=sample(timestamp),
+                    target_spec=spec,
+                )
+                coordinator.poll(now_s=timestamp, target_manager=manager)
+
+            manager.start_tracking(0.7)
+            coordinator.submit_frame(camera_sample=sample(0.9), target_spec=spec)
+            visible = coordinator.poll(now_s=0.9, target_manager=manager)
+            predicted = coordinator.poll(now_s=1.5, target_manager=manager)
+
+        self.assertIsNotNone(visible)
+        self.assertTrue(visible.visible)
+        self.assertIsNotNone(predicted)
+        self.assertTrue(predicted.predicted_only)
+
+        metrics = coordinator.runtime_metrics()
+        expected_counts = {
+            "camera_frames_received": 4,
+            "yolo_requests_submitted": 4,
+            "yolo_results_received": 4,
+            "detections_total": 4,
+            "tracked_detections_total": 4,
+            "candidate_created": 1,
+            "candidate_confirmed": 1,
+            "candidate_rejected": 0,
+            "depth_resolution_attempts": 4,
+            "depth_resolution_successes": 4,
+            "depth_resolution_failures": 0,
+            "measurement_created": 4,
+            "measurement_rejected": 0,
+            "kalman_updates_accepted": 2,
+            "kalman_updates_rejected": 0,
+            "position_world_outputs": 5,
+            "predicted_only_outputs": 1,
+            "search_target_found": 1,
+            "track_visible_updates": 1,
+            "track_predicted_updates": 1,
+            "attribute_confirmed": 0,
+            "attribute_ambiguous": 0,
+        }
+        for name, expected in expected_counts.items():
+            self.assertEqual(metrics[name], expected, name)
+
+        prefix = "[PerceptionCandidate] "
+        records = [
+            json.loads(line.removeprefix(prefix))
+            for line in output.getvalue().splitlines()
+            if line.startswith(prefix)
+        ]
+        self.assertEqual(
+            [record["transition"] for record in records],
+            ["candidate_created", "candidate_confirmed"],
+        )
+        expected_fields = {
+            "timestamp",
+            "uav_id",
+            "assignment_id",
+            "transition",
+            "tracker_id",
+            "candidate_id",
+            "bbox",
+            "detector_confidence",
+            "attribute_state",
+            "color_result",
+            "geometry_state",
+            "measurement_source",
+            "position_world_m",
+            "confirmed",
+            "target_id",
+            "estimate_source",
+        }
+        for record in records:
+            self.assertEqual(set(record), expected_fields)
+            self.assertEqual(record["uav_id"], "uav_metrics")
+            self.assertEqual(record["assignment_id"], "assignment_metrics")
+            self.assertEqual(
+                record["measurement_source"],
+                "isaac_depth_foreground_cluster_median",
+            )
+        self.assertEqual(
+            list(coordinator.candidate_transition_records()),
+            records,
+        )
+        self.assertEqual(
+            list(coordinator.drain_candidate_transition_records()),
+            records,
+        )
+        self.assertEqual(coordinator.drain_candidate_transition_records(), ())
+        scalar_log = output.getvalue().casefold()
+        for forbidden in (
+            "ground_truth",
+            "oracle_target",
+            "prim_path",
+            "motion_seed",
+        ):
+            self.assertNotIn(forbidden, scalar_log)
+        coordinator.close()
 
     def test_reset_is_atomic_fail_fast_handshake_and_checks_model_family(self) -> None:
         class MismatchedClient(FakeClient):
@@ -255,6 +404,115 @@ class TargetPerceptionCoordinatorTest(unittest.TestCase):
             coordinator.submit_frame(camera_sample=sample(timestamp), target_spec=spec)
         self.assertEqual(len(holding.futures), 1)
         self.assertEqual(coordinator.metrics.yolo_dropped_frames, 1)
+        coordinator.close()
+
+    def test_timeout_serializes_reset_barrier_before_newest_pending_track(self) -> None:
+        """A local timeout must not be mistaken for remote inference completion."""
+
+        class OrphanedInferenceClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first_track = True
+                self.remote_inference_active = False
+                self.concurrent_track_attempts = 0
+                self.busy_reset_attempts = 0
+
+            def track(self, request, rgb) -> TrackResponse:
+                if self.first_track:
+                    self.first_track = False
+                    self.track_calls += 1
+                    self.remote_inference_active = True
+                    raise YoloClientRequestTimeout(
+                        "deadline elapsed while model.track still runs"
+                    )
+                if self.remote_inference_active:
+                    self.concurrent_track_attempts += 1
+                    raise YoloClientStreamBusy("HTTP 409 STREAM_BUSY")
+                return super().track(request, rgb)
+
+            def reset_stream(self, request) -> None:
+                if self.remote_inference_active:
+                    self.busy_reset_attempts += 1
+                    if self.busy_reset_attempts == 1:
+                        raise YoloClientStreamBusy("HTTP 409 STREAM_BUSY")
+                    self.remote_inference_active = False
+                super().reset_stream(request)
+
+        app = load_config(ROOT / "configs/default.yaml")
+        config = replace(app.target_perception, backend="ultralytics_service")
+        executor = ManualExecutor()
+        client = OrphanedInferenceClient()
+        coordinator = TargetPerceptionCoordinator(
+            config,
+            client=client,
+            executor=executor,
+            model_names={0: "person"},
+            query_compiler=lambda spec, names: TargetQuery((0,), ()),
+        )
+        manager = TargetManager()
+        spec = TargetSpec("person", category="person")
+        manager.start_search(spec, 0.0)
+        coordinator.reset(mission_id="mission_timeout_race", uav_id="uav_1")
+
+        coordinator.submit_frame(camera_sample=sample(0.0), target_spec=spec)
+        coordinator.submit_frame(camera_sample=sample(0.1), target_spec=spec)
+        executor.run_next()  # local timeout; remote inference remains active
+        coordinator.poll(now_s=0.1, target_manager=manager)
+
+        # While the asynchronous reset barrier is queued, only the newest
+        # camera frame may replace the pending slot.  No Track call is queued.
+        coordinator.submit_frame(camera_sample=sample(0.2), target_spec=spec)
+        self.assertEqual(len(executor.tasks), 1)
+        self.assertEqual(client.track_calls, 1)
+        self.assertEqual(client.concurrent_track_attempts, 0)
+
+        executor.run_next()  # reset observes one 409, then retires the stream
+        coordinator.poll(now_s=0.2, target_manager=manager)
+        self.assertEqual(len(executor.tasks), 1)  # newest Track launches now
+        executor.run_next()
+        coordinator.poll(now_s=0.2, target_manager=manager)
+
+        self.assertEqual(client.track_calls, 2)
+        self.assertEqual(client.concurrent_track_attempts, 0)
+        self.assertEqual(client.busy_reset_attempts, 2)
+        self.assertEqual(coordinator.metrics.yolo_timeouts, 1)
+        self.assertEqual(coordinator.metrics.yolo_stream_recoveries, 1)
+        self.assertEqual(coordinator.metrics.yolo_stream_recovery_failures, 0)
+        coordinator.close()
+
+    def test_track_stream_busy_is_recovered_instead_of_failed_closed(self) -> None:
+        class BusyOnceTrackClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.busy_once = True
+
+            def track(self, request, rgb) -> TrackResponse:
+                if self.busy_once:
+                    self.busy_once = False
+                    raise YoloClientStreamBusy(
+                        "YOLO service rejected request (409, STREAM_BUSY)"
+                    )
+                return super().track(request, rgb)
+
+        client = BusyOnceTrackClient()
+        coordinator = self.make_coordinator(client)
+        manager = TargetManager()
+        spec = TargetSpec("person", category="person")
+        manager.start_search(spec, 0.0)
+        coordinator.reset(mission_id="mission_track_busy", uav_id="uav_1")
+
+        coordinator.submit_frame(camera_sample=sample(0.0), target_spec=spec)
+        self.assertIsNone(
+            coordinator.poll(now_s=0.0, target_manager=manager)
+        )
+        coordinator.submit_frame(camera_sample=sample(0.1), target_spec=spec)
+        estimate = coordinator.poll(now_s=0.1, target_manager=manager)
+
+        self.assertIsNotNone(estimate)
+        self.assertEqual(coordinator.metrics.yolo_stream_busy_responses, 1)
+        self.assertEqual(coordinator.metrics.yolo_response_errors, 0)
+        self.assertEqual(coordinator.metrics.yolo_stream_recoveries, 1)
+        self.assertIsNone(coordinator._fatal_error)
         coordinator.close()
 
     def test_stable_attribute_candidate_uses_typed_qwen_semantic_review(self) -> None:
@@ -417,6 +675,207 @@ class TargetPerceptionCoordinatorTest(unittest.TestCase):
         self.assertFalse(
             coordinator.qwen_fallback_required("mission_reid_uav_1_track_8")
         )
+        coordinator.close()
+
+    def test_new_reacquire_track_can_use_deterministic_color_position_time(self) -> None:
+        client = FakeClient()
+        app = load_config(ROOT / "configs/default.yaml")
+        config = replace(
+            app.target_perception,
+            backend="ultralytics_service",
+            confirmation=replace(
+                app.target_perception.confirmation,
+                require_qwen_for_reacquire_new_track_id=False,
+            ),
+        )
+
+        def deterministic_color(candidate, spec, detection, timestamp_s):
+            return SemanticVerification(
+                candidate_id=candidate.candidate_id,
+                timestamp_s=timestamp_s,
+                target_description=spec.description,
+                matches=True,
+                confidence=0.9,
+                verifier=DETERMINISTIC_ATTRIBUTE_VERIFIER,
+            )
+
+        coordinator = TargetPerceptionCoordinator(
+            config,
+            client=client,
+            executor=InlineExecutor(),
+            model_names={0: "person"},
+            query_compiler=lambda spec, names: TargetQuery((0,), ()),
+            semantic_evidence_provider=deterministic_color,
+        )
+        manager = TargetManager()
+        spec = TargetSpec(
+            "red person",
+            category="person",
+            hard_attributes=("color=red",),
+        )
+        manager.start_search(spec, 0.0)
+        coordinator.reset(mission_id="mission_deterministic_reid", uav_id="uav_1")
+        for timestamp in (0.0, 0.3, 0.6):
+            coordinator.submit_frame(camera_sample=sample(timestamp), target_spec=spec)
+            coordinator.poll(now_s=timestamp, target_manager=manager)
+        original_target_id = manager.snapshot().target_id
+        self.assertIsNotNone(original_target_id)
+        manager.start_tracking(0.7)
+        manager.mark_lost(timestamp_s=0.8)
+        manager.start_reacquiring(0.9)
+        client.track_id = 8
+
+        estimates = []
+        for timestamp in (1.0, 1.3, 1.6):
+            coordinator.submit_frame(camera_sample=sample(timestamp), target_spec=spec)
+            estimates.append(coordinator.poll(now_s=timestamp, target_manager=manager))
+
+        self.assertFalse(estimates[1].confirmed)
+        self.assertTrue(estimates[2].confirmed)
+        self.assertEqual(manager.snapshot().target_id, original_target_id)
+        self.assertEqual(coordinator.metrics.reacquire_successes, 1)
+        self.assertFalse(
+            coordinator.qwen_fallback_required(
+                "mission_deterministic_reid_uav_1_track_8"
+            )
+        )
+        coordinator.close()
+
+    def test_new_reacquire_track_without_each_deterministic_proof_stays_candidate(
+        self,
+    ) -> None:
+        for missing_proof in ("color", "position", "time"):
+            with self.subTest(missing_proof=missing_proof):
+                client = FakeClient()
+                app = load_config(ROOT / "configs/default.yaml")
+                config = replace(
+                    app.target_perception,
+                    backend="ultralytics_service",
+                    confirmation=replace(
+                        app.target_perception.confirmation,
+                        require_qwen_for_reacquire_new_track_id=False,
+                    ),
+                )
+
+                def semantic(candidate, spec, detection, timestamp_s):
+                    return SemanticVerification(
+                        candidate_id=candidate.candidate_id,
+                        timestamp_s=timestamp_s,
+                        target_description=spec.description,
+                        matches=True,
+                        confidence=0.9,
+                        verifier=(
+                            "class_only_test"
+                            if missing_proof == "color"
+                            else DETERMINISTIC_ATTRIBUTE_VERIFIER
+                        ),
+                    )
+
+                coordinator = TargetPerceptionCoordinator(
+                    config,
+                    client=client,
+                    executor=InlineExecutor(),
+                    model_names={0: "person"},
+                    query_compiler=lambda spec, names: TargetQuery((0,), ()),
+                    semantic_evidence_provider=semantic,
+                )
+                manager = TargetManager()
+                spec = TargetSpec(
+                    "red person",
+                    category="person",
+                    hard_attributes=("color=red",),
+                )
+                manager.start_search(spec, 0.0)
+                coordinator.reset(
+                    mission_id=f"mission_missing_{missing_proof}",
+                    uav_id="uav_1",
+                )
+                for timestamp in (0.0, 0.3, 0.6):
+                    coordinator.submit_frame(
+                        camera_sample=sample(timestamp), target_spec=spec
+                    )
+                    coordinator.poll(now_s=timestamp, target_manager=manager)
+                original_target_id = manager.snapshot().target_id
+                manager.start_tracking(0.7)
+                manager.mark_lost(timestamp_s=0.8)
+                manager.start_reacquiring(0.9)
+                client.track_id = 8
+
+                timestamps = (
+                    (3.0, 3.3, 3.6)
+                    if missing_proof == "time"
+                    else (1.0, 1.3, 1.6)
+                )
+                estimate = None
+                for timestamp in timestamps:
+                    coordinator.submit_frame(
+                        camera_sample=sample(
+                            timestamp,
+                            depth_m=100.0 if missing_proof == "position" else 10.0,
+                        ),
+                        target_spec=spec,
+                    )
+                    estimate = coordinator.poll(
+                        now_s=timestamp,
+                        target_manager=manager,
+                    )
+
+                self.assertIsNotNone(estimate)
+                self.assertFalse(estimate.confirmed)
+                self.assertEqual(manager.lifecycle, TargetLifecycle.CANDIDATE)
+                self.assertNotEqual(manager.snapshot().target_id, original_target_id)
+                self.assertEqual(coordinator.metrics.reacquire_successes, 0)
+                coordinator.close()
+
+    def test_resolution_failure_reason_is_persisted_and_logs_are_throttled(
+        self,
+    ) -> None:
+        client = FakeClient()
+        app = load_config(ROOT / "configs/default.yaml")
+        config = replace(app.target_perception, backend="ultralytics_service")
+        coordinator = TargetPerceptionCoordinator(
+            config,
+            client=client,
+            resolver=UnavailableResolver("foreground_depth_cluster_empty"),
+            executor=InlineExecutor(),
+            model_names={0: "person"},
+            query_compiler=lambda spec, names: TargetQuery((0,), ()),
+        )
+        manager = TargetManager()
+        spec = TargetSpec("person", category="person")
+        manager.start_search(spec, 0.0)
+        output = StringIO()
+        with redirect_stdout(output):
+            coordinator.reset(mission_id="mission_depth_reason", uav_id="uav_1")
+            for index in range(10):
+                timestamp = index * 0.1
+                coordinator.submit_frame(
+                    camera_sample=sample(timestamp), target_spec=spec
+                )
+                coordinator.poll(now_s=timestamp, target_manager=manager)
+
+        reason = (
+            "CandidateResolutionUnavailable:foreground_depth_cluster_empty"
+        )
+        metrics = coordinator.runtime_metrics()
+        self.assertEqual(metrics["depth_resolution_failures"], 10)
+        self.assertEqual(metrics["measurement_rejected"], 10)
+        self.assertEqual(metrics["depth_resolution_last_failure_reason"], reason)
+        self.assertEqual(
+            metrics["depth_resolution_failure_reason_counts"],
+            {reason: 10},
+        )
+        records = [
+            json.loads(line.removeprefix("[PerceptionDepthFailure] "))
+            for line in output.getvalue().splitlines()
+            if line.startswith("[PerceptionDepthFailure] ")
+        ]
+        self.assertEqual(
+            [record["reason_occurrence"] for record in records],
+            [1, 2, 4, 8],
+        )
+        self.assertTrue(all(record["reason"] == reason for record in records))
+        self.assertEqual(manager.lifecycle, TargetLifecycle.CANDIDATE)
         coordinator.close()
 
     def test_unconfirmed_tracker_cannot_contaminate_locked_control_prediction(self) -> None:

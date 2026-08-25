@@ -60,8 +60,8 @@ target_perception:
     per_uav_urls:
       uav_a: http://127.0.0.1:8011
       uav_b: http://127.0.0.1:8012
-    request_timeout_s: 0.5
-    max_result_age_s: 0.5
+    request_timeout_s: 5.0
+    max_result_age_s: 2.0
     jpeg_quality: 90
     max_inflight_per_uav: 1
   detector:
@@ -69,13 +69,17 @@ target_perception:
     proposal_mode: closed_set
     confidence_threshold: 0.25
     class_aliases_path: configs/yolo/class_aliases.yaml
+    expected_model_family: yolo
+    expected_model_names:
+      0: cube
+    expected_model_sha256: 895de7caa8af200c12f343c72e3a726ffae65e4d96d2092decaf96ef4558de07
   tracker:
     type: botsort
     min_track_observations: 3
     min_track_duration_s: 0.5
   geometry:
     mode: isaac_depth
-    depth_anchor: bbox_bottom_center
+    depth_anchor: foreground_cluster_median
     depth_patch_radius_px: 4
     min_depth_m: 0.2
     max_depth_m: 200.0
@@ -278,4 +282,3 @@ storage:
   min_free_space_gb_during_run: 10.0
   warning_run_size_gb: 3.0
   max_run_size_gb: 5.0
-

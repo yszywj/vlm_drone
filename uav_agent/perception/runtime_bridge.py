@@ -8,7 +8,7 @@ and attaches only a :class:`TargetEstimate` to the shared Observation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isclose
+from math import atan2, cos, isclose, sin
 from typing import Mapping
 
 import numpy as np
@@ -17,10 +17,10 @@ from common.ids import validate_routing_id, validate_uav_id
 from env.camera_types import CameraSample
 from perception.runtime import validate_observation_access
 from perception.target_perception_coordinator import TargetPerceptionCoordinator
+from perception.target_query import TargetQuerySpec
 from perception.vision_backend import VisionPerceptionBackend
 from skills.types import Observation
 from target.target_manager import TargetManager
-from target.types import TargetSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +68,46 @@ class SynchronizedTargetPerceptionInput:
             raise ValueError("Observation pose must come from the same CameraSample")
 
 
+def synchronized_uav_self_motion(
+    observation: Observation,
+    *,
+    previous_yaw_rad: float | None,
+    previous_timestamp_s: float | None,
+) -> tuple[
+    tuple[float, float, float],
+    tuple[float, float, float],
+]:
+    """Return synchronized world-linear/body-angular UAV motion.
+
+    The canonical UAV observation currently exposes yaw but not full body
+    angular velocity.  Therefore the body x/y angular components are exactly
+    zero and body-z is the wrap-safe finite difference of synchronized yaw.
+    This is UAV state, not motion inferred from the camera extrinsics.
+    """
+
+    if not isinstance(observation, Observation):
+        raise TypeError("observation must be an Observation")
+    if (previous_yaw_rad is None) != (previous_timestamp_s is None):
+        raise ValueError("previous UAV yaw and timestamp must be paired")
+    linear_velocity = tuple(float(value) for value in observation.uav_velocity)
+    yaw = float(observation.uav_pose.yaw)
+    timestamp = float(observation.timestamp)
+    if previous_yaw_rad is None:
+        yaw_rate = 0.0
+    else:
+        delta_t = timestamp - float(previous_timestamp_s)
+        if delta_t <= 1e-9:
+            raise ValueError(
+                "new camera samples require increasing UAV state timestamps"
+            )
+        wrapped_delta = atan2(
+            sin(yaw - float(previous_yaw_rad)),
+            cos(yaw - float(previous_yaw_rad)),
+        )
+        yaw_rate = wrapped_delta / delta_t
+    return linear_velocity, (0.0, 0.0, yaw_rate)
+
+
 class CoordinatedVisionPerceptionBackend:
     """Per-UAV adapter around an asynchronous YOLO coordinator.
 
@@ -92,9 +132,11 @@ class CoordinatedVisionPerceptionBackend:
             raise ValueError("vision_backend.uav_id does not match bridge")
         self._coordinator = coordinator
         self._vision_backend = vision_backend
-        self._target_spec: TargetSpec | None = None
+        self._target_query: TargetQuerySpec | None = None
         self._target_alias: str | None = None
         self._last_submitted_timestamp_s: float | None = None
+        self._last_uav_yaw_rad: float | None = None
+        self._last_uav_motion_timestamp_s: float | None = None
         self._closed = False
 
     @property
@@ -121,31 +163,48 @@ class CoordinatedVisionPerceptionBackend:
         )
         return () if not callable(drain) else tuple(drain())
 
+    def candidate_transition_records(self) -> tuple[object, ...]:
+        records = getattr(self._coordinator, "candidate_transition_records", None)
+        return () if not callable(records) else tuple(records())
+
+    def drain_candidate_transition_records(self) -> tuple[object, ...]:
+        drain = getattr(
+            self._coordinator,
+            "drain_candidate_transition_records",
+            None,
+        )
+        return () if not callable(drain) else tuple(drain())
+
     def reset(
         self,
         *,
         mission_id: str,
-        target_spec: TargetSpec,
+        target_query: TargetQuerySpec,
         assignment_id: str | None = None,
-        target_alias: str,
     ) -> None:
         if self._closed:
             raise RuntimeError("perception bridge is closed")
         # Retire the previous binding before validating or handshaking the
         # replacement. No failed reset may leave an old Assignment usable.
-        self._target_spec = None
+        self._target_query = None
         self._target_alias = None
         self._last_submitted_timestamp_s = None
-        if not isinstance(target_spec, TargetSpec):
-            raise TypeError("target_spec must be a TargetSpec")
-        routed_target = validate_routing_id(target_alias, "target_alias")
+        self._last_uav_yaw_rad = None
+        self._last_uav_motion_timestamp_s = None
+        if not isinstance(target_query, TargetQuerySpec):
+            raise TypeError("target_query must be a TargetQuerySpec")
+        routed_target = validate_routing_id(
+            target_query.target_alias,
+            "target_alias",
+        )
         self._coordinator.reset(
             mission_id=mission_id,
             uav_id=self._uav_id,
             assignment_id=assignment_id,
             target_alias=routed_target,
+            target_query=target_query,
         )
-        self._target_spec = target_spec
+        self._target_query = target_query
         self._target_alias = routed_target
 
     def observe(
@@ -164,7 +223,7 @@ class CoordinatedVisionPerceptionBackend:
             raise TypeError("target_manager must be a TargetManager")
         if synchronized_input.base_observation.uav_id != self._uav_id:
             raise ValueError("perception input is routed to another UAV")
-        if self._target_spec is None:
+        if self._target_query is None:
             raise RuntimeError("perception bridge must be reset before observe")
 
         now_s = float(synchronized_input.base_observation.timestamp)
@@ -186,13 +245,25 @@ class CoordinatedVisionPerceptionBackend:
             or synchronized_input.camera_sample.timestamp_s
             > self._last_submitted_timestamp_s + 1e-9
         ):
+            observation = synchronized_input.base_observation
+            yaw = float(observation.uav_pose.yaw)
+            previous_yaw = self._last_uav_yaw_rad
+            previous_timestamp = self._last_uav_motion_timestamp_s
+            linear_velocity, angular_velocity = synchronized_uav_self_motion(
+                observation,
+                previous_yaw_rad=previous_yaw,
+                previous_timestamp_s=previous_timestamp,
+            )
             self._coordinator.submit_frame(
                 camera_sample=synchronized_input.camera_sample,
-                target_spec=self._target_spec,
+                uav_linear_velocity_world_mps=linear_velocity,
+                uav_angular_velocity_body_radps=angular_velocity,
             )
             self._last_submitted_timestamp_s = (
                 synchronized_input.camera_sample.timestamp_s
             )
+            self._last_uav_yaw_rad = yaw
+            self._last_uav_motion_timestamp_s = now_s
         return self._vision_backend.attach_target_estimate(
             synchronized_input.base_observation,
             estimate,
@@ -212,9 +283,11 @@ class CoordinatedVisionPerceptionBackend:
         if self._closed:
             return
         self._closed = True
-        self._target_spec = None
+        self._target_query = None
         self._target_alias = None
         self._last_submitted_timestamp_s = None
+        self._last_uav_yaw_rad = None
+        self._last_uav_motion_timestamp_s = None
         self._coordinator.close()
 
 

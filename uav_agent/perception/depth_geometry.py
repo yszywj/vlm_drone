@@ -12,6 +12,7 @@ guess is used anywhere in this module.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from math import ceil, floor, isfinite
 from numbers import Integral, Real
@@ -22,8 +23,8 @@ from env.camera_types import CameraIntrinsics
 from perception.candidate_bank import CandidateSnapshot
 from perception.grounding import (
     CandidateResolutionUnavailable,
-    ResolvedCandidatePosition,
 )
+from perception.measurement import TargetMeasurement
 from perception.runtime import PerceptionRuntimeProfile
 from runtime.frame_store import FrameCameraGeometry, FrameStore
 
@@ -32,7 +33,20 @@ class DepthSamplingStrategy(str, Enum):
     BBOX_CENTER = "bbox_center"
     BBOX_BOTTOM_CENTER = "bbox_bottom_center"
     BBOX_PATCH_MEDIAN = "bbox_patch_median"
+    FOREGROUND_CLUSTER_MEDIAN = "foreground_cluster_median"
     MASK_MEDIAN = "mask_median"
+
+
+@dataclass(frozen=True, slots=True)
+class _DepthSample:
+    depth_m: float
+    u_px: float
+    v_px: float
+    robust_depth_sigma_m: float
+    valid_fraction: float
+    cluster_fraction: float
+    bbox_width_px: int
+    bbox_height_px: int
 
 
 def _finite(value: object, field_name: str) -> float:
@@ -199,13 +213,15 @@ class DepthCandidateResolver:
         frame_store: FrameStore,
         *,
         sampling_strategy: DepthSamplingStrategy | str = (
-            DepthSamplingStrategy.BBOX_BOTTOM_CENTER
+            DepthSamplingStrategy.FOREGROUND_CLUSTER_MEDIAN
         ),
         patch_radius_px: int = 4,
         min_depth_m: float = 0.2,
         max_depth_m: float = 200.0,
         min_valid_samples: int = 3,
         fallback_to_bbox_median: bool = True,
+        foreground_inset_ratio: float = 0.1,
+        foreground_bottom_exclusion_ratio: float = 0.15,
         source: str = "isaac_depth",
     ) -> None:
         if not isinstance(frame_store, FrameStore):
@@ -229,6 +245,19 @@ class DepthCandidateResolver:
         if not isinstance(fallback_to_bbox_median, bool):
             raise TypeError("fallback_to_bbox_median must be a bool")
         self._fallback_to_bbox_median = fallback_to_bbox_median
+        inset = _finite(foreground_inset_ratio, "foreground_inset_ratio")
+        bottom_exclusion = _finite(
+            foreground_bottom_exclusion_ratio,
+            "foreground_bottom_exclusion_ratio",
+        )
+        if not 0.0 <= inset < 0.5:
+            raise ValueError("foreground_inset_ratio must be within [0, 0.5)")
+        if not 0.0 <= bottom_exclusion < 0.5:
+            raise ValueError(
+                "foreground_bottom_exclusion_ratio must be within [0, 0.5)"
+            )
+        self._foreground_inset_ratio = inset
+        self._foreground_bottom_exclusion_ratio = bottom_exclusion
         if not isinstance(source, str) or not source or source != source.strip():
             raise ValueError("source must be non-empty without surrounding whitespace")
         self._source = source
@@ -246,7 +275,7 @@ class DepthCandidateResolver:
         candidate: CandidateSnapshot,
         *,
         timestamp_s: float,
-    ) -> ResolvedCandidatePosition:
+    ) -> TargetMeasurement:
         if not isinstance(candidate, CandidateSnapshot):
             raise TypeError("candidate must be a CandidateSnapshot")
         timestamp = _finite(timestamp_s, "timestamp_s")
@@ -265,18 +294,36 @@ class DepthCandidateResolver:
                 "candidate frame has no synchronized depth and camera geometry"
             )
         bbox = candidate.bbox_history[-1]
-        depth_m, u_px, v_px = self._sample_depth(depth, bbox)
+        sampled = self._sample_depth_details(depth, bbox)
         optical = backproject_pixel_to_camera_optical(
-            u_px=u_px,
-            v_px=v_px,
-            depth_m=depth_m,
+            u_px=sampled.u_px,
+            v_px=sampled.v_px,
+            depth_m=sampled.depth_m,
             intrinsics=geometry.intrinsics,
         )
-        world = camera_flu_to_world(optical_to_camera_flu(optical), geometry)
-        return ResolvedCandidatePosition(
-            uav_id=candidate.uav_id,
+        camera_flu = optical_to_camera_flu(optical)
+        world = camera_flu_to_world(camera_flu, geometry)
+        quality = self._measurement_quality(
+            sampled,
+            image_width=geometry.intrinsics.width,
+            image_height=geometry.intrinsics.height,
+        )
+        covariance = self._world_covariance(
+            sampled=sampled,
+            quality=quality,
+            geometry=geometry,
+        )
+        return TargetMeasurement(
+            timestamp_s=frame_ref.timestamp_s,
             candidate_id=candidate.candidate_id,
-            position_xyz_m=world,
+            tracker_id=candidate.tracker_id_history[-1],
+            pixel_uv=(sampled.u_px, sampled.v_px),
+            raw_depth_m=sampled.depth_m,
+            corrected_depth_m=sampled.depth_m,
+            position_camera_flu_m=camera_flu,
+            position_world_m=world,
+            covariance_world_m2=covariance,
+            measurement_quality=quality,
             source=f"{self._source}_{self._sampling_strategy.value}",
         )
 
@@ -285,11 +332,32 @@ class DepthCandidateResolver:
         depth: np.ndarray,
         bbox: tuple[float, float, float, float],
     ) -> tuple[float, float, float]:
+        """Compatibility wrapper returning only depth and sampled pixel."""
+
+        sampled = self._sample_depth_details(depth, bbox)
+        return sampled.depth_m, sampled.u_px, sampled.v_px
+
+    def _sample_depth_details(
+        self,
+        depth: np.ndarray,
+        bbox: tuple[float, float, float, float],
+    ) -> _DepthSample:
+        if not isinstance(depth, np.ndarray) or depth.ndim != 2:
+            raise CandidateResolutionUnavailable(
+                "candidate depth image must be a two-dimensional array"
+            )
         height, width = depth.shape
-        x1 = max(0, min(width - 1, floor(bbox[0] * width)))
-        y1 = max(0, min(height - 1, floor(bbox[1] * height)))
-        x2 = max(x1, min(width - 1, ceil(bbox[2] * width) - 1))
-        y2 = max(y1, min(height - 1, ceil(bbox[3] * height) - 1))
+        if height <= 0 or width <= 0:
+            raise CandidateResolutionUnavailable("candidate depth image is empty")
+        x1, y1, x2, y2 = self._bbox_pixels(bbox, width=width, height=height)
+        if self._sampling_strategy is DepthSamplingStrategy.FOREGROUND_CLUSTER_MEDIAN:
+            return self._sample_foreground_cluster(
+                depth,
+                x1=x1,
+                y1=y1,
+                x2=x2,
+                y2=y2,
+            )
         u = (x1 + x2) / 2.0
         v = (
             float(y2)
@@ -313,12 +381,239 @@ class DepthCandidateResolver:
             and self._fallback_to_bbox_median
             and self._sampling_strategy is not DepthSamplingStrategy.BBOX_PATCH_MEDIAN
         ):
-            valid = self._valid_values(depth[y1 : y2 + 1, x1 : x2 + 1])
+            values = depth[y1 : y2 + 1, x1 : x2 + 1]
+            valid = self._valid_values(values)
         if valid.size < self._min_valid_samples:
             raise CandidateResolutionUnavailable(
-                "candidate bbox has insufficient valid metric depth samples"
+                "insufficient_valid_metric_depth_samples"
             )
-        return float(np.median(valid)), u, v
+        median = float(np.median(valid))
+        robust_sigma = float(1.4826 * np.median(np.abs(valid - median)))
+        return _DepthSample(
+            depth_m=median,
+            u_px=u,
+            v_px=v,
+            robust_depth_sigma_m=robust_sigma,
+            valid_fraction=float(valid.size / max(values.size, 1)),
+            cluster_fraction=1.0,
+            bbox_width_px=x2 - x1 + 1,
+            bbox_height_px=y2 - y1 + 1,
+        )
+
+    def _bbox_pixels(
+        self,
+        bbox: tuple[float, float, float, float],
+        *,
+        width: int,
+        height: int,
+    ) -> tuple[int, int, int, int]:
+        if not isinstance(bbox, tuple) or len(bbox) != 4:
+            raise CandidateResolutionUnavailable(
+                "candidate_bbox_must_have_four_normalized_coordinates"
+            )
+        values = tuple(_finite(value, f"bbox[{index}]") for index, value in enumerate(bbox))
+        if any(value < 0.0 or value > 1.0 for value in values):
+            raise CandidateResolutionUnavailable("candidate_bbox_out_of_bounds")
+        if values[0] >= values[2] or values[1] >= values[3]:
+            raise CandidateResolutionUnavailable("candidate_bbox_has_non_positive_area")
+        x1 = max(0, min(width - 1, floor(values[0] * width)))
+        y1 = max(0, min(height - 1, floor(values[1] * height)))
+        x2 = max(x1, min(width - 1, ceil(values[2] * width) - 1))
+        y2 = max(y1, min(height - 1, ceil(values[3] * height) - 1))
+        return x1, y1, x2, y2
+
+    def _sample_foreground_cluster(
+        self,
+        depth: np.ndarray,
+        *,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+    ) -> _DepthSample:
+        bbox_width = x2 - x1 + 1
+        bbox_height = y2 - y1 + 1
+        inset_x = min(
+            max(int(round(bbox_width * self._foreground_inset_ratio)), 0),
+            max((bbox_width - 1) // 2, 0),
+        )
+        inset_y = min(
+            max(int(round(bbox_height * self._foreground_inset_ratio)), 0),
+            max((bbox_height - 1) // 2, 0),
+        )
+        ix1, ix2 = x1 + inset_x, x2 - inset_x
+        iy1 = y1 + inset_y
+        bottom_rows = int(round(bbox_height * self._foreground_bottom_exclusion_ratio))
+        iy2 = max(iy1, y2 - inset_y - bottom_rows)
+        roi = depth[iy1 : iy2 + 1, ix1 : ix2 + 1]
+        valid_mask = (
+            np.isfinite(roi)
+            & (roi >= self._min_depth_m)
+            & (roi <= self._max_depth_m)
+        )
+        valid_count = int(np.count_nonzero(valid_mask))
+        if valid_count < self._min_valid_samples:
+            raise CandidateResolutionUnavailable(
+                "foreground_cluster_insufficient_valid_depth_samples"
+            )
+
+        center_x = int(round((x1 + x2) / 2.0))
+        center_y = int(round((y1 + y2) / 2.0))
+        seed_radius = min(
+            self._patch_radius_px,
+            max(1, min(bbox_width, bbox_height) // 8),
+        )
+        seed_patch = depth[
+            max(iy1, center_y - seed_radius) : min(iy2 + 1, center_y + seed_radius + 1),
+            max(ix1, center_x - seed_radius) : min(ix2 + 1, center_x + seed_radius + 1),
+        ]
+        seed_values = self._valid_values(seed_patch)
+        center_depth = depth[center_y, center_x]
+        if (
+            isfinite(float(center_depth))
+            and self._min_depth_m <= float(center_depth) <= self._max_depth_m
+        ):
+            # A valid center ray is the least ambiguous seed.  A patch median
+            # can otherwise let a thin foreground object be overwhelmed by
+            # eight surrounding background pixels.
+            seed_depth = float(center_depth)
+            near_center = seed_values[
+                np.abs(seed_values - seed_depth)
+                <= max(0.15, 0.05 * seed_depth)
+            ]
+            seed_mad = (
+                0.0
+                if near_center.size == 0
+                else float(np.median(np.abs(near_center - seed_depth)))
+            )
+        elif seed_values.size:
+            seed_depth = float(np.median(seed_values))
+            seed_mad = float(
+                np.median(np.abs(seed_values - seed_depth))
+            )
+        else:
+            # The center can be an invalid hole.  Select the valid samples
+            # nearest the center in image space rather than guessing that the
+            # globally nearest depth must be the target.
+            valid_y, valid_x = np.nonzero(valid_mask)
+            distances = (
+                (valid_x + ix1 - center_x) ** 2
+                + (valid_y + iy1 - center_y) ** 2
+            )
+            nearest_count = max(
+                self._min_valid_samples,
+                min(valid_count, int(ceil(valid_count * 0.1))),
+            )
+            nearest = np.argpartition(distances, nearest_count - 1)[:nearest_count]
+            nearest_depths = roi[valid_y[nearest], valid_x[nearest]]
+            seed_depth = float(np.median(nearest_depths))
+            seed_mad = float(
+                np.median(np.abs(nearest_depths - seed_depth))
+            )
+
+        tolerance_m = max(0.15, 0.05 * seed_depth, 3.0 * 1.4826 * seed_mad)
+        tolerance_m = min(tolerance_m, max(0.5, 0.15 * seed_depth))
+        cluster_mask = valid_mask & (np.abs(roi - seed_depth) <= tolerance_m)
+        cluster_y, cluster_x = np.nonzero(cluster_mask)
+        cluster_values = roi[cluster_y, cluster_x]
+        if cluster_values.size < self._min_valid_samples:
+            raise CandidateResolutionUnavailable(
+                "foreground_depth_cluster_has_insufficient_support"
+            )
+        depth_m = float(np.median(cluster_values))
+        robust_sigma = float(
+            1.4826 * np.median(np.abs(cluster_values - depth_m))
+        )
+        return _DepthSample(
+            depth_m=depth_m,
+            u_px=float(np.median(cluster_x + ix1)),
+            v_px=float(np.median(cluster_y + iy1)),
+            robust_depth_sigma_m=robust_sigma,
+            valid_fraction=float(valid_count / max(roi.size, 1)),
+            cluster_fraction=float(cluster_values.size / valid_count),
+            bbox_width_px=bbox_width,
+            bbox_height_px=bbox_height,
+        )
+
+    @staticmethod
+    def _measurement_quality(
+        sampled: _DepthSample,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> float:
+        relative_spread = sampled.robust_depth_sigma_m / max(sampled.depth_m, 1e-6)
+        stability = 1.0 / (1.0 + 20.0 * relative_spread)
+        area_fraction = (
+            sampled.bbox_width_px * sampled.bbox_height_px
+            / float(image_width * image_height)
+        )
+        size_score = min(1.0, np.sqrt(area_fraction / 0.05))
+        quality = (
+            0.30 * sampled.valid_fraction
+            + 0.30 * sampled.cluster_fraction
+            + 0.25 * stability
+            + 0.15 * size_score
+        )
+        return float(np.clip(quality, 0.0, 1.0))
+
+    @staticmethod
+    def _world_covariance(
+        *,
+        sampled: _DepthSample,
+        quality: float,
+        geometry: FrameCameraGeometry,
+    ) -> tuple[
+        tuple[float, float, float],
+        tuple[float, float, float],
+        tuple[float, float, float],
+    ]:
+        intrinsics = geometry.intrinsics
+        quality_scale = 1.0 / np.sqrt(max(quality, 0.05))
+        sigma_depth = max(
+            0.02,
+            0.005 * sampled.depth_m,
+            sampled.robust_depth_sigma_m,
+        ) * quality_scale
+        sigma_pixel = max(
+            0.5,
+            0.03 * max(sampled.bbox_width_px, sampled.bbox_height_px),
+        ) * quality_scale
+        jacobian = np.asarray(
+            [
+                [
+                    sampled.depth_m / intrinsics.fx,
+                    0.0,
+                    (sampled.u_px - intrinsics.cx) / intrinsics.fx,
+                ],
+                [
+                    0.0,
+                    sampled.depth_m / intrinsics.fy,
+                    (sampled.v_px - intrinsics.cy) / intrinsics.fy,
+                ],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        input_covariance = np.diag(
+            [sigma_pixel**2, sigma_pixel**2, sigma_depth**2]
+        )
+        optical_covariance = jacobian @ input_covariance @ jacobian.T
+        optical_to_flu = np.asarray(
+            [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+            dtype=np.float64,
+        )
+        rotation = _quaternion_rotation_matrix(
+            geometry.camera_orientation_world_wxyz
+        )
+        transform = rotation @ optical_to_flu
+        world_covariance = transform @ optical_covariance @ transform.T
+        world_covariance = (world_covariance + world_covariance.T) / 2.0
+        world_covariance += np.eye(3, dtype=np.float64) * 1e-9
+        return tuple(
+            tuple(float(value) for value in row)
+            for row in world_covariance
+        )  # type: ignore[return-value]
 
     def _valid_values(self, values: np.ndarray) -> np.ndarray:
         return values[

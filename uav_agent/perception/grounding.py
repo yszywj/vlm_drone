@@ -19,6 +19,7 @@ import numpy as np
 
 from common.ids import validate_routing_id, validate_uav_id
 from perception.candidate_bank import CandidateSnapshot
+from perception.measurement import TargetMeasurement
 from perception.prompt_types import PromptBundle
 from perception.runtime import (
     PerceptionBoundaryError,
@@ -313,7 +314,11 @@ class ResolvedCandidatePosition:
 
 @runtime_checkable
 class CandidateResolver(Protocol):
-    """Resolve a candidate to trusted internal geometry for a motion Skill."""
+    """Resolve a candidate to a validated sensor measurement.
+
+    ``ResolvedCandidatePosition`` remains only for the explicitly privileged
+    Oracle INSPECT compatibility adapter while production geometry migrates.
+    """
 
     @property
     def profile(self) -> PerceptionRuntimeProfile: ...
@@ -323,7 +328,7 @@ class CandidateResolver(Protocol):
         candidate: CandidateSnapshot,
         *,
         timestamp_s: float,
-    ) -> ResolvedCandidatePosition: ...
+    ) -> TargetMeasurement | None: ...
 
 
 OraclePositionProvider = Callable[
@@ -407,7 +412,7 @@ class ProductionCandidateResolver:
         candidate: CandidateSnapshot,
         *,
         timestamp_s: float,
-    ) -> ResolvedCandidatePosition:
+    ) -> TargetMeasurement | None:
         if not isinstance(candidate, CandidateSnapshot):
             raise TypeError("candidate must be a CandidateSnapshot")
         del timestamp_s

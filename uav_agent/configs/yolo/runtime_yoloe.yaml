@@ -48,8 +48,8 @@ target_perception:
   backend: ultralytics_service
   yolo_service:
     url: http://127.0.0.1:8011
-    request_timeout_s: 0.5
-    max_result_age_s: 0.5
+    request_timeout_s: 5.0
+    max_result_age_s: 2.0
     jpeg_quality: 90
     max_inflight_per_uav: 1
   detector:
@@ -63,7 +63,7 @@ target_perception:
     min_track_duration_s: 0.5
   geometry:
     mode: isaac_depth
-    depth_anchor: bbox_bottom_center
+    depth_anchor: foreground_cluster_median
     depth_patch_radius_px: 4
     min_depth_m: 0.2
     max_depth_m: 200.0

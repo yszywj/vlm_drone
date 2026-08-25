@@ -273,6 +273,30 @@ ATTRIBUTE_EVIDENCE_FIELDS: tuple[str, ...] = (
 )
 
 
+# Throttled lifecycle edges emitted by TargetPerceptionCoordinator.  The
+# whitelist deliberately excludes Camera/image/depth payloads and every
+# simulator/evaluator identity surface (prim paths, motion seeds, truth).
+TARGET_PERCEPTION_TRANSITION_FIELDS: tuple[str, ...] = (
+    "schema_version",
+    "timestamp",
+    "uav_id",
+    "assignment_id",
+    "transition",
+    "tracker_id",
+    "candidate_id",
+    "bbox",
+    "detector_confidence",
+    "attribute_state",
+    "color_result",
+    "geometry_state",
+    "measurement_source",
+    "position_world_m",
+    "confirmed",
+    "target_id",
+    "estimate_source",
+)
+
+
 # Required on manifest.yaml, summary.json, and report.md whenever a fleet run
 # declares a target-perception mode. ``backend_by_uav`` stays structured on
 # JSON/YAML surfaces and is intentionally not flattened into the fleet CSV.
@@ -426,6 +450,28 @@ def _record_positive_count(value: object, name: str) -> int:
     return value
 
 
+def _record_vector(
+    value: object,
+    name: str,
+    length: int,
+    *,
+    optional: bool = False,
+) -> tuple[float, ...] | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise TypeError(f"{name} must contain exactly {length} finite numbers")
+    result: list[float] = []
+    for index, item in enumerate(value):
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            raise TypeError(f"{name}[{index}] must be a finite number")
+        normalized = float(item)
+        if not isfinite(normalized):
+            raise ValueError(f"{name}[{index}] must be finite")
+        result.append(normalized)
+    return tuple(result)
+
+
 class _FleetRecord:
     """Small convenience API shared by immutable fleet records."""
 
@@ -548,6 +594,161 @@ class AttributeEvidenceRecord(_FleetRecord):
         if missing:
             raise ValueError(
                 "attribute evidence is missing required fields: " + ", ".join(missing)
+            )
+        return cls(**raw)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class TargetPerceptionTransitionRecord(_FleetRecord):
+    """One bounded production candidate lifecycle edge."""
+
+    timestamp: float
+    uav_id: str
+    assignment_id: str
+    transition: str
+    tracker_id: str
+    candidate_id: str
+    bbox: tuple[float, float, float, float]
+    detector_confidence: float
+    attribute_state: str
+    color_result: str | None
+    geometry_state: str
+    measurement_source: str | None
+    position_world_m: tuple[float, float, float] | None
+    confirmed: bool
+    target_id: str | None
+    estimate_source: str
+    schema_version: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError(
+                "target perception transition schema_version must be exactly 1"
+            )
+        object.__setattr__(self, "timestamp", _record_time(self.timestamp, "timestamp"))
+        for name in (
+            "uav_id",
+            "assignment_id",
+            "tracker_id",
+            "candidate_id",
+            "estimate_source",
+        ):
+            object.__setattr__(self, name, _record_text(getattr(self, name), name))
+
+        transition = _record_text(self.transition, "transition")
+        assert transition is not None
+        transition = transition.casefold()
+        if transition not in {
+            "candidate_created",
+            "candidate_rejected",
+            "candidate_confirmed",
+        }:
+            raise ValueError("unsupported target perception transition")
+        object.__setattr__(self, "transition", transition)
+
+        bbox = _record_vector(self.bbox, "bbox", 4)
+        assert bbox is not None
+        x1, y1, x2, y2 = bbox
+        if not (0.0 <= x1 < x2 <= 1.0 and 0.0 <= y1 < y2 <= 1.0):
+            raise ValueError("bbox must be ordered normalized xyxy coordinates")
+        object.__setattr__(self, "bbox", bbox)
+        object.__setattr__(
+            self,
+            "detector_confidence",
+            _record_unit_interval(self.detector_confidence, "detector_confidence"),
+        )
+
+        attribute_state = _record_text(self.attribute_state, "attribute_state")
+        assert attribute_state is not None
+        attribute_state = attribute_state.casefold()
+        if attribute_state not in {"match", "mismatch", "pending", "unsupported"}:
+            raise ValueError("unsupported attribute_state")
+        object.__setattr__(self, "attribute_state", attribute_state)
+
+        color_result = _record_text(
+            self.color_result,
+            "color_result",
+            optional=True,
+        )
+        if color_result is not None:
+            lowered = color_result.casefold()
+            if len(color_result) > 64 or "base64," in lowered or lowered.startswith("data:"):
+                raise ValueError("color_result must be a bounded scalar label")
+        object.__setattr__(self, "color_result", color_result)
+
+        geometry_state = _record_text(self.geometry_state, "geometry_state")
+        assert geometry_state is not None
+        geometry_state = geometry_state.casefold()
+        if geometry_state not in {"measurement_created", "measurement_rejected"}:
+            raise ValueError("unsupported geometry_state")
+        object.__setattr__(self, "geometry_state", geometry_state)
+        measurement_source = _record_text(
+            self.measurement_source,
+            "measurement_source",
+            optional=True,
+        )
+        allowed_measurement_sources = {
+            "isaac_depth",
+            "isaac_depth_bbox_center",
+            "isaac_depth_bbox_bottom_center",
+            "isaac_depth_bbox_patch_median",
+            "isaac_depth_foreground_cluster_median",
+            "rgbd_depth_geometry",
+            "rgbd_depth_geometry_bbox_center",
+            "rgbd_depth_geometry_bbox_bottom_center",
+            "rgbd_depth_geometry_bbox_patch_median",
+            "rgbd_depth_geometry_foreground_cluster_median",
+            "rgbd_depth_geometry_fallback",
+            "temporal_ray_depth",
+        }
+        if (
+            measurement_source is not None
+            and measurement_source not in allowed_measurement_sources
+        ):
+            raise ValueError("unsupported measurement_source")
+        if geometry_state == "measurement_created" and measurement_source is None:
+            raise ValueError("measurement_created requires measurement_source")
+        if geometry_state == "measurement_rejected" and measurement_source is not None:
+            raise ValueError("measurement_rejected cannot carry measurement_source")
+        object.__setattr__(self, "measurement_source", measurement_source)
+        object.__setattr__(
+            self,
+            "position_world_m",
+            _record_vector(
+                self.position_world_m,
+                "position_world_m",
+                3,
+                optional=True,
+            ),
+        )
+        if type(self.confirmed) is not bool:
+            raise TypeError("confirmed must be bool")
+        target_id = _record_text(self.target_id, "target_id", optional=True)
+        if self.confirmed and target_id is None:
+            raise ValueError("confirmed transition requires target_id")
+        if not self.confirmed and target_id is not None:
+            raise ValueError("unconfirmed transition cannot carry target_id")
+        object.__setattr__(self, "target_id", target_id)
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, object],
+    ) -> "TargetPerceptionTransitionRecord":
+        if not isinstance(value, Mapping):
+            raise TypeError("target perception transition must be a mapping")
+        raw = dict(value)
+        unknown = sorted(set(raw) - set(TARGET_PERCEPTION_TRANSITION_FIELDS))
+        if unknown:
+            raise ValueError(
+                "target perception transition contains unknown fields: "
+                + ", ".join(unknown)
+            )
+        missing = sorted(set(TARGET_PERCEPTION_TRANSITION_FIELDS) - set(raw))
+        if missing:
+            raise ValueError(
+                "target perception transition is missing required fields: "
+                + ", ".join(missing)
             )
         return cls(**raw)  # type: ignore[arg-type]
 
@@ -756,9 +957,11 @@ __all__ = [
     "RunStatus",
     "SKILL_EXECUTION_FIELDS",
     "STATE_SAMPLE_FIELDS",
+    "TARGET_PERCEPTION_TRANSITION_FIELDS",
     "SkillExecutionRecord",
     "StateSampleRecord",
     "StorageStatus",
+    "TargetPerceptionTransitionRecord",
     "TRAIN_METRIC_FIELDS",
     "ValidationFindingRecord",
 ]

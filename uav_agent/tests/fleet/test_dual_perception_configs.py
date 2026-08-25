@@ -237,6 +237,78 @@ def test_explicit_modes_complete_pure_preparation(
     assert sorted(prepared.compilations) == ["uav_a", "uav_b"]
 
 
+def test_inferred_yolo_preflight_and_bounded_audit_precede_first_isaac_import(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    expected_sha = (
+        "895de7caa8af200c12f343c72e3a726f"
+        "fae65e4d96d2092decaf96ef4558de07"
+    )
+    args = run_fleet_mission.parse_args(
+        [
+            "--config",
+            str(YOLO_CONFIG),
+            "--output-root",
+            str(tmp_path),
+        ]
+    )
+    prepared = run_fleet_mission.prepare_fleet_mission(args)
+    ordering: list[str] = []
+
+    def preflight(config, active_uav_ids):
+        ordering.append("preflight")
+        return {
+            uav_id: {
+                "url": config.target_perception.yolo_service.per_uav_urls[uav_id],
+                "model_family": "yolo",
+                "model_names": {0: "cube"},
+                "model_sha256": expected_sha,
+                "ready": True,
+            }
+            for uav_id in active_uav_ids
+        }
+
+    class IsaacBoundaryReached(RuntimeError):
+        pass
+
+    original_import = builtins.__import__
+
+    def stop_at_isaac(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "isaacsim":
+            ordering.append("isaac_import")
+            raise IsaacBoundaryReached("synthetic first Isaac import")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(
+        run_fleet_mission,
+        "preflight_fleet_yolo_services",
+        preflight,
+    )
+    monkeypatch.setattr(builtins, "__import__", stop_at_isaac)
+    with pytest.raises(IsaacBoundaryReached, match="first Isaac import"):
+        run_fleet_mission.run_prepared_fleet_mission(prepared, args)
+
+    assert ordering == ["preflight", "isaac_import"]
+    audit_lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[Fleet] target_perception_startup_audit=")
+    ]
+    assert len(audit_lines) == 1
+    audit = json.loads(audit_lines[0].split("=", 1)[1])
+    assert audit["target_perception_mode"] == "yolo"
+    assert audit["runtime_profile"] == "production"
+    assert audit["backend_by_uav"] == {
+        "uav_a": "ultralytics_service",
+        "uav_b": "ultralytics_service",
+    }
+    assert audit["privileged"] is False
+    assert audit["yolo_model_sha256"] == expected_sha
+    assert "disabled" not in audit_lines[0]
+
+
 def test_oracle_and_yolo_prepare_identical_tasks_plans_and_local_goals() -> None:
     oracle = run_fleet_mission.prepare_fleet_mission(
         run_fleet_mission.parse_args(
@@ -302,7 +374,7 @@ def test_disabled_target_plan_fails_before_isaac_and_recommends_modes(
     assert attempted == []
 
 
-def test_legacy_yolo_gate_still_requires_explicit_gate_acknowledgement() -> None:
+def test_inferred_yolo_mode_still_requires_explicit_gate_acknowledgement() -> None:
     common = [
         "--config",
         str(YOLO_CONFIG),
@@ -323,8 +395,32 @@ def test_legacy_yolo_gate_still_requires_explicit_gate_acknowledgement() -> None
             [*common, "--acknowledge-vision-gate"]
         )
     )
-    assert prepared.resolved_target_perception_mode is None
+    assert prepared.resolved_target_perception_mode is not None
+    assert (
+        prepared.resolved_target_perception_mode.mode
+        is TargetPerceptionMode.YOLO
+    )
+    assert (
+        prepared.resolved_target_perception_mode.runtime_profile.value
+        == "PRODUCTION"
+    )
     assert prepared.vision_review_mode == "gate"
+
+
+def test_yolo_yaml_without_mode_flag_enters_strict_production_path() -> None:
+    args = run_fleet_mission.parse_args(["--config", str(YOLO_CONFIG)])
+    assert args.target_perception_mode is None
+
+    prepared = run_fleet_mission.prepare_fleet_mission(args)
+
+    assert prepared.resolved_target_perception_mode is not None
+    assert (
+        prepared.resolved_target_perception_mode.mode
+        is TargetPerceptionMode.YOLO
+    )
+    assert prepared.resolved_target_perception_mode.backend == "ultralytics_service"
+    assert prepared.resolved_target_perception_mode.privileged is False
+    assert args.perception_runtime_profile == "production"
 
 
 def test_failed_oracle_preparation_still_labels_every_result_surface(

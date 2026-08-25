@@ -29,11 +29,13 @@ from .schemas import (
     GOAL_METRIC_FIELDS,
     SKILL_EXECUTION_FIELDS,
     STATE_SAMPLE_FIELDS,
+    TARGET_PERCEPTION_TRANSITION_FIELDS,
     AgentMetricRecord,
     AttributeEvidenceRecord,
     GoalResultRecord,
     SkillExecutionRecord,
     StateSampleRecord,
+    TargetPerceptionTransitionRecord,
 )
 
 
@@ -695,6 +697,41 @@ class FleetResultRecorder:
         )
 
     log_attribute_evidence = record_attribute_evidence
+
+    def record_target_perception_transition(
+        self,
+        uav_id: str,
+        transition: Mapping[str, object] | object,
+        *,
+        target_perception_mode: str,
+    ) -> bool:
+        """Persist one throttled, scalar-only YOLO candidate lifecycle edge."""
+
+        self._ensure_open()
+        normalized_uav = validate_uav_id(uav_id)
+        if target_perception_mode != "yolo":
+            raise ResultRecorderError(
+                "target perception transitions are applicable only to "
+                "target_perception_mode=yolo"
+            )
+        values = _mapping(transition)
+        values.setdefault("schema_version", 1)
+        record = TargetPerceptionTransitionRecord.from_mapping(values)
+        if record.uav_id != normalized_uav:
+            raise ValueError(
+                "target perception transition uav_id does not match stream route"
+            )
+        serialized = record.to_dict()
+        ordered = {
+            name: serialized[name]
+            for name in TARGET_PERCEPTION_TRANSITION_FIELDS
+        }
+        return self._store.append_jsonl(
+            f"agents/{normalized_uav}/target_perception_transitions.jsonl",
+            ordered,
+        )
+
+    log_target_perception_transition = record_target_perception_transition
 
     def agent_metric_snapshots(
         self,

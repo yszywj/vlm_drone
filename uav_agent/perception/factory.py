@@ -5,9 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
 
-from configs.schema import AppConfig
+from configs.schema import AppConfig, TargetPerceptionConfig
 from perception.base import PerceptionBackend
-from perception.oracle import OraclePerception
 from perception.mode import ResolvedTargetPerceptionMode, TargetPerceptionMode
 from perception.runtime import (
     GuardedPerceptionBackend,
@@ -19,6 +18,7 @@ from perception.vision_backend import (
     VisionPerceptionBackend,
 )
 from skills.types import SkillName
+from runtime.frame_store import FrameStore
 
 
 class TargetPerceptionConfigurationError(PerceptionBoundaryError):
@@ -52,6 +52,10 @@ def build_target_perception_backend(
     backend_name = config.target_perception.backend
 
     if runtime_profile is PerceptionRuntimeProfile.ORACLE_EVALUATION:
+        # Keep the privileged implementation out of ordinary production
+        # import paths as well as out of constructed YOLO runtime objects.
+        from perception.oracle import OraclePerception
+
         if backend_name != "oracle_evaluation":
             raise TargetPerceptionConfigurationError(
                 "ORACLE_EVALUATION requires target_perception.backend="
@@ -112,6 +116,107 @@ def validate_target_perception_preflight(
         )
 
 
+def build_target_candidate_resolver(
+    config: TargetPerceptionConfig,
+    *,
+    frame_store: FrameStore,
+) -> object:
+    """Build the configured production geometry resolver without fallback.
+
+    This is the single construction boundary shared by Fleet, the standalone
+    visual mission, and :class:`TargetPerceptionCoordinator`.  In particular,
+    selecting ``temporal_ray_depth`` can never silently construct the
+    deterministic resolver as the primary implementation.
+    """
+
+    if not isinstance(config, TargetPerceptionConfig):
+        raise TypeError("config must be a TargetPerceptionConfig")
+    if not isinstance(frame_store, FrameStore):
+        raise TypeError("frame_store must be a FrameStore")
+    geometry = config.geometry
+    if geometry.mode == "isaac_depth":
+        from perception.depth_geometry import DepthCandidateResolver
+
+        return DepthCandidateResolver(
+            frame_store,
+            sampling_strategy=geometry.depth_anchor,
+            patch_radius_px=geometry.depth_patch_radius_px,
+            min_depth_m=geometry.min_depth_m,
+            max_depth_m=geometry.max_depth_m,
+        )
+    if geometry.mode == "temporal_ray_depth":
+        from perception.temporal_ray_depth import TemporalRayDepthResolver
+
+        temporal = geometry.temporal_ray_depth
+        if temporal.checkpoint_path is None or temporal.expected_sha256 is None:
+            raise TargetPerceptionConfigurationError(
+                "temporal_ray_depth artifact identity is incomplete"
+            )
+        return TemporalRayDepthResolver(
+            frame_store,
+            checkpoint_path=temporal.checkpoint_path,
+            expected_sha256=temporal.expected_sha256,
+            manifest_path=temporal.manifest_path,
+            history_size=temporal.history_size,
+            max_history_age_s=temporal.max_history_age_s,
+            roi_size_px=temporal.roi_size_px,
+            use_rgb=temporal.use_rgb,
+            use_depth=temporal.use_depth,
+            deterministic_fallback=temporal.deterministic_fallback,
+            device=temporal.device,
+            min_depth_m=geometry.min_depth_m,
+            max_depth_m=geometry.max_depth_m,
+            sampling_strategy=geometry.depth_anchor,
+            patch_radius_px=geometry.depth_patch_radius_px,
+        )
+    raise TargetPerceptionConfigurationError(
+        "ultralytics_service requires isaac_depth or temporal_ray_depth geometry"
+    )
+
+
+def preflight_temporal_ray_depth(config: AppConfig) -> Mapping[str, object] | None:
+    """Validate and dry-run a temporal artifact before the first Isaac import."""
+
+    if not isinstance(config, AppConfig):
+        raise TypeError("config must be an AppConfig")
+    geometry = config.target_perception.geometry
+    if geometry.mode != "temporal_ray_depth":
+        return None
+    temporal = geometry.temporal_ray_depth
+    if temporal.checkpoint_path is None or temporal.expected_sha256 is None:
+        raise TargetPerceptionConfigurationError(
+            "temporal_ray_depth requires checkpoint_path and expected_sha256"
+        )
+    try:
+        resolver = build_target_candidate_resolver(
+            config.target_perception,
+            frame_store=FrameStore(
+                max_frames=temporal.history_size + 2,
+                max_bytes=1024,
+                max_age_s=temporal.max_history_age_s,
+            ),
+        )
+    except Exception as exc:
+        raise TargetPerceptionConfigurationError(
+            "temporal ray-depth preflight failed closed before Isaac import: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    artifact = resolver.artifact_info
+    return {
+        "checkpoint_path": str(artifact.checkpoint_path),
+        "checkpoint_sha256": artifact.checkpoint_sha256,
+        "manifest_path": str(artifact.manifest_path),
+        "history_size": artifact.history_size,
+        "max_history_age_s": artifact.max_history_age_s,
+        "roi_size_px": artifact.roi_size_px,
+        "camera_convention": "camera_optical_x_right_y_down_z_forward",
+        "coordinate_convention": "world_flu_x_forward_y_left_z_up",
+        "training_stage": "yolo_deployment",
+        "promotion": "passed",
+        "dry_run": "passed",
+    }
+
+
 def yolo_service_url_for_uav(config: AppConfig, uav_id: str) -> str:
     """Resolve one isolated worker URL without cross-UAV fallback."""
 
@@ -144,7 +249,12 @@ def preflight_fleet_yolo_services(
     """Check every production worker before the first Isaac import."""
 
     from common.ids import validate_uav_id
-    from perception.yolo_client import YoloServiceClient
+    from perception.yolo_client import (
+        YoloClientError,
+        YoloClientUnavailable,
+        YoloServiceClient,
+        validate_yolo_model_identity,
+    )
 
     if not isinstance(config, AppConfig):
         raise TypeError("config must be an AppConfig")
@@ -155,6 +265,20 @@ def preflight_fleet_yolo_services(
     if config.target_perception.backend != "ultralytics_service":
         raise TargetPerceptionConfigurationError(
             "YOLO service preflight requires backend=ultralytics_service"
+        )
+    detector = config.target_perception.detector
+    confirmation_mode = config.target_perception.confirmation.mode
+    if (
+        detector.model_family == "yolo"
+        and confirmation_mode != "class_track_attribute_or_qwen"
+    ):
+        raise TargetPerceptionConfigurationError(
+            "production YOLO preflight requires "
+            "target_perception.confirmation.mode="
+            "'class_track_attribute_or_qwen'; "
+            f"actual_confirmation_mode={confirmation_mode!r}. "
+            "Class/track-only confirmation is forbidden because it can lock "
+            "a target before temporal attribute evidence is established."
         )
     factory = YoloServiceClient if client_factory is None else client_factory
     if not callable(factory):
@@ -178,6 +302,18 @@ def preflight_fleet_yolo_services(
         )
 
     service = config.target_perception.yolo_service
+    if detector.model_family == "yolo" and (
+        detector.expected_model_family != "yolo"
+        or dict(detector.expected_model_names) != {0: "cube"}
+        or detector.expected_model_sha256 is None
+    ):
+        raise TargetPerceptionConfigurationError(
+            "production YOLO preflight requires an explicit trained-model "
+            "identity contract: expected_model_family=yolo, "
+            "expected_model_names={0: 'cube'}, and expected_model_sha256"
+        )
+    expected_family = detector.expected_model_family or detector.model_family
+    expected_names = dict(detector.expected_model_names)
     result: dict[str, Mapping[str, object]] = {}
     for uav_id, url in zip(uav_ids, urls, strict=True):
         client = factory(
@@ -185,30 +321,52 @@ def preflight_fleet_yolo_services(
             request_timeout_s=service.request_timeout_s,
             jpeg_quality=service.jpeg_quality,
         )
-        health = client.health()
+        try:
+            health = client.health()
+            info = client.model_info()
+        except YoloClientUnavailable as exc:
+            raise YoloClientUnavailable(
+                "YOLO worker preflight failed closed: "
+                f"worker_url={url}; "
+                f"expected_model_sha256={detector.expected_model_sha256!r}; "
+                "actual_model_sha256='<unavailable>'; "
+                "actual_model_names='<unavailable>'; "
+                f"cause={type(exc).__name__}: {exc}"
+            ) from exc
+        except YoloClientError as exc:
+            raise TargetPerceptionConfigurationError(
+                "YOLO worker preflight failed closed: "
+                f"worker_url={url}; "
+                f"expected_model_sha256={detector.expected_model_sha256!r}; "
+                "actual_model_sha256='<unavailable>'; "
+                "actual_model_names='<unavailable>'; "
+                f"cause={type(exc).__name__}: {exc}"
+            ) from exc
         if not isinstance(health, Mapping) or (
             health.get("schema_version") != 1
             or health.get("status") != "ok"
             or health.get("ready") is not True
         ):
             raise TargetPerceptionConfigurationError(
-                f"YOLO service for {uav_id} returned an invalid health response"
+                f"YOLO service for {uav_id} returned an invalid health response: "
+                f"worker_url={url}; "
+                f"expected_model_sha256={detector.expected_model_sha256!r}; "
+                f"actual_model_sha256={info.model_sha256!r}; "
+                f"actual_model_names={dict(info.names)!r}; ready={health.get('ready')!r}"
             )
-        info = client.model_info()
-        if info.model_family != "yolo":
+        try:
+            validate_yolo_model_identity(
+                info,
+                expected_model_family=expected_family,
+                expected_model_names=expected_names,
+                expected_model_sha256=detector.expected_model_sha256,
+                worker_url=url,
+            )
+        except YoloClientError as exc:
             raise TargetPerceptionConfigurationError(
-                f"YOLO service for {uav_id} must report model_family='yolo'"
-            )
+                f"YOLO service for {uav_id} failed model identity validation: {exc}"
+            ) from exc
         names = dict(info.names)
-        normalized_names = {
-            class_id: name.strip().casefold()
-            for class_id, name in names.items()
-            if isinstance(class_id, int) and isinstance(name, str)
-        }
-        if normalized_names != {0: "cube"} or len(names) != 1:
-            raise TargetPerceptionConfigurationError(
-                f"YOLO service for {uav_id} must expose exactly class 0='cube'"
-            )
         result[uav_id] = {
             "url": url,
             "model_family": info.model_family,
@@ -226,8 +384,14 @@ def build_target_perception_runtime(
     environment: object,
     uav_id: str,
     attribute_evidence_sink: Callable[[object], None] | None = None,
+    candidate_transition_sink: Callable[[object], None] | None = None,
 ) -> object:
-    """Create one provider; all Oracle/YOLO construction branches live here."""
+    """Compatibility dispatcher for explicitly split capability builders.
+
+    New production entrypoints should call
+    :func:`build_yolo_target_perception_runtime` directly so an environment
+    capability is never in scope during YOLO construction.
+    """
 
     if not isinstance(config, AppConfig):
         raise TypeError("config must be an AppConfig")
@@ -239,77 +403,20 @@ def build_target_perception_runtime(
         )
 
     if resolved_mode.mode is TargetPerceptionMode.ORACLE:
-        make_oracle = getattr(environment, "make_oracle_perception", None)
-        evaluator = getattr(environment, "get_evaluator_frame", None)
-        if not callable(make_oracle) or not callable(evaluator):
-            raise TargetPerceptionConfigurationError(
-                "Oracle runtime requires assignment-scoped evaluator APIs"
-            )
-        raw = make_oracle(uav_id)
-        guarded = GuardedPerceptionBackend(
-            raw,
-            profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
-            acknowledge_privileged_oracle=True,
-        )
-        from perception.runtime_provider import OracleTargetPerceptionRuntime
-
-        return OracleTargetPerceptionRuntime(
+        return build_oracle_target_perception_runtime(
+            config,
+            resolved_mode=resolved_mode,
+            environment=environment,
             uav_id=uav_id,
-            oracle_backend=guarded,
-            frame_provider=evaluator,
         )
 
     if resolved_mode.mode is TargetPerceptionMode.YOLO:
-        from perception.runtime_bridge import CoordinatedVisionPerceptionBackend
-        from perception.runtime_provider import YoloTargetPerceptionRuntime
-        from perception.candidate_bank import CandidateBank
-        from perception.semantic_fusion import TemporalRgbdAttributeSemanticProvider
-        from perception.target_perception_coordinator import TargetPerceptionCoordinator
-        from runtime.frame_store import FrameStore
-
-        service = config.target_perception.yolo_service
-        per_uav_config = replace(
-            config.target_perception,
-            yolo_service=replace(
-                service,
-                url=yolo_service_url_for_uav(config, uav_id),
-            ),
-        )
-        frame_config = config.frame_store
-        frame_store = FrameStore(
-            max_frames=frame_config.max_frames,
-            max_bytes=frame_config.max_bytes,
-            max_age_s=frame_config.max_age_s,
-        )
-        semantic_provider = (
-            TemporalRgbdAttributeSemanticProvider.from_target_perception_config(
-                per_uav_config,
-                # observe() is unavailable before the public runtime's first
-                # Assignment reset, so these valid inert IDs carry no data.
-                mission_id="mission_unbound",
-                uav_id=uav_id,
-                assignment_id="assignment_unbound",
-                frame_store=frame_store,
-                expected_class_name="cube",
-                expected_class_id=0,
-            )
-        )
-        candidate_bank = CandidateBank(uav_id=uav_id)
-        coordinator = TargetPerceptionCoordinator(
-            per_uav_config,
-            frame_store=frame_store,
-            candidate_bank=candidate_bank,
-            semantic_evidence_provider=semantic_provider,
-        )
-        vision = VisionPerceptionBackend(per_uav_config, uav_id=uav_id)
-        return YoloTargetPerceptionRuntime(
+        return build_yolo_target_perception_runtime(
+            config,
+            resolved_mode=resolved_mode,
             uav_id=uav_id,
             attribute_evidence_sink=attribute_evidence_sink,
-            bridge=CoordinatedVisionPerceptionBackend(
-                uav_id=uav_id,
-                coordinator=coordinator,
-                vision_backend=vision,
-            ),
+            candidate_transition_sink=candidate_transition_sink,
         )
 
     raise TargetPerceptionConfigurationError(
@@ -317,12 +424,157 @@ def build_target_perception_runtime(
     )
 
 
+def build_oracle_target_perception_runtime(
+    config: AppConfig,
+    *,
+    resolved_mode: ResolvedTargetPerceptionMode,
+    environment: object,
+    uav_id: str,
+) -> object:
+    """Construct the sole runtime allowed to receive evaluator capability."""
+
+    if not isinstance(config, AppConfig):
+        raise TypeError("config must be an AppConfig")
+    if not isinstance(resolved_mode, ResolvedTargetPerceptionMode):
+        raise TypeError("resolved_mode must be ResolvedTargetPerceptionMode")
+    if (
+        resolved_mode.mode is not TargetPerceptionMode.ORACLE
+        or resolved_mode.backend != "oracle_evaluation"
+        or config.target_perception.backend != "oracle_evaluation"
+    ):
+        raise TargetPerceptionConfigurationError(
+            "Oracle runtime builder requires explicit oracle_evaluation mode"
+        )
+    make_oracle = getattr(environment, "make_oracle_perception", None)
+    evaluator = getattr(environment, "get_evaluator_frame", None)
+    if not callable(make_oracle) or not callable(evaluator):
+        raise TargetPerceptionConfigurationError(
+            "Oracle runtime requires assignment-scoped evaluator APIs"
+        )
+    raw = make_oracle(uav_id)
+    guarded = GuardedPerceptionBackend(
+        raw,
+        profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,
+        acknowledge_privileged_oracle=True,
+    )
+    from perception.runtime_provider import OracleTargetPerceptionRuntime
+
+    return OracleTargetPerceptionRuntime(
+        uav_id=uav_id,
+        oracle_backend=guarded,
+        frame_provider=evaluator,
+    )
+
+
+def build_yolo_target_perception_runtime(
+    config: AppConfig,
+    *,
+    resolved_mode: ResolvedTargetPerceptionMode,
+    uav_id: str,
+    attribute_evidence_sink: Callable[[object], None] | None = None,
+    candidate_transition_sink: Callable[[object], None] | None = None,
+) -> object:
+    """Construct production vision without any environment/evaluator input."""
+
+    if not isinstance(config, AppConfig):
+        raise TypeError("config must be an AppConfig")
+    if not isinstance(resolved_mode, ResolvedTargetPerceptionMode):
+        raise TypeError("resolved_mode must be ResolvedTargetPerceptionMode")
+    if (
+        resolved_mode.mode is not TargetPerceptionMode.YOLO
+        or resolved_mode.backend != "ultralytics_service"
+        or config.target_perception.backend != "ultralytics_service"
+    ):
+        raise TargetPerceptionConfigurationError(
+            "YOLO runtime builder requires production ultralytics_service mode"
+        )
+
+    from perception.candidate_bank import CandidateBank
+    from perception.class_aliases import ClassAliasMapper
+    from perception.runtime_bridge import CoordinatedVisionPerceptionBackend
+    from perception.runtime_provider import YoloTargetPerceptionRuntime
+    from perception.semantic_fusion import TemporalRgbdAttributeSemanticProvider
+    from perception.target_perception_coordinator import TargetPerceptionCoordinator
+    from runtime.frame_store import FrameStore
+
+    service = config.target_perception.yolo_service
+    per_uav_config = replace(
+        config.target_perception,
+        yolo_service=replace(
+            service,
+            url=yolo_service_url_for_uav(config, uav_id),
+        ),
+    )
+    frame_config = config.frame_store
+    frame_store = FrameStore(
+        max_frames=frame_config.max_frames,
+        max_bytes=frame_config.max_bytes,
+        max_age_s=frame_config.max_age_s,
+    )
+    expected_names = dict(per_uav_config.detector.expected_model_names)
+    if per_uav_config.detector.model_family == "yolo" and len(expected_names) != 1:
+        raise TargetPerceptionConfigurationError(
+            "production YOLO runtime requires exactly one configured "
+            "expected_model_names entry"
+        )
+    if expected_names:
+        expected_class_id, expected_class_name = next(iter(expected_names.items()))
+    else:
+        # Open-vocabulary YOLOE assigns the active prompt at reset time.  Its
+        # legacy semantic adapter still needs inert construction defaults;
+        # they are not a detector-class authorization decision.
+        expected_class_id, expected_class_name = 0, "cube"
+    alias_mapper = ClassAliasMapper.from_yaml(
+        per_uav_config.detector.class_aliases_path
+    )
+
+    def resolve_detector_class(category: str) -> tuple[int, str]:
+        if per_uav_config.detector.model_family == "yoloe":
+            return 0, category
+        resolved = alias_mapper.resolve(category, expected_names)
+        return resolved.class_id, resolved.class_name
+    semantic_provider = (
+        TemporalRgbdAttributeSemanticProvider.from_target_perception_config(
+            per_uav_config,
+            mission_id="mission_unbound",
+            uav_id=uav_id,
+            assignment_id="assignment_unbound",
+            frame_store=frame_store,
+            expected_class_name=expected_class_name,
+            expected_class_id=expected_class_id,
+        )
+    )
+    candidate_bank = CandidateBank(uav_id=uav_id)
+    coordinator = TargetPerceptionCoordinator(
+        per_uav_config,
+        frame_store=frame_store,
+        candidate_bank=candidate_bank,
+        semantic_evidence_provider=semantic_provider,
+    )
+    vision = VisionPerceptionBackend(per_uav_config, uav_id=uav_id)
+    return YoloTargetPerceptionRuntime(
+        uav_id=uav_id,
+        attribute_evidence_sink=attribute_evidence_sink,
+        candidate_transition_sink=candidate_transition_sink,
+        detector_class_resolver=resolve_detector_class,
+        bridge=CoordinatedVisionPerceptionBackend(
+            uav_id=uav_id,
+            coordinator=coordinator,
+            vision_backend=vision,
+        ),
+    )
+
+
 __all__ = [
     "TargetPerceptionConfigurationError",
     "TargetPerceptionUnavailableError",
+    "build_target_candidate_resolver",
     "build_target_perception_backend",
+    "build_oracle_target_perception_runtime",
     "build_target_perception_runtime",
+    "build_yolo_target_perception_runtime",
     "preflight_fleet_yolo_services",
+    "preflight_temporal_ray_depth",
     "validate_target_perception_preflight",
     "yolo_service_url_for_uav",
 ]

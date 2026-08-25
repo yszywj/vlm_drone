@@ -108,6 +108,76 @@ class TargetDetectorConfig:
     proposal_mode: str = "closed_set"
     confidence_threshold: float = 0.25
     class_aliases_path: str = "configs/yolo/class_aliases.yaml"
+    expected_model_family: str | None = None
+    expected_model_names: Mapping[int, str] = field(
+        default_factory=dict,
+        metadata={"run_manager_allow_integer_mapping_keys": True},
+    )
+    expected_model_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.model_family, str)
+            or self.model_family not in {"yolo", "yoloe"}
+        ):
+            raise ValueError("model_family must be yolo or yoloe")
+        expected_family = self.expected_model_family
+        if expected_family is not None:
+            if (
+                not isinstance(expected_family, str)
+                or expected_family not in {"yolo", "yoloe"}
+            ):
+                raise ValueError(
+                    "expected_model_family must be yolo or yoloe"
+                )
+            if expected_family != self.model_family:
+                raise ValueError(
+                    "expected_model_family must match model_family"
+                )
+        if not isinstance(self.expected_model_names, Mapping):
+            raise TypeError("expected_model_names must be a mapping")
+        normalized_names: dict[int, str] = {}
+        for raw_id, raw_name in self.expected_model_names.items():
+            if (
+                isinstance(raw_id, bool)
+                or not isinstance(raw_id, int)
+                or raw_id < 0
+            ):
+                raise ValueError(
+                    "expected_model_names keys must be non-negative integers"
+                )
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise ValueError(
+                    "expected_model_names values must be non-empty strings"
+                )
+            normalized_names[int(raw_id)] = raw_name.strip()
+        object.__setattr__(
+            self,
+            "expected_model_names",
+            MappingProxyType(normalized_names),
+        )
+        digest = self.expected_model_sha256
+        if digest is not None:
+            if expected_family is None:
+                raise ValueError(
+                    "expected_model_sha256 requires expected_model_family"
+                )
+            if not normalized_names:
+                raise ValueError(
+                    "expected_model_sha256 requires expected_model_names"
+                )
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(
+                    character not in "0123456789abcdefABCDEF"
+                    for character in digest
+                )
+            ):
+                raise ValueError(
+                    "expected_model_sha256 must be a 64-character hexadecimal digest"
+                )
+            object.__setattr__(self, "expected_model_sha256", digest.lower())
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,15 +190,77 @@ class TargetTrackerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class TemporalRayDepthConfig:
+    """Learned residual artifact contract for production geometry."""
+
+    checkpoint_path: str | None = None
+    expected_sha256: str | None = None
+    manifest_path: str | None = None
+    history_size: int = 6
+    max_history_age_s: float = 2.0
+    roi_size_px: int = 128
+    use_rgb: bool = True
+    use_depth: bool = True
+    deterministic_fallback: bool = True
+    device: str = "cpu"
+
+    def __post_init__(self) -> None:
+        artifact_values = (
+            self.checkpoint_path,
+            self.expected_sha256,
+            self.manifest_path,
+        )
+        if any(value is not None for value in artifact_values):
+            if not isinstance(self.checkpoint_path, str) or not self.checkpoint_path.strip():
+                raise ValueError("checkpoint_path must be non-empty when configured")
+            digest = self.expected_sha256
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdefABCDEF" for character in digest)
+            ):
+                raise ValueError("expected_sha256 must be a 64-character hexadecimal digest")
+            object.__setattr__(self, "expected_sha256", digest.casefold())
+            if self.manifest_path is not None and (
+                not isinstance(self.manifest_path, str)
+                or not self.manifest_path.strip()
+            ):
+                raise ValueError("manifest_path must be non-empty when configured")
+        if isinstance(self.history_size, bool) or not isinstance(self.history_size, int) or not 4 <= self.history_size <= 8:
+            raise ValueError("history_size must be within [4, 8]")
+        if (
+            isinstance(self.max_history_age_s, bool)
+            or not isinstance(self.max_history_age_s, (int, float))
+            or not isfinite(float(self.max_history_age_s))
+            or float(self.max_history_age_s) <= 0.0
+        ):
+            raise ValueError("max_history_age_s must be finite and positive")
+        if isinstance(self.roi_size_px, bool) or not isinstance(self.roi_size_px, int) or not 32 <= self.roi_size_px <= 512:
+            raise ValueError("roi_size_px must be within [32, 512]")
+        if not all(
+            isinstance(value, bool)
+            for value in (self.use_rgb, self.use_depth, self.deterministic_fallback)
+        ):
+            raise TypeError("use_rgb/use_depth/deterministic_fallback must be bool")
+        if not self.use_rgb and not self.use_depth:
+            raise ValueError("at least one of use_rgb/use_depth must be enabled")
+        if not isinstance(self.device, str) or not self.device.strip():
+            raise ValueError("device must be non-empty")
+
+
+@dataclass(frozen=True, slots=True)
 class TargetGeometryConfig:
     """Trusted RGB-D candidate-position resolver settings."""
 
     mode: str = "isaac_depth"
-    depth_anchor: str = "bbox_bottom_center"
+    depth_anchor: str = "foreground_cluster_median"
     depth_patch_radius_px: int = 4
     min_depth_m: float = 0.2
     max_depth_m: float = 200.0
     max_measurement_age_s: float = 0.5
+    temporal_ray_depth: TemporalRayDepthConfig = field(
+        default_factory=TemporalRayDepthConfig
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -708,6 +840,7 @@ __all__ = [
     "TargetAttributeConfig",
     "TargetColorAttributeConfig",
     "TargetGeometryConfig",
+    "TemporalRayDepthConfig",
     "TargetPerceptionConfig",
     "TargetStateEstimatorConfig",
     "TargetTrackerConfig",

@@ -139,6 +139,26 @@ def test_search_keeps_unconfirmed_detection_in_candidate_state() -> None:
     assert feedback["candidate_source"] == "yolo26_botsort"
 
 
+def test_search_rejects_predicted_only_or_positionless_first_confirmation() -> None:
+    for estimate in (
+        _estimate(visible=False, predicted_only=True),
+        _estimate(position_world_m=None),
+    ):
+        uav, clock, context = _runtime()
+        skill = SearchSkill()
+        skill.start(_search_goal(), context)
+
+        assert skill.tick(_observation(uav, clock, estimate)) is SkillStatus.RUNNING
+        assert skill.get_result() is None
+
+
+def test_search_requires_confirmed_assignment_target_id_before_success() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="stable target_id"):
+        _estimate(target_id=None)
+
+
 def test_track_consumes_neutral_estimate_and_never_requires_oracle_fields() -> None:
     uav, clock, context = _runtime()
     skill = TrackSkill()
@@ -199,4 +219,3 @@ def test_reacquire_succeeds_only_for_matching_confirmed_target_estimate() -> Non
     assert result.data["perception_source"] == "yolo26_botsort"
     assert result.data["tracker_id"] == "track_7"
     assert "oracle_target_pose" not in result.data
-

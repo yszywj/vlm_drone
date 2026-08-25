@@ -458,6 +458,9 @@ class SearchSkill(Skill):
             and estimate.visible
             and estimate.confirmed
             and not estimate.predicted_only
+            and estimate.position_world_m is not None
+            and isinstance(estimate.target_id, str)
+            and bool(estimate.target_id.strip())
             and frame_elapsed <= goal.timeout + 1e-12
         ):
             self._complete_target_found(observation, elapsed)
@@ -900,9 +903,15 @@ class SearchSkill(Skill):
     ) -> None:
         goal = self._search_goal(self._active_goal)
         estimate = observation.target_estimate
-        if estimate is None or not estimate.visible or not estimate.confirmed:
+        if (
+            estimate is None
+            or not estimate.visible
+            or not estimate.confirmed
+            or estimate.predicted_only
+            or estimate.position_world_m is None
+        ):
             raise SkillExecutionStateError(
-                "TARGET_FOUND requires a visible confirmed TargetEstimate"
+                "TARGET_FOUND requires a visible, confirmed, measured TargetEstimate"
             )
         target_id = estimate.target_id
         if not isinstance(target_id, str) or not target_id.strip():

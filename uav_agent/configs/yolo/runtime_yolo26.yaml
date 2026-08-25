@@ -48,8 +48,11 @@ target_perception:
   backend: ultralytics_service
   yolo_service:
     url: http://127.0.0.1:8011
-    request_timeout_s: 0.5
-    max_result_age_s: 0.5
+    # Real GPU workers need a bounded warm-up allowance on their first Track
+    # call.  A sub-second HTTP deadline can expire while model.track() keeps
+    # running remotely and creates a false STREAM_BUSY race on the next frame.
+    request_timeout_s: 5.0
+    max_result_age_s: 2.0
     jpeg_quality: 90
     max_inflight_per_uav: 1
   detector:
@@ -57,17 +60,32 @@ target_perception:
     proposal_mode: closed_set
     confidence_threshold: 0.25
     class_aliases_path: configs/yolo/class_aliases.yaml
+    expected_model_family: yolo
+    expected_model_names:
+      0: cube
+    expected_model_sha256: 895de7caa8af200c12f343c72e3a726ffae65e4d96d2092decaf96ef4558de07
   tracker:
     type: botsort
     min_track_observations: 3
     min_track_duration_s: 0.5
   geometry:
-    mode: isaac_depth
-    depth_anchor: bbox_bottom_center
+    mode: temporal_ray_depth
+    depth_anchor: foreground_cluster_median
     depth_patch_radius_px: 4
     min_depth_m: 0.2
     max_depth_m: 200.0
     max_measurement_age_s: 0.5
+    temporal_ray_depth:
+      checkpoint_path: /home/amax/ry/vlm_drones/outputs/trained_models/target_state/temporal_ray_depth_yolo_deployment_v2/best.pt
+      expected_sha256: 2a8acd63347a568a4e5588cfc335979709958f7859617405841062af679e023c
+      manifest_path: /home/amax/ry/vlm_drones/outputs/trained_models/target_state/temporal_ray_depth_yolo_deployment_v2/model_manifest.json
+      history_size: 6
+      max_history_age_s: 2.0
+      roi_size_px: 128
+      use_rgb: true
+      use_depth: true
+      deterministic_fallback: true
+      device: cpu
   state_estimator:
     type: constant_velocity_kalman
     max_prediction_age_s: 2.0
@@ -75,9 +93,37 @@ target_perception:
     process_noise: 1.0
     measurement_noise: 0.5
   confirmation:
-    mode: class_track_or_qwen
+    mode: class_track_attribute_or_qwen
     require_qwen_for_attributes: true
     require_qwen_for_reacquire_new_track_id: true
+  attributes:
+    enabled: true
+    mode: deterministic_then_qwen
+    require_qwen_for_unsupported_attributes: true
+    require_qwen_for_ambiguous_attributes: true
+    color:
+      enabled: true
+      method: hsv_depth_mask
+      supported_values:
+        - red
+        - blue
+      roi_inset_ratio: 0.12
+      min_valid_pixel_ratio: 0.15
+      min_saturation: 0.25
+      min_value: 0.15
+      min_dominant_fraction: 0.55
+      min_score_margin: 0.15
+      depth_absolute_tolerance_m: 0.25
+      depth_relative_tolerance: 0.05
+      min_observations: 3
+      min_duration_s: 0.4
+      max_history_per_candidate: 16
+      hue_ranges_deg:
+        red:
+          - [0.0, 20.0]
+          - [340.0, 360.0]
+        blue:
+          - [190.0, 260.0]
 
 target:
   initial_region:
@@ -143,7 +189,9 @@ frame_store:
   max_age_s: 20.0
 
 debug_images:
-  enabled: false
+  # Representative, annotated candidate-state images only. Raw frames and
+  # video remain disabled below, and this writer is hard-capped per run.
+  enabled: true
   max_images_per_run: 20
 
 experiment:

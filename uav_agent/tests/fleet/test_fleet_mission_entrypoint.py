@@ -81,6 +81,46 @@ def test_parser_exposes_complete_fleet_runtime_surface() -> None:
     assert args.max_sim_time == 300.0
 
 
+def test_fleet_simulation_app_uses_graceful_shutdown() -> None:
+    assert run_fleet_mission._simulation_app_launch_config(headless=True) == {
+        "headless": True,
+        "fast_shutdown": False,
+        "multi_gpu": False,
+    }
+    with pytest.raises(TypeError, match="headless"):
+        run_fleet_mission._simulation_app_launch_config(  # type: ignore[arg-type]
+            headless=1
+        )
+
+
+def test_scripted_run_retains_preflight_verified_yolo_identity(
+    prepared_oracle,
+) -> None:
+    prepared = replace(prepared_oracle, preparation_context=None)
+    metadata = {
+        "uav_a": {
+            "url": "http://127.0.0.1:8011",
+            "model_family": "yolo",
+            "model_names": {"0": "cube"},
+            "model_sha256": "ab" * 32,
+            "ready": True,
+        }
+    }
+    run_fleet_mission._retain_yolo_service_metadata(prepared, metadata)
+    metadata["uav_a"]["ready"] = False
+
+    assert prepared.preparation_context is not None
+    assert prepared.preparation_context["yolo_service_metadata"] == {
+        "uav_a": {
+            "url": "http://127.0.0.1:8011",
+            "model_family": "yolo",
+                "model_names": {"0": "cube"},
+            "model_sha256": "ab" * 32,
+            "ready": True,
+        }
+    }
+
+
 def test_pure_preparation_completes_without_isaac_import(monkeypatch) -> None:
     attempted: list[str] = []
     original_import = builtins.__import__

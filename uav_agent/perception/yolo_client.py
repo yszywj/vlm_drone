@@ -15,7 +15,7 @@ from math import isfinite
 from numbers import Real
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 import numpy as np
 
@@ -36,8 +36,36 @@ class YoloClientUnavailable(YoloClientError):
     """Network, timeout, or service availability failure."""
 
 
+class YoloClientRequestTimeout(YoloClientUnavailable):
+    """The client deadline elapsed while the remote request may still run."""
+
+
 class YoloClientResponseError(YoloClientError):
     """Malformed, mismatched, or explicitly rejected response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+
+
+class YoloClientStreamBusy(YoloClientUnavailable):
+    """The worker is finishing an earlier inference for the same process.
+
+    This is service backpressure, not a malformed detector response.  In
+    particular, a local HTTP timeout does not cancel ``model.track()`` in the
+    worker process, so the next request can legitimately observe
+    ``STREAM_BUSY`` until that orphaned request finishes.
+    """
+
+    status_code = 409
+    error_code = "STREAM_BUSY"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,9 +94,14 @@ class YoloModelInfo:
             if (
                 not isinstance(self.model_sha256, str)
                 or len(self.model_sha256) != 64
-                or any(character not in "0123456789abcdefABCDEF" for character in self.model_sha256)
+                or any(
+                    character not in "0123456789abcdefABCDEF"
+                    for character in self.model_sha256
+                )
             ):
-                raise ValueError("model_sha256 must be a 64-character hexadecimal digest")
+                raise ValueError(
+                    "model_sha256 must be a 64-character hexadecimal digest"
+                )
             object.__setattr__(self, "model_sha256", self.model_sha256.lower())
 
     @property
@@ -76,7 +109,94 @@ class YoloModelInfo:
         return dict(self.class_names)
 
 
+def validate_yolo_model_identity(
+    info: YoloModelInfo,
+    *,
+    expected_model_family: str,
+    expected_model_names: Mapping[int, str],
+    expected_model_sha256: str | None,
+    worker_url: str,
+) -> None:
+    """Fail closed when a worker does not expose the configured model.
+
+    The diagnostic is deliberately complete and scalar-only so a launch log
+    always identifies the contacted worker, both digests, and the actual class
+    catalog without disclosing any frame or target data.
+    """
+
+    if not isinstance(info, YoloModelInfo):
+        raise TypeError("info must be a YoloModelInfo")
+    normalized_url = validate_loopback_http_url(worker_url, "worker_url")
+    if expected_model_family not in {"yolo", "yoloe"}:
+        raise ValueError("expected_model_family must be yolo or yoloe")
+    normalized_expected: dict[int, str] = {}
+    for raw_id, raw_name in expected_model_names.items():
+        if (
+            isinstance(raw_id, bool)
+            or not isinstance(raw_id, int)
+            or raw_id < 0
+            or not isinstance(raw_name, str)
+            or not raw_name.strip()
+        ):
+            raise ValueError(
+                "expected_model_names must map non-negative IDs to names"
+            )
+        normalized_expected[int(raw_id)] = raw_name.strip().casefold()
+    expected_digest = None
+    if expected_model_sha256 is not None:
+        if (
+            not isinstance(expected_model_sha256, str)
+            or len(expected_model_sha256) != 64
+            or any(
+                character not in "0123456789abcdefABCDEF"
+                for character in expected_model_sha256
+            )
+        ):
+            raise ValueError(
+                "expected_model_sha256 must be a 64-character hexadecimal digest"
+            )
+        expected_digest = expected_model_sha256.lower()
+    actual_names = dict(info.names)
+    normalized_actual = {
+        class_id: class_name.strip().casefold()
+        for class_id, class_name in actual_names.items()
+    }
+    mismatches: list[str] = []
+    if info.model_family != expected_model_family:
+        mismatches.append("model_family")
+    if normalized_expected and normalized_actual != normalized_expected:
+        mismatches.append("model_names")
+    if expected_digest is not None and info.model_sha256 != expected_digest:
+        mismatches.append("model_sha256")
+    if not mismatches:
+        return
+    compatibility_prefix = (
+        "YOLO model family mismatch; "
+        if "model_family" in mismatches
+        else ""
+    )
+    if "model_names" in mismatches:
+        compatibility_prefix += "worker must expose exactly class 0='cube'; "
+    raise YoloClientResponseError(
+        compatibility_prefix
+        + "YOLO model identity mismatch: "
+        f"fields={','.join(mismatches)}; worker_url={normalized_url}; "
+        f"expected_model_family={expected_model_family!r}; "
+        f"actual_model_family={info.model_family!r}; "
+        f"expected_model_sha256={expected_digest!r}; "
+        f"actual_model_sha256={info.model_sha256!r}; "
+        f"expected_model_names={dict(sorted(normalized_expected.items()))!r}; "
+        f"actual_model_names={dict(sorted(actual_names.items()))!r}"
+    )
+
+
 Transport = Callable[[str, str, bytes | None, Mapping[str, str], float], bytes]
+
+
+# The service authority is already restricted to an explicit loopback address.
+# Do not let ambient HTTP(S)_PROXY settings redirect detector traffic away from
+# that local trust boundary or make an otherwise healthy worker look offline.
+_DIRECT_LOOPBACK_OPENER = build_opener(ProxyHandler({}))
 
 
 class YoloServiceClient:
@@ -120,7 +240,9 @@ class YoloServiceClient:
             or payload.get("status") != "ok"
             or payload.get("ready") is not True
         ):
-            raise YoloClientResponseError("YOLO service health response is invalid")
+            raise YoloClientResponseError(
+                f"YOLO service health response from {self._base_url} is invalid"
+            )
         return payload
 
     def model_info(self) -> YoloModelInfo:
@@ -219,7 +341,11 @@ class YoloServiceClient:
             )
         except YoloClientError:
             raise
-        except (TimeoutError, OSError) as exc:
+        except TimeoutError as exc:
+            raise YoloClientRequestTimeout(
+                "YOLO service request timed out; remote completion is unknown"
+            ) from exc
+        except OSError as exc:
             raise YoloClientUnavailable(
                 f"YOLO service request failed: {type(exc).__name__}"
             ) from exc
@@ -291,7 +417,9 @@ def _urllib_transport(
 ) -> bytes:
     request = Request(url, data=body, headers=dict(headers), method=method)
     try:
-        with urlopen(request, timeout=timeout_s) as response:  # noqa: S310 - loopback checked
+        with _DIRECT_LOOPBACK_OPENER.open(
+            request, timeout=timeout_s
+        ) as response:  # noqa: S310 - loopback checked and proxies disabled
             return response.read()
     except HTTPError as exc:
         try:
@@ -304,10 +432,21 @@ def _urllib_transport(
                 code, message = "HTTP_ERROR", "request rejected"
         except Exception:
             code, message = "HTTP_ERROR", "request rejected"
-        raise YoloClientResponseError(
+        detail = (
             f"YOLO service rejected request ({exc.code}, {code}): {message[:256]}"
+        )
+        if exc.code == 409 and code == "STREAM_BUSY":
+            raise YoloClientStreamBusy(detail) from exc
+        raise YoloClientResponseError(
+            detail,
+            status_code=exc.code,
+            error_code=code,
         ) from exc
     except URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise YoloClientRequestTimeout(
+                "YOLO service request timed out; remote completion is unknown"
+            ) from exc
         raise YoloClientUnavailable(
             f"YOLO service is unavailable: {type(exc.reason).__name__}"
         ) from exc
@@ -315,9 +454,12 @@ def _urllib_transport(
 
 __all__ = [
     "YoloClientError",
+    "YoloClientRequestTimeout",
     "YoloClientResponseError",
+    "YoloClientStreamBusy",
     "YoloClientUnavailable",
     "YoloModelInfo",
     "YoloServiceClient",
     "encode_rgb_jpeg",
+    "validate_yolo_model_identity",
 ]

@@ -7,10 +7,12 @@ one request in flight and one newest pending frame per UAV.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
+import json
 from math import isfinite
 from numbers import Real
 from statistics import fmean
@@ -37,12 +39,13 @@ from perception.confirmation import (
     ConfirmationDecision,
     ConfirmationPolicy,
 )
-from perception.depth_geometry import DepthCandidateResolver
 from perception.grounding import (
     CandidateResolutionUnavailable,
+    CandidateResolver,
     GroundingProposal,
     UltralyticsGrounder,
 )
+from perception.measurement import TargetMeasurement
 from perception.target_state_estimator import (
     TargetStateEstimator,
     TargetStateMeasurementRejected,
@@ -51,6 +54,7 @@ from perception.target_debug_images import (
     BoundedTargetDebugImageWriter,
     TargetDebugAnnotation,
 )
+from perception.target_query import TargetQuerySpec
 from perception.types import (
     DetectionCandidate,
     IdentityConsistencyEvidence,
@@ -58,9 +62,12 @@ from perception.types import (
     ShortTrackEvidence,
 )
 from perception.yolo_client import (
+    YoloClientRequestTimeout,
     YoloClientResponseError,
+    YoloClientStreamBusy,
     YoloClientUnavailable,
     YoloServiceClient,
+    validate_yolo_model_identity,
 )
 from perception.visual_review import QwenVisualReview
 from perception.visual_evidence import (
@@ -75,6 +82,7 @@ from perception.visual_evidence import (
     VisualEvidenceError,
 )
 from perception.semantic_fusion import AttributeSemanticVerificationPending
+from perception.semantic_fusion import DETERMINISTIC_ATTRIBUTE_VERIFIER
 from runtime.frame_store import FrameRef, FrameStore
 from target import TargetLifecycle, TargetManager
 from target.types import TargetSpec
@@ -101,6 +109,9 @@ class TargetQueryUnsupported(TargetPerceptionError):
 
 
 _MAX_CONSECUTIVE_AVAILABILITY_FAILURES = 3
+_MAX_CANDIDATE_TRANSITION_LOGS_PER_ASSIGNMENT = 256
+_MAX_DEPTH_RESOLUTION_FAILURE_LOGS_PER_ASSIGNMENT = 32
+_MAX_DEPTH_RESOLUTION_FAILURE_REASON_KEYS = 16
 
 
 SemanticEvidenceProvider = Callable[
@@ -115,13 +126,23 @@ VisualReviewReferenceProvider = Callable[[str], Sequence[str]]
 
 @dataclass(slots=True)
 class TargetPerceptionMetrics:
+    camera_frames_received: int = 0
+    yolo_requests_submitted: int = 0
+    yolo_results_received: int = 0
     yolo_requests: int = 0
     yolo_successful_responses: int = 0
     yolo_timeouts: int = 0
     yolo_response_errors: int = 0
+    yolo_stream_busy_responses: int = 0
+    yolo_stream_recoveries: int = 0
+    yolo_stream_recovery_failures: int = 0
     yolo_stale_results: int = 0
     yolo_dropped_frames: int = 0
     detections_total: int = 0
+    tracked_detections_total: int = 0
+    candidate_created: int = 0
+    candidate_confirmed: int = 0
+    candidate_rejected: int = 0
     candidates_total: int = 0
     candidates_rejected: int = 0
     candidates_confirmed: int = 0
@@ -133,6 +154,21 @@ class TargetPerceptionMetrics:
     reacquire_attempts: int = 0
     reacquire_successes: int = 0
     depth_resolution_failures: int = 0
+    depth_resolution_attempts: int = 0
+    depth_resolution_successes: int = 0
+    depth_resolution_last_failure_reason: str | None = None
+    depth_resolution_failure_reason_counts: dict[str, int] = field(
+        default_factory=dict
+    )
+    measurement_created: int = 0
+    measurement_rejected: int = 0
+    kalman_updates_accepted: int = 0
+    kalman_updates_rejected: int = 0
+    position_world_outputs: int = 0
+    predicted_only_outputs: int = 0
+    search_target_found: int = 0
+    track_visible_updates: int = 0
+    track_predicted_updates: int = 0
     qwen_attribute_fallback_count: int = 0
     _latencies_ms: list[float] = field(default_factory=list, repr=False)
     _measurement_ages_s: list[float] = field(default_factory=list, repr=False)
@@ -170,7 +206,7 @@ class TargetPerceptionMetrics:
             self._velocity_squared_errors.append(velocity * velocity)
             del self._velocity_squared_errors[:-10_000]
 
-    def to_dict(self) -> dict[str, int | float | None]:
+    def to_dict(self) -> dict[str, object]:
         latency_sorted = sorted(self._latencies_ms)
         p95 = (
             None
@@ -178,15 +214,25 @@ class TargetPerceptionMetrics:
             else latency_sorted[min(len(latency_sorted) - 1, int(0.95 * len(latency_sorted)))]
         )
         return {
+            "camera_frames_received": self.camera_frames_received,
+            "yolo_requests_submitted": self.yolo_requests_submitted,
+            "yolo_results_received": self.yolo_results_received,
             "yolo_requests": self.yolo_requests,
             "yolo_successful_responses": self.yolo_successful_responses,
             "yolo_timeouts": self.yolo_timeouts,
             "yolo_response_errors": self.yolo_response_errors,
+            "yolo_stream_busy_responses": self.yolo_stream_busy_responses,
+            "yolo_stream_recoveries": self.yolo_stream_recoveries,
+            "yolo_stream_recovery_failures": self.yolo_stream_recovery_failures,
             "yolo_stale_results": self.yolo_stale_results,
             "yolo_dropped_frames": self.yolo_dropped_frames,
             "yolo_inference_latency_ms_mean": _mean_or_none(self._latencies_ms),
             "yolo_inference_latency_ms_p95": p95,
             "detections_total": self.detections_total,
+            "tracked_detections_total": self.tracked_detections_total,
+            "candidate_created": self.candidate_created,
+            "candidate_confirmed": self.candidate_confirmed,
+            "candidate_rejected": self.candidate_rejected,
             "candidates_total": self.candidates_total,
             "candidates_rejected": self.candidates_rejected,
             "candidates_confirmed": self.candidates_confirmed,
@@ -201,6 +247,23 @@ class TargetPerceptionMetrics:
             "reacquire_attempts": self.reacquire_attempts,
             "reacquire_successes": self.reacquire_successes,
             "depth_resolution_failures": self.depth_resolution_failures,
+            "depth_resolution_attempts": self.depth_resolution_attempts,
+            "depth_resolution_successes": self.depth_resolution_successes,
+            "depth_resolution_last_failure_reason": (
+                self.depth_resolution_last_failure_reason
+            ),
+            "depth_resolution_failure_reason_counts": dict(
+                sorted(self.depth_resolution_failure_reason_counts.items())
+            ),
+            "measurement_created": self.measurement_created,
+            "measurement_rejected": self.measurement_rejected,
+            "kalman_updates_accepted": self.kalman_updates_accepted,
+            "kalman_updates_rejected": self.kalman_updates_rejected,
+            "position_world_outputs": self.position_world_outputs,
+            "predicted_only_outputs": self.predicted_only_outputs,
+            "search_target_found": self.search_target_found,
+            "track_visible_updates": self.track_visible_updates,
+            "track_predicted_updates": self.track_predicted_updates,
             "qwen_attribute_fallback_count": self.qwen_attribute_fallback_count,
             "target_visible_frames": self.target_visible_frames,
             "target_total_frames": self.target_total_frames,
@@ -237,7 +300,7 @@ class TargetPerceptionCoordinator:
         client: YoloServiceClient | object | None = None,
         frame_store: FrameStore | None = None,
         candidate_bank: CandidateBank | None = None,
-        resolver: DepthCandidateResolver | None = None,
+        resolver: CandidateResolver | None = None,
         state_estimator: TargetStateEstimator | None = None,
         executor: Executor | None = None,
         model_names: Mapping[int, str] | Sequence[str] | None = None,
@@ -270,13 +333,17 @@ class TargetPerceptionCoordinator:
         if candidate_bank is not None and not isinstance(candidate_bank, CandidateBank):
             raise TypeError("candidate_bank must be a CandidateBank or None")
         self._provided_candidate_bank = candidate_bank
-        self._resolver = resolver or DepthCandidateResolver(
-            self._frame_store,
-            sampling_strategy=config.geometry.depth_anchor,
-            patch_radius_px=config.geometry.depth_patch_radius_px,
-            min_depth_m=config.geometry.min_depth_m,
-            max_depth_m=config.geometry.max_depth_m,
-        )
+        if resolver is not None:
+            self._resolver = resolver
+        else:
+            # Local import avoids a module cycle: the factory imports this
+            # coordinator only inside the production runtime builder.
+            from perception.factory import build_target_candidate_resolver
+
+            self._resolver = build_target_candidate_resolver(
+                config,
+                frame_store=self._frame_store,
+            )
         estimator_cfg = config.state_estimator
         self._estimator = state_estimator or TargetStateEstimator(
             max_prediction_age_s=estimator_cfg.max_prediction_age_s,
@@ -331,11 +398,18 @@ class TargetPerceptionCoordinator:
         self._debug_image_writer = debug_image_writer
         self._mission_id: str | None = None
         self._uav_id: str | None = None
+        self._assignment_id: str | None = None
         self._target_alias: str | None = None
+        self._target_query: TargetQuerySpec | None = None
         self._stream_id: str | None = None
         self._candidate_bank: CandidateBank | None = None
         self._frame_sequence = 0
         self._inflight: _Inflight | None = None
+        # A client timeout only ends the local HTTP wait; the worker's
+        # model.track() thread can still own its process-wide stream.  Recovery
+        # is therefore a first-class asynchronous barrier.  No later Track
+        # request may launch until its reset future has completed successfully.
+        self._stream_recovery: Future[None] | None = None
         self._pending: _Submission | None = None
         self._latest_estimate: TargetEstimate | None = None
         # Prediction used for control may inherit state only from a confirmed
@@ -354,6 +428,12 @@ class TargetPerceptionCoordinator:
         self._last_error: str | None = None
         self._fatal_error: str | None = None
         self._consecutive_availability_failures = 0
+        self._candidate_transition_logs_emitted = 0
+        self._candidate_transition_records: deque[dict[str, object]] = deque(
+            maxlen=_MAX_CANDIDATE_TRANSITION_LOGS_PER_ASSIGNMENT
+        )
+        self._depth_resolution_failure_logs_emitted = 0
+        self._depth_resolution_failure_log_counts: dict[str, int] = {}
         self._closed = False
         self._lock = RLock()
         self.metrics = TargetPerceptionMetrics()
@@ -419,6 +499,8 @@ class TargetPerceptionCoordinator:
             for public_name, internal_name in aliases.items():
                 if internal_name in extra:
                     extra[public_name] = extra[internal_name]
+            extra["attribute_confirmed"] = int(extra.get("semantic_match", 0))
+            extra["attribute_ambiguous"] = int(extra.get("semantic_pending", 0))
             overlap = set(result).intersection(extra)
             if overlap:
                 raise ValueError(
@@ -426,6 +508,28 @@ class TargetPerceptionCoordinator:
                     + ", ".join(sorted(overlap))
                 )
             result.update(extra)
+        result.setdefault("attribute_confirmed", 0)
+        result.setdefault("attribute_ambiguous", 0)
+        resolver_statistics = getattr(self._resolver, "statistics", None)
+        if resolver_statistics is not None:
+            resolver_value = (
+                resolver_statistics()
+                if callable(resolver_statistics)
+                else resolver_statistics
+            )
+            resolver_to_dict = getattr(resolver_value, "to_dict", None)
+            resolver_metrics = (
+                resolver_to_dict() if callable(resolver_to_dict) else resolver_value
+            )
+            if not isinstance(resolver_metrics, Mapping):
+                raise TypeError("resolver statistics must be a mapping")
+            overlap = set(result).intersection(resolver_metrics)
+            if overlap:
+                raise ValueError(
+                    "resolver metrics collide with coordinator metrics: "
+                    + ", ".join(sorted(overlap))
+                )
+            result.update(dict(resolver_metrics))
         return result
 
     def attribute_evidence_records(self) -> tuple[object, ...]:
@@ -450,6 +554,24 @@ class TargetPerceptionCoordinator:
             raise ValueError("semantic provider returned unbounded evidence records")
         return values
 
+    def candidate_transition_records(self) -> tuple[Mapping[str, object], ...]:
+        """Return a copy of the bounded scalar candidate-transition buffer."""
+
+        with self._lock:
+            return tuple(dict(record) for record in self._candidate_transition_records)
+
+    def drain_candidate_transition_records(
+        self,
+    ) -> tuple[Mapping[str, object], ...]:
+        """Atomically consume candidate lifecycle edges for experiment output."""
+
+        with self._lock:
+            values = tuple(
+                dict(record) for record in self._candidate_transition_records
+            )
+            self._candidate_transition_records.clear()
+            return values
+
     def reset(
         self,
         *,
@@ -457,6 +579,7 @@ class TargetPerceptionCoordinator:
         uav_id: str,
         assignment_id: str | None = None,
         target_alias: str | None = None,
+        target_query: TargetQuerySpec | None = None,
     ) -> None:
         mission = validate_mission_id(mission_id)
         uav = validate_uav_id(uav_id)
@@ -470,6 +593,16 @@ class TargetPerceptionCoordinator:
             if target_alias is None
             else validate_routing_id(target_alias, "target_alias")
         )
+        if target_query is not None and not isinstance(
+            target_query,
+            TargetQuerySpec,
+        ):
+            raise TypeError("target_query must be a TargetQuerySpec or None")
+        if target_query is not None:
+            if routed_target is None:
+                routed_target = target_query.target_alias
+            elif routed_target != target_query.target_alias:
+                raise ValueError("target_alias must match target_query.target_alias")
         if routed_target is not None and assignment is None:
             raise ValueError("target_alias requires assignment_id")
         with self._lock:
@@ -481,13 +614,19 @@ class TargetPerceptionCoordinator:
             self._inflight = None
             if inflight is not None:
                 inflight.future.cancel()
+            recovery = self._stream_recovery
+            self._stream_recovery = None
+            if recovery is not None:
+                recovery.cancel()
             self._pending = None
             # A failed handshake must not leave a coordinator that appears
             # ready.  Publish routing state only after health/reset/model-info
             # have all succeeded.
             self._mission_id = None
             self._uav_id = None
+            self._assignment_id = None
             self._target_alias = None
+            self._target_query = None
             self._stream_id = None
             self._candidate_bank = None
             self._fatal_error = None
@@ -501,6 +640,7 @@ class TargetPerceptionCoordinator:
 
         cleanup_wait_s = self._cleanup_wait_s()
         self._drain_future(inflight, timeout_s=cleanup_wait_s)
+        self._drain_executor_future(recovery, timeout_s=cleanup_wait_s)
         try:
             # A reused coordinator must first retire the previous persistent
             # BoT-SORT stream.  Refuse the next mission if this cannot be done
@@ -526,13 +666,19 @@ class TargetPerceptionCoordinator:
                 timeout_s=cleanup_wait_s,
             )
             info = self._client.model_info()
-            expected_family = self._config.detector.model_family
-            if info.model_family != expected_family:
-                raise YoloClientResponseError(
-                    "YOLO model family mismatch: "
-                    f"service={info.model_family!r}, config={expected_family!r}"
-                )
+            detector = self._config.detector
+            validate_yolo_model_identity(
+                info,
+                expected_model_family=(
+                    detector.expected_model_family or detector.model_family
+                ),
+                expected_model_names=detector.expected_model_names,
+                expected_model_sha256=detector.expected_model_sha256,
+                worker_url=self._config.yolo_service.url,
+            )
             model_names = _normalize_model_names(info.names)
+            if target_query is not None:
+                self._validate_target_query_model(target_query, model_names)
         except Exception as exc:
             message = _safe_error("yolo_startup_handshake_failed", exc)
             with self._lock:
@@ -545,7 +691,9 @@ class TargetPerceptionCoordinator:
             self._ensure_open()
             self._mission_id = mission
             self._uav_id = uav
+            self._assignment_id = assignment
             self._target_alias = routed_target
+            self._target_query = target_query
             self._stream_id = f"{mission}:{uav}"
             self._model_names = model_names
             if self._provided_candidate_bank is not None:
@@ -570,7 +718,13 @@ class TargetPerceptionCoordinator:
             self._last_error = None
             self._fatal_error = None
             self._consecutive_availability_failures = 0
+            self._candidate_transition_logs_emitted = 0
+            self._depth_resolution_failure_logs_emitted = 0
+            self._depth_resolution_failure_log_counts.clear()
             self._estimator.reset()
+            resolver_reset = getattr(self._resolver, "reset", None)
+            if callable(resolver_reset):
+                resolver_reset(uav_id=uav, assignment_id=assignment)
             semantic_reset = getattr(self._semantic_provider, "reset", None)
             if assignment is not None and callable(semantic_reset):
                 semantic_reset(
@@ -583,14 +737,23 @@ class TargetPerceptionCoordinator:
         self,
         *,
         camera_sample: CameraSample,
-        target_spec: TargetSpec,
+        target_spec: TargetSpec | None = None,
+        uav_linear_velocity_world_mps: Sequence[float] | None = None,
+        uav_angular_velocity_body_radps: Sequence[float] | None = None,
     ) -> None:
         if not isinstance(camera_sample, CameraSample):
             raise TypeError("camera_sample must be a CameraSample")
-        if not isinstance(target_spec, TargetSpec):
-            raise TypeError("target_spec must be a TargetSpec")
+        if self._config.geometry.mode == "temporal_ray_depth" and (
+            uav_linear_velocity_world_mps is None
+            or uav_angular_velocity_body_radps is None
+        ):
+            raise ValueError(
+                "temporal_ray_depth requires synchronized UAV linear and "
+                "angular self-motion"
+            )
         with self._lock:
             self._ensure_ready()
+            self.metrics.camera_frames_received += 1
             assert self._mission_id is not None
             assert self._uav_id is not None
             assert self._stream_id is not None
@@ -600,8 +763,33 @@ class TargetPerceptionCoordinator:
                 uav_id=self._uav_id,
                 frame_id=frame_id,
                 sample=camera_sample,
+                uav_linear_velocity_world_mps=(
+                    uav_linear_velocity_world_mps
+                ),
+                uav_angular_velocity_body_radps=(
+                    uav_angular_velocity_body_radps
+                ),
             )
-            query = self._compile_query(target_spec)
+            # Production reset binds a closed TargetQuerySpec.  In that mode
+            # a complete TargetSpec is rejected even if a caller attempts to
+            # bypass the public runtime bridge.  The optional TargetSpec path
+            # remains only for isolated legacy coordinator tests which reset
+            # without a production query.
+            if self._target_query is not None:
+                if target_spec is not None:
+                    raise PermissionError(
+                        "production coordinator rejects complete TargetSpec input"
+                    )
+                semantic_target_spec = self._target_query.to_semantic_target_spec()
+                query = self._compile_target_query_spec(self._target_query)
+            else:
+                if not isinstance(target_spec, TargetSpec):
+                    raise TypeError(
+                        "legacy direct coordinator use requires target_spec; "
+                        "production reset requires target_query"
+                    )
+                semantic_target_spec = target_spec
+                query = self._compile_query(target_spec)
             submission = _Submission(
                 TrackRequest(
                     schema_version=1,
@@ -614,9 +802,9 @@ class TargetPerceptionCoordinator:
                     target_query=query,
                 ),
                 frame_ref,
-                target_spec,
+                semantic_target_spec,
             )
-            if self._inflight is None:
+            if self._inflight is None and self._stream_recovery is None:
                 self._launch(submission)
             else:
                 if self._pending is not None:
@@ -638,6 +826,27 @@ class TargetPerceptionCoordinator:
                 target_manager.snapshot().lifecycle,
                 timestamp_s=now,
             )
+            recovery = self._stream_recovery
+            if recovery is not None and recovery.done():
+                self._stream_recovery = None
+                try:
+                    recovery.result()
+                    self.metrics.yolo_stream_recoveries += 1
+                except Exception as exc:
+                    self.metrics.yolo_stream_recovery_failures += 1
+                    self._pending = None
+                    self._last_error = _safe_error(
+                        "yolo_stream_recovery_failed",
+                        exc,
+                    )
+                    self._fatal_error = self._last_error
+                    raise TargetPerceptionError(
+                        "YOLO stream ownership could not be recovered"
+                    ) from exc
+                if self._pending is not None:
+                    pending, self._pending = self._pending, None
+                    self._launch(pending)
+
             completed = self._inflight
             if completed is not None and completed.future.done():
                 self._inflight = None
@@ -646,6 +855,7 @@ class TargetPerceptionCoordinator:
                     response.assert_matches(completed.submission.request)
                     self._consecutive_availability_failures = 0
                     self.metrics.yolo_successful_responses += 1
+                    self.metrics.yolo_results_received += 1
                     self.metrics.record_latency(response.timing_ms.inference)
                     if now - response.timestamp_s > self._config.yolo_service.max_result_age_s:
                         self.metrics.yolo_stale_results += 1
@@ -662,7 +872,15 @@ class TargetPerceptionCoordinator:
                             timestamp_s=now,
                         )
                 except Exception as exc:
-                    if isinstance(exc, (TimeoutError, YoloClientUnavailable)):
+                    stream_busy = isinstance(exc, YoloClientStreamBusy)
+                    remote_completion_unknown = isinstance(
+                        exc,
+                        (TimeoutError, YoloClientRequestTimeout, YoloClientStreamBusy),
+                    )
+                    if stream_busy:
+                        self.metrics.yolo_stream_busy_responses += 1
+                        self._consecutive_availability_failures += 1
+                    elif isinstance(exc, (TimeoutError, YoloClientUnavailable)):
                         self.metrics.yolo_timeouts += 1
                         self._consecutive_availability_failures += 1
                     elif isinstance(
@@ -698,7 +916,9 @@ class TargetPerceptionCoordinator:
                             )
                             else "YOLO perception contract or processing failure"
                         ) from exc
-                if self._pending is not None:
+                    if remote_completion_unknown:
+                        self._start_stream_recovery()
+                if self._pending is not None and self._stream_recovery is None:
                     pending, self._pending = self._pending, None
                     self._launch(pending)
 
@@ -707,6 +927,15 @@ class TargetPerceptionCoordinator:
             self.metrics.target_total_frames += 1
             if estimate is not None and estimate.visible:
                 self.metrics.target_visible_frames += 1
+            if estimate is not None and estimate.position_world_m is not None:
+                self.metrics.position_world_outputs += 1
+            if estimate is not None and estimate.predicted_only:
+                self.metrics.predicted_only_outputs += 1
+            if target_manager.lifecycle is TargetLifecycle.TRACKING:
+                if estimate is not None and estimate.predicted_only:
+                    self.metrics.track_predicted_updates += 1
+                elif estimate is not None and estimate.visible:
+                    self.metrics.track_visible_updates += 1
             return estimate
 
     def close(self) -> None:
@@ -718,11 +947,17 @@ class TargetPerceptionCoordinator:
             self._inflight = None
             if inflight is not None:
                 inflight.future.cancel()
+            recovery = self._stream_recovery
+            self._stream_recovery = None
+            if recovery is not None:
+                recovery.cancel()
             self._pending = None
             self._estimator.reset()
             self._track_evidence.reset()
             self._track_snapshots.clear()
             self._target_alias = None
+            self._target_query = None
+            self._assignment_id = None
             if uav is not None:
                 self._frame_store.clear(uav_id=uav)
             self._closed = True
@@ -731,6 +966,7 @@ class TargetPerceptionCoordinator:
         # service to destroy its persistent BoT-SORT state.
         cleanup_wait_s = self._cleanup_wait_s()
         self._drain_future(inflight, timeout_s=cleanup_wait_s)
+        self._drain_executor_future(recovery, timeout_s=cleanup_wait_s)
         if mission is not None and uav is not None and stream is not None:
             try:
                 self._reset_stream_with_retry(
@@ -748,18 +984,56 @@ class TargetPerceptionCoordinator:
             close_semantic()
 
     def _launch(self, submission: _Submission) -> None:
+        if self._stream_recovery is not None:
+            raise RuntimeError("cannot launch YOLO while stream recovery is active")
         rgb = self._frame_store.get_frame(submission.frame_ref)
         if rgb is None:
             self.metrics.yolo_dropped_frames += 1
             self._last_error = "frame_evicted_before_yolo_submit"
             return
         self.metrics.yolo_requests += 1
+        self.metrics.yolo_requests_submitted += 1
         future = self._executor.submit(
             self._client.track,
             submission.request,
             rgb,
         )
         self._inflight = _Inflight(submission, future)
+
+    def _start_stream_recovery(self) -> None:
+        """Serialize remote stream retirement ahead of the newest frame.
+
+        HTTP request cancellation cannot cancel an inference already running in
+        the service thread pool.  The reset helper waits through exact
+        ``STREAM_BUSY`` responses and only then releases the executor queue for
+        another Track request.
+        """
+
+        if self._stream_recovery is not None:
+            return
+        if self._mission_id is None or self._uav_id is None or self._stream_id is None:
+            raise TargetPerceptionNotReady("stream recovery requires an active binding")
+        self._stream_recovery = self._executor.submit(
+            self._recover_stream,
+            self._mission_id,
+            self._uav_id,
+            self._stream_id,
+            self._cleanup_wait_s(),
+        )
+
+    def _recover_stream(
+        self,
+        mission_id: str,
+        uav_id: str,
+        stream_id: str,
+        timeout_s: float,
+    ) -> None:
+        self._reset_stream_with_retry(
+            mission_id=mission_id,
+            uav_id=uav_id,
+            stream_id=stream_id,
+            timeout_s=timeout_s,
+        )
 
     def bind_visual_review_provider(
         self,
@@ -803,6 +1077,7 @@ class TargetPerceptionCoordinator:
         now_s: float,
     ) -> None:
         self.metrics.detections_total += len(response.detections)
+        self.metrics.tracked_detections_total += len(response.detections)
         if not response.detections:
             return
         proposals = UltralyticsGrounder.from_response(
@@ -899,6 +1174,8 @@ class TargetPerceptionCoordinator:
             bbox_xyxy_normalized=proposal.bbox_xyxy_normalized,
             frame_ref=proposal.frame_ref,
             source=proposal.source,
+            confidence=detection.confidence,
+            tracker_id=f"track_{detection.track_id}",
         )
         if candidate is None:
             return None
@@ -927,10 +1204,13 @@ class TargetPerceptionCoordinator:
         self._tracker_id_by_candidate[candidate.candidate_id] = detection.track_id
         snapshots.append(track)
         del snapshots[:-32]
-        position = self._resolve_position(
+        measurement = self._resolve_measurement(
             candidate,
             timestamp_s,
             now_s=now_s,
+        )
+        position = (
+            None if measurement is None else measurement.position_world_m
         )
         candidates_before = self.metrics.candidates_total
         rejected_before = self.metrics.candidates_rejected
@@ -948,19 +1228,23 @@ class TargetPerceptionCoordinator:
         # with a provisional candidate, including a new tracker observed while
         # another target remains LOCKED/TRACKING.
         filtered = None
-        if confirmed and position is not None:
+        if confirmed and measurement is not None:
             try:
                 if self._estimator_tracker_id != detection.track_id:
                     self._estimator.reset()
                     self._estimator_tracker_id = detection.track_id
                 filtered = self._estimator.update(
-                    timestamp_s=timestamp_s,
-                    position_world_m=position,
-                    confidence=detection.confidence,
+                    replace(
+                        measurement,
+                        tracker_id=f"track_{detection.track_id}",
+                    )
                 )
+                self.metrics.kalman_updates_accepted += 1
                 self.metrics.record_measurement_age(filtered.measurement_age_s)
             except (TargetStateMeasurementRejected, ValueError):
                 self.metrics.depth_resolution_failures += 1
+                self.metrics.measurement_rejected += 1
+                self.metrics.kalman_updates_rejected += 1
 
                 # Rejected depth/geometry measurements are untrusted control
                 # inputs.  Never fall back to the raw position after the
@@ -1011,28 +1295,55 @@ class TargetPerceptionCoordinator:
             source=("kalman_prediction" if prediction_only else self._source_name),
         )
         if self.metrics.candidates_total > candidates_before:
+            self._log_candidate_transition(
+                "candidate_created",
+                timestamp_s=timestamp_s,
+                detection=detection,
+                candidate_id=candidate.candidate_id,
+                measurement=measurement,
+                estimate=estimate,
+            )
             self._capture_debug_image(
                 "first_candidate",
                 frame_ref=submission.frame_ref,
                 detection=detection,
                 candidate_id=candidate.candidate_id,
                 estimate=estimate,
+                measurement=measurement,
             )
         if self.metrics.candidates_rejected > rejected_before:
+            self._log_candidate_transition(
+                "candidate_rejected",
+                timestamp_s=timestamp_s,
+                detection=detection,
+                candidate_id=candidate.candidate_id,
+                measurement=measurement,
+                estimate=estimate,
+            )
             self._capture_debug_image(
                 "candidate_rejected",
                 frame_ref=submission.frame_ref,
                 detection=detection,
                 candidate_id=candidate.candidate_id,
                 estimate=estimate,
+                measurement=measurement,
             )
         if self.metrics.candidates_confirmed > confirmed_before:
+            self._log_candidate_transition(
+                "candidate_confirmed",
+                timestamp_s=timestamp_s,
+                detection=detection,
+                candidate_id=candidate.candidate_id,
+                measurement=measurement,
+                estimate=estimate,
+            )
             self._capture_debug_image(
                 "confirmation_success",
                 frame_ref=submission.frame_ref,
                 detection=detection,
                 candidate_id=candidate.candidate_id,
                 estimate=estimate,
+                measurement=measurement,
             )
         if self.metrics.reacquire_successes > reacquired_before:
             self._capture_debug_image(
@@ -1041,8 +1352,85 @@ class TargetPerceptionCoordinator:
                 detection=detection,
                 candidate_id=candidate.candidate_id,
                 estimate=estimate,
+                measurement=measurement,
             )
         return estimate
+
+    def _log_candidate_transition(
+        self,
+        transition: str,
+        *,
+        timestamp_s: float,
+        detection: TrackDetection,
+        candidate_id: str,
+        measurement: TargetMeasurement | None,
+        estimate: TargetEstimate,
+    ) -> None:
+        """Emit one scalar-only event per lifecycle edge, never per frame.
+
+        The event is intentionally restricted to production evidence. It does
+        not contain target truth, simulator object identity, prim paths, motion
+        seeds, images, or depth arrays.
+        """
+
+        if (
+            self._candidate_transition_logs_emitted
+            >= _MAX_CANDIDATE_TRANSITION_LOGS_PER_ASSIGNMENT
+        ):
+            return
+        self._candidate_transition_logs_emitted += 1
+
+        attribute_state = "pending"
+        color_result: str | None = None
+        records = getattr(self._semantic_provider, "evidence_records", None)
+        if callable(records):
+            for record in reversed(tuple(records())):
+                if getattr(record, "candidate_id", None) != candidate_id:
+                    continue
+                raw_decision = getattr(record, "decision", "pending")
+                attribute_state = str(
+                    getattr(raw_decision, "value", raw_decision)
+                ).casefold()
+                raw_color = getattr(record, "observed_value", None)
+                color_result = None if raw_color is None else str(raw_color)
+                break
+        position = estimate.position_world_m
+        record = {
+            "timestamp": float(timestamp_s),
+            "uav_id": self._uav_id,
+            "assignment_id": self._assignment_id,
+            "transition": transition,
+            "tracker_id": f"track_{detection.track_id}",
+            "candidate_id": candidate_id,
+            "bbox": list(detection.bbox_xyxy_normalized),
+            "detector_confidence": float(detection.confidence),
+            "attribute_state": attribute_state,
+            "color_result": color_result,
+            "geometry_state": (
+                "measurement_created"
+                if measurement is not None
+                else "measurement_rejected"
+            ),
+            "measurement_source": (
+                None if measurement is None else measurement.source
+            ),
+            "position_world_m": None if position is None else list(position),
+            "confirmed": bool(estimate.confirmed),
+            "target_id": estimate.target_id if estimate.confirmed else None,
+            "estimate_source": estimate.source,
+        }
+        self._candidate_transition_records.append(dict(record))
+        print(
+            "[PerceptionCandidate] "
+            + json.dumps(
+                record,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
     def _confirmation_state(
         self,
@@ -1094,6 +1482,7 @@ class TargetPerceptionCoordinator:
             )
             self._confirmation.register_candidate(detection_candidate, target_manager)
             self.metrics.candidates_total += 1
+            self.metrics.candidate_created += 1
             return False, None
         active_id = target_manager.snapshot().target_id
         if active_id != candidate.candidate_id:
@@ -1108,6 +1497,14 @@ class TargetPerceptionCoordinator:
             track.observation_count < self._config.tracker.min_track_observations
             or track.duration_s < self._config.tracker.min_track_duration_s
         ):
+            return False, None
+
+        # A detector/semantic match without a finite current 3-D measurement
+        # is not actionable identity evidence.  Keep initial acquisition and
+        # REACQUIRE candidates pending; the early LOCKED/TRACKING same-ID path
+        # above still permits bounded estimator prediction during a transient
+        # depth outage.
+        if position is None:
             return False, None
 
         semantic = self._semantic_evidence(
@@ -1159,6 +1556,9 @@ class TargetPerceptionCoordinator:
             is_new_reacquire_track,
             max(confirmation_track.timestamp_s, semantic.timestamp_s),
             confirmation_track,
+            semantic,
+            target_spec,
+            position,
         )
         if identity is None:
             identity = IdentityConsistencyEvidence(
@@ -1178,7 +1578,11 @@ class TargetPerceptionCoordinator:
                     0.0 if is_new_reacquire_track else confirmation_track.confidence
                 ),
                 source=(
-                    "qwen_reacquire_pending"
+                    (
+                        "qwen_reacquire_pending"
+                        if self._config.confirmation.require_qwen_for_reacquire_new_track_id
+                        else "deterministic_reacquire_pending"
+                    )
                     if is_new_reacquire_track
                     else "temporal_track"
                 ),
@@ -1191,6 +1595,7 @@ class TargetPerceptionCoordinator:
         )
         if result.decision is ConfirmationDecision.REJECTED:
             self.metrics.candidates_rejected += 1
+            self.metrics.candidate_rejected += 1
             bank_candidate = self._require_candidate_bank().get(candidate.candidate_id)
             if bank_candidate is not None and bank_candidate.lifecycle not in {
                 CandidateLifecycle.REJECTED,
@@ -1210,6 +1615,9 @@ class TargetPerceptionCoordinator:
             return False, None
         if result.decision is ConfirmationDecision.CONFIRMED:
             self.metrics.candidates_confirmed += 1
+            self.metrics.candidate_confirmed += 1
+            if snapshot.lifecycle is TargetLifecycle.CANDIDATE:
+                self.metrics.search_target_found += 1
             if self._expected_reacquire_target_id is not None:
                 self.metrics.reacquire_successes += 1
             self._locked_tracker_id = detection.track_id
@@ -1339,6 +1747,9 @@ class TargetPerceptionCoordinator:
         new_reacquire_track: bool,
         timestamp_s: float,
         track: ShortTrackEvidence,
+        semantic: SemanticVerification,
+        target_spec: TargetSpec,
+        position: tuple[float, float, float] | None,
     ) -> IdentityConsistencyEvidence | None:
         if self._identity_provider is not None:
             supplied = self._identity_provider(
@@ -1376,6 +1787,16 @@ class TargetPerceptionCoordinator:
                 )
             except (QwenEvidencePending, VisualEvidenceError, ValueError, TypeError):
                 return None
+        if new_reacquire_track:
+            return self._deterministic_reacquire_identity(
+                candidate=candidate,
+                target_id=target_id,
+                timestamp_s=timestamp_s,
+                track=track,
+                semantic=semantic,
+                target_spec=target_spec,
+                position=position,
+            )
         reference_track_id = (
             tracker_id if self._locked_tracker_id is None else self._locked_tracker_id
         )
@@ -1390,6 +1811,84 @@ class TargetPerceptionCoordinator:
             )
         except ReacquireIdentityRequiresQwen:
             return None
+
+    def _deterministic_reacquire_identity(
+        self,
+        *,
+        candidate: CandidateSnapshot,
+        target_id: str,
+        timestamp_s: float,
+        track: ShortTrackEvidence,
+        semantic: SemanticVerification,
+        target_spec: TargetSpec,
+        position: tuple[float, float, float] | None,
+    ) -> IdentityConsistencyEvidence | None:
+        """Rebind a fragmented track only from bounded production evidence.
+
+        This path is used only when the explicit Qwen-new-track gate is off.
+        A class match alone is deliberately insufficient: a supported exact
+        colour assertion must have terminal deterministic RGB-D evidence, the
+        measured position must remain close to the last confirmed kinematic
+        state, and the gap must fit inside the configured prediction horizon.
+        Returning ``None`` keeps TargetManager in CANDIDATE.
+        """
+
+        expected_color: str | None = None
+        for assertion in target_spec.hard_attributes:
+            if assertion.count("=") != 1:
+                return None
+            name, value = assertion.split("=", 1)
+            if name.casefold() == "color":
+                if expected_color is not None:
+                    return None
+                expected_color = value.casefold()
+        supported_colors = {
+            value.casefold()
+            for value in self._config.attributes.color.supported_values
+        }
+        color_consistent = bool(
+            expected_color in supported_colors
+            and semantic.matches
+            and semantic.verifier == DETERMINISTIC_ATTRIBUTE_VERIFIER
+            and semantic.confidence >= self._confirmation.policy.min_semantic_confidence
+        )
+        reference = self._latest_confirmed_estimate
+        if (
+            not color_consistent
+            or reference is None
+            or reference.target_id != target_id
+            or reference.position_world_m is None
+            or position is None
+        ):
+            return None
+        elapsed_s = timestamp_s - reference.timestamp_s
+        if (
+            elapsed_s < 0.0
+            or elapsed_s > self._config.state_estimator.max_prediction_age_s
+        ):
+            return None
+        reference_velocity = reference.velocity_world_mps or (0.0, 0.0, 0.0)
+        expected_position = tuple(
+            reference.position_world_m[index]
+            + reference_velocity[index] * elapsed_s
+            for index in range(3)
+        )
+        position_error_m = sum(
+            (position[index] - expected_position[index]) ** 2
+            for index in range(3)
+        ) ** 0.5
+        if position_error_m > self._config.state_estimator.max_position_jump_m:
+            return None
+        return IdentityConsistencyEvidence(
+            candidate_id=candidate.candidate_id,
+            target_id=target_id,
+            timestamp_s=timestamp_s,
+            reidentified=True,
+            temporally_consistent=track.stable,
+            consistent_observations=track.observation_count,
+            confidence=min(track.confidence, semantic.confidence),
+            source="deterministic_color_position_time_reacquire",
+        )
 
     def _latest_visual_review(
         self,
@@ -1427,24 +1926,98 @@ class TargetPerceptionCoordinator:
             self._identity_reference_refs = (frame_ref,)
             return
 
-    def _resolve_position(
+    def _resolve_measurement(
         self,
         candidate: CandidateSnapshot,
         timestamp_s: float,
         *,
         now_s: float,
-    ) -> tuple[float, float, float] | None:
+    ) -> TargetMeasurement | None:
+        self.metrics.depth_resolution_attempts += 1
         if now_s - timestamp_s > self._config.geometry.max_measurement_age_s:
-            self.metrics.depth_resolution_failures += 1
+            self._record_depth_resolution_failure(
+                "measurement_too_old",
+                candidate=candidate,
+                timestamp_s=timestamp_s,
+            )
             return None
         try:
-            return self._resolver.resolve(
+            measurement = self._resolver.resolve(
                 candidate,
                 timestamp_s=timestamp_s,
-            ).position_xyz_m
-        except CandidateResolutionUnavailable:
-            self.metrics.depth_resolution_failures += 1
+            )
+            if measurement is None:
+                self._record_depth_resolution_failure(
+                    "resolver_returned_none",
+                    candidate=candidate,
+                    timestamp_s=timestamp_s,
+                )
+                return None
+            if not isinstance(measurement, TargetMeasurement):
+                raise TypeError(
+                    "production CandidateResolver must return TargetMeasurement or None"
+                )
+            self.metrics.depth_resolution_successes += 1
+            self.metrics.measurement_created += 1
+            return measurement
+        except CandidateResolutionUnavailable as exc:
+            self._record_depth_resolution_failure(
+                _resolution_failure_reason(exc),
+                candidate=candidate,
+                timestamp_s=timestamp_s,
+            )
             return None
+
+    def _record_depth_resolution_failure(
+        self,
+        reason: str,
+        *,
+        candidate: CandidateSnapshot,
+        timestamp_s: float,
+    ) -> None:
+        """Count every failure and emit exponentially throttled bounded logs."""
+
+        normalized = _bounded_reason(reason)
+        counts = self.metrics.depth_resolution_failure_reason_counts
+        metric_key = normalized
+        if metric_key not in counts and len(counts) >= _MAX_DEPTH_RESOLUTION_FAILURE_REASON_KEYS:
+            metric_key = "other_resolution_failure"
+        counts[metric_key] = counts.get(metric_key, 0) + 1
+        self.metrics.depth_resolution_last_failure_reason = normalized
+        self.metrics.depth_resolution_failures += 1
+        self.metrics.measurement_rejected += 1
+
+        assignment_count = self._depth_resolution_failure_log_counts.get(normalized, 0) + 1
+        self._depth_resolution_failure_log_counts[normalized] = assignment_count
+        # Emit occurrences 1, 2, 4, 8, ... for each reason, subject to a hard
+        # per-assignment cap. Persistent failures remain visible without a
+        # frame-rate log flood.
+        should_emit = assignment_count & (assignment_count - 1) == 0
+        if (
+            not should_emit
+            or self._depth_resolution_failure_logs_emitted
+            >= _MAX_DEPTH_RESOLUTION_FAILURE_LOGS_PER_ASSIGNMENT
+        ):
+            return
+        self._depth_resolution_failure_logs_emitted += 1
+        print(
+            "[PerceptionDepthFailure] "
+            + json.dumps(
+                {
+                    "timestamp": timestamp_s,
+                    "uav_id": self._uav_id,
+                    "assignment_id": self._assignment_id,
+                    "candidate_id": candidate.candidate_id,
+                    "reason": normalized,
+                    "reason_occurrence": assignment_count,
+                },
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            flush=True,
+        )
 
     def _estimate_for_now(
         self,
@@ -1553,6 +2126,7 @@ class TargetPerceptionCoordinator:
         candidate_id: str | None,
         estimate: TargetEstimate | None,
         measurement_age_s: float | None = None,
+        measurement: TargetMeasurement | None = None,
     ) -> None:
         writer = self._debug_image_writer
         if writer is None:
@@ -1612,6 +2186,12 @@ class TargetPerceptionCoordinator:
                         )
                     ),
                     source=self._source_name,
+                    sampled_pixel_uv=(
+                        None if measurement is None else measurement.pixel_uv
+                    ),
+                    raw_depth_m=(
+                        None if measurement is None else measurement.raw_depth_m
+                    ),
                 ),
             )
         except Exception:
@@ -1644,6 +2224,46 @@ class TargetPerceptionCoordinator:
                 str(exc)
             ) from exc
 
+    def _compile_target_query_spec(
+        self,
+        target_query: TargetQuerySpec,
+    ) -> TargetQuery:
+        """Compile the already-whitelisted production query."""
+
+        if not isinstance(target_query, TargetQuerySpec):
+            raise TypeError("target_query must be a TargetQuerySpec")
+        self._validate_target_query_model(target_query, self._model_names)
+        if self._config.detector.model_family == "yolo":
+            return TargetQuery(
+                class_ids=(target_query.detector_class_id,),
+                text_prompts=(),
+            )
+        # YOLOE remains open-vocabulary, but its prompt is compiled only from
+        # the same whitelisted semantic value.  No scene/evaluator data is
+        # available at this boundary.
+        return compile_target_query(
+            target_query.to_semantic_target_spec(),
+            self._config.detector.model_family,
+            self._model_names,
+            self._alias_mapper,
+        )
+
+    def _validate_target_query_model(
+        self,
+        target_query: TargetQuerySpec,
+        model_names: Mapping[int, str],
+    ) -> None:
+        if self._config.detector.model_family != "yolo":
+            return
+        actual_name = model_names.get(target_query.detector_class_id)
+        if actual_name != target_query.detector_class_name:
+            raise TargetQueryUnsupported(
+                "production target query class does not exactly match loaded "
+                "model.names: "
+                f"requested={target_query.detector_class_id}:"
+                f"{target_query.detector_class_name!r}, actual={actual_name!r}"
+            )
+
     def _cleanup_wait_s(self) -> float:
         return min(
             5.0,
@@ -1659,6 +2279,19 @@ class TargetPerceptionCoordinator:
         except Exception:
             # Cancellation, request failure and timeout are all followed by a
             # stream reset.  The caller decides whether reset failure is fatal.
+            pass
+
+    @staticmethod
+    def _drain_executor_future(
+        future: Future[object] | None,
+        *,
+        timeout_s: float,
+    ) -> None:
+        if future is None or future.cancelled():
+            return
+        try:
+            future.result(timeout=timeout_s)
+        except Exception:
             pass
 
     def _reset_stream_with_retry(
@@ -1682,7 +2315,7 @@ class TargetPerceptionCoordinator:
                     )
                 )
                 return
-            except YoloClientResponseError as exc:
+            except (YoloClientStreamBusy, YoloClientResponseError) as exc:
                 message = str(exc).casefold()
                 retryable = any(
                     marker in message for marker in ("stream_busy", "busy", "409")
@@ -1768,6 +2401,20 @@ def _rmse_or_none(squared_errors: Sequence[float]) -> float | None:
 
 def _safe_error(prefix: str, exc: Exception) -> str:
     return f"{prefix}:{type(exc).__name__}"[:256]
+
+
+def _bounded_reason(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("resolution failure reason must be a string")
+    normalized = " ".join(value.split())
+    if not normalized:
+        normalized = "candidate_resolution_unavailable"
+    return normalized[:256]
+
+
+def _resolution_failure_reason(exc: CandidateResolutionUnavailable) -> str:
+    message = _bounded_reason(str(exc))
+    return _bounded_reason(f"{type(exc).__name__}:{message}")
 
 
 __all__ = [

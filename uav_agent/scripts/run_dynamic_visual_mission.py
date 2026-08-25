@@ -67,6 +67,26 @@ class LaunchConfigurationError(ValueError):
     """Raised before Isaac/Qwen startup when an opt-in is incomplete."""
 
 
+def _preflight_dynamic_target_geometry(
+    config: object,
+    *,
+    backend_name: str,
+) -> object | None:
+    """Fail closed on temporal artifacts before the first Isaac import."""
+
+    if backend_name != "ultralytics_service":
+        return None
+    from perception.factory import (
+        TargetPerceptionConfigurationError,
+        preflight_temporal_ray_depth,
+    )
+
+    try:
+        return preflight_temporal_ray_depth(config)
+    except (TargetPerceptionConfigurationError, TypeError, ValueError) as exc:
+        raise LaunchConfigurationError(str(exc)) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class TestInjectionSpec:
     """One explicitly synthetic, simulation-time event trigger."""
@@ -1927,6 +1947,8 @@ def _run_until_terminal(
     route_collision_failed = False
     route_collision_terminal = False
     target_perception_failed = False
+    previous_target_uav_yaw_rad: float | None = None
+    previous_target_uav_motion_timestamp_s: float | None = None
 
     while simulation_app.is_running() and snapshot.status.value == "RUNNING":
         now = clock.now()
@@ -1964,9 +1986,30 @@ def _run_until_terminal(
                     target_spec = target_manager.target_spec
                     try:
                         if target_spec is not None:
+                            from perception.runtime_bridge import (
+                                synchronized_uav_self_motion,
+                            )
+
+                            linear_velocity, angular_velocity = (
+                                synchronized_uav_self_motion(
+                                    base_observation,
+                                    previous_yaw_rad=previous_target_uav_yaw_rad,
+                                    previous_timestamp_s=(
+                                        previous_target_uav_motion_timestamp_s
+                                    ),
+                                )
+                            )
                             target_perception_coordinator.submit_frame(
                                 camera_sample=environment.get_camera_sample(),
                                 target_spec=target_spec,
+                                uav_linear_velocity_world_mps=linear_velocity,
+                                uav_angular_velocity_body_radps=angular_velocity,
+                            )
+                            previous_target_uav_yaw_rad = float(
+                                base_observation.uav_pose.yaw
+                            )
+                            previous_target_uav_motion_timestamp_s = float(
+                                base_observation.timestamp
                             )
                         estimate = target_perception_coordinator.poll(
                             now_s=float(base_observation.timestamp),
@@ -2497,6 +2540,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.effective_obstacle_perception_mode = (
             args.obstacle_perception or config.obstacle_perception.mode
         )
+        temporal_model_metadata = _preflight_dynamic_target_geometry(
+            config,
+            backend_name=effective_target_backend,
+        )
+        if temporal_model_metadata is not None:
+            print(
+                "[Perception] temporal_ray_depth_preflight="
+                + json.dumps(
+                    temporal_model_metadata,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
         review_mode, injections = validate_launch_args(
             args,
             configured_review_mode=config.qwen_visual_review.mode,
@@ -2752,19 +2810,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 acknowledge_privileged_oracle=True,
             )
         elif config.target_perception.backend == "ultralytics_service":
-            from perception.depth_geometry import DepthCandidateResolver
+            from perception.factory import build_target_candidate_resolver
             from perception.target_perception_coordinator import (
                 TargetPerceptionCoordinator,
             )
 
-            candidate_resolver = DepthCandidateResolver(
-                frame_store,
-                sampling_strategy=config.target_perception.geometry.depth_anchor,
-                patch_radius_px=(
-                    config.target_perception.geometry.depth_patch_radius_px
-                ),
-                min_depth_m=config.target_perception.geometry.min_depth_m,
-                max_depth_m=config.target_perception.geometry.max_depth_m,
+            candidate_resolver = build_target_candidate_resolver(
+                config.target_perception,
+                frame_store=frame_store,
             )
             target_perception_coordinator = TargetPerceptionCoordinator(
                 config.target_perception,
@@ -2774,7 +2827,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(
                 "[Perception] production ultralytics_service enabled; "
-                "geometry_source=isaac_depth, oracle_fallback=forbidden"
+                "geometry_source="
+                f"{config.target_perception.geometry.mode}, "
+                "oracle_fallback=forbidden"
             )
         else:
             from perception.grounding import ProductionCandidateResolver

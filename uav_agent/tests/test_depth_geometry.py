@@ -29,6 +29,7 @@ def _candidate(ref: FrameRef) -> CandidateSnapshot:
         source="yolo26_botsort",
         lifecycle=CandidateLifecycle.PROVISIONAL,
         review_history=(),
+        tracker_id_history=("track_1",),
     )
 
 
@@ -97,6 +98,7 @@ class DepthGeometryTest(unittest.TestCase):
         ref = store.add_sample(uav_id="uav_1", frame_id="frame_1", sample=sample)
         resolved = DepthCandidateResolver(
             store,
+            sampling_strategy="bbox_bottom_center",
             patch_radius_px=1,
             min_depth_m=0.2,
             max_depth_m=20.0,
@@ -105,6 +107,7 @@ class DepthGeometryTest(unittest.TestCase):
         # Bottom-center pixel is (5, 7): optical (0, .08, 4), then FLU.
         np.testing.assert_allclose(resolved.position_xyz_m, (5.0, 2.0, 2.92), atol=1e-6)
         self.assertEqual(resolved.source, "isaac_depth_bbox_bottom_center")
+        self.assertEqual(resolved.tracker_id, "track_1")
 
     def test_missing_or_invalid_depth_never_fabricates_zero_position(self) -> None:
         store = FrameStore(max_frames=2, max_bytes=10_000, max_age_s=10.0)

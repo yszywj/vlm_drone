@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future
 from dataclasses import replace
+import json
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ from target import TargetLifecycle, TargetManager, TargetSpec
 from tests.perception.test_yolo_runtime_provider import (
     _Bridge,
     _base,
+    _query,
     _sample,
 )
 from yolo_service.protocol import (
@@ -58,15 +60,13 @@ def test_two_yolo_runtimes_keep_identical_tracker_ids_isolated() -> None:
         mission_id="fleet_mission_1",
         assignment_id="assignment_a",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec_a,
+        target_query=_query(spec_a, "target_i"),
     )
     runtime_b.reset(
         mission_id="fleet_mission_1",
         assignment_id="assignment_b",
         uav_id="uav_b",
-        target_alias="target_j",
-        target_spec=spec_b,
+        target_query=_query(spec_b, "target_j"),
     )
     sample = _sample(1.0)
 
@@ -114,7 +114,11 @@ class _CubeClient:
         return {"schema_version": 1, "status": "ok", "ready": True}
 
     def model_info(self) -> YoloModelInfo:
-        return YoloModelInfo("yolo", ((0, "cube"),))
+        return YoloModelInfo(
+            "yolo",
+            ((0, "cube"),),
+            "895de7caa8af200c12f343c72e3a726ffae65e4d96d2092decaf96ef4558de07",
+        )
 
     def reset_stream(self, request) -> None:
         self.reset_calls.append(request.stream_id)
@@ -265,7 +269,9 @@ def _run_color_sequence(
     return coordinator, manager, estimates, review_calls
 
 
-def test_color_temporal_threshold_blocks_class_only_and_early_qwen_lock() -> None:
+def test_color_temporal_threshold_blocks_class_only_and_early_qwen_lock(
+    capsys,
+) -> None:
     coordinator, manager, estimates, review_calls = _run_color_sequence(
         (255, 0, 0)
     )
@@ -280,6 +286,32 @@ def test_color_temporal_threshold_blocks_class_only_and_early_qwen_lock() -> Non
     assert estimates[-1].confirmed is True
     assert manager.lifecycle is TargetLifecycle.LOCKED
     assert coordinator.metrics.candidates_confirmed == 1
+    metrics = coordinator.runtime_metrics()
+    assert metrics["attribute_confirmed"] == 1
+    assert metrics["attribute_ambiguous"] == 2
+    assert metrics["measurement_created"] == 4
+    assert metrics["kalman_updates_accepted"] == 1
+    assert metrics["search_target_found"] == 1
+
+    prefix = "[PerceptionCandidate] "
+    candidate_events = [
+        json.loads(line.removeprefix(prefix))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith(prefix)
+    ]
+    confirmed = next(
+        event
+        for event in candidate_events
+        if event["transition"] == "candidate_confirmed"
+    )
+    assert confirmed["tracker_id"] == "track_7"
+    assert confirmed["attribute_state"] == "match"
+    assert confirmed["color_result"] == "red"
+    assert confirmed["geometry_state"] == "measurement_created"
+    assert confirmed["measurement_source"] == "isaac_depth_foreground_cluster_median"
+    assert confirmed["confirmed"] is True
+    assert confirmed["position_world_m"] is not None
+    assert confirmed["estimate_source"] == "yolo26_botsort"
     coordinator.close()
 
 
@@ -292,6 +324,9 @@ def test_stable_wrong_color_rejects_candidate_without_qwen_override() -> None:
     assert manager.lifecycle is TargetLifecycle.SEARCHING
     assert coordinator.metrics.candidates_confirmed == 0
     assert coordinator.metrics.candidates_rejected == 1
+    metrics = coordinator.runtime_metrics()
+    assert metrics["attribute_confirmed"] == 0
+    assert metrics["attribute_ambiguous"] == 2
     assert review_calls == []
     coordinator.close()
 
@@ -326,8 +361,7 @@ def test_assignment_alias_is_authoritative_for_yolo_lock_and_estimate() -> None:
         mission_id="mission_color",
         assignment_id="assignment_color",
         uav_id="uav_a",
-        target_alias="target_i",
-        target_spec=spec,
+        target_query=_query(spec, "target_i"),
     )
 
     observed = None

@@ -93,6 +93,8 @@ class CandidateSnapshot:
     source: str
     lifecycle: CandidateLifecycle
     review_history: tuple[CandidateReviewRef, ...]
+    confidence_history: tuple[float | None, ...] = ()
+    tracker_id_history: tuple[str | None, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "uav_id", validate_uav_id(self.uav_id))
@@ -121,6 +123,34 @@ class CandidateSnapshot:
         ):
             raise ValueError("frame_history must contain matching FrameRef values")
         object.__setattr__(self, "frame_history", frame_history)
+        confidences = tuple(self.confidence_history)
+        if not confidences:
+            confidences = (None,) * len(self.bbox_history)
+        if len(confidences) != len(self.bbox_history):
+            raise ValueError("confidence_history must align with bbox_history")
+        normalized_confidences: list[float | None] = []
+        for confidence in confidences:
+            if confidence is None:
+                normalized_confidences.append(None)
+                continue
+            value = _timestamp(confidence, "candidate confidence")
+            if value > 1.0:
+                raise ValueError("candidate confidence must be within [0, 1]")
+            normalized_confidences.append(value)
+        object.__setattr__(self, "confidence_history", tuple(normalized_confidences))
+        tracker_ids = tuple(self.tracker_id_history)
+        if not tracker_ids:
+            tracker_ids = (None,) * len(self.bbox_history)
+        if len(tracker_ids) != len(self.bbox_history):
+            raise ValueError("tracker_id_history must align with bbox_history")
+        object.__setattr__(
+            self,
+            "tracker_id_history",
+            tuple(
+                None if value is None else validate_routing_id(value, "tracker_id")
+                for value in tracker_ids
+            ),
+        )
         object.__setattr__(self, "source", _source(self.source))
         if not isinstance(self.lifecycle, CandidateLifecycle):
             raise TypeError("lifecycle must be a CandidateLifecycle")
@@ -147,6 +177,8 @@ class CandidateSnapshot:
                 }
                 for review in self.review_history
             ],
+            "confidence_history": list(self.confidence_history),
+            "tracker_id_history": list(self.tracker_id_history),
         }
 
 
@@ -194,6 +226,8 @@ class CandidateBank:
         bbox_xyxy_normalized: tuple[float, float, float, float],
         frame_ref: FrameRef,
         source: str,
+        confidence: float | None = None,
+        tracker_id: str | None = None,
     ) -> CandidateSnapshot | None:
         candidate_id = validate_routing_id(candidate_id, "candidate_id")
         timestamp = _timestamp(timestamp_s, "timestamp_s")
@@ -203,6 +237,16 @@ class CandidateBank:
         if abs(frame_ref.timestamp_s - timestamp) > 1e-9:
             raise ValueError("frame_ref timestamp must match candidate timestamp")
         normalized_source = _source(source)
+        normalized_confidence = None
+        if confidence is not None:
+            normalized_confidence = _timestamp(confidence, "confidence")
+            if normalized_confidence > 1.0:
+                raise ValueError("confidence must be within [0, 1]")
+        normalized_tracker_id = (
+            None
+            if tracker_id is None
+            else validate_routing_id(tracker_id, "tracker_id")
+        )
         existing = self._candidates.get(candidate_id)
         if existing is not None:
             if timestamp < existing.last_seen_timestamp_s:
@@ -235,6 +279,16 @@ class CandidateBank:
                 if starts_new_evidence_epoch
                 else (*existing.frame_history, frame_ref)[-self._max_history :]
             )
+            confidences = (
+                (normalized_confidence,)
+                if starts_new_evidence_epoch
+                else (*existing.confidence_history, normalized_confidence)[-self._max_history :]
+            )
+            tracker_ids = (
+                (normalized_tracker_id,)
+                if starts_new_evidence_epoch
+                else (*existing.tracker_id_history, normalized_tracker_id)[-self._max_history :]
+            )
             lifecycle = (
                 CandidateLifecycle.PROVISIONAL
                 if starts_new_evidence_epoch
@@ -251,6 +305,8 @@ class CandidateBank:
                 normalized_source,
                 lifecycle,
                 reviews,
+                confidences,
+                tracker_ids,
             )
         else:
             snapshot = CandidateSnapshot(
@@ -263,6 +319,8 @@ class CandidateBank:
                 normalized_source,
                 CandidateLifecycle.PROVISIONAL,
                 (),
+                (normalized_confidence,),
+                (normalized_tracker_id,),
             )
         self._candidates[candidate_id] = snapshot
         self._evict_oldest()

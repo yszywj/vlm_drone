@@ -15,6 +15,7 @@ from experiments.schemas import (
     PlanningAttemptRecord,
     SkillExecutionRecord,
     StateSampleRecord,
+    TARGET_PERCEPTION_TRANSITION_FIELDS,
 )
 
 
@@ -39,6 +40,29 @@ def _attribute_evidence(**updates):
         "duration_s": 0.6,
         "valid_sample_ratio": 0.71,
         "source": "hsv_depth_mask",
+    }
+    payload.update(updates)
+    return payload
+
+
+def _candidate_transition(**updates):
+    payload = {
+        "timestamp": 12.5,
+        "uav_id": "uav_a",
+        "assignment_id": "assignment_x",
+        "transition": "candidate_confirmed",
+        "tracker_id": "track_3",
+        "candidate_id": "candidate_x",
+        "bbox": [0.1, 0.2, 0.6, 0.8],
+        "detector_confidence": 0.91,
+        "attribute_state": "match",
+        "color_result": "red",
+        "geometry_state": "measurement_created",
+        "measurement_source": "temporal_ray_depth",
+        "position_world_m": [4.0, 5.0, 0.5],
+        "confirmed": True,
+        "target_id": "target_x",
+        "estimate_source": "yolo26_botsort",
     }
     payload.update(updates)
     return payload
@@ -264,6 +288,80 @@ def test_yolo_attribute_evidence_rejects_non_scalar_or_encoded_values(
             target_perception_mode="yolo",
         )
     assert not (tmp_path / "agents/uav_a/attribute_evidence.jsonl").exists()
+
+
+def test_yolo_candidate_transition_persists_exact_whitelist(tmp_path) -> None:
+    recorder = FleetResultRecorder(tmp_path, fleet_mission_id="fleet_yolo")
+
+    assert recorder.record_target_perception_transition(
+        "uav_a",
+        _candidate_transition(),
+        target_perception_mode="yolo",
+    )
+
+    path = tmp_path / "agents/uav_a/target_perception_transitions.jsonl"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert tuple(record) == TARGET_PERCEPTION_TRANSITION_FIELDS
+    assert record["schema_version"] == 1
+    assert record["transition"] == "candidate_confirmed"
+    assert record["position_world_m"] == [4.0, 5.0, 0.5]
+    serialized = path.read_text(encoding="utf-8").casefold()
+    for forbidden in ("image", "prim", "seed", "truth", "oracle"):
+        assert forbidden not in serialized
+    assert '"depth":' not in serialized
+
+
+@pytest.mark.parametrize(
+    "forbidden_field",
+    (
+        "camera_rgb",
+        "depth",
+        "prim_path",
+        "motion_seed",
+        "target_truth",
+        "oracle_target_pose",
+    ),
+)
+def test_yolo_candidate_transition_rejects_unknown_privileged_or_media_fields(
+    tmp_path,
+    forbidden_field,
+) -> None:
+    recorder = FleetResultRecorder(tmp_path, fleet_mission_id="fleet_yolo")
+
+    with pytest.raises(ValueError, match="unknown fields"):
+        recorder.record_target_perception_transition(
+            "uav_a",
+            _candidate_transition(**{forbidden_field: "forbidden"}),
+            target_perception_mode="yolo",
+        )
+
+    assert not (
+        tmp_path / "agents/uav_a/target_perception_transitions.jsonl"
+    ).exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("bbox", [0.1, 0.2, 2.0, 0.8]),
+        ("position_world_m", [1.0, float("nan"), 2.0]),
+        ("detector_confidence", True),
+        ("color_result", "data:image/png;base64,AAAA"),
+        ("confirmed", "true"),
+    ),
+)
+def test_yolo_candidate_transition_rejects_invalid_values(
+    tmp_path,
+    field,
+    value,
+) -> None:
+    recorder = FleetResultRecorder(tmp_path, fleet_mission_id="fleet_yolo")
+    with pytest.raises((TypeError, ValueError)):
+        recorder.record_target_perception_transition(
+            "uav_a",
+            _candidate_transition(**{field: value}),
+            target_perception_mode="yolo",
+        )
 
 
 def test_collision_count_tracks_distinct_breach_episodes_not_frames(tmp_path) -> None:

@@ -140,6 +140,8 @@ def test_annotation_contains_every_required_field() -> None:
         "confirmed",
         "position_world_m",
         "measurement_age",
+        "sampled_pixel_uv",
+        "raw_depth",
     ):
         if field != "bbox":
             assert f"{field}=" in lines
@@ -152,6 +154,41 @@ def test_annotation_contains_every_required_field() -> None:
         "target_lost",
         "reacquire_success",
     }
+
+
+def test_debug_image_marks_sampled_pixel_and_foreground_depth_without_saving_depth(
+    tmp_path: Path,
+) -> None:
+    store = FrameStore(max_frames=2, max_bytes=4_000_000, max_age_s=10.0)
+    rgb = np.full((40, 60, 3), 80, dtype=np.uint8)
+    depth = np.full((40, 60), 9.0, dtype=np.float32)
+    depth[10:30, 15:45] = 4.0
+    ref = store.add_frame(
+        uav_id="uav_1",
+        frame_id="frame_depth_1",
+        timestamp_s=0.0,
+        rgb=rgb,
+        depth_to_image_plane_m=depth,
+        intrinsics=CameraIntrinsics(fx=50.0, fy=50.0, cx=29.5, cy=19.5, width=60, height=40),
+        camera_position_world_m=(0.0, 0.0, 0.0),
+        camera_orientation_world_wxyz=(1.0, 0.0, 0.0, 0.0),
+    )
+    writer = BoundedTargetDebugImageWriter(tmp_path, enabled=True, max_images_per_run=1)
+    annotation = replace(
+        _annotation(),
+        bbox_xyxy_normalized=(0.25, 0.25, 0.75, 0.75),
+        sampled_pixel_uv=(30.0, 20.0),
+        raw_depth_m=4.0,
+    )
+
+    assert writer.capture(
+        event="confirmation_success",
+        frame_store=store,
+        frame_ref=ref,
+        annotation=annotation,
+    )
+    assert len(list(tmp_path.glob("*.jpg"))) == 1
+    assert not list(tmp_path.glob("*.npy"))
 
 
 class _InlineExecutor:

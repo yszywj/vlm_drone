@@ -26,6 +26,7 @@ from perception.grounding import (
     CandidateResolver,
     ResolvedCandidatePosition,
 )
+from perception.measurement import TargetMeasurement
 from perception.runtime import (
     PerceptionRuntimeProfile,
 )
@@ -196,7 +197,7 @@ class InspectSkill(Skill):
         self._policy = selected_policy
         self._phase: InspectPhase | None = None
         self._candidate: CandidateSnapshot | None = None
-        self._resolved: ResolvedCandidatePosition | None = None
+        self._resolved: ResolvedCandidatePosition | TargetMeasurement | None = None
         self._approach_position: np.ndarray | None = None
         self._viewpoint_position: np.ndarray | None = None
         self._inspect_motion_policy: MotionPolicy | None = None
@@ -282,14 +283,17 @@ class InspectSkill(Skill):
             )
         except CandidateResolutionUnavailable as exc:
             raise SkillExecutionStateError(str(exc)) from None
-        if not isinstance(resolved, ResolvedCandidatePosition):
-            raise SkillExecutionStateError(
-                "CandidateResolver must return ResolvedCandidatePosition"
-            )
-        if (
-            resolved.uav_id != context.uav_id
-            or resolved.candidate_id != candidate.candidate_id
+        if not isinstance(
+            resolved,
+            (ResolvedCandidatePosition, TargetMeasurement),
         ):
+            raise SkillExecutionStateError(
+                "CandidateResolver must return TargetMeasurement"
+            )
+        route_mismatch = resolved.candidate_id != candidate.candidate_id
+        if isinstance(resolved, ResolvedCandidatePosition):
+            route_mismatch = route_mismatch or resolved.uav_id != context.uav_id
+        if route_mismatch:
             raise SkillExecutionStateError(
                 "CandidateResolver returned mismatched routing IDs"
             )

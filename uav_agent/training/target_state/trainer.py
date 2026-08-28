@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import json
 import math
@@ -219,32 +219,84 @@ def _metric_block(
     }
 
 
-@torch.no_grad()
-def evaluate_model(
-    model: TemporalRayDepthNet,
-    loader: DataLoader[dict[str, Tensor]],
-    *,
-    device: torch.device,
-    maximum_depth_m: float,
-) -> dict[str, object]:
-    model.eval()
-    model_errors: list[Tensor] = []
-    baseline_errors: list[Tensor] = []
-    model_failures: list[Tensor] = []
-    baseline_failures: list[Tensor] = []
-    model_no_target_claims: list[Tensor] = []
-    baseline_no_target_claims: list[Tensor] = []
-    uncertainties: list[Tensor] = []
-    occlusions: list[Tensor] = []
-    jitters: list[Tensor] = []
-    invalid_model = 0
-    invalid_baseline = 0
-    losses: list[float] = []
-    for raw_batch in loader:
-        batch = _to_device(raw_batch, device)
-        output = model(batch["roi_rgbd"], batch["geometry"], batch["missing_mask"])
-        loss = compute_target_state_losses(output, batch)
-        losses.append(float(loss.total.cpu()))
+_EVALUATION_ACCUMULATOR_SCHEMA_VERSION = 1
+_EVALUATION_TENSOR_FIELDS = (
+    "model_errors",
+    "baseline_errors",
+    "model_failures",
+    "baseline_failures",
+    "model_no_target_claims",
+    "baseline_no_target_claims",
+    "uncertainties",
+    "occlusions",
+    "jitters",
+)
+_EVALUATION_BOOLEAN_TENSOR_FIELDS = frozenset(
+    {
+        "model_failures",
+        "baseline_failures",
+        "model_no_target_claims",
+        "baseline_no_target_claims",
+    }
+)
+
+
+@dataclass(slots=True)
+class TargetStateEvaluationAccumulator:
+    """Mergeable sufficient statistics for target-state evaluation.
+
+    Every tensor retained here is a detached CPU snapshot.  Final shard
+    metrics must not be averaged: callers accumulate batches per shard, merge
+    accumulators in dataset order, and call :meth:`finalize` once for the full
+    validation or test split.
+    """
+
+    maximum_depth_m: float
+    model_errors: list[Tensor] = field(default_factory=list)
+    baseline_errors: list[Tensor] = field(default_factory=list)
+    model_failures: list[Tensor] = field(default_factory=list)
+    baseline_failures: list[Tensor] = field(default_factory=list)
+    model_no_target_claims: list[Tensor] = field(default_factory=list)
+    baseline_no_target_claims: list[Tensor] = field(default_factory=list)
+    uncertainties: list[Tensor] = field(default_factory=list)
+    occlusions: list[Tensor] = field(default_factory=list)
+    jitters: list[Tensor] = field(default_factory=list)
+    invalid_model_output_count: int = 0
+    invalid_baseline_output_count: int = 0
+    loss_sum: float = 0.0
+    batch_count: int = 0
+
+    def __post_init__(self) -> None:
+        if isinstance(self.maximum_depth_m, bool):
+            raise ValueError("maximum_depth_m must be finite and positive")
+        self.maximum_depth_m = float(self.maximum_depth_m)
+        if not math.isfinite(self.maximum_depth_m) or self.maximum_depth_m <= 0.0:
+            raise ValueError("maximum_depth_m must be finite and positive")
+
+    @staticmethod
+    def _cpu_snapshot(value: Tensor) -> Tensor:
+        return value.detach().cpu().clone()
+
+    @torch.no_grad()
+    def add_batch(
+        self,
+        *,
+        batch: Mapping[str, Tensor],
+        output: TemporalRayDepthOutput,
+    ) -> None:
+        """Accumulate one already-inferred batch without retaining GPU state."""
+
+        network_heads = (
+            output.delta_uv_px,
+            output.depth_residual_m,
+            output.position_log_variance,
+            output.measurement_valid_logit,
+        )
+        if any(not bool(torch.isfinite(value).all().item()) for value in network_heads):
+            raise TargetStateTrainingError(
+                "evaluation batch contains a non-finite model output"
+            )
+        loss = compute_target_state_losses(output, batch)  # type: ignore[arg-type]
         baseline_world, baseline_depth, baseline_ray_valid = corrected_ray_to_world(
             anchor_uv_px=batch["anchor_uv_px"],
             raw_depth_m=batch["raw_depth_m"],
@@ -255,9 +307,8 @@ def evaluate_model(
             camera_orientation_world_wxyz=batch["camera_orientation_world_wxyz"],
         )
         target = batch["target_position_world_m"]
-        # Evaluation includes every visible target, including real YOLO misses;
-        # otherwise the reported failure rate would silently discard deployment
-        # failures and favor both resolvers.
+        # Keep the original non-sharded semantics: every visible target is an
+        # evaluation sample, including a real detector miss.
         target_present = batch["target_present_mask"].bool()
         label_valid = (
             batch["label_valid_mask"].bool()
@@ -267,65 +318,336 @@ def evaluate_model(
         )
         model_claims_valid = torch.sigmoid(output.measurement_valid_logit) >= 0.5
         model_output_valid = (
-            loss.ray_valid_mask & torch.isfinite(loss.predicted_position_world_m).all(dim=-1)
-            & torch.isfinite(loss.corrected_depth_m) & (loss.corrected_depth_m <= maximum_depth_m)
+            loss.ray_valid_mask
+            & torch.isfinite(loss.predicted_position_world_m).all(dim=-1)
+            & torch.isfinite(loss.corrected_depth_m)
+            & (loss.corrected_depth_m <= self.maximum_depth_m)
             & model_claims_valid
         )
         baseline_output_valid = (
-            baseline_ray_valid & torch.isfinite(baseline_world).all(dim=-1)
-            & torch.isfinite(baseline_depth) & (baseline_depth <= maximum_depth_m)
+            baseline_ray_valid
+            & torch.isfinite(baseline_world).all(dim=-1)
+            & torch.isfinite(baseline_depth)
+            & (baseline_depth <= self.maximum_depth_m)
         )
-        eval_mask = label_valid
-        model_error = torch.linalg.vector_norm(loss.predicted_position_world_m - target, dim=-1)
+        model_error = torch.linalg.vector_norm(
+            loss.predicted_position_world_m - target, dim=-1
+        )
         baseline_error = torch.linalg.vector_norm(baseline_world - target, dim=-1)
-        model_errors.append(model_error[eval_mask].cpu())
-        baseline_errors.append(baseline_error[eval_mask].cpu())
-        model_failures.append((~model_output_valid[eval_mask]).cpu())
-        baseline_failures.append((~baseline_output_valid[eval_mask]).cpu())
         no_target = ~target_present
-        model_no_target_claims.append(model_output_valid[no_target].cpu())
-        baseline_no_target_claims.append(baseline_output_valid[no_target].cpu())
-        uncertainties.append(torch.exp(output.position_log_variance).sum(dim=-1)[eval_mask].cpu())
-        occlusions.append(batch["occlusion_ratio"][eval_mask].cpu())
-        jitters.append(batch["bbox_jitter_score"][eval_mask].cpu())
-        invalid_model += int(_invalid_model_output_mask(
-            output,
-            predicted_position_world_m=loss.predicted_position_world_m,
-            corrected_depth_m=loss.corrected_depth_m,
-            model_claims_valid=model_claims_valid,
-            maximum_depth_m=maximum_depth_m,
-        ).sum().cpu())
-        invalid_baseline += int((
-            ~torch.isfinite(baseline_world).all(dim=-1)
-            | ~torch.isfinite(baseline_depth)
-        ).sum().cpu())
-    if not model_errors:
-        raise TargetStateTrainingError("evaluation loader produced no batches")
-    model_error_values = torch.cat(model_errors)
-    baseline_error_values = torch.cat(baseline_errors)
-    common = {
-        "occlusion": torch.cat(occlusions),
-        "jitter": torch.cat(jitters),
-    }
-    return {
-        "mean_loss": float(np.mean(losses)),
-        "model": _metric_block(
-            model_error_values,
-            failures=torch.cat(model_failures),
-            no_target_valid_claims=torch.cat(model_no_target_claims),
-            uncertainty=torch.cat(uncertainties),
-            invalid_output_count=invalid_model,
-            **common,
-        ),
-        "deterministic_rgbd_baseline": _metric_block(
-            baseline_error_values,
-            failures=torch.cat(baseline_failures),
-            no_target_valid_claims=torch.cat(baseline_no_target_claims),
-            uncertainty=None,
-            invalid_output_count=invalid_baseline,
-            **common,
-        ),
-    }
+
+        # Compute all snapshots/counts before mutating self, so a malformed
+        # batch cannot leave a partially-added accumulator entry.
+        values = {
+            "model_errors": self._cpu_snapshot(model_error[label_valid]),
+            "baseline_errors": self._cpu_snapshot(baseline_error[label_valid]),
+            "model_failures": self._cpu_snapshot(~model_output_valid[label_valid]),
+            "baseline_failures": self._cpu_snapshot(~baseline_output_valid[label_valid]),
+            "model_no_target_claims": self._cpu_snapshot(model_output_valid[no_target]),
+            "baseline_no_target_claims": self._cpu_snapshot(baseline_output_valid[no_target]),
+            "uncertainties": self._cpu_snapshot(
+                torch.exp(output.position_log_variance).sum(dim=-1)[label_valid]
+            ),
+            "occlusions": self._cpu_snapshot(batch["occlusion_ratio"][label_valid]),
+            "jitters": self._cpu_snapshot(batch["bbox_jitter_score"][label_valid]),
+        }
+        invalid_model = int(
+            _invalid_model_output_mask(
+                output,
+                predicted_position_world_m=loss.predicted_position_world_m,
+                corrected_depth_m=loss.corrected_depth_m,
+                model_claims_valid=model_claims_valid,
+                maximum_depth_m=self.maximum_depth_m,
+            ).sum().cpu()
+        )
+        invalid_baseline = int(
+            (
+                ~torch.isfinite(baseline_world).all(dim=-1)
+                | ~torch.isfinite(baseline_depth)
+            ).sum().cpu()
+        )
+        loss_value = float(loss.total.detach().cpu())
+        if not math.isfinite(loss_value):
+            raise TargetStateTrainingError(
+                "evaluation batch produced a non-finite loss"
+            )
+        floating_metric_fields = (
+            "model_errors",
+            "baseline_errors",
+            "uncertainties",
+            "occlusions",
+            "jitters",
+        )
+        for name in floating_metric_fields:
+            if not bool(torch.isfinite(values[name]).all().item()):
+                raise TargetStateTrainingError(
+                    f"evaluation batch produced non-finite metric values: {name}"
+                )
+        next_loss_sum = self.loss_sum + loss_value
+        if not math.isfinite(self.loss_sum) or not math.isfinite(next_loss_sum):
+            raise TargetStateTrainingError(
+                "evaluation accumulated loss is non-finite"
+            )
+
+        for name, value in values.items():
+            getattr(self, name).append(value)
+        self.invalid_model_output_count += invalid_model
+        self.invalid_baseline_output_count += invalid_baseline
+        self.loss_sum = next_loss_sum
+        self.batch_count += 1
+
+    def merge(
+        self, other: "TargetStateEvaluationAccumulator"
+    ) -> "TargetStateEvaluationAccumulator":
+        """Merge *other* into this accumulator in caller-defined shard order."""
+
+        if not isinstance(other, TargetStateEvaluationAccumulator):
+            raise TypeError("other must be a TargetStateEvaluationAccumulator")
+        if other is self:
+            raise ValueError("an evaluation accumulator cannot merge itself")
+        if self.maximum_depth_m != other.maximum_depth_m:
+            raise ValueError(
+                "cannot merge evaluation accumulators with different maximum_depth_m"
+            )
+        if not math.isfinite(self.loss_sum) or not math.isfinite(other.loss_sum):
+            raise TargetStateTrainingError(
+                "cannot merge an accumulator with non-finite loss_sum"
+            )
+        merged_loss_sum = self.loss_sum + other.loss_sum
+        if not math.isfinite(merged_loss_sum):
+            raise TargetStateTrainingError(
+                "merged evaluation loss_sum would be non-finite"
+            )
+        for name in _EVALUATION_TENSOR_FIELDS:
+            getattr(self, name).extend(value.clone() for value in getattr(other, name))
+        self.invalid_model_output_count += other.invalid_model_output_count
+        self.invalid_baseline_output_count += other.invalid_baseline_output_count
+        self.loss_sum = merged_loss_sum
+        self.batch_count += other.batch_count
+        return self
+
+    def state_dict(self) -> dict[str, object]:
+        """Return a validated, checkpoint-safe CPU-only accumulator state."""
+
+        state: dict[str, object] = {
+            "schema_version": _EVALUATION_ACCUMULATOR_SCHEMA_VERSION,
+            "maximum_depth_m": self.maximum_depth_m,
+            "invalid_model_output_count": self.invalid_model_output_count,
+            "invalid_baseline_output_count": self.invalid_baseline_output_count,
+            "loss_sum": self.loss_sum,
+            "batch_count": self.batch_count,
+        }
+        for name in _EVALUATION_TENSOR_FIELDS:
+            state[name] = [value.detach().cpu().clone() for value in getattr(self, name)]
+        # Public fields are intentionally inspectable.  Validate them before
+        # persisting so accidental caller mutation cannot create a corrupt
+        # eval-boundary checkpoint.
+        self.from_state_dict(state, maximum_depth_m=self.maximum_depth_m)
+        return state
+
+    @classmethod
+    def from_state_dict(
+        cls,
+        state: Mapping[str, object],
+        *,
+        maximum_depth_m: float,
+    ) -> "TargetStateEvaluationAccumulator":
+        """Restore a strictly validated CPU-only accumulator checkpoint."""
+
+        if not isinstance(state, Mapping):
+            raise TypeError("evaluation accumulator state must be a mapping")
+        expected_keys = {
+            "schema_version",
+            "maximum_depth_m",
+            "invalid_model_output_count",
+            "invalid_baseline_output_count",
+            "loss_sum",
+            "batch_count",
+            *_EVALUATION_TENSOR_FIELDS,
+        }
+        if set(state) != expected_keys:
+            missing = sorted(expected_keys - set(state))
+            extra = sorted(repr(value) for value in set(state) - expected_keys)
+            raise ValueError(
+                f"invalid evaluation accumulator state keys; missing={missing}, extra={extra}"
+            )
+        if (
+            isinstance(state["schema_version"], bool)
+            or not isinstance(state["schema_version"], int)
+            or state["schema_version"] != _EVALUATION_ACCUMULATOR_SCHEMA_VERSION
+        ):
+            raise ValueError("unsupported evaluation accumulator schema_version")
+
+        if isinstance(maximum_depth_m, bool):
+            raise ValueError("maximum_depth_m must be finite and positive")
+        requested_maximum = float(maximum_depth_m)
+        if not math.isfinite(requested_maximum) or requested_maximum <= 0.0:
+            raise ValueError("maximum_depth_m must be finite and positive")
+        stored_maximum = state["maximum_depth_m"]
+        if isinstance(stored_maximum, bool) or not isinstance(stored_maximum, (int, float)):
+            raise TypeError("state maximum_depth_m must be numeric")
+        if float(stored_maximum) != requested_maximum:
+            raise ValueError("state maximum_depth_m does not match requested evaluation")
+
+        def nonnegative_integer(name: str) -> int:
+            value = state[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"state {name} must be a non-negative integer")
+            return value
+
+        invalid_model_output_count = nonnegative_integer(
+            "invalid_model_output_count"
+        )
+        invalid_baseline_output_count = nonnegative_integer(
+            "invalid_baseline_output_count"
+        )
+        batch_count = nonnegative_integer("batch_count")
+        loss_sum = state["loss_sum"]
+        if isinstance(loss_sum, bool) or not isinstance(loss_sum, (int, float)):
+            raise TypeError("state loss_sum must be numeric")
+        restored_loss_sum = float(loss_sum)
+        if not math.isfinite(restored_loss_sum):
+            raise ValueError("state loss_sum must be finite")
+
+        restored: dict[str, list[Tensor]] = {}
+        for name in _EVALUATION_TENSOR_FIELDS:
+            values = state[name]
+            if not isinstance(values, list) or len(values) != batch_count:
+                raise ValueError(
+                    f"state {name} must be a list with batch_count entries"
+                )
+            snapshots: list[Tensor] = []
+            for value in values:
+                if (
+                    not isinstance(value, Tensor)
+                    or value.device.type != "cpu"
+                    or value.layout is not torch.strided
+                    or value.ndim != 1
+                    or value.requires_grad
+                ):
+                    raise ValueError(
+                        f"state {name} entries must be detached 1-D strided CPU tensors"
+                    )
+                if name in _EVALUATION_BOOLEAN_TENSOR_FIELDS:
+                    if value.dtype != torch.bool:
+                        raise ValueError(f"state {name} entries must use bool dtype")
+                else:
+                    if not value.is_floating_point():
+                        raise ValueError(
+                            f"state {name} entries must be floating-point tensors"
+                        )
+                    if not bool(torch.isfinite(value).all().item()):
+                        raise ValueError(
+                            f"state {name} entries must contain only finite values"
+                        )
+                snapshots.append(value.clone())
+            restored[name] = snapshots
+
+        visible_groups = (
+            "model_errors",
+            "baseline_errors",
+            "model_failures",
+            "baseline_failures",
+            "uncertainties",
+            "occlusions",
+            "jitters",
+        )
+        for index in range(batch_count):
+            visible_lengths = {restored[name][index].numel() for name in visible_groups}
+            if len(visible_lengths) != 1:
+                raise ValueError(
+                    "state visible-target tensor lengths disagree within a batch"
+                )
+            no_target_lengths = {
+                restored[name][index].numel()
+                for name in ("model_no_target_claims", "baseline_no_target_claims")
+            }
+            if len(no_target_lengths) != 1:
+                raise ValueError(
+                    "state no-target tensor lengths disagree within a batch"
+                )
+
+        # Construct and populate the accumulator only after the complete state
+        # has passed validation.  A corrupt checkpoint therefore cannot expose
+        # a partially restored object.
+        result = cls(requested_maximum)
+        result.invalid_model_output_count = invalid_model_output_count
+        result.invalid_baseline_output_count = invalid_baseline_output_count
+        result.batch_count = batch_count
+        result.loss_sum = restored_loss_sum
+        for name, values in restored.items():
+            setattr(result, name, values)
+        return result
+
+    def finalize(self) -> dict[str, object]:
+        """Compute full-split metrics from all accumulated raw observations."""
+
+        if self.batch_count == 0:
+            raise TargetStateTrainingError("evaluation loader produced no batches")
+        model_error_values = torch.cat(self.model_errors)
+        baseline_error_values = torch.cat(self.baseline_errors)
+        common = {
+            "occlusion": torch.cat(self.occlusions),
+            "jitter": torch.cat(self.jitters),
+        }
+        return {
+            "mean_loss": self.loss_sum / self.batch_count,
+            "model": _metric_block(
+                model_error_values,
+                failures=torch.cat(self.model_failures),
+                no_target_valid_claims=torch.cat(self.model_no_target_claims),
+                uncertainty=torch.cat(self.uncertainties),
+                invalid_output_count=self.invalid_model_output_count,
+                **common,
+            ),
+            "deterministic_rgbd_baseline": _metric_block(
+                baseline_error_values,
+                failures=torch.cat(self.baseline_failures),
+                no_target_valid_claims=torch.cat(self.baseline_no_target_claims),
+                uncertainty=None,
+                invalid_output_count=self.invalid_baseline_output_count,
+                **common,
+            ),
+        }
+
+
+@torch.no_grad()
+def accumulate_evaluation(
+    model: TemporalRayDepthNet,
+    loader: DataLoader[dict[str, Tensor]],
+    *,
+    device: torch.device,
+    maximum_depth_m: float,
+    accumulator: TargetStateEvaluationAccumulator | None = None,
+) -> TargetStateEvaluationAccumulator:
+    """Evaluate one loader into a new or existing mergeable accumulator."""
+
+    if accumulator is None:
+        accumulator = TargetStateEvaluationAccumulator(maximum_depth_m)
+    elif accumulator.maximum_depth_m != float(maximum_depth_m):
+        raise ValueError("accumulator maximum_depth_m does not match evaluation")
+    model.eval()
+    for raw_batch in loader:
+        batch = _to_device(raw_batch, device)
+        output = model(batch["roi_rgbd"], batch["geometry"], batch["missing_mask"])
+        accumulator.add_batch(batch=batch, output=output)
+    return accumulator
+
+
+@torch.no_grad()
+def evaluate_model(
+    model: TemporalRayDepthNet,
+    loader: DataLoader[dict[str, Tensor]],
+    *,
+    device: torch.device,
+    maximum_depth_m: float,
+) -> dict[str, object]:
+    return accumulate_evaluation(
+        model,
+        loader,
+        device=device,
+        maximum_depth_m=maximum_depth_m,
+    ).finalize()
 
 
 def evaluate_promotion(
@@ -771,6 +1093,7 @@ def train_target_state(
 
 __all__ = [
     "MODEL_SCHEMA_VERSION", "MODEL_TYPE", "OUTPUT_FIELDS", "TargetStateTrainingError",
-    "TargetStateTrainingResult", "evaluate_model", "evaluate_promotion", "sha256_file",
+    "TargetStateEvaluationAccumulator", "TargetStateTrainingResult",
+    "accumulate_evaluation", "evaluate_model", "evaluate_promotion", "sha256_file",
     "train_target_state", "validate_initial_checkpoint",
 ]

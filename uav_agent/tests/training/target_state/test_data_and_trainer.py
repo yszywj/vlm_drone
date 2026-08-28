@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -37,8 +38,10 @@ from training.target_state.data import (
     _relative_camera_pose as training_relative_camera_pose,
 )
 from training.target_state.trainer import (
+    TargetStateEvaluationAccumulator,
     TargetStateTrainingError,
     _invalid_model_output_mask,
+    accumulate_evaluation,
     evaluate_model,
     evaluate_promotion,
     sha256_file,
@@ -46,6 +49,7 @@ from training.target_state.trainer import (
     validate_initial_checkpoint,
 )
 from training.target_state.model import TemporalRayDepthOutput
+from training.target_state.losses import compute_target_state_losses
 from perception.depth_geometry import DepthCandidateResolver
 from perception.temporal_ray_depth import (
     _relative_camera_pose as production_relative_camera_pose,
@@ -362,6 +366,207 @@ class TargetStateDataTest(unittest.TestCase):
 
 
 class TargetStateTrainerTest(unittest.TestCase):
+    def assertAccumulatorStateEqual(
+        self, left: dict[str, object], right: dict[str, object]
+    ) -> None:
+        self.assertEqual(set(left), set(right))
+        for name in left:
+            if isinstance(left[name], list):
+                self.assertIsInstance(right[name], list)
+                self.assertEqual(len(left[name]), len(right[name]))
+                for left_tensor, right_tensor in zip(left[name], right[name]):
+                    torch.testing.assert_close(left_tensor, right_tensor)
+            else:
+                self.assertEqual(left[name], right[name])
+
+    @staticmethod
+    def _evaluation_batches() -> list[dict[str, torch.Tensor]]:
+        batches: list[dict[str, torch.Tensor]] = []
+        for index in range(4):
+            batch = {
+                name: value.clone()
+                for name, value in _missing_depth_evaluation_batch().items()
+            }
+            batch["target_position_world_m"][0, 0] = float(index + 1)
+            batch["occlusion_ratio"][0] = 0.3 if index % 2 else 0.0
+            batch["bbox_jitter_score"][0] = 0.02 if index >= 2 else 0.0
+            batches.append(batch)
+        no_target = {
+            name: value.clone()
+            for name, value in _missing_depth_evaluation_batch().items()
+        }
+        no_target["target_present_mask"].fill_(False)
+        no_target["label_valid_mask"].fill_(False)
+        no_target["target_position_world_m"].zero_()
+        batches.append(no_target)
+        return batches
+
+    def test_evaluation_accumulators_merge_to_whole_loader_metrics(self) -> None:
+        model = _FixedEvaluationModel(validity_logit=-10.0)
+        batches = self._evaluation_batches()
+        expected = evaluate_model(
+            model,
+            batches,
+            device=torch.device("cpu"),
+            maximum_depth_m=200.0,
+        )
+        first = accumulate_evaluation(
+            model,
+            batches[:2],
+            device=torch.device("cpu"),
+            maximum_depth_m=200.0,
+        )
+        second = accumulate_evaluation(
+            model,
+            batches[2:],
+            device=torch.device("cpu"),
+            maximum_depth_m=200.0,
+        )
+        returned = first.merge(second)
+        self.assertIs(returned, first)
+        self.assertEqual(first.batch_count, len(batches))
+        self.assertAlmostEqual(
+            first.loss_sum / first.batch_count, expected["mean_loss"]
+        )
+        self.assertTrue(
+            all(value.device.type == "cpu" for value in first.model_errors)
+        )
+        self.assertEqual(first.finalize(), expected)
+
+    def test_accumulate_evaluation_can_reuse_one_cross_shard_accumulator(self) -> None:
+        model = _FixedEvaluationModel(validity_logit=-10.0)
+        batches = self._evaluation_batches()
+        accumulator = TargetStateEvaluationAccumulator(maximum_depth_m=200.0)
+        first_result = accumulate_evaluation(
+            model,
+            batches[:3],
+            device=torch.device("cpu"),
+            maximum_depth_m=200.0,
+            accumulator=accumulator,
+        )
+        second_result = accumulate_evaluation(
+            model,
+            batches[3:],
+            device=torch.device("cpu"),
+            maximum_depth_m=200.0,
+            accumulator=accumulator,
+        )
+        self.assertIs(first_result, accumulator)
+        self.assertIs(second_result, accumulator)
+        self.assertEqual(accumulator.batch_count, len(batches))
+
+    def test_evaluation_accumulator_state_round_trip_is_lossless(self) -> None:
+        accumulator = accumulate_evaluation(
+            _FixedEvaluationModel(validity_logit=-10.0),
+            self._evaluation_batches(),
+            device=torch.device("cpu"),
+            maximum_depth_m=200.0,
+        )
+        state = accumulator.state_dict()
+        restored = TargetStateEvaluationAccumulator.from_state_dict(
+            state, maximum_depth_m=200.0
+        )
+        self.assertEqual(restored.finalize(), accumulator.finalize())
+        self.assertEqual(restored.loss_sum, accumulator.loss_sum)
+        self.assertEqual(restored.batch_count, accumulator.batch_count)
+        state["model_errors"][0].fill_(999.0)
+        self.assertNotEqual(
+            state["model_errors"][0].tolist(), restored.model_errors[0].tolist()
+        )
+
+    def test_evaluation_accumulator_state_and_merge_validation(self) -> None:
+        empty = TargetStateEvaluationAccumulator(maximum_depth_m=200.0)
+        with self.assertRaisesRegex(TargetStateTrainingError, "no batches"):
+            empty.finalize()
+        with self.assertRaisesRegex(ValueError, "different maximum_depth_m"):
+            empty.merge(TargetStateEvaluationAccumulator(maximum_depth_m=100.0))
+        state = empty.state_dict()
+        state["batch_count"] = 1
+        with self.assertRaisesRegex(ValueError, "batch_count entries"):
+            TargetStateEvaluationAccumulator.from_state_dict(
+                state, maximum_depth_m=200.0
+            )
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            TargetStateEvaluationAccumulator.from_state_dict(
+                empty.state_dict(), maximum_depth_m=100.0
+            )
+
+    def test_nonfinite_batch_loss_fails_before_accumulator_mutation(self) -> None:
+        batch = _missing_depth_evaluation_batch()
+        model = _FixedEvaluationModel(validity_logit=-10.0)
+        output = model(batch["roi_rgbd"], batch["geometry"], batch["missing_mask"])
+        accumulator = TargetStateEvaluationAccumulator(maximum_depth_m=200.0)
+        accumulator.add_batch(batch=batch, output=output)
+        before = accumulator.state_dict()
+        finite_loss = compute_target_state_losses(output, batch)
+        invalid_loss = replace(finite_loss, total=torch.tensor(float("nan")))
+
+        with patch(
+            "training.target_state.trainer.compute_target_state_losses",
+            return_value=invalid_loss,
+        ):
+            with self.assertRaisesRegex(TargetStateTrainingError, "non-finite loss"):
+                accumulator.add_batch(batch=batch, output=output)
+
+        self.assertAccumulatorStateEqual(before, accumulator.state_dict())
+
+    def test_nonfinite_metric_value_fails_before_accumulator_mutation(self) -> None:
+        batch = _missing_depth_evaluation_batch()
+        output = _FixedEvaluationModel(validity_logit=-10.0)(
+            batch["roi_rgbd"], batch["geometry"], batch["missing_mask"]
+        )
+        overflowing_uncertainty = replace(
+            output,
+            position_log_variance=torch.full_like(
+                output.position_log_variance, 1000.0
+            ),
+        )
+        accumulator = TargetStateEvaluationAccumulator(maximum_depth_m=200.0)
+        before = accumulator.state_dict()
+
+        with self.assertRaisesRegex(
+            TargetStateTrainingError, "non-finite metric values: uncertainties"
+        ):
+            accumulator.add_batch(batch=batch, output=overflowing_uncertainty)
+
+        self.assertAccumulatorStateEqual(before, accumulator.state_dict())
+
+    def test_evaluation_accumulator_restore_rejects_nonfinite_loss_sum(self) -> None:
+        state = TargetStateEvaluationAccumulator(
+            maximum_depth_m=200.0
+        ).state_dict()
+        state["loss_sum"] = float("nan")
+        with self.assertRaisesRegex(ValueError, "loss_sum must be finite"):
+            TargetStateEvaluationAccumulator.from_state_dict(
+                state, maximum_depth_m=200.0
+            )
+
+    def test_evaluation_accumulator_restore_rejects_nonfinite_float_tensors(self) -> None:
+        accumulator = accumulate_evaluation(
+            _FixedEvaluationModel(validity_logit=-10.0),
+            self._evaluation_batches(),
+            device=torch.device("cpu"),
+            maximum_depth_m=200.0,
+        )
+        float_fields = (
+            "model_errors",
+            "baseline_errors",
+            "uncertainties",
+            "occlusions",
+            "jitters",
+        )
+        invalid_values = (float("nan"), float("inf"), float("-inf"))
+        for index, name in enumerate(float_fields):
+            with self.subTest(field=name):
+                state = accumulator.state_dict()
+                state[name][0][0] = invalid_values[index % len(invalid_values)]
+                with self.assertRaisesRegex(
+                    ValueError, rf"state {name} entries must contain only finite values"
+                ):
+                    TargetStateEvaluationAccumulator.from_state_dict(
+                        state, maximum_depth_m=200.0
+                    )
+
     def test_evaluate_model_counts_rejected_missing_depth_as_failure_only(self) -> None:
         metrics = evaluate_model(
             _FixedEvaluationModel(validity_logit=-10.0),

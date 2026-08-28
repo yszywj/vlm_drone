@@ -40,6 +40,9 @@ from training.target_state.collector import (  # noqa: E402
     TargetStateDatasetWriter,
     require_privileged_collection_acknowledgements,
 )
+from training.target_state.collection_spool import (  # noqa: E402
+    TargetStateCollectionSpool,
+)
 from training.target_state.isaac_capture import (  # noqa: E402
     TargetStateFrameAssembler,
     preflight_deployed_yolo,
@@ -56,6 +59,12 @@ from yolo_service.protocol import (  # noqa: E402
 EXPECTED_ENV = Path(
     os.environ.get("UAV_AGENT_CONDA_ENV", "/home/amax/miniconda3/envs/r_isaac_sim")
 ).expanduser()
+DEFAULT_PC_TRANS_ROOT = Path("/home/amax/ry/pc_trans")
+DEFAULT_PC_TRANS_CONFIG = DEFAULT_PC_TRANS_ROOT / "config" / "config.json"
+DEFAULT_BRIDGE_ROOT = Path("/home/amax/ry/vlm_drones/datasets/_bridge")
+DEFAULT_COLLECTION_SESSION_DIR = (
+    _PACKAGE_ROOT.parent / "outputs" / "collection_sessions"
+)
 DEFAULT_MODEL_SHA256 = (
     "895de7caa8af200c12f343c72e3a726ffae65e4d96d2092decaf96ef4558de07"
 )
@@ -64,6 +73,12 @@ DEFAULT_MODEL_SHA256 = (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("isaac", "external"), default="isaac")
+    parser.add_argument(
+        "--storage-mode",
+        choices=("local", "collection-spool"),
+        default="local",
+        help="write one local dataset or publish complete-episode collection shards",
+    )
     parser.add_argument("--source-dataset", type=Path)
     parser.add_argument("--config", default="configs/default.yaml")
     parser.add_argument(
@@ -71,7 +86,33 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=_PACKAGE_ROOT / "configs" / "yolo" / "collect_cube.yaml",
     )
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="local dataset directory (required only with --storage-mode local)",
+    )
+    parser.add_argument("--pc-trans-root", type=Path, default=DEFAULT_PC_TRANS_ROOT)
+    parser.add_argument(
+        "--pc-trans-config", type=Path, default=DEFAULT_PC_TRANS_CONFIG
+    )
+    parser.add_argument("--bridge-root", type=Path, default=DEFAULT_BRIDGE_ROOT)
+    parser.add_argument(
+        "--collection-session-dir",
+        type=Path,
+        default=DEFAULT_COLLECTION_SESSION_DIR,
+        help="parent directory for new collection session journals",
+    )
+    parser.add_argument(
+        "--collection-shard-size-mib",
+        type=float,
+        default=512.0,
+        help="soft shard target checked only after a complete episode",
+    )
+    parser.add_argument(
+        "--resume-session",
+        type=Path,
+        help="existing <collection-session-dir>/<collection_id> to resume",
+    )
     parser.add_argument("--yolo-model-sha256", default=DEFAULT_MODEL_SHA256)
     parser.add_argument("--yolo-url", default="http://127.0.0.1:8011")
     parser.add_argument("--request-timeout-s", type=float, default=5.0)
@@ -95,6 +136,30 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_storage_arguments(args: argparse.Namespace) -> None:
+    if args.storage_mode == "local":
+        if args.resume_session is not None:
+            raise ValueError(
+                "--resume-session is valid only with --storage-mode collection-spool"
+            )
+        if args.output is None:
+            raise ValueError("--output is required with --storage-mode local")
+        return
+    if args.mode != "isaac":
+        raise ValueError("--storage-mode collection-spool requires --mode isaac")
+    if args.output is not None:
+        raise ValueError(
+            "--output is only for local datasets; use --collection-session-dir "
+            "with --storage-mode collection-spool"
+        )
+    if (
+        isinstance(args.collection_shard_size_mib, bool)
+        or not np.isfinite(args.collection_shard_size_mib)
+        or args.collection_shard_size_mib <= 0.0
+    ):
+        raise ValueError("--collection-shard-size-mib must be positive and finite")
+
+
 def _load_depth(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         return np.load(path, allow_pickle=False)
@@ -112,6 +177,8 @@ def _materialize_external(args: argparse.Namespace) -> int:
 
     if args.source_dataset is None:
         raise ValueError("--source-dataset is required when --mode external")
+    if args.output is None:  # guarded by _validate_storage_arguments
+        raise ValueError("--output is required when --mode external")
     source = args.source_dataset.expanduser().resolve()
     output = args.output.expanduser().resolve()
     if source == output:
@@ -187,6 +254,15 @@ def _collect_isaac(args: argparse.Namespace) -> int:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if args.max_frames is not None and args.max_frames <= 0:
         raise ValueError("--max-frames must be positive")
+    if (
+        args.storage_mode == "collection-spool"
+        and args.max_frames is not None
+        and args.max_frames % args.frames_per_episode != 0
+    ):
+        raise ValueError(
+            "--max-frames must be a multiple of --frames-per-episode in "
+            "collection-spool mode; partial episodes are forbidden"
+        )
     if args.scene_seed < 0 or args.gpu_device < 0:
         raise ValueError("scene-seed and gpu-device must be non-negative")
     if args.sample_hz <= 0.0 or args.min_bbox_area_px <= 0.0:
@@ -238,6 +314,7 @@ def _collect_isaac(args: argparse.Namespace) -> int:
     )
     environment = None
     writer: TargetStateDatasetWriter | None = None
+    spool: TargetStateCollectionSpool | None = None
     try:
         from env.simple_uav_search_env import SimpleUavSearchEnv
 
@@ -250,13 +327,55 @@ def _collect_isaac(args: argparse.Namespace) -> int:
             protocol=protocol,
             crossing_trajectories=True,
         )
-        writer = TargetStateDatasetWriter(
-            args.output,
-            verified_yolo_deployment=receipt,
-            split_seed=args.split_seed,
-            history_size=args.history_size,
-            max_history_age_s=args.max_history_age_s,
-        )
+        if args.storage_mode == "local":
+            if args.output is None:  # guarded by _validate_storage_arguments
+                raise ValueError("--output is required for local collection")
+            writer = TargetStateDatasetWriter(
+                args.output,
+                verified_yolo_deployment=receipt,
+                split_seed=args.split_seed,
+                history_size=args.history_size,
+                max_history_age_s=args.max_history_age_s,
+            )
+            first_episode_index = 0
+            captures = records_written = 0
+        else:
+            shard_target_size_bytes = int(
+                args.collection_shard_size_mib * 1024 * 1024
+            )
+            if shard_target_size_bytes <= 0:
+                raise ValueError(
+                    "--collection-shard-size-mib rounds below one byte"
+                )
+            spool_arguments = {
+                "pc_trans_root": args.pc_trans_root,
+                "pc_trans_config": args.pc_trans_config,
+                "bridge_root": args.bridge_root,
+                "shard_target_size_bytes": shard_target_size_bytes,
+                "scene_seed": args.scene_seed,
+                "split_seed": args.split_seed,
+                "history_size": args.history_size,
+                "max_history_age_s": args.max_history_age_s,
+                "verified_yolo_deployment": receipt,
+            }
+            spool = (
+                TargetStateCollectionSpool.resume(
+                    args.resume_session,
+                    **spool_arguments,
+                )
+                if args.resume_session is not None
+                else TargetStateCollectionSpool.create(
+                    collection_session_dir=args.collection_session_dir,
+                    **spool_arguments,
+                )
+            )
+            first_episode_index = spool.next_episode_index
+            captures = spool.sealed_physical_capture_count
+            records_written = spool.sealed_record_count
+            if captures != first_episode_index * args.frames_per_episode:
+                raise ValueError(
+                    "resume --frames-per-episode does not match sealed session captures"
+                )
         assembler = TargetStateFrameAssembler(
             uav_id="uav_1",
             minimum_bbox_area_px=args.min_bbox_area_px,
@@ -266,17 +385,23 @@ def _collect_isaac(args: argparse.Namespace) -> int:
             _randomization_bounds(config),
             scene_seed=args.scene_seed,
         )
+        planned_captures = args.max_episodes * args.frames_per_episode
         maximum_captures = (
-            args.max_episodes * args.frames_per_episode
+            planned_captures
             if args.max_frames is None
-            else args.max_frames
+            else min(args.max_frames, planned_captures)
         )
+        if captures > maximum_captures:
+            raise ValueError(
+                "resume session already exceeds the requested collection size"
+            )
         mission_id = f"targetstate_{args.scene_seed}"
         stream_id = f"{mission_id}:uav_1"
-        captures = records_written = 0
-        for episode_index in range(args.max_episodes):
+        for episode_index in range(first_episode_index, args.max_episodes):
             if captures >= maximum_captures:
                 break
+            if spool is not None:
+                spool.wait_before_episode()
             plan = randomizer.plan(episode_index)
             # Deterministic coverage: multi-target crossing, no-target, and
             # ordinary positives are present without relying on lucky draws.
@@ -298,6 +423,11 @@ def _collect_isaac(args: argparse.Namespace) -> int:
                     else plan.target_speed_mps
                 ),
             )
+            if spool is not None:
+                spool.begin_episode(
+                    plan.key.episode_id,
+                    episode_index=episode_index,
+                )
             adapter.begin_episode(plan)
             assembler.reset_episode()
             client.reset_stream(
@@ -310,8 +440,9 @@ def _collect_isaac(args: argparse.Namespace) -> int:
                 )
             )
             assignment_id = f"assignment_{episode_index:06d}"
+            episode_capture_count = 0
             for frame_index in range(args.frames_per_episode):
-                if captures >= maximum_captures:
+                if spool is None and captures >= maximum_captures:
                     break
                 adapter.advance_to_next_sample(1.0 / args.sample_hz)
                 capture_id = (
@@ -346,26 +477,55 @@ def _collect_isaac(args: argparse.Namespace) -> int:
                 if sample.depth_to_image_plane_m is None:
                     raise RuntimeError("target-state collection requires synchronized depth")
                 for record in records:
-                    writer.append(
+                    sink = spool if spool is not None else writer
+                    if sink is None:  # defensive lifecycle invariant
+                        raise RuntimeError("target-state collection sink is unavailable")
+                    sink.append(
                         record,
                         rgb=sample.rgb,
                         depth_m=sample.depth_to_image_plane_m,
                         asset_id=capture_id,
                     )
                     records_written += 1
+                if spool is not None:
+                    spool.record_physical_capture()
                 captures += 1
-        manifest, report = writer.finalize()
+                episode_capture_count += 1
+            if spool is not None:
+                if episode_capture_count != args.frames_per_episode:
+                    raise RuntimeError(
+                        "collection-spool mode cannot commit a partial episode"
+                    )
+                spool.complete_episode()
+        if spool is not None:
+            spool_result = spool.finalize()
+            result_payload = {
+                "ok": True,
+                "mode": "isaac",
+                "storage_mode": "collection-spool",
+                "physical_capture_count": captures,
+                "record_count": records_written,
+                **spool_result.to_dict(),
+                "detector_deployment": receipt.to_manifest_dict(),
+            }
+        else:
+            if writer is None:  # defensive lifecycle invariant
+                raise RuntimeError("local dataset writer is unavailable")
+            manifest, report = writer.finalize()
+            writer = None
+            result_payload = {
+                "ok": True,
+                "mode": "isaac",
+                "storage_mode": "local",
+                "physical_capture_count": captures,
+                "record_count": records_written,
+                "dataset_manifest": str(manifest),
+                "detector_deployment": receipt.to_manifest_dict(),
+                "report": report.to_dict(),
+            }
         print(
             json.dumps(
-                {
-                    "ok": True,
-                    "mode": "isaac",
-                    "physical_capture_count": captures,
-                    "record_count": records_written,
-                    "dataset_manifest": str(manifest),
-                    "detector_deployment": receipt.to_manifest_dict(),
-                    "report": report.to_dict(),
-                },
+                result_payload,
                 indent=2,
                 ensure_ascii=False,
                 allow_nan=False,
@@ -373,7 +533,9 @@ def _collect_isaac(args: argparse.Namespace) -> int:
         )
         return 0
     except Exception:
-        if writer is not None:
+        if spool is not None:
+            spool.abort()
+        elif writer is not None:
             writer.abort()
         raise
     finally:
@@ -387,6 +549,7 @@ def _collect_isaac(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        _validate_storage_arguments(args)
         require_privileged_collection_acknowledgements(
             oracle_label_generation=args.oracle_label_generation,
             acknowledge_privileged_oracle=args.acknowledge_privileged_oracle,

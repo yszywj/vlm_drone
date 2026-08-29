@@ -168,6 +168,57 @@ def test_tracker_switch_reuses_sensor_candidate_and_miss_keeps_short_continuity(
     assert missed.training_label.velocity_world_mps == (0.3, 0.1, 0.0)
 
 
+def test_missed_object_cannot_reuse_candidate_reserved_by_current_detection() -> None:
+    assembler = TargetStateFrameAssembler(minimum_bbox_area_px=4.0)
+    first_sample = _sample(1.0)
+    first = assembler.assemble(
+        capture_id="capture_1",
+        episode_id="episode_1",
+        assignment_id="assignment_1",
+        truth=OracleFrameTruth(
+            first_sample,
+            objects=(_truth_object("cube_0"),),
+        ),
+        uav_input=_uav(),
+        response=_response(first_sample, (_detection(1),)),
+    )[0]
+
+    second_sample = _sample(1.2)
+    second_records = assembler.assemble(
+        capture_id="capture_2",
+        episode_id="episode_1",
+        assignment_id="assignment_1",
+        truth=OracleFrameTruth(
+            second_sample,
+            objects=(
+                # The historical cube is fully occluded/missed, while the
+                # current detection overlaps the previous sensor box and is
+                # associated with a different visible cube.
+                replace(_truth_object("cube_0"), occlusion_ratio=1.0),
+                _truth_object("cube_1", color="blue"),
+            ),
+        ),
+        uav_input=_uav(),
+        response=_response(second_sample, (_detection(99),), frame_id="frame_2"),
+    )
+
+    by_instance = {
+        record.training_label.instance_id: record
+        for record in second_records
+        if record.training_label is not None
+    }
+    assert by_instance["cube_1"].detector_prediction.candidate_id == (
+        first.detector_prediction.candidate_id
+    )
+    assert by_instance["cube_0"].detector_prediction.candidate_id is None
+    non_null_candidates = [
+        record.detector_prediction.candidate_id
+        for record in second_records
+        if record.detector_prediction.candidate_id is not None
+    ]
+    assert len(non_null_candidates) == len(set(non_null_candidates))
+
+
 def test_multi_target_matching_is_one_to_one_and_false_positive_has_null_label() -> None:
     assembler = TargetStateFrameAssembler(minimum_bbox_area_px=4.0)
     sample = _sample()

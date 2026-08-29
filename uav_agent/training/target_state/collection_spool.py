@@ -634,15 +634,19 @@ class TargetStateCollectionSpool:
         self.close()
         return result
 
-    def abort(self) -> None:
-        """Retain all partial evidence and mark the resumable session interrupted."""
+    def abort(self, *, error: str | None = None) -> None:
+        """Retain partial evidence and mark the resumable session interrupted."""
 
         try:
             if self._writer is not None:
                 self._writer.abort()
                 self._writer = None
             if self._status != "completed":
-                self._write_session(status="interrupted", pending=self._pending)
+                self._write_session(
+                    status="interrupted",
+                    pending=self._pending,
+                    last_error=error,
+                )
         finally:
             self.close()
 
@@ -972,7 +976,11 @@ class TargetStateCollectionSpool:
         self._episode_record_count = 0
 
     def _session_payload(
-        self, *, status: str, pending: Mapping[str, object] | None
+        self,
+        *,
+        status: str,
+        pending: Mapping[str, object] | None,
+        last_error: str | None = None,
     ) -> dict[str, object]:
         return {
             "schema_version": COLLECTION_SCHEMA_VERSION,
@@ -998,15 +1006,25 @@ class TargetStateCollectionSpool:
             "sealed_physical_capture_count": self.sealed_physical_capture_count,
             "sealed_record_count": self.sealed_record_count,
             "status": status,
+            "last_error": last_error,
             "pending_shard": None if pending is None else dict(pending),
         }
 
     def _write_session(
-        self, *, status: str, pending: Mapping[str, object] | None
+        self,
+        *,
+        status: str,
+        pending: Mapping[str, object] | None,
+        last_error: str | None = None,
     ) -> None:
         self._status = status
         _atomic_write_json(
-            self.session_path, self._session_payload(status=status, pending=pending)
+            self.session_path,
+            self._session_payload(
+                status=status,
+                pending=pending,
+                last_error=last_error,
+            ),
         )
 
     def _index_payload(self, *, status: str) -> dict[str, object]:

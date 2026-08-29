@@ -23,6 +23,7 @@ from datasets.target_state.dataset import (
     build_manifest,
     check_dataset,
     compute_dataset_sha256,
+    read_frame_records,
 )
 from datasets.target_state.schema import SensorInput, TargetStateFrameRecord
 from datasets.target_state.sequence import build_sequences
@@ -219,8 +220,19 @@ class TargetStateDatasetWriter:
             raise TargetStateCollectionError("dataset writer is already finalized")
         self._stream.close()
         self._closed = True
+        # Validate the exact records that were persisted.  Reconstructing
+        # CameraFrameInput/UavFrameInput from JSON normalizes quaternions, so
+        # comparing sequences built from the pre-serialization objects can
+        # reject an otherwise valid dataset due to sub-ulp float differences.
+        canonical_records = read_frame_records(self.root / "frames.jsonl")
+        if len(canonical_records) != len(self._records) or tuple(
+            record.frame_id for record in canonical_records
+        ) != tuple(record.frame_id for record in self._records):
+            raise TargetStateCollectionError(
+                "frames.jsonl does not contain the same records that were appended"
+            )
         sequences = build_sequences(
-            self._records,
+            canonical_records,
             history_size=self.history_size,
             max_history_age_s=self.max_history_age_s,
         )
@@ -235,9 +247,9 @@ class TargetStateDatasetWriter:
             raise TargetStateCollectionError(
                 "written target-state dataset failed validation: " + "; ".join(report.errors[:5])
             )
-        dataset_sha = compute_dataset_sha256(self.root, self._records)
+        dataset_sha = compute_dataset_sha256(self.root, canonical_records)
         manifest = build_manifest(
-            self._records,
+            canonical_records,
             sequences,
             dataset_sha256=dataset_sha,
             split_seed=self.split_seed,

@@ -893,6 +893,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "--/rtx-transient/post/aa/limitedOps=false",
                 "--/app/hydra/renderSettings/useUsdAttributes=false",
                 "--/app/hydra/renderSettings/useFabricAttributes=false",
+                # Keep Isaac's known non-fatal Camera/Timeline warnings out
+                # of the terminal while preserving error-level diagnostics.
+                "--/log/channels/isaacsim.core.simulation_manager.plugin=error",
+                "--/log/channels/isaacsim.sensors.camera.camera=error",
             ],
             # A 640x480 collection render does not benefit from spanning every
             # server GPU, and doing so can interfere with model/training jobs.

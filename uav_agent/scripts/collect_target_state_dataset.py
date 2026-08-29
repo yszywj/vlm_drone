@@ -309,6 +309,12 @@ def _collect_isaac(args: argparse.Namespace) -> int:
                 "--/rtx-transient/post/aa/limitedOps=false",
                 "--/app/hydra/renderSettings/useUsdAttributes=false",
                 "--/app/hydra/renderSettings/useFabricAttributes=false",
+                # Isaac 5.1 emits these known non-fatal messages while a
+                # per-episode World reset reinitializes Camera/Timeline
+                # state. Keep errors visible but avoid flooding the collector
+                # terminal with warnings that do not describe a bad sample.
+                "--/log/channels/isaacsim.core.simulation_manager.plugin=error",
+                "--/log/channels/isaacsim.sensors.camera.camera=error",
             ],
         }
     )
@@ -532,11 +538,22 @@ def _collect_isaac(args: argparse.Namespace) -> int:
             )
         )
         return 0
-    except Exception:
+    except Exception as exc:
+        error_text = f"{type(exc).__name__}: {exc}"
         if spool is not None:
-            spool.abort()
+            spool.abort(error=error_text)
         elif writer is not None:
             writer.abort()
+        # Isaac Sim shutdown can redirect or suppress Python stderr.  Emit the
+        # actionable failure while the application is still alive; main()
+        # reports the normal CLI error again after cleanup when possible.
+        print(
+            f"target-state collection failed before Isaac shutdown: {error_text}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if os.environ.get("UAV_AGENT_COLLECTION_TRACEBACK") == "1":
+            traceback.print_exc(file=sys.stderr)
         raise
     finally:
         try:

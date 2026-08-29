@@ -330,6 +330,14 @@ class TargetStateFrameAssembler:
             timestamp_s=sample.timestamp_s,
             appearance_keys=appearance_keys,
         )
+        # A detector candidate is a sensor-side identity and may occur at
+        # most once in one Camera capture.  Current detections (including
+        # detections that later become false positives) reserve their IDs
+        # before historical truth associations are considered.  Without this
+        # reservation, a temporarily missed object could reuse the same
+        # candidate as another object in the current frame, producing two
+        # records at one timestamp and an invalid temporal sequence.
+        used_candidate_ids = set(candidate_ids)
 
         projected: list[tuple[OracleObjectTruth, ProjectionDecision, tuple[float, float, float, float] | None]] = []
         for obj in truth.objects:
@@ -370,13 +378,15 @@ class TargetStateFrameAssembler:
             detection_index = associations.get(obj.object_id)
             if detection_index is None:
                 remembered = self._truth_candidate.get(obj.object_id)
-                candidate_id = (
-                    remembered[0]
-                    if remembered is not None
+                candidate_id = None
+                if (
+                    remembered is not None
                     and sample.timestamp_s - remembered[1]
                     <= self._linker.maximum_gap_s
-                    else None
-                )
+                    and remembered[0] not in used_candidate_ids
+                ):
+                    candidate_id = remembered[0]
+                    used_candidate_ids.add(candidate_id)
                 detector = DetectorPrediction(False, None, None, None, candidate_id)
             else:
                 detection = detections[detection_index]

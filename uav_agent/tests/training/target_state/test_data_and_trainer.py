@@ -346,8 +346,26 @@ class TargetStateDataTest(unittest.TestCase):
             root = Path(temporary) / "written"
             episode = _episode_for("train")
             writer = TargetStateDatasetWriter(root, yolo_model_sha256="a" * 64)
+            camera = CameraFrameInput(
+                fx=24.0,
+                fy=24.0,
+                cx=15.5,
+                cy=11.5,
+                position_world_m=(0.0, 0.0, 0.0),
+                orientation_world_wxyz=(
+                    0.7651479363685005,
+                    -0.1989238050344461,
+                    0.2793046475962796,
+                    0.5449466662828217,
+                ),
+                resolution_wh_px=(32, 24),
+            )
             for index in range(7):
                 record = _record(index, episode, "writer", missed=index == 2)
+                record = replace(
+                    record,
+                    sensor_input=replace(record.sensor_input, camera=camera),
+                )
                 writer.append(
                     record,
                     rgb=np.full((24, 32, 3), 100, dtype=np.uint8),

@@ -432,8 +432,25 @@ def finalize_target_state_collection(
                 "merged episode count does not match collection index"
             )
         _write_frames(temporary / "frames.jsonl", all_records)
+        # Build every derived parent-dataset artifact from the exact records
+        # decoded from the persisted JSONL.  CameraFrameInput/UavFrameInput
+        # normalize quaternions during schema reconstruction, so a JSON
+        # round-trip can change individual float components by one ulp.  A
+        # sequence built from the pre-serialization objects would then fail
+        # check_dataset's intentionally strict frame equality check.
+        canonical_records = read_frame_records(temporary / "frames.jsonl")
+        if len(canonical_records) != len(all_records):
+            raise CollectionFinalizationError(
+                "merged frames.jsonl record count changed during canonicalization"
+            )
+        if tuple(record.frame_id for record in canonical_records) != tuple(
+            record.frame_id for record in all_records
+        ):
+            raise CollectionFinalizationError(
+                "merged frames.jsonl frame IDs changed during canonicalization"
+            )
         sequences = build_sequences(
-            all_records,
+            canonical_records,
             history_size=index.history_size,
             max_history_age_s=index.max_history_age_s,
         )
@@ -449,11 +466,11 @@ def finalize_target_state_collection(
                 "merged collection failed pre-manifest check_dataset: "
                 + "; ".join(preliminary.errors[:5])
             )
-        dataset_sha = compute_dataset_sha256(temporary, all_records)
+        dataset_sha = compute_dataset_sha256(temporary, canonical_records)
         if provenance is None:  # pragma: no cover - non-empty index invariant
             raise CollectionFinalizationError("collection has no provenance")
         manifest = build_manifest(
-            all_records,
+            canonical_records,
             sequences,
             dataset_sha256=dataset_sha,
             split_seed=index.split_seed,

@@ -40,6 +40,15 @@ from training.target_state.collection_spool import TargetStateCollectionSpool
 
 _COLLECTION_ID = "collection_test_001"
 _YOLO_SHA = "a" * 64
+# This quaternion reaches a two-value sub-ulp normalization cycle.  A record
+# decoded from a collection shard therefore differs from the same record
+# decoded once more after the parent frames.jsonl is written.
+_ROUND_TRIP_QUATERNION = (
+    -402228.7797876074,
+    419053.4198575469,
+    -12912.393104000017,
+    416702.1386527759,
+)
 _PROVENANCE = {
     "generation_commit_sha": "testcommit",
     "detector_prediction_source": "external_capture_spool_unverified",
@@ -51,7 +60,13 @@ _PROVENANCE = {
 
 
 class _CollectionFixture:
-    def __init__(self, root: Path, *, asset_conflict: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        asset_conflict: bool = False,
+        round_trip_quaternion: bool = False,
+    ) -> None:
         self.root = root
         self.shards = root / "collection_shards"
         self.shards.mkdir()
@@ -70,6 +85,20 @@ class _CollectionFixture:
                 )
                 for index in range(start, start + 5)
             ]
+            if round_trip_quaternion:
+                records = [
+                    replace(
+                        record,
+                        sensor_input=replace(
+                            record.sensor_input,
+                            camera=replace(
+                                record.sensor_input.camera,
+                                orientation_world_wxyz=_ROUND_TRIP_QUATERNION,
+                            ),
+                        ),
+                    )
+                    for record in records
+                ]
             if ordinal == 1:
                 source = records[0]
                 records.append(
@@ -143,10 +172,17 @@ class _CollectionFixture:
             ),
             encoding="utf-8",
         )
-        sequences = build_sequences(records, history_size=4, max_history_age_s=2.0)
-        dataset_sha = compute_dataset_sha256(workspace, records)
+        # Mirror the production writer: shard-derived data is based on the
+        # exact schema objects decoded from the persisted frames.jsonl.
+        canonical_records = read_frame_records(workspace / "frames.jsonl")
+        sequences = build_sequences(
+            canonical_records,
+            history_size=4,
+            max_history_age_s=2.0,
+        )
+        dataset_sha = compute_dataset_sha256(workspace, canonical_records)
         dataset_manifest = build_manifest(
-            records,
+            canonical_records,
             sequences,
             dataset_sha256=dataset_sha,
             split_seed=42,
@@ -164,9 +200,10 @@ class _CollectionFixture:
             json.dumps(dataset_manifest, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
         )
-        episode_ids = sorted({record.episode_id for record in records})
+        episode_ids = sorted({record.episode_id for record in canonical_records})
         captures = {
-            (record.episode_id, record.sensor_input.rgb_path) for record in records
+            (record.episode_id, record.sensor_input.rgb_path)
+            for record in canonical_records
         }
         collection_manifest = {
             "schema_version": COLLECTION_SCHEMA_VERSION,
@@ -176,7 +213,7 @@ class _CollectionFixture:
             "episode_ids": episode_ids,
             "episode_count": len(episode_ids),
             "physical_capture_count": len(captures),
-            "record_count": len(records),
+            "record_count": len(canonical_records),
             "scene_seed": 123,
             "split_seed": 42,
             "history_size": 4,
@@ -204,7 +241,7 @@ class _CollectionFixture:
             "episode_ids": episode_ids,
             "episode_count": len(episode_ids),
             "physical_capture_count": len(captures),
-            "record_count": len(records),
+            "record_count": len(canonical_records),
         }
 
     def write_index(self) -> None:
@@ -239,6 +276,7 @@ class TargetStateCollectionFinalizerTest(unittest.TestCase):
 
     def test_finalizes_complete_parent_dataset_atomically_and_preserves_archives(self) -> None:
         fixture = _CollectionFixture(self.root)
+        index_before = fixture.index.read_bytes()
         archives_before = {
             path.name: sha256(path.read_bytes()).hexdigest()
             for path in fixture.shards.glob("*.tar")
@@ -287,7 +325,83 @@ class TargetStateCollectionFinalizerTest(unittest.TestCase):
                 for path in fixture.shards.glob("*.tar")
             },
         )
+        self.assertEqual(index_before, fixture.index.read_bytes())
         self.assertFalse(any(path.name.startswith(".complete_parent") for path in self.root.iterdir()))
+
+    def test_parent_sequences_manifest_and_sha_use_round_trip_canonical_records(self) -> None:
+        fixture = _CollectionFixture(self.root, round_trip_quaternion=True)
+        shard_records = read_frame_records(
+            self.root / "workspace_1" / "frames.jsonl"
+        )
+        shard_record = shard_records[0]
+        round_tripped_record = type(shard_record).from_dict(
+            json.loads(
+                json.dumps(
+                    shard_record.to_dict(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+        )
+        self.assertEqual(shard_record.frame_id, round_tripped_record.frame_id)
+        self.assertNotEqual(
+            shard_record.sensor_input.camera.orientation_world_wxyz,
+            round_tripped_record.sensor_input.camera.orientation_world_wxyz,
+        )
+        component_deltas = tuple(
+            abs(actual - expected)
+            for actual, expected in zip(
+                shard_record.sensor_input.camera.orientation_world_wxyz,
+                round_tripped_record.sensor_input.camera.orientation_world_wxyz,
+            )
+        )
+        self.assertGreater(max(component_deltas), 0.0)
+        self.assertLess(max(component_deltas), 1e-15)
+
+        archives_before = {
+            path.name: path.read_bytes() for path in fixture.shards.glob("*.tar")
+        }
+        index_before = fixture.index.read_bytes()
+        output = self.root / "canonical_parent"
+        result = finalize_target_state_collection(
+            fixture.index,
+            fixture.shards,
+            output,
+        )
+
+        canonical_records = read_frame_records(output / "frames.jsonl")
+        canonical_sequences = build_sequences(
+            canonical_records,
+            history_size=4,
+            max_history_age_s=2.0,
+        )
+        manifest = json.loads(
+            (output / "dataset_manifest.json").read_text(encoding="utf-8")
+        )
+        canonical_sha = compute_dataset_sha256(output, canonical_records)
+        report = check_dataset(
+            output,
+            sequences=canonical_sequences,
+            history_size=4,
+            max_history_age_s=2.0,
+            split_seed=42,
+        )
+        self.assertTrue(report.ok, report.errors)
+        self.assertNotIn("frames differ from frames.jsonl", "\n".join(report.errors))
+        self.assertEqual(result.dataset_sha256, canonical_sha)
+        self.assertEqual(manifest["dataset_sha256"], canonical_sha)
+        self.assertEqual(manifest["frame_count"], len(canonical_records))
+        self.assertEqual(manifest["sequence_count"], len(canonical_sequences))
+        self.assertEqual(result.dataset_report.sequence_count, len(canonical_sequences))
+        self.assertEqual(
+            round_tripped_record.sensor_input.camera.orientation_world_wxyz,
+            canonical_records[0].sensor_input.camera.orientation_world_wxyz,
+        )
+        self.assertEqual(
+            archives_before,
+            {path.name: path.read_bytes() for path in fixture.shards.glob("*.tar")},
+        )
+        self.assertEqual(index_before, fixture.index.read_bytes())
 
     def test_check_dataset_failure_names_the_collection_archive(self) -> None:
         fixture = _CollectionFixture(self.root)
@@ -442,8 +556,14 @@ class TargetStateCollectionFinalizerTest(unittest.TestCase):
                 with self.assertRaises(CollectionFinalizationError):
                     load_collection_index(fixture.index)
 
-    def test_rejects_archive_sha_frame_and_asset_conflicts_without_output(self) -> None:
-        for case in ("sha", "manifest_identity", "duplicate_frame", "asset_conflict"):
+    def test_rejects_archive_sha_frame_episode_and_asset_conflicts_without_output(self) -> None:
+        for case in (
+            "sha",
+            "manifest_identity",
+            "duplicate_frame",
+            "episode_identity",
+            "asset_conflict",
+        ):
             with self.subTest(case=case):
                 case_root = self.root / case
                 case_root.mkdir()
@@ -465,13 +585,30 @@ class TargetStateCollectionFinalizerTest(unittest.TestCase):
                     records[0] = replace(records[0], frame_id="frame_0")
                     fixture.payload["shards"][1] = fixture._write_shard(2, records)
                     fixture.write_index()
+                elif case == "episode_identity":
+                    fixture.payload["shards"][1]["episode_ids"] = [
+                        "episode_identity_changed"
+                    ]
+                    fixture.write_index()
+                archives_before = {
+                    path.name: path.read_bytes()
+                    for path in fixture.shards.glob("*.tar")
+                }
+                index_before = fixture.index.read_bytes()
                 output = case_root / "output"
                 with self.assertRaises(CollectionFinalizationError):
                     finalize_target_state_collection(
                         fixture.index, fixture.shards, output
                     )
                 self.assertFalse(output.exists())
-                self.assertEqual(len(tuple(fixture.shards.glob("*.tar"))), 2)
+                self.assertEqual(
+                    archives_before,
+                    {
+                        path.name: path.read_bytes()
+                        for path in fixture.shards.glob("*.tar")
+                    },
+                )
+                self.assertEqual(index_before, fixture.index.read_bytes())
 
     def test_rejects_traversal_links_devices_fifo_duplicates_and_unexpected_files(self) -> None:
         cases = (

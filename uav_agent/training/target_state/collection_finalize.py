@@ -710,7 +710,8 @@ def _validate_extracted_collection_shard(
     )
     if not report.ok or report.dataset_sha256 != actual_sha:
         raise CollectionFinalizationError(
-            "collection shard failed check_dataset: " + "; ".join(report.errors[:5])
+            f"collection shard {entry.filename} failed check_dataset: "
+            + "; ".join(report.errors[:5])
         )
     return records, MappingProxyType(provenance)
 

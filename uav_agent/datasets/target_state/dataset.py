@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 import json
+import math
 from pathlib import Path
 from math import isfinite
 from typing import Mapping, Sequence
@@ -17,6 +18,28 @@ from datasets.target_state.sequence import TargetStateSequence, build_sequences
 
 
 _SPLITS = ("train", "validation", "test")
+_DERIVED_FLOAT_MANIFEST_FIELDS = frozenset(
+    {
+        "mean_detector_bbox_center_step_normalized",
+        "mean_occlusion_ratio",
+        "yolo_miss_rate",
+    }
+)
+
+
+def _derived_manifest_float_matches(actual: object, expected: object) -> bool:
+    """Compare a derived numeric statistic without weakening type checks."""
+
+    if actual is None or expected is None:
+        return actual is None and expected is None
+    if type(actual) is not float or type(expected) is not float:
+        return False
+    return math.isclose(
+        actual,
+        expected,
+        rel_tol=1e-12,
+        abs_tol=1e-15,
+    )
 
 
 def split_for_episode(episode_id: str, *, seed: int = 42) -> str:
@@ -193,7 +216,14 @@ def _validate_existing_manifest(
         "negative_sequence_count",
         "mixed_presence_sequence_count",
     ):
-        if field in payload and payload[field] != expected[field]:
+        if field not in payload:
+            continue
+        matches = (
+            _derived_manifest_float_matches(payload[field], expected[field])
+            if field in _DERIVED_FLOAT_MANIFEST_FIELDS
+            else payload[field] == expected[field]
+        )
+        if not matches:
             errors.append(
                 f"dataset manifest {field} does not match decoded dataset"
             )

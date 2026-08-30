@@ -13,6 +13,7 @@ import shutil
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -252,6 +253,25 @@ class TargetStateCollectionFinalizerTest(unittest.TestCase):
         self.assertEqual(manifest["dataset_sha256"], result.dataset_sha256)
         self.assertEqual(manifest["source_collection_id"], _COLLECTION_ID)
         self.assertEqual(manifest["physical_capture_count"], 10)
+        merged_records = read_frame_records(output / "frames.jsonl")
+        merged_sequences = build_sequences(
+            merged_records,
+            history_size=4,
+            max_history_age_s=2.0,
+        )
+        canonical_manifest = build_manifest(
+            merged_records,
+            merged_sequences,
+            dataset_sha256=result.dataset_sha256,
+            split_seed=42,
+            generation_commit_sha="testcommit",
+        )
+        for field, expected in canonical_manifest.items():
+            self.assertEqual(
+                manifest[field],
+                expected,
+                msg=f"final parent manifest field was not regenerated: {field}",
+            )
         self.assertTrue(
             check_dataset(
                 output,
@@ -268,6 +288,36 @@ class TargetStateCollectionFinalizerTest(unittest.TestCase):
             },
         )
         self.assertFalse(any(path.name.startswith(".complete_parent") for path in self.root.iterdir()))
+
+    def test_check_dataset_failure_names_the_collection_archive(self) -> None:
+        fixture = _CollectionFixture(self.root)
+        first_workspace = self.root / "workspace_1"
+        report = check_dataset(
+            first_workspace,
+            history_size=4,
+            max_history_age_s=2.0,
+            split_seed=42,
+        )
+        self.assertTrue(report.ok)
+        failed_report = replace(
+            report,
+            ok=False,
+            errors=("synthetic checker failure",),
+        )
+        first_filename = fixture.payload["shards"][0]["filename"]
+        with patch(
+            "training.target_state.collection_finalize.check_dataset",
+            return_value=failed_report,
+        ):
+            with self.assertRaises(CollectionFinalizationError) as caught:
+                finalize_target_state_collection(
+                    fixture.index,
+                    fixture.shards,
+                    self.root / "failed_output",
+                )
+        message = str(caught.exception)
+        self.assertIn(f"collection shard {first_filename} failed check_dataset", message)
+        self.assertIn("synthetic checker failure", message)
 
     def test_production_spool_to_pc_pull_to_finalizer_round_trip(self) -> None:
         pc_trans_root = self.root / "pc_trans"

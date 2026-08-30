@@ -1,0 +1,21 @@
+name: qwen_lora
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip>=24.2
+  - pip:
+      # Qwen3-VL is available in the 4.57 Transformers generation used by the
+      # local checkpoint. Keep this environment separate from Isaac and vLLM.
+      - "torch==2.7.1"
+      - "torchvision==0.22.1"
+      - "transformers==4.57.1"
+      - "peft==0.17.1"
+      - "accelerate==1.10.1"
+      - "safetensors==0.6.2"
+      - "tensorboard==2.20.0"
+      - "pillow==11.3.0"
+      - "pytest==8.4.2"
+variables:
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"

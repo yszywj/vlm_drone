@@ -45,6 +45,14 @@ from training.target_state.shards import (
 )
 
 
+_ROUND_TRIP_QUATERNION = (
+    -402228.7797876074,
+    419053.4198575469,
+    -12912.393104000017,
+    416702.1386527759,
+)
+
+
 def _episode_for(split: str, ordinal: int = 0) -> str:
     found = []
     for index in range(100_000):
@@ -56,7 +64,11 @@ def _episode_for(split: str, ordinal: int = 0) -> str:
     raise AssertionError(f"cannot find episode for split {split}")
 
 
-def _write_parent_dataset(root: Path) -> None:
+def _write_parent_dataset(
+    root: Path,
+    *,
+    round_trip_quaternion: bool = False,
+) -> None:
     for name in ("rgb", "depth", "instance_mask"):
         (root / name).mkdir(parents=True, exist_ok=True)
     episodes = (
@@ -93,6 +105,21 @@ def _write_parent_dataset(root: Path) -> None:
             )
             frame_index += 1
 
+    if round_trip_quaternion:
+        records = [
+            replace(
+                record,
+                sensor_input=replace(
+                    record.sensor_input,
+                    camera=replace(
+                        record.sensor_input.camera,
+                        orientation_world_wxyz=_ROUND_TRIP_QUATERNION,
+                    ),
+                ),
+            )
+            for record in records
+        ]
+
     # A second logical target shares one synchronized physical capture.  The
     # builder must store each referenced asset path only once in its tar.
     original = records[0]
@@ -119,10 +146,15 @@ def _write_parent_dataset(root: Path) -> None:
         ),
         encoding="utf-8",
     )
-    sequences = build_sequences(records, history_size=4, max_history_age_s=2.0)
-    dataset_sha = compute_dataset_sha256(root, records)
+    canonical_records = read_frame_records(root / "frames.jsonl")
+    sequences = build_sequences(
+        canonical_records,
+        history_size=4,
+        max_history_age_s=2.0,
+    )
+    dataset_sha = compute_dataset_sha256(root, canonical_records)
     manifest = build_manifest(
-        records,
+        canonical_records,
         sequences,
         dataset_sha256=dataset_sha,
         split_seed=42,
@@ -318,6 +350,156 @@ class TargetStateShardTest(unittest.TestCase):
 
         self.assertEqual(raised.exception.errno, errno.EIO)
         self.assertEqual(list((self.base / "shards").iterdir()), [])
+
+    def test_shard_derivatives_use_round_trip_canonical_records(self) -> None:
+        dataset = self.base / "canonical_dataset"
+        dataset.mkdir()
+        _write_parent_dataset(dataset, round_trip_quaternion=True)
+        parent_records = read_frame_records(dataset / "frames.jsonl")
+        parent_record = parent_records[0]
+        round_tripped_record = type(parent_record).from_dict(
+            json.loads(
+                json.dumps(
+                    parent_record.to_dict(),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+        )
+        self.assertEqual(parent_record.frame_id, round_tripped_record.frame_id)
+        self.assertNotEqual(
+            parent_record.sensor_input.camera.orientation_world_wxyz,
+            round_tripped_record.sensor_input.camera.orientation_world_wxyz,
+        )
+        component_deltas = tuple(
+            abs(actual - expected)
+            for actual, expected in zip(
+                parent_record.sensor_input.camera.orientation_world_wxyz,
+                round_tripped_record.sensor_input.camera.orientation_world_wxyz,
+            )
+        )
+        self.assertGreater(max(component_deltas), 0.0)
+        self.assertLess(max(component_deltas), 1e-15)
+
+        result = build_target_state_shards(
+            dataset,
+            self.base / "canonical_shards",
+            target_shard_size_bytes=1,
+            history_size=4,
+            max_history_age_s=2.0,
+            split_seed=42,
+        )
+
+        materialized_root = self.base / "canonical_check" / ".materialized"
+        materialized_root.parent.mkdir()
+        for entry in result.shard_index.shards:
+            archive = result.output_dir / entry.filename
+            receipt = materialize_shard(
+                archive,
+                result.shard_index,
+                materialized_root=materialized_root,
+            )
+            canonical_records = read_frame_records(
+                receipt.dataset_root / "frames.jsonl"
+            )
+            canonical_sequences = build_sequences(
+                canonical_records,
+                history_size=4,
+                max_history_age_s=2.0,
+            )
+            canonical_sha = compute_dataset_sha256(
+                receipt.dataset_root,
+                canonical_records,
+            )
+            manifest = json.loads(
+                (receipt.dataset_root / "dataset_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            shard_manifest = json.loads(
+                (receipt.dataset_root / "shard_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            report = check_dataset(
+                receipt.dataset_root,
+                sequences=canonical_sequences,
+                history_size=4,
+                max_history_age_s=2.0,
+                split_seed=42,
+            )
+            self.assertTrue(report.ok, report.errors)
+            self.assertNotIn(
+                "frames differ from frames.jsonl",
+                "\n".join(report.errors),
+            )
+            self.assertEqual(sha256_file(archive), entry.archive_sha256)
+            self.assertEqual(entry.shard_dataset_sha256, canonical_sha)
+            self.assertEqual(manifest["dataset_sha256"], canonical_sha)
+            self.assertEqual(
+                shard_manifest["shard_dataset_sha256"],
+                canonical_sha,
+            )
+            self.assertEqual(manifest["frame_count"], len(canonical_records))
+            self.assertEqual(manifest["sequence_count"], len(canonical_sequences))
+            self.assertEqual(shard_manifest["frame_count"], len(canonical_records))
+            self.assertEqual(
+                shard_manifest["sequence_count"],
+                len(canonical_sequences),
+            )
+            self.assertEqual(entry.frame_count, len(canonical_records))
+            self.assertEqual(entry.sequence_count, len(canonical_sequences))
+            cleanup_materialized_shard(receipt)
+
+    def test_shard_round_trip_rejects_changed_record_identity(self) -> None:
+        original_reader = read_frame_records
+
+        def mutate_frame(record, field):
+            if field == "frame":
+                return replace(record, frame_id=f"changed_{record.frame_id}")
+            if field == "episode":
+                return replace(record, episode_id=f"changed_{record.episode_id}")
+            sensor = record.sensor_input
+            if field == "rgb":
+                sensor = replace(sensor, rgb_path="rgb/changed.jpg")
+            elif field == "depth":
+                sensor = replace(sensor, depth_path="depth/changed.npy")
+            elif field == "instance_mask":
+                sensor = replace(
+                    sensor,
+                    instance_mask_path="instance_mask/changed.png",
+                )
+            return replace(record, sensor_input=sensor)
+
+        cases = (
+            ("frame", "frame identity changed"),
+            ("episode", "episode identity changed"),
+            ("rgb", "asset paths changed"),
+            ("depth", "asset paths changed"),
+            ("instance_mask", "asset paths changed"),
+        )
+        for field, expected_error in cases:
+            with self.subTest(field=field):
+                def changed_record_identity(path):
+                    records = original_reader(path)
+                    if Path(path).parent == self.dataset:
+                        return records
+                    return (
+                        mutate_frame(records[0], field),
+                        *records[1:],
+                    )
+
+                with patch(
+                    "training.target_state.shards.read_frame_records",
+                    side_effect=changed_record_identity,
+                ):
+                    with self.assertRaisesRegex(
+                        ShardFormatError,
+                        expected_error,
+                    ):
+                        self._build()
+
+                self.assertEqual(list((self.base / "shards").iterdir()), [])
 
     def test_plan_is_episode_atomic_single_split_deterministic_and_soft_sized(self) -> None:
         first = plan_target_state_shards(

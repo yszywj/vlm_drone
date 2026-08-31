@@ -449,14 +449,78 @@ def build_target_state_shards(
             shard_root.mkdir(mode=0o755)
             _copy_assets(parent.root, shard_root, plan.asset_paths)
             _write_frames(shard_root / "frames.jsonl", plan.records)
+            # Schema reconstruction normalizes quaternions.  Build every
+            # derived shard artifact from the exact objects decoded from the
+            # persisted JSONL so strict sequence/frame equality remains true
+            # even when serialization causes a sub-ulp normalization cycle.
+            canonical_records = read_frame_records(shard_root / "frames.jsonl")
+            if len(canonical_records) != len(plan.records):
+                raise ShardFormatError(
+                    f"generated shard {plan.shard_id} frame count changed after "
+                    "frames.jsonl round-trip"
+                )
+            if tuple(record.frame_id for record in canonical_records) != tuple(
+                record.frame_id for record in plan.records
+            ):
+                raise ShardFormatError(
+                    f"generated shard {plan.shard_id} frame identity changed after "
+                    "frames.jsonl round-trip"
+                )
+            if tuple(record.episode_id for record in canonical_records) != tuple(
+                record.episode_id for record in plan.records
+            ):
+                raise ShardFormatError(
+                    f"generated shard {plan.shard_id} episode identity changed after "
+                    "frames.jsonl round-trip"
+                )
+            canonical_asset_paths = tuple(
+                (
+                    record.sensor_input.rgb_path,
+                    record.sensor_input.depth_path,
+                    record.sensor_input.instance_mask_path,
+                )
+                for record in canonical_records
+            )
+            planned_asset_paths = tuple(
+                (
+                    record.sensor_input.rgb_path,
+                    record.sensor_input.depth_path,
+                    record.sensor_input.instance_mask_path,
+                )
+                for record in plan.records
+            )
+            if canonical_asset_paths != planned_asset_paths:
+                raise ShardFormatError(
+                    f"generated shard {plan.shard_id} asset paths changed after "
+                    "frames.jsonl round-trip"
+                )
+            canonical_episode_ids = tuple(
+                sorted({record.episode_id for record in canonical_records})
+            )
             sequences = build_sequences(
-                plan.records,
+                canonical_records,
                 history_size=history_size,
                 max_history_age_s=max_history_age_s,
             )
-            shard_dataset_sha = compute_dataset_sha256(shard_root, plan.records)
+            preliminary = check_dataset(
+                shard_root,
+                sequences=sequences,
+                history_size=history_size,
+                max_history_age_s=max_history_age_s,
+                split_seed=split_seed,
+            )
+            if not preliminary.ok:
+                details = "; ".join(preliminary.errors[:5])
+                raise ShardFormatError(
+                    f"generated shard {plan.shard_id} failed pre-manifest "
+                    f"check_dataset: {details}"
+                )
+            shard_dataset_sha = compute_dataset_sha256(
+                shard_root,
+                canonical_records,
+            )
             dataset_manifest = build_manifest(
-                plan.records,
+                canonical_records,
                 sequences,
                 dataset_sha256=shard_dataset_sha,
                 split_seed=split_seed,
@@ -478,9 +542,9 @@ def build_target_state_shards(
                 "split": plan.split,
                 "parent_dataset_sha256": parent.dataset_sha256,
                 "shard_dataset_sha256": shard_dataset_sha,
-                "episode_ids": list(plan.episode_ids),
-                "episode_count": len(plan.episode_ids),
-                "frame_count": len(plan.records),
+                "episode_ids": list(canonical_episode_ids),
+                "episode_count": len(canonical_episode_ids),
+                "frame_count": len(canonical_records),
                 "sequence_count": len(sequences),
                 "history_size": history_size,
                 "max_history_age_s": max_history_age_s,
@@ -511,9 +575,9 @@ def build_target_state_shards(
                     shard_id=plan.shard_id,
                     filename=plan.filename,
                     split=plan.split,
-                    episode_ids=plan.episode_ids,
-                    episode_count=len(plan.episode_ids),
-                    frame_count=len(plan.records),
+                    episode_ids=canonical_episode_ids,
+                    episode_count=len(canonical_episode_ids),
+                    frame_count=len(canonical_records),
                     sequence_count=len(sequences),
                     shard_dataset_sha256=shard_dataset_sha,
                     archive_sha256=sha256_file(archive),

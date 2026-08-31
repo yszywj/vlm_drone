@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from contextlib import redirect_stdout
+import errno
 from hashlib import sha256
 import io
 import json
@@ -14,6 +15,7 @@ import shutil
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -217,6 +219,105 @@ class TargetStateShardTest(unittest.TestCase):
             max_history_age_s=2.0,
             split_seed=42,
         )
+
+    def _assert_published_integrity(self, result) -> None:
+        index_path = result.shard_index.source_path
+        reloaded = load_shard_index(index_path)
+        self.assertEqual(
+            reloaded.index_sha256,
+            sha256(index_path.read_bytes()).hexdigest(),
+        )
+        self.assertEqual(reloaded.to_dict(), result.shard_index.to_dict())
+        for entry in reloaded.shards:
+            archive = result.output_dir / entry.filename
+            self.assertEqual(archive.stat().st_size, entry.archive_size_bytes)
+            self.assertEqual(sha256_file(archive), entry.archive_sha256)
+
+        entry = reloaded.shards[0]
+        archive = result.output_dir / entry.filename
+        materialized_root = self.base / "portable_check" / ".materialized"
+        materialized_root.parent.mkdir(exist_ok=True)
+        receipt = materialize_shard(
+            archive,
+            reloaded,
+            materialized_root=materialized_root,
+        )
+        self.assertTrue(receipt.dataset_report.ok)
+        self.assertEqual(
+            receipt.dataset_report.dataset_sha256,
+            entry.shard_dataset_sha256,
+        )
+        cleanup_materialized_shard(receipt)
+
+    def test_archive_chmod_eperm_is_portable_and_tar_protocol_is_unchanged(self) -> None:
+        real_chmod = os.chmod
+        rejected: list[Path] = []
+
+        def drvfs_chmod(path, mode):
+            candidate = Path(path)
+            if ".tar.tmp." in candidate.name:
+                rejected.append(candidate)
+                raise OSError(errno.EPERM, "DrvFS does not support POSIX mode")
+            return real_chmod(path, mode)
+
+        with patch(
+            "training.target_state.shards.os.chmod",
+            side_effect=drvfs_chmod,
+        ):
+            result = self._build()
+
+        self.assertTrue(rejected)
+        self._assert_published_integrity(result)
+        for entry in result.shard_index.shards:
+            with tarfile.open(result.output_dir / entry.filename, "r:") as archive:
+                members = archive.getmembers()
+                self.assertTrue(members)
+                for member in members:
+                    self.assertEqual(member.mode, 0o444)
+                    self.assertEqual(member.mtime, 0)
+                    self.assertEqual(member.uid, 0)
+                    self.assertEqual(member.gid, 0)
+                    self.assertEqual(member.uname, "")
+                    self.assertEqual(member.gname, "")
+
+    def test_shard_index_chmod_eperm_is_portable_and_index_validates(self) -> None:
+        real_chmod = os.chmod
+        rejected: list[Path] = []
+
+        def drvfs_chmod(path, mode):
+            candidate = Path(path)
+            if candidate.name.startswith(".shard_index.json.tmp."):
+                rejected.append(candidate)
+                raise OSError(errno.EPERM, "DrvFS does not support POSIX mode")
+            return real_chmod(path, mode)
+
+        with patch(
+            "training.target_state.shards.os.chmod",
+            side_effect=drvfs_chmod,
+        ):
+            result = self._build()
+
+        self.assertEqual(len(rejected), 1)
+        self._assert_published_integrity(result)
+
+    def test_unrelated_chmod_error_remains_fatal_and_cleans_outputs(self) -> None:
+        real_chmod = os.chmod
+
+        def failing_chmod(path, mode):
+            candidate = Path(path)
+            if candidate.name.startswith(".shard_index.json.tmp."):
+                raise OSError(errno.EIO, "simulated storage failure")
+            return real_chmod(path, mode)
+
+        with patch(
+            "training.target_state.shards.os.chmod",
+            side_effect=failing_chmod,
+        ):
+            with self.assertRaises(OSError) as raised:
+                self._build()
+
+        self.assertEqual(raised.exception.errno, errno.EIO)
+        self.assertEqual(list((self.base / "shards").iterdir()), [])
 
     def test_plan_is_episode_atomic_single_split_deterministic_and_soft_sized(self) -> None:
         first = plan_target_state_shards(

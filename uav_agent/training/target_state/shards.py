@@ -825,7 +825,10 @@ def _write_deterministic_tar_atomic(source_root: Path, destination: Path) -> Non
         f".{destination.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}"
     )
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    file_descriptor = os.open(temporary, flags, 0o444)
+    # Keep the staging inode writable while the complete archive is being
+    # produced.  The requested read-only host mode is best-effort metadata;
+    # archive integrity is provided by the deterministic tar bytes and SHA.
+    file_descriptor = os.open(temporary, flags, 0o600)
     try:
         with os.fdopen(file_descriptor, "wb", closefd=False) as raw:
             with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
@@ -846,7 +849,7 @@ def _write_deterministic_tar_atomic(source_root: Path, destination: Path) -> Non
                         archive.addfile(info, stream)
             raw.flush()
             os.fsync(file_descriptor)
-        os.chmod(temporary, 0o444)
+        _try_chmod_portable(temporary, 0o444)
         _publish_file_noreplace(temporary, destination)
     finally:
         os.close(file_descriptor)
@@ -858,13 +861,17 @@ def _write_deterministic_tar_atomic(source_root: Path, destination: Path) -> Non
 
 def _atomic_write_bytes(path: Path, data: bytes, *, mode: int) -> None:
     temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{os.urandom(6).hex()}")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as stream:
             stream.write(data)
             stream.flush()
             os.fsync(descriptor)
-        os.chmod(temporary, mode)
+        _try_chmod_portable(temporary, mode)
         _publish_file_noreplace(temporary, path)
     finally:
         os.close(descriptor)
@@ -872,6 +879,26 @@ def _atomic_write_bytes(path: Path, data: bytes, *, mode: int) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _try_chmod_portable(path: Path, mode: int) -> None:
+    """Apply a host-file mode unless the filesystem lacks POSIX modes.
+
+    WSL DrvFS/NTFS mounts may reject ``chmod`` even though writing, syncing,
+    linking, and reading the file all work.  Only the errno values that
+    explicitly describe an unsupported permission operation are tolerated;
+    I/O errors and every other failure remain fatal.
+    """
+
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        if exc.errno not in {
+            errno.EPERM,
+            errno.ENOTSUP,
+            errno.EOPNOTSUPP,
+        }:
+            raise
 
 
 def _publish_file_noreplace(temporary: Path, destination: Path) -> None:

@@ -25,4 +25,6 @@ uav_agent/logs/
 
 # Unreviewed optional Planner paraphrases are local candidates.  The official
 # datasets/planner_v1 JSONL, manifest, statistics and checksums are not ignored.
+# 本地数据集，不上传 GitHub
 /datasets/
+/uav_agent/datasets/

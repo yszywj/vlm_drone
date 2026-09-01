@@ -28,3 +28,6 @@ uav_agent/logs/
 # 本地数据集，不上传 GitHub
 /datasets/
 /uav_agent/datasets/
+# 不上传任何目录下的 README 文件
+**/README*
+**/readme*

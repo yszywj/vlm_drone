@@ -1,0 +1,24 @@
+# Weight-only comparison with quality_cached_50k.yaml; preserve the old run.
+base_config: validity_probe_geometry_v2_50k.yaml
+experiment_name: quality_cached_power050_v2
+validity_fit:
+  epochs: 1
+  batch_size: 256
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  hard_example_weight: 1.0
+  seed: 42
+  class_balance_power: 0.25
+  anchor_logit_weight: 0.1
+quality_fit:
+  epochs: 20
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  seed: 42
+  class_balance_power: 0.5
+experiments:
+  - name: quality_linear
+    hidden_dim: 0
+  - name: quality_mlp32
+    hidden_dim: 32

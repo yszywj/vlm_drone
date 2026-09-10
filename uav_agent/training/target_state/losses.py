@@ -181,6 +181,8 @@ def compute_target_state_losses(
         & batch["history_visible_mask"].to(dtype=torch.bool)
         & torch.isfinite(batch["history_center_uv_px"]).all(dim=-1)
     )
+    if "history_center_in_image_mask" in batch:
+        reprojection_mask = reprojection_mask & batch["history_center_in_image_mask"].bool()
     history_occlusion_weight = _occlusion_visibility_weight(
         batch["history_occlusion_ratio"], dtype=projected_uv.dtype
     )
@@ -201,7 +203,10 @@ def compute_target_state_losses(
     validity_loss = F.binary_cross_entropy_with_logits(
         output.measurement_valid_logit,
         measurement_valid.to(dtype=output.measurement_valid_logit.dtype),
+        reduction="none",
     )
+    validity_loss = _masked_mean(validity_loss, batch.get(
+        "validity_supervision_mask", torch.ones_like(measurement_valid)).bool())
     total = (
         float(weights.depth) * depth_loss
         + float(weights.position_3d) * position_loss

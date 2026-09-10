@@ -23,6 +23,9 @@ from datasets.target_state.dataset import read_frame_records, split_for_episode
 from datasets.target_state.schema import TargetStateFrameRecord
 from datasets.target_state.sequence import TargetStateSequence, build_sequences
 from training.target_state.config import TargetStateTrainingConfig, TrainingStage
+from datasets.target_state.projection import project_label_center, center_in_image
+from perception.rgbd_consistency import SensorObservation, guard_sequence
+from perception.ray_measurement_gate import ray_measurement_gate
 
 
 GEOMETRY_INPUT_FIELDS = (
@@ -92,7 +95,7 @@ def _mask_bbox(path: Path, width: int, height: int) -> tuple[float, float, float
     )
 
 
-def _clean_bbox(record: TargetStateFrameRecord, root: Path) -> tuple[float, float, float, float] | None:
+def _clean_bbox(record: TargetStateFrameRecord, root: Path, *, projected_center=False) -> tuple[float, float, float, float] | None:
     label = record.training_label
     if label is None or not label.visible or label.center_pixel_uv is None:
         return None
@@ -108,7 +111,16 @@ def _clean_bbox(record: TargetStateFrameRecord, root: Path) -> tuple[float, floa
         box_height = max(detector_bbox[3] - detector_bbox[1], 2.0 / height)
     else:
         box_width, box_height = 0.2, 0.2
-    center_u, center_v = label.center_pixel_uv
+    center = label.center_pixel_uv
+    if projected_center:
+        camera = record.sensor_input.camera
+        center, _ = project_label_center(label.position_world_m, camera.position_world_m,
+            camera.orientation_world_wxyz, (camera.fx,camera.fy,camera.cx,camera.cy))
+        if not center_in_image(center, (width,height)):
+            # Preserve an observed partial object, without inventing a crop
+            # centred on a clipped substitute for its true geometric centre.
+            return detector_bbox
+    center_u, center_v = center
     center_x, center_y = center_u / width, center_v / height
     x1, x2 = max(0.0, center_x - box_width / 2), min(1.0, center_x + box_width / 2)
     y1, y2 = max(0.0, center_y - box_height / 2), min(1.0, center_y + box_height / 2)
@@ -120,9 +132,10 @@ def _detector_view(
     *,
     root: Path,
     stage: TrainingStage,
+    supervision_protocol: str = "legacy_v1",
 ) -> tuple[tuple[float, float, float, float] | None, float, bool, str | None]:
     if stage is TrainingStage.ORACLE_CLEAN:
-        bbox = _clean_bbox(record, root)
+        bbox = _clean_bbox(record, root, projected_center=supervision_protocol == "projected_center_v2")
         return bbox, (1.0 if bbox is not None else 0.0), bbox is not None, (
             "oracle_clean" if bbox is not None else None
         )
@@ -394,6 +407,8 @@ class TargetStateTorchDataset(Dataset[dict[str, Tensor]]):
         bbox_centers: list[tuple[float, float]] = []
         tracker_change_flags: list[bool] = []
         previous_tracker: str | None = None
+        sensor_observations = []
+        center_inside_flags = []
         for record, delta_t in zip(frames, sequence.delta_t_s):
             camera = record.sensor_input.camera
             uav = record.sensor_input.uav
@@ -403,8 +418,13 @@ class TargetStateTorchDataset(Dataset[dict[str, Tensor]]):
                 rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
             depth = _load_depth(self.root / record.sensor_input.depth_path)
             bbox, confidence, detected, tracker_id = _detector_view(
-                record, root=self.root, stage=self.config.stage
+                record, root=self.root, stage=self.config.stage,
+                supervision_protocol=self.config.supervision_protocol,
             )
+            if self.config.reference_guard_protocol != "none":
+                sensor_observations.append(SensorObservation(rgb, depth, bbox,
+                    (camera.fx,camera.fy,camera.cx,camera.cy), camera.position_world_m,
+                    camera.orientation_world_wxyz, record.timestamp_s, tracker_id))
             roi, _, _valid_fraction, _bbox_anchor = _crop_rgbd(
                 rgb,
                 depth,
@@ -468,6 +488,13 @@ class TargetStateTorchDataset(Dataset[dict[str, Tensor]]):
             bbox_centers.append(((bbox_values[0] + bbox_values[2]) / 2, (bbox_values[1] + bbox_values[3]) / 2))
             label = record.training_label
             center = None if label is None else label.center_pixel_uv
+            if self.config.supervision_protocol == "projected_center_v2" and label is not None:
+                # Versioned in-memory label overlay, AFTER archive validation.
+                # Never alter frames.jsonl or use this projection as a Stage B input.
+                center, _ = project_label_center(label.position_world_m,
+                    camera.position_world_m, camera.orientation_world_wxyz,
+                    (camera.fx,camera.fy,camera.cx,camera.cy))
+            center_inside_flags.append(center_in_image(center, (width,height)))
             # Missing privileged labels are genuine negatives. Finite zero
             # placeholders keep collation stable, while the explicit masks
             # below ensure they never supervise geometric regression.
@@ -487,6 +514,30 @@ class TargetStateTorchDataset(Dataset[dict[str, Tensor]]):
         reference_raw_depth = raw_depths[-1]
         reference_detected = detected_flags[-1]
         measurement_valid = reference_visible and reference_detected and reference_raw_depth > 0.0
+        sensor_consistent = True
+        if sensor_observations:
+            sensor_consistent = guard_sequence(sensor_observations,
+                minimum_depth_m=self.config.minimum_depth_m, maximum_depth_m=self.config.maximum_depth_m,
+                max_history_age_s=self.config.max_history_age_s)[-1].accepted
+        validity_supervised = True
+        if self.config.supervision_protocol == "projected_center_v2":
+            reference_depth = 0.0 if reference_label is None else _target_depth(reference)
+            ideal = ray_measurement_gate(reference_detected=reference_detected,
+                raw_depth_m=reference_raw_depth, anchor_uv_px=anchors[-1],
+                corrected_uv_px=centers[-1], corrected_depth_m=reference_depth,
+                image_size_wh=reference.sensor_input.camera.resolution_wh_px,
+                validity_probability=1.0, minimum_depth_m=self.config.minimum_depth_m,
+                maximum_depth_m=self.config.maximum_depth_m)
+            measurement_valid = bool(reference_visible and ideal.accepted and sensor_consistent)
+            # Old data lacks object extents/masks. A large residual is UNKNOWN
+            # association evidence, not an automatic false-positive label.
+            # Keep the window and evaluation denominator; mask only supervision.
+            margin = max(1.0, .1*abs(reference_depth)) + max(.15,.02*abs(reference_depth))
+            if measurement_valid and abs(reference_raw_depth-reference_depth) > margin:
+                measurement_valid = False
+                validity_supervised = False
+        else:
+            measurement_valid = bool(measurement_valid and sensor_consistent)
         detected_centers = np.asarray(
             [value for value, is_detected in zip(bbox_centers, detected_flags) if is_detected],
             dtype=np.float32,
@@ -507,6 +558,8 @@ class TargetStateTorchDataset(Dataset[dict[str, Tensor]]):
             "missing_mask": torch.tensor([not value for value in detected_flags], dtype=torch.bool),
             "anchor_uv_px": torch.tensor(anchors[-1], dtype=torch.float32),
             "raw_depth_m": torch.tensor(reference_raw_depth, dtype=torch.float32),
+            "image_size_wh": torch.tensor(reference.sensor_input.camera.resolution_wh_px, dtype=torch.float32),
+            "depth_range_m": torch.tensor([self.config.minimum_depth_m, self.config.maximum_depth_m], dtype=torch.float32),
             "intrinsics_fx_fy_cx_cy": torch.tensor(camera_intrinsics[-1], dtype=torch.float32),
             "camera_position_world_m": torch.tensor(camera_positions[-1], dtype=torch.float32),
             "camera_orientation_world_wxyz": torch.tensor(camera_orientations[-1], dtype=torch.float32),
@@ -515,6 +568,12 @@ class TargetStateTorchDataset(Dataset[dict[str, Tensor]]):
             "target_present_mask": torch.tensor(target_present, dtype=torch.bool),
             "label_valid_mask": torch.tensor(target_present, dtype=torch.bool),
             "measurement_valid": torch.tensor(measurement_valid, dtype=torch.bool),
+            "validity_supervision_mask": torch.tensor(validity_supervised, dtype=torch.bool),
+            "reference_sensor_consistent": torch.tensor(sensor_consistent, dtype=torch.bool),
+            "reference_center_in_image": torch.tensor(center_inside_flags[-1], dtype=torch.bool),
+            "history_center_in_image_mask": torch.tensor(
+                center_inside_flags if self.config.supervision_protocol == "projected_center_v2"
+                else [True]*len(frames), dtype=torch.bool),
             "valid_depth_mask": torch.tensor(reference_raw_depth > 0.0, dtype=torch.bool),
             "history_intrinsics_fx_fy_cx_cy": torch.tensor(camera_intrinsics, dtype=torch.float32),
             "history_camera_position_world_m": torch.tensor(camera_positions, dtype=torch.float32),

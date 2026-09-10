@@ -64,8 +64,14 @@ class TargetStateTrainingConfig:
     require_dataset_manifest: bool = True
     expected_yolo_model_sha256: str | None = None
     loss_weights: LossWeights = LossWeights()
+    supervision_protocol: str = "legacy_v1"
+    reference_guard_protocol: str = "none"
 
     def __post_init__(self) -> None:
+        if self.supervision_protocol not in {"legacy_v1", "projected_center_v2"}:
+            raise ValueError("unsupported supervision_protocol")
+        if self.reference_guard_protocol not in {"none", "rgbd_consistency_v1"}:
+            raise ValueError("unsupported reference_guard_protocol")
         object.__setattr__(self, "dataset_root", Path(self.dataset_root).expanduser().resolve())
         object.__setattr__(self, "output_dir", Path(self.output_dir).expanduser().resolve())
         if self.initial_checkpoint_path is not None:
@@ -137,6 +143,19 @@ class TargetStateTrainingConfig:
             raise ValueError("minimum_depth_m must be below maximum_depth_m")
 
 
+def preprocessing_contract(config):
+    return {
+        "rgb_scale": 255.0, "depth_scale_m": config.maximum_depth_m,
+        "minimum_depth_m": config.minimum_depth_m, "maximum_depth_m": config.maximum_depth_m,
+        "roi_interpolation": "bilinear_align_corners_false",
+        "baseline_depth_sampling": "foreground_cluster_median",
+        "foreground_inset_ratio": .1, "foreground_bottom_exclusion_ratio": .15,
+        "foreground_min_valid_samples": 3, "foreground_seed_patch_radius_px": 4,
+        **({"reference_guard_protocol": config.reference_guard_protocol}
+           if config.reference_guard_protocol != "none" else {}),
+    }
+
+
 def _mapping(value: object, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{field} must be a mapping")
@@ -158,6 +177,7 @@ def load_training_config(path: str | Path) -> TargetStateTrainingConfig:
         "require_dataset_manifest",
         "expected_yolo_model_sha256",
         "minimum_depth_m",
+        "supervision_protocol", "reference_guard_protocol",
     }
     if unknown:
         raise ValueError(f"unknown target-state training fields: {sorted(unknown)}")

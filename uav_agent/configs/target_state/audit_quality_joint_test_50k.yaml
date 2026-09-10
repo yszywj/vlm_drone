@@ -1,0 +1,15 @@
+# Fixed before TEST. Never switch to last, another epoch, or another head on TEST.
+selection_config: quality_cached_power050_50k.yaml
+candidate_bundle: /home/amax/ry/vlm_drones/outputs/diagnostics/validity_probe_geometry_v2_50k_v1/quality_cached_power050_v2/quality_linear/best_quality_bundle.pt
+candidate_sha256: 584c8902d513005b3064cdaf1673d9ba01c0e212decd2f6109243eeafc1eea9d
+base_checkpoint_sha256: 3c74793784f958f6cf46aec3f7b661132923cbfbabb85cf22b754df99e64119d
+expected_epoch: 19
+run_id_prefix: audit_quality_joint_50k_v1
+output_dir: /home/amax/ry/vlm_drones/outputs/diagnostics/audit_quality_joint_50k_v1
+device: cuda:0
+num_workers: 4
+wait_timeout_s: 86400
+case_assets_max_gib: 2
+case_episode_ids:
+  - episode_000516
+  - episode_001821

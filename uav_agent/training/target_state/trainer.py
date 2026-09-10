@@ -21,10 +21,12 @@ from torch.utils.data import DataLoader, Dataset
 
 from datasets.target_state.dataset import compute_dataset_sha256, read_frame_records
 from experiments.metric_logger import ScalarEventWriter
+from perception.ray_measurement_gate import MEASUREMENT_PROTOCOL
 from training.target_state.config import TargetStateTrainingConfig, TrainingStage
 from training.target_state.data import GEOMETRY_INPUT_FIELDS, TargetStateTorchDataset
 from training.target_state.geometry import corrected_ray_to_world
 from training.target_state.losses import compute_target_state_losses
+from training.target_state.measurement_gate import gate_batch
 from training.target_state.model import TemporalRayDepthNet, TemporalRayDepthOutput
 
 
@@ -197,11 +199,14 @@ def _metric_block(
     no_target_valid_claims: Tensor,
     invalid_output_count: int,
 ) -> dict[str, object]:
-    occluded = errors[occlusion >= 0.25]
-    jittered = errors[jitter >= 0.01]
+    accepted = ~failures
+    occluded = errors[(occlusion >= 0.25) & accepted]
+    jittered = errors[(jitter >= 0.01) & accepted]
     return {
-        "position_median_error_m": _quantile(errors, 0.5),
-        "position_p95_error_m": _quantile(errors, 0.95),
+        "measurement_protocol": MEASUREMENT_PROTOCOL,
+        "position_error_scope": "accepted_visible_measurements_only",
+        "position_median_error_m": _quantile(errors[accepted], 0.5),
+        "position_p95_error_m": _quantile(errors[accepted], 0.95),
         "measurement_failure_rate": float(failures.float().mean().cpu()) if failures.numel() else None,
         "no_target_false_positive_rate": (
             float(no_target_valid_claims.float().mean().cpu())
@@ -211,15 +216,16 @@ def _metric_block(
         "occluded_position_median_error_m": _quantile(occluded, 0.5),
         "jittered_position_median_error_m": _quantile(jittered, 0.5),
         "covariance_error_spearman": (
-            _rank_correlation(uncertainty, errors) if uncertainty is not None else None
+            _rank_correlation(uncertainty[accepted], errors[accepted]) if uncertainty is not None else None
         ),
         "invalid_output_count": int(invalid_output_count),
         "evaluated_measurement_count": int(errors.numel()),
+        "accepted_measurement_count": int(accepted.sum()),
         "evaluated_no_target_count": int(no_target_valid_claims.numel()),
     }
 
 
-_EVALUATION_ACCUMULATOR_SCHEMA_VERSION = 1
+_EVALUATION_ACCUMULATOR_SCHEMA_VERSION = 2
 _EVALUATION_TENSOR_FIELDS = (
     "model_errors",
     "baseline_errors",
@@ -317,18 +323,31 @@ class TargetStateEvaluationAccumulator:
             & torch.isfinite(target).all(dim=-1)
         )
         model_claims_valid = torch.sigmoid(output.measurement_valid_logit) >= 0.5
+        model_gate = gate_batch(
+            batch, corrected_depth_m=loss.corrected_depth_m,
+            delta_uv_px=output.delta_uv_px,
+            validity_probability=torch.sigmoid(output.measurement_valid_logit),
+            maximum_depth_m=self.maximum_depth_m,
+        )
+        baseline_gate = gate_batch(
+            batch, corrected_depth_m=baseline_depth,
+            delta_uv_px=torch.zeros_like(output.delta_uv_px),
+            validity_probability=torch.ones_like(output.measurement_valid_logit),
+            maximum_depth_m=self.maximum_depth_m,
+        )
         model_output_valid = (
             loss.ray_valid_mask
             & torch.isfinite(loss.predicted_position_world_m).all(dim=-1)
             & torch.isfinite(loss.corrected_depth_m)
             & (loss.corrected_depth_m <= self.maximum_depth_m)
-            & model_claims_valid
+            & model_gate.accepted
         )
         baseline_output_valid = (
             baseline_ray_valid
             & torch.isfinite(baseline_world).all(dim=-1)
             & torch.isfinite(baseline_depth)
             & (baseline_depth <= self.maximum_depth_m)
+            & baseline_gate.accepted
         )
         model_error = torch.linalg.vector_norm(
             loss.predicted_position_world_m - target, dim=-1
@@ -356,7 +375,7 @@ class TargetStateEvaluationAccumulator:
                 output,
                 predicted_position_world_m=loss.predicted_position_world_m,
                 corrected_depth_m=loss.corrected_depth_m,
-                model_claims_valid=model_claims_valid,
+                model_claims_valid=model_claims_valid & model_gate.input_valid,
                 maximum_depth_m=self.maximum_depth_m,
             ).sum().cpu()
         )
@@ -717,12 +736,14 @@ def _save_checkpoint(
     model_config: Mapping[str, int],
     dataset_sha256: str,
     dataset_provenance: Mapping[str, object],
+    reference_guard_protocol: str = "none",
 ) -> None:
     torch.save(
         {
             "model_type": MODEL_TYPE,
             "schema_version": MODEL_SCHEMA_VERSION,
             "training_stage": training_stage.value,
+            "reference_guard_protocol": reference_guard_protocol,
             "model_config": dict(model_config),
             "dataset_sha256": dataset_sha256,
             "dataset_provenance": _json_safe(dataset_provenance),
@@ -926,6 +947,7 @@ def train_target_state(
                 epoch,
                 last_validation,
                 training_stage=config.stage,
+                reference_guard_protocol=config.reference_guard_protocol,
                 model_config=model_config,
                 dataset_sha256=dataset_sha256,
                 dataset_provenance=dataset_provenance,
@@ -939,6 +961,7 @@ def train_target_state(
                     epoch,
                     last_validation,
                     training_stage=config.stage,
+                    reference_guard_protocol=config.reference_guard_protocol,
                     model_config=model_config,
                     dataset_sha256=dataset_sha256,
                     dataset_provenance=dataset_provenance,
@@ -1030,6 +1053,8 @@ def train_target_state(
         "output_fields": list(OUTPUT_FIELDS),
         "model_config": model_config,
         "preprocessing": {
+            **({"reference_guard_protocol": config.reference_guard_protocol}
+               if config.reference_guard_protocol != "none" else {}),
             "rgb_scale": 255.0,
             "depth_scale_m": config.maximum_depth_m,
             "minimum_depth_m": config.minimum_depth_m,

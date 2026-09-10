@@ -175,6 +175,8 @@ def _missing_depth_evaluation_batch() -> dict[str, torch.Tensor]:
         "missing_mask": torch.ones(batch_size, steps, dtype=torch.bool),
         "anchor_uv_px": torch.tensor([[15.5, 11.5]]),
         "raw_depth_m": torch.zeros(batch_size),
+        "image_size_wh": torch.tensor([[32.0, 24.0]]),
+        "depth_range_m": torch.tensor([[0.2, 200.0]]),
         "intrinsics_fx_fy_cx_cy": intrinsics,
         "camera_position_world_m": camera_position,
         "camera_orientation_world_wxyz": camera_orientation,
@@ -595,7 +597,7 @@ class TargetStateTrainerTest(unittest.TestCase):
         self.assertEqual(metrics["measurement_failure_rate"], 1.0)
         self.assertEqual(metrics["invalid_output_count"], 0)
 
-    def test_evaluate_model_counts_claimed_missing_depth_as_invalid_output(self) -> None:
+    def test_evaluate_model_blocks_missing_reference_before_geometry_publication(self) -> None:
         metrics = evaluate_model(
             _FixedEvaluationModel(validity_logit=10.0),
             [_missing_depth_evaluation_batch()],
@@ -603,7 +605,9 @@ class TargetStateTrainerTest(unittest.TestCase):
             maximum_depth_m=200.0,
         )["model"]
         self.assertEqual(metrics["measurement_failure_rate"], 1.0)
-        self.assertEqual(metrics["invalid_output_count"], 1)
+        self.assertEqual(metrics["invalid_output_count"], 0)
+        self.assertEqual(metrics["accepted_measurement_count"], 0)
+        self.assertIsNone(metrics["position_p95_error_m"])
 
     def test_invalid_output_mask_treats_rejected_missing_depth_as_failure_not_numeric_violation(self) -> None:
         output = TemporalRayDepthOutput(

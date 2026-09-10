@@ -1,0 +1,21 @@
+# Offline head-only experiment. No production model or threshold is changed.
+model_manifest: /home/amax/ry/vlm_drones/outputs/trained_models/target_state_geometry_v2_50k/stageb_geometry_v2_50k_v1/model_manifest.json
+shard_index: /home/amax/ry/vlm_drones/datasets/stage_a_indexes/target_state_extreme_v1_50k_shard_index.json
+train_review_manifest: /home/amax/ry/vlm_drones/outputs/diagnostics/audit_association_50k_v1/train_review_manifest.json
+pc_trans_root: /home/amax/ry/pc_trans
+pc_trans_config: /home/amax/ry/pc_trans/config/config.json
+bridge_root: /home/amax/ry/vlm_drones/datasets/_bridge
+output_dir: /home/amax/ry/vlm_drones/outputs/diagnostics/validity_probe_geometry_v2_50k_v1
+run_id_prefix: audit_validity_probe_50k_v1
+experiment_name: head_balanced_v1
+device: cuda:0
+num_workers: 4
+wait_timeout_s: 86400
+case_assets_max_gib: 2
+fit:
+  epochs: 10
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  hard_example_weight: 3.0
+  seed: 42

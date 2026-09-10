@@ -31,6 +31,8 @@ from perception.depth_geometry import (
 )
 from perception.grounding import CandidateResolutionUnavailable
 from perception.measurement import TargetMeasurement
+from perception.ray_measurement_gate import ray_measurement_gate
+from perception.rgbd_consistency import SensorObservation, guard_sequence, REFERENCE_GUARD_PROTOCOL
 from perception.runtime import PerceptionRuntimeProfile
 from runtime.frame_store import (
     FrameCameraGeometry,
@@ -73,6 +75,10 @@ INPUT_SEMANTICS = {
 _MAX_REASON_KEYS = 16
 
 
+class TemporalMeasurementRejected(CandidateResolutionUnavailable):
+    """Explicit sensor/model rejection; RGB-D fallback must not undo it."""
+
+
 @dataclass(frozen=True, slots=True)
 class TemporalRayDepthArtifactInfo:
     checkpoint_path: Path
@@ -83,6 +89,7 @@ class TemporalRayDepthArtifactInfo:
     max_history_age_s: float
     roi_size_px: int
     model_config: Mapping[str, int]
+    reference_guard_protocol: str = "none"
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +399,9 @@ def _load_artifact(
         raise ValueError("temporal model time_steps must equal history_size + 1")
 
     preprocessing = _manifest_mapping(raw["preprocessing"], "preprocessing")
+    reference_guard_protocol = preprocessing.get("reference_guard_protocol", "none")
+    if reference_guard_protocol not in {"none", REFERENCE_GUARD_PROTOCOL}:
+        raise ValueError("unsupported reference_guard_protocol")
     expected_preprocessing = {
         "rgb_scale": 255.0,
         "depth_scale_m": max_depth_m,
@@ -404,6 +414,8 @@ def _load_artifact(
         "foreground_min_valid_samples": 3,
         "foreground_seed_patch_radius_px": 4,
     }
+    if "reference_guard_protocol" in preprocessing:
+        expected_preprocessing["reference_guard_protocol"] = reference_guard_protocol
     if dict(preprocessing) != expected_preprocessing:
         raise ValueError(
             "temporal model manifest preprocessing does not match runtime"
@@ -428,6 +440,8 @@ def _load_artifact(
             raise TypeError("checkpoint payload must be a mapping")
         if payload.get("model_type") != "temporal_ray_depth_residual":
             raise ValueError("checkpoint model_type does not match manifest")
+        if payload.get("reference_guard_protocol", "none") != reference_guard_protocol:
+            raise ValueError("checkpoint reference guard does not match manifest")
         checkpoint_schema = payload.get("schema_version")
         if isinstance(checkpoint_schema, bool) or checkpoint_schema != 1:
             raise ValueError("checkpoint schema_version does not match manifest")
@@ -469,6 +483,7 @@ def _load_artifact(
             max_history_age_s=max_age,
             roi_size_px=roi_size,
             model_config=model_config,
+            reference_guard_protocol=reference_guard_protocol,
         ),
         model,
     )
@@ -654,6 +669,14 @@ class TemporalRayDepthResolver:
             raise CandidateResolutionUnavailable(
                 "temporal_ray_depth_unavailable:candidate_history_expired"
             )
+        if self._artifact.reference_guard_protocol != "none":
+            try:
+                self._guard_reference(candidate)
+            except (CandidateResolutionUnavailable, ValueError, TypeError, RuntimeError) as exc:
+                self._record_unavailable(_reason_code(exc))
+                # Neither learned inference nor deterministic fallback may
+                # bypass a reference surface ambiguity rejection.
+                raise TemporalMeasurementRejected(str(exc)) from exc
         try:
             baseline = self._fallback.resolve(candidate, timestamp_s=timestamp)
         except CandidateResolutionUnavailable as exc:
@@ -663,6 +686,9 @@ class TemporalRayDepthResolver:
         try:
             roi, geometry_features, missing_mask = self._build_model_inputs(candidate)
             measurement = self._infer_measurement(candidate, baseline, roi, geometry_features, missing_mask)
+        except TemporalMeasurementRejected as exc:
+            self._record_unavailable(_reason_code(exc))
+            raise
         except (
             CandidateResolutionUnavailable,
             ValueError,
@@ -714,6 +740,35 @@ class TemporalRayDepthResolver:
             self._unavailable_total += 1
             _bounded_counter_increment(self._unavailable_reasons, normalized)
             self._last_unavailable_reason = normalized
+
+    def _guard_reference(self, candidate):
+        if not candidate.frame_history or not (
+            len(candidate.frame_history) == len(candidate.bbox_history) == len(candidate.tracker_id_history)
+        ):
+            raise TemporalMeasurementRejected("rgbd_guard_invalid_candidate_history")
+        last = candidate.frame_history[-1]
+        refs = tuple(ref for ref in self._frame_store.refs(uav_id=candidate.uav_id)
+            if candidate.first_seen_timestamp_s-1e-9 <= ref.timestamp_s <= last.timestamp_s+1e-9
+            and last.timestamp_s-ref.timestamp_s <= self._max_history_age_s+1e-9)[-self._sequence_length:]
+        if not refs or refs[-1] != last:
+            raise TemporalMeasurementRejected("rgbd_guard_reference_unavailable")
+        detected = {ref.frame_id:(bbox,tracker) for ref,bbox,tracker in zip(
+            candidate.frame_history,candidate.bbox_history,candidate.tracker_id_history)}
+        observations = []
+        for ref in refs:
+            inputs = self._frame_store.get_temporal_inputs(ref)
+            if inputs is None:
+                raise TemporalMeasurementRejected("rgbd_guard_history_unavailable")
+            rgb,depth,camera,_ = inputs
+            bbox,tracker = detected.get(ref.frame_id,(None,None))
+            intr = camera.intrinsics
+            observations.append(SensorObservation(rgb,depth,bbox,
+                (intr.fx,intr.fy,intr.cx,intr.cy),camera.camera_position_world_m,
+                camera.camera_orientation_world_wxyz,ref.timestamp_s,tracker))
+        decision = guard_sequence(observations,minimum_depth_m=self._min_depth_m,
+            maximum_depth_m=self._max_depth_m,max_history_age_s=self._max_history_age_s)[-1]
+        if not decision.accepted:
+            raise TemporalMeasurementRejected("rgbd_guard_"+decision.reason)
 
     def _build_model_inputs(self, candidate: CandidateSnapshot):
         try:
@@ -875,6 +930,24 @@ class TemporalRayDepthResolver:
     def _infer_measurement(self, candidate, baseline, roi, features, missing):
         import torch
 
+        last_ref = candidate.frame_history[-1]
+        geometry = self._frame_store.get_camera_geometry(last_ref)
+        if geometry is None:
+            raise CandidateResolutionUnavailable("reference_camera_geometry_evicted")
+        gate_inputs = dict(
+            reference_detected=not bool(missing[0, -1].item()),
+            raw_depth_m=float(baseline.raw_depth_m) if baseline.raw_depth_m is not None else float("nan"),
+            anchor_uv_px=baseline.pixel_uv,
+            image_size_wh=(geometry.intrinsics.width, geometry.intrinsics.height),
+            minimum_depth_m=self._min_depth_m,
+            maximum_depth_m=self._max_depth_m,
+        )
+        initial_gate = ray_measurement_gate(
+            **gate_inputs, corrected_uv_px=baseline.pixel_uv,
+            corrected_depth_m=baseline.corrected_depth_m, validity_probability=1.0,
+        )
+        if not initial_gate.input_valid:
+            raise TemporalMeasurementRejected("temporal_reference_measurement_unavailable")
         with torch.inference_mode():
             output = self._model(roi, features, missing)
         values = output.as_dict()
@@ -882,26 +955,19 @@ class TemporalRayDepthResolver:
             raise ValueError("temporal_network_non_finite_output")
         valid_probability = float(torch.sigmoid(output.measurement_valid_logit[0]).cpu())
         if valid_probability < 0.5:
-            raise CandidateResolutionUnavailable(
+            raise TemporalMeasurementRejected(
                 f"temporal_measurement_invalid_probability:{valid_probability:.4f}"
             )
         delta_uv = output.delta_uv_px[0].detach().cpu().numpy().astype(np.float64)
         residual = float(output.depth_residual_m[0].detach().cpu())
         corrected_uv = np.asarray(baseline.pixel_uv, dtype=np.float64) + delta_uv
         corrected_depth = float(baseline.corrected_depth_m + residual)
-        last_ref = candidate.frame_history[-1]
-        geometry = self._frame_store.get_camera_geometry(last_ref)
-        if geometry is None:
-            raise CandidateResolutionUnavailable("reference_camera_geometry_evicted")
-        if (
-            corrected_uv[0] < 0.0
-            or corrected_uv[1] < 0.0
-            or corrected_uv[0] >= geometry.intrinsics.width
-            or corrected_uv[1] >= geometry.intrinsics.height
-        ):
-            raise ValueError("temporal_corrected_pixel_out_of_bounds")
-        if not self._min_depth_m <= corrected_depth <= self._max_depth_m:
-            raise ValueError("temporal_corrected_depth_out_of_bounds")
+        gate = ray_measurement_gate(
+            **gate_inputs, corrected_uv_px=corrected_uv,
+            corrected_depth_m=corrected_depth, validity_probability=valid_probability,
+        )
+        if not gate.accepted:
+            raise TemporalMeasurementRejected("temporal_corrected_geometry_out_of_bounds")
         optical = backproject_pixel_to_camera_optical(
             u_px=float(corrected_uv[0]),
             v_px=float(corrected_uv[1]),

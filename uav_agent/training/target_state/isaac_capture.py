@@ -29,6 +29,8 @@ from perception.yolo_client import (
     validate_yolo_model_identity,
 )
 from training.target_state.collector import VerifiedYoloDeployment
+from training.target_state.association_quality import depth_support
+from datasets.target_state.projection import project_label_center, center_in_image
 from training.yolo.collection_scene import CUBE_CLASS_NAME
 from training.yolo.isaac_collector import (
     OracleFrameTruth,
@@ -101,9 +103,17 @@ def associate_detections_to_truth(
     truth_decisions: Sequence[tuple[OracleObjectTruth, ProjectionDecision]],
     *,
     resolution_wh_px: tuple[int, int],
+    depth_to_image_plane_m: np.ndarray,
     minimum_iou: float = 0.1,
 ) -> tuple[DetectionTruthAssociation, ...]:
-    """Greedy deterministic one-to-one association used only for labels."""
+    """Depth-supported, unambiguous one-to-one OFFLINE label association."""
+    return _review_associations(detections, truth_decisions,
+        resolution_wh_px=resolution_wh_px, depth=depth_to_image_plane_m,
+        minimum_iou=minimum_iou)[0]
+
+
+def _review_associations(detections, truth_decisions, *, resolution_wh_px,
+                         depth, minimum_iou):
 
     threshold = _probability(minimum_iou, "minimum_iou")
     width, height = resolution_wh_px
@@ -116,26 +126,55 @@ def associate_detections_to_truth(
         or height <= 0
     ):
         raise ValueError("resolution_wh_px must contain positive integers")
+    if np.asarray(depth).shape != (height, width):
+        raise ValueError("association depth resolution does not match camera")
     proposals: list[tuple[float, str, int]] = []
+    plausible_truth: set[str] = set()
+    plausible_detections: set[int] = set()
     for truth, decision in truth_decisions:
-        if truth.shape != CUBE_CLASS_NAME or decision.label is None:
+        if truth.shape != CUBE_CLASS_NAME:
             continue
-        x1, y1, x2, y2 = decision.label.bbox_xyxy_px
+        if decision.label is None:
+            # Fully occluded truth has no visible YOLO label. Its projected
+            # extent can still make a detection ambiguous; never silently
+            # turn that detection into a supervised false positive.
+            pixels = np.asarray(truth.projected_pixels_uv)
+            depths = np.asarray(truth.projected_depth_m)
+            usable = np.isfinite(pixels).all(axis=1) & np.isfinite(depths) & (depths > 0)
+            if not np.any(usable):
+                continue
+            lo, hi = pixels[usable].min(axis=0), pixels[usable].max(axis=0)
+            x1, y1 = max(0.0, float(lo[0])), max(0.0, float(lo[1]))
+            x2, y2 = min(float(width), float(hi[0])), min(float(height), float(hi[1]))
+            if x1 >= x2 or y1 >= y2:
+                continue
+        else:
+            x1, y1, x2, y2 = decision.label.bbox_xyxy_px
         normalized = (x1 / width, y1 / height, x2 / width, y2 / height)
         for index, detection in enumerate(detections):
             if detection.class_id != 0 or detection.class_name.casefold() != "cube":
                 continue
             overlap = _bbox_iou(normalized, detection.bbox_xyxy_normalized)
             if overlap >= threshold:
-                proposals.append((-overlap, truth.object_id, index))
-    used_truth: set[str] = set()
-    used_detections: set[int] = set()
+                plausible_truth.add(truth.object_id)
+                plausible_detections.add(index)
+                if decision.label is None:
+                    continue
+                depths = np.asarray(truth.projected_depth_m)
+                # Do not invent a target surface when corners cross the camera
+                # plane or the projection is incomplete/non-finite.
+                if not depths.size or not np.isfinite(depths).all() or np.any(depths <= 0):
+                    continue
+                evidence = depth_support(depth, detection.bbox_xyxy_normalized,
+                                         float(depths.min()), float(depths.max()))
+                if evidence["supported"]:
+                    proposals.append((-overlap, truth.object_id, index))
     result: list[DetectionTruthAssociation] = []
     for negative_iou, object_id, detection_index in sorted(proposals):
-        if object_id in used_truth or detection_index in used_detections:
+        # IoU ranking alone cannot resolve same-depth crossings/duplicates.
+        if (sum(p[1] == object_id for p in proposals) != 1
+                or sum(p[2] == detection_index for p in proposals) != 1):
             continue
-        used_truth.add(object_id)
-        used_detections.add(detection_index)
         result.append(
             DetectionTruthAssociation(
                 object_id=object_id,
@@ -143,7 +182,8 @@ def associate_detections_to_truth(
                 iou=-negative_iou,
             )
         )
-    return tuple(result)
+    return (tuple(result), plausible_truth - {r.object_id for r in result},
+            plausible_detections - {r.detection_index for r in result})
 
 
 @dataclass(slots=True)
@@ -355,23 +395,13 @@ class TargetStateFrameAssembler:
                 normalized = (x1 / width, y1 / height, x2 / width, y2 / height)
             projected.append((obj, decision, normalized))
 
-        proposals: list[tuple[float, str, int]] = []
-        for obj, _decision, normalized in projected:
-            if normalized is None:
-                continue
-            for detection_index, detection in enumerate(detections):
-                if detection.class_id != 0 or detection.class_name.casefold() != "cube":
-                    continue
-                overlap = _bbox_iou(normalized, detection.bbox_xyxy_normalized)
-                if overlap >= self.minimum_truth_iou:
-                    proposals.append((-overlap, obj.object_id, detection_index))
-        associations: dict[str, int] = {}
-        used_detections: set[int] = set()
-        for _negative_iou, object_id, detection_index in sorted(proposals):
-            if object_id in associations or detection_index in used_detections:
-                continue
-            associations[object_id] = detection_index
-            used_detections.add(detection_index)
+        matched, review_truth, review_detections = _review_associations(
+            detections, [(obj, decision) for obj, decision, _ in projected],
+            resolution_wh_px=(width, height), depth=sample.depth_to_image_plane_m,
+            minimum_iou=self.minimum_truth_iou,
+        )
+        associations = {item.object_id: item.detection_index for item in matched}
+        used_detections = {item.detection_index for item in matched}
 
         records: list[TargetStateFrameRecord] = []
         for target_index, (obj, decision, normalized) in enumerate(projected):
@@ -405,15 +435,13 @@ class TargetStateFrameAssembler:
             visible = decision.label is not None
             center = None
             if visible and decision.label is not None:
-                x1, y1, x2, y2 = decision.label.bbox_xyxy_px
-                projected_center = obj.center_pixel_uv
-                center = (
-                    projected_center
-                    if projected_center is not None
-                    and 0.0 <= projected_center[0] < width
-                    and 0.0 <= projected_center[1] < height
-                    else ((x1 + x2) * 0.5, (y1 + y2) * 0.5)
-                )
+                center, _ = project_label_center(obj.position_world_m,
+                    camera.position_world_m, camera.orientation_world_wxyz,
+                    (camera.fx, camera.fy, camera.cx, camera.cy))
+                # A box crossing the camera plane can be visible even though
+                # the centre is not projectable. Retain truth as unavailable.
+                if center is None:
+                    visible = False
             label = TargetTrainingLabel(
                 position_world_m=obj.position_world_m,
                 velocity_world_mps=obj.velocity_world_mps,
@@ -426,6 +454,7 @@ class TargetStateFrameAssembler:
                 ),
                 color_name=obj.color_name,
                 instance_id=obj.object_id,
+                center_in_image=center_in_image(center, (width, height)),
             )
             records.append(
                 TargetStateFrameRecord(
@@ -437,6 +466,7 @@ class TargetStateFrameAssembler:
                     sensor_input=sensor,
                     detector_prediction=detector,
                     training_label=label,
+                    association_review_required=obj.object_id in review_truth,
                 )
             )
 
@@ -459,6 +489,7 @@ class TargetStateFrameAssembler:
                         candidate_ids[detection_index],
                     ),
                     training_label=None,
+                    association_review_required=detection_index in review_detections,
                 )
             )
         if not projected and not detections:

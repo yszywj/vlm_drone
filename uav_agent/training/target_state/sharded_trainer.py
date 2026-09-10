@@ -35,7 +35,8 @@ from torch.utils.data import DataLoader
 
 from datasets.target_state.dataset import split_for_episode
 from experiments.metric_logger import ScalarEventWriter
-from training.target_state.config import TargetStateTrainingConfig, TrainingStage
+from perception.ray_measurement_gate import MEASUREMENT_PROTOCOL
+from training.target_state.config import TargetStateTrainingConfig, TrainingStage, preprocessing_contract
 from training.target_state.data import GEOMETRY_INPUT_FIELDS, TargetStateTorchDataset
 from training.target_state.losses import compute_target_state_losses
 from training.target_state.model import TemporalRayDepthNet
@@ -537,6 +538,9 @@ def _training_contract_sha256(config: TargetStateTrainingConfig) -> str:
     """Hash semantic settings that may not change during same-run resume."""
 
     payload = {
+        "measurement_protocol": MEASUREMENT_PROTOCOL,
+        "supervision_protocol": config.supervision_protocol,
+        "reference_guard_protocol": config.reference_guard_protocol,
         "stage": config.stage.value,
         "history_size": config.history_size,
         "max_history_age_s": config.max_history_age_s,
@@ -558,6 +562,11 @@ def _training_contract_sha256(config: TargetStateTrainingConfig) -> str:
         "expected_yolo_model_sha256": config.expected_yolo_model_sha256,
         "loss_weights": asdict(config.loss_weights),
     }
+    if config.supervision_protocol != "legacy_v1" or config.reference_guard_protocol != "none":
+        root = Path(__file__).resolve().parents[2]
+        payload["semantic_source_sha256"] = {name:sha256_file(root/name) for name in (
+            "training/target_state/data.py", "training/target_state/losses.py",
+            "datasets/target_state/projection.py", "perception/rgbd_consistency.py")}
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")
@@ -703,6 +712,8 @@ def _checkpoint_payload(
         "schema_version": MODEL_SCHEMA_VERSION,
         "training_stage": config.stage.value,
         "model_config": dict(model_config),
+        "supervision_protocol": config.supervision_protocol,
+        "reference_guard_protocol": config.reference_guard_protocol,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "dataset_sha256": index.parent_dataset_sha256,
@@ -2654,6 +2665,20 @@ def _train_target_state_sharded_locked(
         "model_type": MODEL_TYPE,
         "schema_version": MODEL_SCHEMA_VERSION,
         "training_stage": config.stage.value,
+        "supervision_protocol": config.supervision_protocol,
+        "training_contract_sha256": _training_contract_sha256(config),
+        "input_fields": {"roi_rgbd": ["red","green","blue","normalized_depth"],
+                         "geometry_25d": list(GEOMETRY_INPUT_FIELDS), "missing_mask": True},
+        "input_semantics": {
+            "roi_source": "detector_bbox_crop",
+            "camera_relative_pose_source": "synchronized_camera_pose_including_extrinsics",
+            "uav_linear_velocity_frame": "world", "uav_angular_velocity_frame": "body",
+            "delta_t_reference": "reference_timestamp_minus_frame_timestamp",
+            "tracker_continuity_source": "previous_non_missing_tracker_id_match"},
+        "output_fields": list(OUTPUT_FIELDS), "model_config": model_config,
+        "preprocessing": preprocessing_contract(config),
+        "history_size": config.history_size, "max_history_age_s": config.max_history_age_s,
+        "camera_convention": config.camera_convention, "coordinate_convention": config.coordinate_convention,
         "training_protocol": TRAINING_PROTOCOL,
         "resume_protocol": RESUME_PROTOCOL,
         "checkpoint_path": str(best_path.resolve()),

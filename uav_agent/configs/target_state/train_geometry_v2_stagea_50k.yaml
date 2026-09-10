@@ -1,0 +1,18 @@
+# New run, model-only warm start; never resume the legacy optimizer/checkpoints.
+dataset_root: /home/amax/ry/vlm_drones/datasets/target_state_v1
+output_dir: /home/amax/ry/vlm_drones/outputs/trained_models/target_state_geometry_v2_50k
+run_name: stagea_geometry_v2_50k_v1
+initial_checkpoint_path: /home/amax/ry/vlm_drones/outputs/trained_models/target_state_extreme_50k/temporal_ray_depth_oracle_clean_50k_5ep_v2/best.pt
+stage: oracle_clean
+supervision_protocol: projected_center_v2
+reference_guard_protocol: rgbd_consistency_v1
+epochs: 2
+learning_rate: 0.0001
+batch_size: 16
+num_workers: 4
+seed: 42
+history_size: 6
+max_history_age_s: 2.0
+device: cuda:0
+require_dataset_manifest: true
+expected_yolo_model_sha256: 895de7caa8af200c12f343c72e3a726ffae65e4d96d2092decaf96ef4558de07

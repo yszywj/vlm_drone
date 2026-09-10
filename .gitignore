@@ -28,6 +28,13 @@ uav_agent/logs/
 # 本地数据集，不上传 GitHub
 /datasets/
 /uav_agent/datasets/
+# Target-state schema/sequence code is source, not captured training data.
+!/uav_agent/datasets/
+/uav_agent/datasets/*
+!/uav_agent/datasets/__init__.py
+!/uav_agent/datasets/target_state/
+/uav_agent/datasets/target_state/*
+!/uav_agent/datasets/target_state/*.py
 # 不上传任何目录下的 README 文件
 **/README*
 **/readme*

@@ -39,3 +39,5 @@ uav_agent/logs/
 # 不上传任何目录下的 README 文件
 **/README*
 **/readme*
+
+/research/

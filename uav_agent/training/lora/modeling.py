@@ -509,6 +509,9 @@ def load_qwen_base_model(
             model.enable_input_require_grads()
         if hasattr(model, "config"):
             model.config.use_cache = False
+            text_config = getattr(model.config, "text_config", None)
+            if text_config is not None:
+                text_config.use_cache = False
     return BaseModelBundle(model=model, processor=processor)
 
 

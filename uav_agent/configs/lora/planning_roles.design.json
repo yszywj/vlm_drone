@@ -1,0 +1,196 @@
+{
+  "document_type": "planning_lora_design",
+  "design_version": 1,
+  "status": "first_training_in_progress",
+  "training_enabled": true,
+  "runtime_routing_enabled": false,
+  "notice": "Design and progress record, not accepted by the training config loader or adapter router. The first three-role run is in progress through separate *_train.json configs; runtime deployment remains disabled.",
+  "base_model": {
+    "name": "Qwen3-VL-4B-Instruct",
+    "local_path": "/home/amax/ry/vlm_drones/models/initial_model/Qwen3-VL-4B-Instruct",
+    "architecture": "Qwen3VLForConditionalGeneration",
+    "language_backbone": "decoder_transformer",
+    "language_layers": 36,
+    "language_hidden_size": 2560,
+    "language_intermediate_size": 9728,
+    "config_sha256": "edac7703329133edfc53e46ac0081835144c99d7eebf28b71c732694d435224d",
+    "checkpoint_index_sha256": "58a7841d7bff2548dd91577d216274a83cf1b500bc6a534b809d6c1b1707cf2b",
+    "index_matched_language_projection_weights": 252,
+    "actual_loaded_module_audit_completed_in_this_design": true
+  },
+  "adapter_design": {
+    "method": "standard_peft_lora",
+    "task_type": "CAUSAL_LM",
+    "rank": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "bias": "none",
+    "hyperparameter_status": "experimental_starting_values_not_validated_optimum",
+    "comparison": {
+      "rank": 32,
+      "lora_alpha": 64,
+      "lora_dropout": 0.05
+    },
+    "target_modules": [
+      "model.language_model.layers.*.self_attn.q_proj",
+      "model.language_model.layers.*.self_attn.k_proj",
+      "model.language_model.layers.*.self_attn.v_proj",
+      "model.language_model.layers.*.self_attn.o_proj",
+      "model.language_model.layers.*.mlp.gate_proj",
+      "model.language_model.layers.*.mlp.up_proj",
+      "model.language_model.layers.*.mlp.down_proj"
+    ],
+    "freeze_all_base_parameters": true,
+    "freeze_vision": true,
+    "freeze_visual_merger": true,
+    "train_only_language_lora_parameters": true,
+    "input_modality": "text_and_structured_state",
+    "roles_trained_independently": true,
+    "stack_role_adapters": false
+  },
+  "roles": {
+    "mission_interpreter": {
+      "operations": [
+        "MISSION_INTERPRETATION"
+      ],
+      "input_contract": "original_instruction_and_trusted_alias_catalogs",
+      "output_contract": "FleetTaskSpecV1",
+      "trained_adapter_path": null
+    },
+    "fleet_planner": {
+      "operations": [
+        "FLEET_PLAN",
+        "FLEET_REPLAN"
+      ],
+      "input_contract": "FleetMissionRequestV2",
+      "output_contract": "FleetMissionPlanV2",
+      "trained_adapter_path": null
+    },
+    "spatial_mission": {
+      "operations": [
+        "AGENT_SPATIAL_PLAN"
+      ],
+      "input_contract": "AgentPlannerRequestV2",
+      "output_contract": "SkillPlanDraftV3",
+      "trained_adapter_path": null
+    }
+  },
+  "task_generation_design": {
+    "status": "first_positive_pilot_generated",
+    "gold_first": true,
+    "sample_uav_target_and_task_counts_separately": true,
+    "allow_targetless_tasks": true,
+    "initial_task_families": [
+      "coordinate_navigation",
+      "hover_wait",
+      "search_without_tracking",
+      "search_then_track",
+      "mixed_parallel_fleet_tasks"
+    ],
+    "termination_requirements": [
+      "return_home",
+      "land_at_own_home",
+      "return_home_and_land",
+      "wait"
+    ],
+    "do_not_invent_unrequested_search_tracking_or_termination_goals": true,
+    "separate_host_execution_policy_from_user_goals": true,
+    "conditional_task_families": {
+      "named_destination_navigation": "requires_trusted_navigation_point_catalog_in_fleet_context",
+      "confirmed_target_direct_tracking": "requires_runtime_entrypoint_trusted_target_id_wiring",
+      "ordered_waypoints_and_dwell": "requires_independent_order_and_dwell_location_checks"
+    },
+    "deferred_execution_families": [
+      "initial_inspection",
+      "report_action",
+      "arbitrary_location_landing",
+      "cross_uav_synchronization",
+      "multiple_semantic_targets_per_assignment"
+    ],
+    "max_active_assignments_per_uav": 1,
+    "max_semantic_targets_per_assignment": 1,
+    "split_group": "underlying_task_including_all_paraphrases_role_projections_and_repairs",
+    "initial_dataset": {
+      "path": "/home/amax/ry/vlm_drones/datasets/planning_roles_v1",
+      "manifest": "/home/amax/ry/vlm_drones/datasets/planning_roles_v1/manifest.json",
+      "underlying_tasks": 1000,
+      "role_samples": 8000,
+      "task_splits": {
+        "train": 800,
+        "validation": 100,
+        "test": 100
+      },
+      "scope": "positive_explicit_must_assignments_five_families",
+      "notes": "Targetless NAV/WAIT and mixed target counts included; pure search families still pair one target per UAV. Full independent inventory/task-count sampling, repair, clarification and free assignment optimization remain future work."
+    }
+  },
+  "training_prerequisites": {
+    "role_dataset_pipelines_implemented": true,
+    "independent_gold_validated_against_production_contracts": true,
+    "assistant_only_supervision": true,
+    "model_max_length": 8192,
+    "length_must_cover_prompt_and_complete_answer": true,
+    "required_oversize_policy": "reject_with_sample_id_never_silently_truncate",
+    "current_collator_truncation_requires_resolution": false,
+    "actual_module_and_trainable_parameter_audits_required": true,
+    "current_training_entry_contract": "planning_roles_v1_messages_three_roles",
+    "role_dataset_generation_implemented": true,
+    "pilot_token_audit": {
+      "max_full_tokens": {
+        "mission_interpreter": 6109,
+        "fleet_planner": 6092,
+        "spatial_mission": 3643
+      },
+      "max_interpreter_answer_tokens": 4516,
+      "interpreter_default_budget_overflow_samples": 146,
+      "training_length_not_yet_validated_on_gpu": false
+    }
+  },
+  "evaluation": {
+    "regression_suite": "configs/benchmarks/fleet_open_scaling_2_to_10.json",
+    "additional_held_out_tasks_required": true,
+    "scales": [
+      2,
+      4,
+      6,
+      8,
+      10
+    ],
+    "experiments": [
+      "train_2_to_10_test_unseen_tasks",
+      "train_2_to_8_hold_out_10"
+    ],
+    "metrics": [
+      "first_attempt_strict_pass_rate",
+      "after_repair_strict_pass_rate",
+      "original_goal_coverage",
+      "missing_or_duplicate_assignment_count",
+      "complete_local_plan_count",
+      "program_completion_rate",
+      "latency",
+      "token_usage",
+      "output_truncation_and_service_errors"
+    ]
+  },
+  "references": [
+    "docs/planning_lora_design.md",
+    "training/lora/modeling.py",
+    "https://huggingface.co/docs/peft/en/package_reference/lora",
+    "https://github.com/QwenLM/Qwen3-VL/blob/main/qwen-vl-finetune/README.md"
+  ],
+  "active_training_run": {
+    "run_id": "roles_r16_20260912T133403Z",
+    "tmux_session": "planning_lora",
+    "roles_to_gpu": {
+      "mission_interpreter": 0,
+      "fleet_planner": 2,
+      "spatial_mission": 3
+    },
+    "epochs": 3,
+    "learning_rate": 0.0001,
+    "micro_batch_size": 1,
+    "gradient_accumulation_steps": 16,
+    "language_lora_parameters": 33030144,
+    "runtime_status_files": "/home/amax/ry/vlm_drones/outputs/lora/planning_roles/<role>/roles_r16_20260912T133403Z/status.json"
+  }
+}

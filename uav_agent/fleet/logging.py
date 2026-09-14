@@ -109,6 +109,8 @@ class FleetMissionLogger:
         "adapter_status",
         "effective_model",
         "fallback_used",
+        "json_schema_property_order",
+        "generation_options_json",
         "prompt_tokens",
         "completion_tokens",
         "latency_s",

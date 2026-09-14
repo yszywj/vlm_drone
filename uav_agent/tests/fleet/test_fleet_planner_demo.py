@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -22,7 +23,19 @@ _INSTRUCTION = (
 )
 
 
-def test_scripted_demo_prints_all_required_sections_without_isaac(capsys) -> None:
+@pytest.fixture
+def placeholder_config(tmp_path: Path) -> Path:
+    payload = json.loads((_ROOT / "configs/adapters.json").read_text())
+    for adapter in payload["adapters"].values():
+        adapter.update(status="placeholder", path=None, rank=None)
+        adapter.pop("generation", None)
+    payload["fallback_to_base"] = True
+    config = tmp_path / "adapters.json"
+    config.write_text(json.dumps(payload), encoding="utf-8")
+    return config
+
+
+def test_scripted_demo_prints_all_required_sections_without_isaac(capsys, placeholder_config: Path) -> None:
     before = {name for name in sys.modules if name.startswith(("isaacsim", "omni"))}
     code = run_fleet_planner_demo.main(
         [
@@ -35,7 +48,7 @@ def test_scripted_demo_prints_all_required_sections_without_isaac(capsys) -> Non
             "--planning-contract",
             "v3",
             "--adapter-config",
-            str(_ROOT / "configs/adapters.json"),
+            str(placeholder_config),
             "--instruction",
             _INSTRUCTION,
         ]
@@ -60,13 +73,13 @@ def test_scripted_demo_prints_all_required_sections_without_isaac(capsys) -> Non
     assert after == before
 
 
-def test_scripted_demo_preserves_both_routing_relationships() -> None:
+def test_scripted_demo_preserves_both_routing_relationships(placeholder_config: Path) -> None:
     arguments = run_fleet_planner_demo._parser().parse_args(
         [
             "--config",
             str(_ROOT / "configs/multi_uav_demo.yaml"),
             "--adapter-config",
-            str(_ROOT / "configs/adapters.json"),
+            str(placeholder_config),
             "--instruction",
             _INSTRUCTION,
         ]
@@ -120,7 +133,7 @@ def test_cross_contract_modes_fail_instead_of_falling_back() -> None:
         run_fleet_planner_demo._effective_local_planner(args)
 
 
-def test_scripted_path_still_uses_fixed_parser(monkeypatch) -> None:
+def test_scripted_path_still_uses_fixed_parser(monkeypatch, placeholder_config: Path) -> None:
     calls: list[str] = []
     original = run_fleet_planner_demo.parse_explicit_assignment_instruction
 
@@ -138,7 +151,7 @@ def test_scripted_path_still_uses_fixed_parser(monkeypatch) -> None:
             "--config",
             str(_ROOT / "configs/multi_uav_demo.yaml"),
             "--adapter-config",
-            str(_ROOT / "configs/adapters.json"),
+            str(placeholder_config),
             "--instruction",
             _INSTRUCTION,
         ]
@@ -153,6 +166,7 @@ def test_scripted_path_still_uses_fixed_parser(monkeypatch) -> None:
 
 def test_llm_v2_never_calls_fixed_parser_and_uses_roles_in_order(
     monkeypatch,
+    placeholder_config: Path,
 ) -> None:
     task_spec = FleetTaskSpecV1(
         source_text="请找一下目标i，具体派谁由系统决定",
@@ -303,7 +317,7 @@ def test_llm_v2_never_calls_fixed_parser_and_uses_roles_in_order(
             "--config",
             str(_ROOT / "configs/multi_uav_demo.yaml"),
             "--adapter-config",
-            str(_ROOT / "configs/adapters.json"),
+            str(placeholder_config),
             "--fleet-planner",
             "llm",
             "--instruction",

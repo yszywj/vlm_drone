@@ -9,7 +9,10 @@ QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-${REPO_ROOT}/models/initial_model/Qwen3-VL-4
 QWEN_SERVED_MODEL_NAME="${QWEN_SERVED_MODEL_NAME:-Qwen3-VL-4B-Instruct}"
 QWEN_HOST="${QWEN_HOST:-127.0.0.1}"
 QWEN_PORT="${QWEN_PORT:-8000}"
-QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-4096}"
+QWEN_MAX_MODEL_LEN="${QWEN_MAX_MODEL_LEN:-16384}"
+QWEN_DTYPE="${QWEN_DTYPE:-bfloat16}"
+QWEN_MAX_NUM_SEQS="${QWEN_MAX_NUM_SEQS:-32}"
+QWEN_MAX_NUM_BATCHED_TOKENS="${QWEN_MAX_NUM_BATCHED_TOKENS:-8192}"
 QWEN_GPU_MEMORY_UTILIZATION="${QWEN_GPU_MEMORY_UTILIZATION:-0.90}"
 QWEN_CUDA_VISIBLE_DEVICES="${QWEN_CUDA_VISIBLE_DEVICES:-1}"
 VLLM_BIN="${VLLM_BIN:-vllm}"
@@ -72,6 +75,7 @@ printf '%s\n' \
   "Bind address: ${QWEN_HOST}:${QWEN_PORT}" \
   "CUDA visible devices: ${QWEN_CUDA_VISIBLE_DEVICES}" \
   "Maximum model length: ${QWEN_MAX_MODEL_LEN}" \
+  "Model dtype: ${QWEN_DTYPE}" \
   "GPU memory utilization: ${QWEN_GPU_MEMORY_UTILIZATION}"
 if ((${#QWEN_LORA_ARGS[@]} > 0)); then
   printf 'Static active LoRA adapters (including mission interpreter when active): enabled (%s vLLM arguments)\n' "${#QWEN_LORA_ARGS[@]}"
@@ -84,7 +88,10 @@ exec "${VLLM_BIN}" serve "${QWEN_MODEL_PATH}" \
   --served-model-name "${QWEN_SERVED_MODEL_NAME}" \
   --host "${QWEN_HOST}" \
   --port "${QWEN_PORT}" \
-  --dtype float16 \
+  --dtype "${QWEN_DTYPE}" \
   --max-model-len "${QWEN_MAX_MODEL_LEN}" \
+  --max-num-seqs "${QWEN_MAX_NUM_SEQS}" \
+  --max-num-batched-tokens "${QWEN_MAX_NUM_BATCHED_TOKENS}" \
+  --enable-prefix-caching \
   --gpu-memory-utilization "${QWEN_GPU_MEMORY_UTILIZATION}" \
   "${QWEN_LORA_ARGS[@]}"

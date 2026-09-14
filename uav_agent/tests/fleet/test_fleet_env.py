@@ -89,6 +89,9 @@ class _Sensor:
     def destroy(self) -> None:
         self.destroyed = True
 
+    def detach_annotators(self) -> None:
+        pass
+
 
 class _SampleSensor(_Sensor):
     def __init__(

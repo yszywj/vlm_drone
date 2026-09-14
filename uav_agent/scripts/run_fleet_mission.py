@@ -59,12 +59,12 @@ from fleet.local_spatial_planner import (  # noqa: E402
     ScriptedAssignmentSpatialPlanner,
 )
 from fleet.preplanned_planner import RoutedPreplannedFleetPlanner  # noqa: E402
+from fleet.planning_service import FleetPlanningService  # noqa: E402
 from fleet.request_builder import (  # noqa: E402
     FleetRequestBuildError,
     build_agent_world_contexts,
     build_agent_world_contexts_v2,
     build_fleet_mission_request,
-    build_fleet_mission_request_v2,
     build_target_catalog,
     parse_explicit_assignment_instruction,
 )
@@ -361,6 +361,7 @@ class PreparedFleetMission:
     task_spec: FleetTaskSpecV1 | None = None
     fleet_request_v2: FleetMissionRequestV2 | None = None
     fleet_plan_v2: FleetMissionPlanV2 | None = None
+    fleet_planner_max_tokens: int = 2048
     mission_interpreter_source: str = "scripted_fixed_parser"
     mission_interpreter_diagnostics: Mapping[str, object] | None = None
     mission_interpreter_proposals: tuple[Mapping[str, object], ...] = ()
@@ -513,6 +514,13 @@ class _StoreExplicitRuntimeProfile(argparse.Action):
         setattr(namespace, "_perception_runtime_profile_explicit", True)
 
 
+def _generation_token_budget(value: str) -> int:
+    parsed = int(value)
+    if not 256 <= parsed <= 8192:
+        raise argparse.ArgumentTypeError("token budget must be within [256, 8192]")
+    return parsed
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -558,6 +566,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url")
     parser.add_argument("--model")
     parser.add_argument("--api-key")
+    parser.add_argument(
+        "--interpreter-max-tokens", type=_generation_token_budget, default=6144,
+        help="mission interpretation output budget; server context must fit input plus output",
+    )
+    parser.add_argument(
+        "--fleet-max-tokens", type=_generation_token_budget, default=2048,
+        help="Fleet plan/replan output budget; server context must fit input plus output",
+    )
     parser.add_argument("--enable-qwen-vision", action="store_true")
     parser.add_argument(
         "--vision-review-mode",
@@ -618,34 +634,6 @@ def _resolved_mission_interpreter(args: argparse.Namespace) -> str:
             "or both be llm; cross-version fallback is forbidden"
         )
     return str(selected)
-
-
-def _mission_alias_catalogs(
-    config: object,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Expose only trusted semantic aliases to the Interpreter."""
-
-    uav_aliases: dict[str, str] = {}
-    for uav in config.uavs:
-        uav_aliases[uav.id] = uav.id
-        if uav.display_name:
-            uav_aliases[uav.display_name] = uav.id
-    target_aliases: dict[str, str] = {}
-    for target in config.targets:
-        target_aliases[target.id] = target.id
-        if target.semantic_alias:
-            target_aliases[target.semantic_alias] = target.id
-    return uav_aliases, target_aliases
-
-
-def _semantic_issue_dict(value: object) -> dict[str, object]:
-    return {
-        "code": getattr(value, "code", type(value).__name__),
-        "message": str(getattr(value, "message", value))[:2048],
-        "constraint_id": getattr(value, "constraint_id", None),
-        "goal_id": getattr(value, "goal_id", None),
-        "assignment_id": getattr(value, "assignment_id", None),
-    }
 
 
 def _lower_v2_target_plan_for_runtime(
@@ -1017,7 +1005,9 @@ def _build_runtime_fleet_replan_handler(
         raise TypeError("agent_factory must be callable")
     client_factory = prepared.model_client_factory
     fleet_planner_factory = fleet_planner_factory or (
-        lambda client: LLMFleetPlannerV2(client, repair_budget=2)
+        lambda client: LLMFleetPlannerV2(
+            client, repair_budget=2, max_tokens=prepared.fleet_planner_max_tokens
+        )
     )
     local_planner_factory = local_planner_factory or (
         lambda client, _uav_id: DynamicLLMPlanner(
@@ -1047,6 +1037,15 @@ def _build_runtime_fleet_replan_handler(
     ):
         if not callable(factory):
             raise TypeError(f"{name} must be callable")
+
+    planning_service = FleetPlanningService(
+        prepared.config,
+        client_factory,
+        fleet_max_tokens=getattr(prepared, "fleet_planner_max_tokens", 2048),
+        # Retain the existing one-client factory seam; its closure owns the
+        # runtime generation settings, including the prepared token budget.
+        fleet_planner_factory=lambda client, **_options: fleet_planner_factory(client),
+    )
 
     active_v2: dict[str, FleetAssignmentV2] = {
         assignment.assignment_id: assignment
@@ -1113,20 +1112,18 @@ def _build_runtime_fleet_replan_handler(
             sort_keys=True,
             separators=(",", ":"),
         )
-        planner = fleet_planner_factory(
-            client_factory.for_role(
-                ModelCallRole.FLEET_REPLAN,
-                fleet_mission_id=request_v2.fleet_mission_id,
+        replan_audit: dict[str, object] = {}
+        try:
+            global_result = planning_service.plan_request(
+                request_v2,
+                replan=True,
                 assignment_id=source_id,
                 uav_id=source_runtime.uav_id,
+                audit_context=replan_audit,
             )
-        )
-        try:
-            proposed_plan = validate_fleet_mission_plan_v2(
-                planner.plan(request_v2), request_v2
-            )
+            proposed_plan = global_result.plan
         finally:
-            proposals = tuple(getattr(planner, "model_proposals", ()))
+            proposals = tuple(replan_audit.get("fleet_planner_proposals", ()))
             safe_audit(
                 lambda: _record_proposal_stage(
                     audit,
@@ -1722,73 +1719,29 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
                 max_run_bytes=config.results.max_run_bytes,
             )
             setattr(args, "_preparation_fleet_logger", live_logger_holder[0])
-        uav_aliases, target_aliases = _mission_alias_catalogs(config)
-        interpreter = LLMFleetTaskInterpreter(
-            client_factory.for_role(
-                ModelCallRole.MISSION_INTERPRETATION,
-                fleet_mission_id=fleet_mission_id,
-            ),
-            uav_alias_catalog=uav_aliases,
-            target_alias_catalog=target_aliases,
-            repair_budget=1,
-        )
-        try:
-            task_spec = interpreter.interpret(args.instruction.strip())
-        except Exception:
-            preparation_context["interpreter_proposals"] = (
-                interpreter.model_proposals
-            )
-            diagnostics = interpreter.last_diagnostics
-            preparation_context["interpreter_diagnostics"] = (
-                None if diagnostics is None else diagnostics.to_dict()
-            )
-            raise
-        diagnostics = interpreter.last_diagnostics
-        interpreter_diagnostics = (
-            None if diagnostics is None else diagnostics.to_dict()
-        )
-        interpreter_proposals = interpreter.model_proposals
-        preparation_context.update(
-            {
-                "task_spec": task_spec,
-                "interpreter_proposals": interpreter_proposals,
-                "interpreter_diagnostics": interpreter_diagnostics,
-            }
-        )
-        request_v2 = build_fleet_mission_request_v2(
+        # Program-directed planning is mandatory for an LLM mission. The same
+        # pure planning service is also callable as a tool, but execution never
+        # depends on a conversational model deciding whether to invoke it.
+        planning_service = FleetPlanningService(
             config,
-            task_spec,
+            client_factory,
+            interpreter_max_tokens=getattr(args, "interpreter_max_tokens", 6144),
+            fleet_max_tokens=getattr(args, "fleet_max_tokens", 2048),
+            interpreter_factory=LLMFleetTaskInterpreter,
+            fleet_planner_factory=LLMFleetPlannerV2,
+        )
+        global_result = planning_service.plan(
+            args.instruction,
             fleet_mission_id=fleet_mission_id,
+            audit_context=preparation_context,
         )
-        preparation_context["request_v2"] = request_v2
-        fleet_planner = LLMFleetPlannerV2(
-            client_factory.for_role(
-                ModelCallRole.FLEET_PLAN,
-                fleet_mission_id=fleet_mission_id,
-            ),
-            repair_budget=2,
+        task_spec, request_v2, plan_v2 = (
+            global_result.task_spec, global_result.request, global_result.plan
         )
-        try:
-            plan_v2 = validate_fleet_mission_plan_v2(
-                fleet_planner.plan(request_v2), request_v2
-            )
-        except Exception:
-            preparation_context["fleet_planner_proposals"] = (
-                fleet_planner.model_proposals
-            )
-            raise
-        fleet_planner_proposals = fleet_planner.model_proposals
-        fleet_semantic_findings = tuple(
-            _semantic_issue_dict(item)
-            for item in fleet_planner.last_semantic_findings
-        )
-        preparation_context.update(
-            {
-                "plan_v2": plan_v2,
-                "fleet_planner_proposals": fleet_planner_proposals,
-                "fleet_semantic_findings": fleet_semantic_findings,
-            }
-        )
+        interpreter_diagnostics = global_result.interpreter_diagnostics
+        interpreter_proposals = global_result.interpreter_proposals
+        fleet_planner_proposals = global_result.fleet_planner_proposals
+        fleet_semantic_findings = global_result.semantic_findings
         request, plan, runtime_envelope_metadata = _lower_v2_target_plan_for_runtime(
             config,
             request_v2,
@@ -2063,7 +2016,11 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
         compiler=compiler,
         planner_limits=limits,
         planner_policy=policy,
-        fleet_planner_source=fleet_planner.source,
+        fleet_planner_source=(
+            fleet_planner.source
+            if args.fleet_planner == "scripted"
+            else global_result.fleet_planner_source
+        ),
         local_planner_source=local_planner_mode,
         adapter_selections=tuple(selections),
         model_call_records=tuple(model_call_records),
@@ -2076,6 +2033,7 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
         task_spec=task_spec,
         fleet_request_v2=request_v2,
         fleet_plan_v2=plan_v2,
+        fleet_planner_max_tokens=getattr(args, "fleet_max_tokens", 2048),
         mission_interpreter_source=(
             "qwen_task_spec_v1"
             if task_spec is not None

@@ -4,6 +4,7 @@ import builtins
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
@@ -324,6 +325,73 @@ def _llm_argv(*extra: str) -> list[str]:
         "llm",
         *extra,
     ]
+
+
+@pytest.mark.parametrize(
+    ("budget_args", "interpreter_budget", "fleet_budget"),
+    [
+        ((), 6144, 2048),
+        (("--interpreter-max-tokens", "6144", "--fleet-max-tokens", "4096"), 6144, 4096),
+    ],
+)
+def test_generation_budgets_reach_initial_and_runtime_planner_constructors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    budget_args: tuple[str, ...],
+    interpreter_budget: int,
+    fleet_budget: int,
+) -> None:
+    from experiments.planning_audit_logger import PlanningAuditLogger
+
+    _install_fake_factory(monkeypatch)
+    attempted_isaac = _guard_isaac_import(monkeypatch)
+    original_interpreter = run_fleet_mission.LLMFleetTaskInterpreter
+    original_fleet = run_fleet_mission.LLMFleetPlannerV2
+    constructor_calls: list[tuple[ModelCallRole, int]] = []
+
+    class ReplanConstructorReached(RuntimeError):
+        pass
+
+    def interpreter_factory(client, **kwargs):
+        constructor_calls.append((client._role, kwargs["max_tokens"]))
+        return original_interpreter(client, **kwargs)
+
+    def fleet_factory(client, **kwargs):
+        constructor_calls.append((client._role, kwargs["max_tokens"]))
+        if client._role is ModelCallRole.FLEET_REPLAN:
+            # Stop at the constructor boundary: this regression concerns
+            # output-budget propagation, not a second mission's semantics.
+            raise ReplanConstructorReached
+        return original_fleet(client, **kwargs)
+
+    monkeypatch.setattr(run_fleet_mission, "LLMFleetTaskInterpreter", interpreter_factory)
+    monkeypatch.setattr(run_fleet_mission, "LLMFleetPlannerV2", fleet_factory)
+    args = run_fleet_mission.parse_args(_llm_argv(
+        "--perception-runtime-profile", "oracle_evaluation",
+        "--acknowledge-privileged-oracle", *budget_args,
+    ))
+    prepared = run_fleet_mission.prepare_fleet_mission(args)
+    assert args.interpreter_max_tokens == interpreter_budget
+    assert args.fleet_max_tokens == fleet_budget
+    assert prepared.fleet_planner_max_tokens == fleet_budget
+    assert constructor_calls == [
+        (ModelCallRole.MISSION_INTERPRETATION, interpreter_budget),
+        (ModelCallRole.FLEET_PLAN, fleet_budget),
+    ]
+
+    handler = run_fleet_mission._build_runtime_fleet_replan_handler(
+        prepared, audit=PlanningAuditLogger(tmp_path),
+        agent_factory=lambda *args: pytest.fail("test reached agent publication"),
+    )
+    assert handler is not None
+    record = SimpleNamespace(assignment=prepared.plan.assignments[0], local_plan_version=1)
+    belief = SimpleNamespace(fleet_plan_version=1, agents={
+        "uav_a": SimpleNamespace(uav_id="uav_a", status="WAITING_REASSIGNMENT"),
+    })
+    with pytest.raises(ReplanConstructorReached):
+        handler(record, belief)
+    assert constructor_calls[-1] == (ModelCallRole.FLEET_REPLAN, fleet_budget)
+    assert attempted_isaac == []
 
 
 def test_llm_defaults_run_interpreter_then_fleet_then_each_local_planner(

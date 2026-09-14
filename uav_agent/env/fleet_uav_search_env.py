@@ -954,7 +954,18 @@ class FleetUavSearchEnv:
             world.stop()
         except Exception as exc:
             first_error = exc
-        for sensor in tuple(self.camera_sensors.values()):
+        sensors = tuple(self.camera_sensors.values())
+        # Camera.destroy() also removes its render product. With multiple
+        # Cameras, that can invalidate shared SyntheticData graph nodes still
+        # needed by another Camera's annotator.detach(). Keep every render
+        # product alive until all sensors have detached their frame annotators.
+        for sensor in sensors:
+            try:
+                sensor.detach_annotators()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+        for sensor in sensors:
             try:
                 sensor.destroy()
             except Exception as exc:

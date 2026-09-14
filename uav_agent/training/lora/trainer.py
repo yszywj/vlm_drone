@@ -107,6 +107,19 @@ def _accepted_keyword(callable_object: object, preferred: str, legacy: str) -> s
     return preferred
 
 
+def _supports_keyword(callable_object: object, name: str) -> bool:
+    """Keep keywords for permissive wrappers, omit removed strict arguments."""
+
+    try:
+        parameters = inspect.signature(callable_object).parameters
+    except (TypeError, ValueError):
+        return True
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
 def build_training_arguments(
     config: object,
     paths: TrainingPaths,
@@ -124,10 +137,11 @@ def build_training_arguments(
     if arguments_class is None:
         arguments_class = _import_transformers().TrainingArguments
     eval_key = _accepted_keyword(arguments_class.__init__, "eval_strategy", "evaluation_strategy")
+    # Transformers 5 accepts a fractional warmup_steps and removed warmup_ratio.
+    warmup_key = _accepted_keyword(arguments_class.__init__, "warmup_ratio", "warmup_steps")
     max_steps = getattr(config, "max_steps")
     kwargs: dict[str, object] = {
         "output_dir": str(paths.checkpoints_dir),
-        "logging_dir": str(paths.tensorboard_dir),
         "num_train_epochs": float(getattr(config, "num_train_epochs")),
         "max_steps": -1 if max_steps is None else int(max_steps),
         "per_device_train_batch_size": int(getattr(config, "per_device_train_batch_size")),
@@ -135,7 +149,7 @@ def build_training_arguments(
         "gradient_accumulation_steps": int(getattr(config, "gradient_accumulation_steps")),
         "learning_rate": float(getattr(config, "learning_rate")),
         "weight_decay": float(getattr(config, "weight_decay")),
-        "warmup_ratio": float(getattr(config, "warmup_ratio")),
+        warmup_key: float(getattr(config, "warmup_ratio")),
         "lr_scheduler_type": str(getattr(config, "lr_scheduler_type")),
         "max_grad_norm": float(getattr(config, "max_grad_norm")),
         "bf16": bool(getattr(config, "bf16")),
@@ -152,9 +166,17 @@ def build_training_arguments(
         "data_seed": int(getattr(config, "seed")),
         "report_to": ["tensorboard"],
         "remove_unused_columns": False,
-        "save_safetensors": True,
+        # Validation only needs loss; avoid retaining sequence-by-vocabulary
+        # logits for every validation example of a long-context language model.
+        "prediction_loss_only": True,
         "ddp_find_unused_parameters": False,
     }
+    # New Transformers releases always save safetensors.  Our Trainer override
+    # additionally requests adapter-only safe serialization explicitly.
+    if _supports_keyword(arguments_class.__init__, "save_safetensors"):
+        kwargs["save_safetensors"] = True
+    if _supports_keyword(arguments_class.__init__, "logging_dir"):
+        kwargs["logging_dir"] = str(paths.tensorboard_dir)
     return arguments_class(**kwargs)
 
 
@@ -272,7 +294,19 @@ def build_trainer(
         trainer_class.__init__, "processing_class", "tokenizer"
     )
     init_kwargs[processor_key] = processor
-    return trainer_class(**init_kwargs)
+    # Transformers 5 moved this setting from TrainingArguments into the
+    # TensorBoard callback's initialization environment.  Restore the caller's
+    # environment once callbacks capture the directory so later runs stay
+    # independent, including when trainer construction fails.
+    previous_tensorboard_dir = os.environ.get("TENSORBOARD_LOGGING_DIR")
+    os.environ["TENSORBOARD_LOGGING_DIR"] = str(paths.tensorboard_dir)
+    try:
+        return trainer_class(**init_kwargs)
+    finally:
+        if previous_tensorboard_dir is None:
+            os.environ.pop("TENSORBOARD_LOGGING_DIR", None)
+        else:
+            os.environ["TENSORBOARD_LOGGING_DIR"] = previous_tensorboard_dir
 
 
 def save_final_adapter(model: object, destination: str | Path) -> Path:

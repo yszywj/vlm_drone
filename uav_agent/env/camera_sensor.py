@@ -310,10 +310,29 @@ class RGBCameraSensor:
         )
         return ImageProjection(pixels_uv=pixels.copy(), depth_m=depth.copy(), visible=visible)
 
+    def detach_annotators(self) -> None:
+        """Release owned frame annotators while every Fleet render product exists.
+
+        Isaac Sim 5.1 can invalidate shared SyntheticData nodes when the first
+        Camera render product is destroyed. Fleet teardown therefore detaches
+        every sensor's annotators before destroying any Camera. Frame keys are
+        published on attachment, including during warmup, so this also handles
+        a Camera whose initialization stopped before all channels were attached.
+        """
+
+        if self.camera is None:
+            return
+        frame = self.camera.get_current_frame()
+        for channel in ("rgb", "distance_to_image_plane"):
+            if channel in frame:
+                self.camera.detach_annotator(channel)
+        self._depth_enabled = False
+
     def destroy(self) -> None:
-        """Detach render products and annotators before closing SimulationApp."""
+        """Detach owned annotators and destroy this Camera's render product."""
 
         if self.camera is not None:
+            self.detach_annotators()
             self.camera.destroy()
             self.camera = None
         self._depth_enabled = False

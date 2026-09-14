@@ -1,0 +1,391 @@
+{
+  "schema_version": 1,
+  "description": "Nested 2/4/6/8/10 UAVs and targets in the same 100x100x30m obstacle-free world. Identical task template and model budgets across all sizes.",
+  "cases": [
+    {
+      "id": "scale_02x02",
+      "description": "2 UAVs, 2 targets. Only inventory size changes; explicit assignment, radius 6m, track 20s, return home and land.",
+      "config": "fleet_scaling/open_2x2.yaml",
+      "instruction": "共有2架无人机和2个目标。所有任务并行执行，每架无人机恰好负责自己的一个目标，不得遗漏或重复分配。无人机A在世界坐标(-40,-18)为中心、半径6米的圆形区域搜索目标A，找到后跟踪20秒。无人机B在世界坐标(-40,18)为中心、半径6米的圆形区域搜索目标B，找到后跟踪20秒。每架无人机完成自己的跟踪任务后，分别返回各自起点并降落。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_a",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              -40,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_b",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              -40,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          }
+        ],
+        "return_home_and_land": true
+      }
+    },
+    {
+      "id": "scale_04x04",
+      "description": "4 UAVs, 4 targets. Only inventory size changes; explicit assignment, radius 6m, track 20s, return home and land.",
+      "config": "fleet_scaling/open_4x4.yaml",
+      "instruction": "共有4架无人机和4个目标。所有任务并行执行，每架无人机恰好负责自己的一个目标，不得遗漏或重复分配。无人机A在世界坐标(-40,-18)为中心、半径6米的圆形区域搜索目标A，找到后跟踪20秒。无人机B在世界坐标(-40,18)为中心、半径6米的圆形区域搜索目标B，找到后跟踪20秒。无人机C在世界坐标(-20,-18)为中心、半径6米的圆形区域搜索目标C，找到后跟踪20秒。无人机D在世界坐标(-20,18)为中心、半径6米的圆形区域搜索目标D，找到后跟踪20秒。每架无人机完成自己的跟踪任务后，分别返回各自起点并降落。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_a",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              -40,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_b",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              -40,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_c",
+            "uav_id": "uav_c",
+            "search_center_xyz_m": [
+              -20,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_d",
+            "uav_id": "uav_d",
+            "search_center_xyz_m": [
+              -20,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          }
+        ],
+        "return_home_and_land": true
+      }
+    },
+    {
+      "id": "scale_06x06",
+      "description": "6 UAVs, 6 targets. Only inventory size changes; explicit assignment, radius 6m, track 20s, return home and land.",
+      "config": "fleet_scaling/open_6x6.yaml",
+      "instruction": "共有6架无人机和6个目标。所有任务并行执行，每架无人机恰好负责自己的一个目标，不得遗漏或重复分配。无人机A在世界坐标(-40,-18)为中心、半径6米的圆形区域搜索目标A，找到后跟踪20秒。无人机B在世界坐标(-40,18)为中心、半径6米的圆形区域搜索目标B，找到后跟踪20秒。无人机C在世界坐标(-20,-18)为中心、半径6米的圆形区域搜索目标C，找到后跟踪20秒。无人机D在世界坐标(-20,18)为中心、半径6米的圆形区域搜索目标D，找到后跟踪20秒。无人机E在世界坐标(0,-18)为中心、半径6米的圆形区域搜索目标E，找到后跟踪20秒。无人机F在世界坐标(0,18)为中心、半径6米的圆形区域搜索目标F，找到后跟踪20秒。每架无人机完成自己的跟踪任务后，分别返回各自起点并降落。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_a",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              -40,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_b",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              -40,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_c",
+            "uav_id": "uav_c",
+            "search_center_xyz_m": [
+              -20,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_d",
+            "uav_id": "uav_d",
+            "search_center_xyz_m": [
+              -20,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_e",
+            "uav_id": "uav_e",
+            "search_center_xyz_m": [
+              0,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_f",
+            "uav_id": "uav_f",
+            "search_center_xyz_m": [
+              0,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          }
+        ],
+        "return_home_and_land": true
+      }
+    },
+    {
+      "id": "scale_08x08",
+      "description": "8 UAVs, 8 targets. Only inventory size changes; explicit assignment, radius 6m, track 20s, return home and land.",
+      "config": "fleet_scaling/open_8x8.yaml",
+      "instruction": "共有8架无人机和8个目标。所有任务并行执行，每架无人机恰好负责自己的一个目标，不得遗漏或重复分配。无人机A在世界坐标(-40,-18)为中心、半径6米的圆形区域搜索目标A，找到后跟踪20秒。无人机B在世界坐标(-40,18)为中心、半径6米的圆形区域搜索目标B，找到后跟踪20秒。无人机C在世界坐标(-20,-18)为中心、半径6米的圆形区域搜索目标C，找到后跟踪20秒。无人机D在世界坐标(-20,18)为中心、半径6米的圆形区域搜索目标D，找到后跟踪20秒。无人机E在世界坐标(0,-18)为中心、半径6米的圆形区域搜索目标E，找到后跟踪20秒。无人机F在世界坐标(0,18)为中心、半径6米的圆形区域搜索目标F，找到后跟踪20秒。无人机G在世界坐标(20,-18)为中心、半径6米的圆形区域搜索目标G，找到后跟踪20秒。无人机H在世界坐标(20,18)为中心、半径6米的圆形区域搜索目标H，找到后跟踪20秒。每架无人机完成自己的跟踪任务后，分别返回各自起点并降落。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_a",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              -40,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_b",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              -40,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_c",
+            "uav_id": "uav_c",
+            "search_center_xyz_m": [
+              -20,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_d",
+            "uav_id": "uav_d",
+            "search_center_xyz_m": [
+              -20,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_e",
+            "uav_id": "uav_e",
+            "search_center_xyz_m": [
+              0,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_f",
+            "uav_id": "uav_f",
+            "search_center_xyz_m": [
+              0,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_g",
+            "uav_id": "uav_g",
+            "search_center_xyz_m": [
+              20,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_h",
+            "uav_id": "uav_h",
+            "search_center_xyz_m": [
+              20,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          }
+        ],
+        "return_home_and_land": true
+      }
+    },
+    {
+      "id": "scale_10x10",
+      "description": "10 UAVs, 10 targets. Only inventory size changes; explicit assignment, radius 6m, track 20s, return home and land.",
+      "config": "fleet_scaling/open_10x10.yaml",
+      "instruction": "共有10架无人机和10个目标。所有任务并行执行，每架无人机恰好负责自己的一个目标，不得遗漏或重复分配。无人机A在世界坐标(-40,-18)为中心、半径6米的圆形区域搜索目标A，找到后跟踪20秒。无人机B在世界坐标(-40,18)为中心、半径6米的圆形区域搜索目标B，找到后跟踪20秒。无人机C在世界坐标(-20,-18)为中心、半径6米的圆形区域搜索目标C，找到后跟踪20秒。无人机D在世界坐标(-20,18)为中心、半径6米的圆形区域搜索目标D，找到后跟踪20秒。无人机E在世界坐标(0,-18)为中心、半径6米的圆形区域搜索目标E，找到后跟踪20秒。无人机F在世界坐标(0,18)为中心、半径6米的圆形区域搜索目标F，找到后跟踪20秒。无人机G在世界坐标(20,-18)为中心、半径6米的圆形区域搜索目标G，找到后跟踪20秒。无人机H在世界坐标(20,18)为中心、半径6米的圆形区域搜索目标H，找到后跟踪20秒。无人机I在世界坐标(40,-18)为中心、半径6米的圆形区域搜索目标I，找到后跟踪20秒。无人机J在世界坐标(40,18)为中心、半径6米的圆形区域搜索目标J，找到后跟踪20秒。每架无人机完成自己的跟踪任务后，分别返回各自起点并降落。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_a",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              -40,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_b",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              -40,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_c",
+            "uav_id": "uav_c",
+            "search_center_xyz_m": [
+              -20,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_d",
+            "uav_id": "uav_d",
+            "search_center_xyz_m": [
+              -20,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_e",
+            "uav_id": "uav_e",
+            "search_center_xyz_m": [
+              0,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_f",
+            "uav_id": "uav_f",
+            "search_center_xyz_m": [
+              0,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_g",
+            "uav_id": "uav_g",
+            "search_center_xyz_m": [
+              20,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_h",
+            "uav_id": "uav_h",
+            "search_center_xyz_m": [
+              20,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_i",
+            "uav_id": "uav_i",
+            "search_center_xyz_m": [
+              40,
+              -18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_j",
+            "uav_id": "uav_j",
+            "search_center_xyz_m": [
+              40,
+              18,
+              0
+            ],
+            "search_radius_m": 6,
+            "track_duration_s": 20
+          }
+        ],
+        "return_home_and_land": true
+      }
+    }
+  ]
+}

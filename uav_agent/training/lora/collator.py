@@ -72,11 +72,11 @@ def _messages(feature: Mapping[str, object]) -> list[dict[str, str]]:
 class AssistantOnlyDataCollator:
     """Apply the Qwen chat template and supervise only its assistant suffix.
 
-    The system+user conversation is rendered with
-    ``add_generation_prompt=True``.  The complete conversation is rendered
-    separately.  A strict token-prefix check establishes the boundary, so a
-    tokenizer/template change fails closed instead of leaking request tokens
-    into the language-model loss.
+    The generation prompt is kept exactly as it will appear at inference.
+    If BPE merges its trailing newline with the first answer character, a
+    verified text prefix permits separately encoding the completion.  This
+    supervises the whole answer without supervising any prompt characters.
+    Overlong examples are rejected, never silently truncated.
     """
 
     def __init__(
@@ -164,14 +164,17 @@ class AssistantOnlyDataCollator:
         )
         if not prompt_ids:
             raise FleetPlannerCollatorError("Qwen prompt template produced no tokens")
-        if len(full_ids) <= len(prompt_ids) or full_ids[: len(prompt_ids)] != prompt_ids:
-            raise FleetPlannerCollatorError(
-                "Qwen full conversation is not prefixed by the generation prompt; "
-                "assistant loss boundary cannot be proven"
-            )
+        if full_ids[: len(prompt_ids)] != prompt_ids:
+            full_ids = self._encode_across_bpe_boundary(messages, prompt_ids, full_ids)
 
-        input_ids = full_ids[: self.model_max_length]
+        input_ids = full_ids
         supervised_start = len(prompt_ids)
+        if len(input_ids) > self.model_max_length:
+            sample_id = feature.get("sample_id", "<unknown>")
+            raise FleetPlannerCollatorError(
+                f"sample {sample_id} needs {len(input_ids)} tokens, exceeds "
+                f"model_max_length={self.model_max_length}; refusing truncation"
+            )
         if len(input_ids) <= supervised_start:
             sample_id = feature.get("sample_id", "<unknown>")
             raise FleetPlannerCollatorError(
@@ -181,18 +184,101 @@ class AssistantOnlyDataCollator:
         labels = [IGNORE_INDEX] * supervised_start + input_ids[supervised_start:]
         return input_ids, labels
 
+    def _encode_across_bpe_boundary(
+        self,
+        messages: Sequence[Mapping[str, str]],
+        prompt_ids: list[int],
+        full_ids: list[int],
+    ) -> list[int]:
+        """Prove a text boundary when tokenization crosses that boundary.
+
+        Encoding prompt and completion separately mirrors generation: the
+        already-tokenized prompt cannot be retokenized by the first new token.
+        Both template tokenizations are checked before using this fallback,
+        so unrelated template corruption still fails closed.
+        """
+
+        error = (
+            "Qwen full conversation is not prefixed by the generation prompt; "
+            "assistant loss boundary cannot be proven"
+        )
+        encode = getattr(self.tokenizer, "encode", None)
+        if not callable(encode):
+            raise FleetPlannerCollatorError(error)
+        try:
+            prompt_text = self.template_owner.apply_chat_template(
+                list(messages[:-1]), tokenize=False, add_generation_prompt=True,
+            )
+            full_text = self.template_owner.apply_chat_template(
+                list(messages), tokenize=False, add_generation_prompt=False,
+            )
+            if (
+                not isinstance(prompt_text, str)
+                or not isinstance(full_text, str)
+                or not full_text.startswith(prompt_text)
+                or len(full_text) <= len(prompt_text)
+            ):
+                raise FleetPlannerCollatorError(error)
+            encoded_prompt = _token_ids(
+                encode(prompt_text, add_special_tokens=False), context="prompt text",
+            )
+            encoded_full = _token_ids(
+                encode(full_text, add_special_tokens=False), context="full text",
+            )
+            if encoded_prompt != prompt_ids or encoded_full != full_ids:
+                raise FleetPlannerCollatorError(error)
+            completion = _token_ids(
+                encode(full_text[len(prompt_text):], add_special_tokens=False),
+                context="assistant completion",
+            )
+            if not completion:
+                raise FleetPlannerCollatorError("assistant completion has no tokens")
+            return prompt_ids + completion
+        except FleetPlannerCollatorError:
+            raise
+        except Exception as exc:
+            raise FleetPlannerCollatorError(f"{error}: {exc}") from exc
+
+    def encode_feature(self, feature: Mapping[str, object]) -> dict[str, list[int]]:
+        """Tokenize once before Trainer iteration, using the same loss boundary."""
+
+        input_ids, labels = self._encode_feature(feature)
+        return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
+
     def __call__(
         self,
         features: Sequence[Mapping[str, object]],
     ) -> Mapping[str, Any]:
         if not features:
             raise FleetPlannerCollatorError("cannot collate an empty batch")
-        encoded = [self._encode_feature(feature) for feature in features]
+        encoded = []
+        for feature in features:
+            if "messages" in feature:
+                encoded.append(self._encode_feature(feature))
+            else:
+                input_ids = _token_ids(feature.get("input_ids"), context="cached input")
+                labels = _token_ids(feature.get("labels"), context="cached labels")
+                supervised_start = next(
+                    (index for index, label in enumerate(labels) if label != IGNORE_INDEX),
+                    len(labels),
+                )
+                if (
+                    not input_ids or len(input_ids) != len(labels)
+                    or len(input_ids) > self.model_max_length
+                    or any(token < 0 for token in input_ids)
+                    or not 0 < supervised_start < len(labels)
+                    or labels[supervised_start:] != input_ids[supervised_start:]
+                    or ("attention_mask" in feature and feature["attention_mask"] != [1] * len(input_ids))
+                ):
+                    raise FleetPlannerCollatorError("invalid cached assistant-only example")
+                encoded.append((input_ids, labels))
         padded_length = max(len(input_ids) for input_ids, _ in encoded)
         if self.pad_to_multiple_of is not None:
             remainder = padded_length % self.pad_to_multiple_of
             if remainder:
                 padded_length += self.pad_to_multiple_of - remainder
+        if padded_length > self.model_max_length:
+            raise FleetPlannerCollatorError("batch padding would exceed model_max_length")
 
         batch_input_ids: list[list[int]] = []
         batch_attention_mask: list[list[int]] = []

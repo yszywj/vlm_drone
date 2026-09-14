@@ -14,8 +14,24 @@ from models.base import ModelProtocolError
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _active_registry(tmp_path: Path) -> AdapterRegistry:
+def _placeholder_payload() -> dict[str, object]:
     payload = json.loads((PROJECT_ROOT / "configs/adapters.json").read_text())
+    for adapter in payload["adapters"].values():
+        adapter.update(status="placeholder", path=None, rank=None)
+        adapter.pop("generation", None)
+    payload["fallback_to_base"] = True
+    return payload
+
+
+@pytest.fixture
+def placeholder_registry(tmp_path: Path) -> AdapterRegistry:
+    config = tmp_path / "adapters.json"
+    config.write_text(json.dumps(_placeholder_payload()), encoding="utf-8")
+    return AdapterRegistry(config)
+
+
+def _active_registry(tmp_path: Path) -> AdapterRegistry:
+    payload = _placeholder_payload()
     for name, rank in (("fleet_planner", 8), ("runtime_visual", 32)):
         path = tmp_path / name
         path.mkdir()
@@ -38,16 +54,14 @@ def test_vllm_args_include_only_active_and_bounded_configured_rank(tmp_path: Pat
     assert args[args.index("--max-cpu-loras") + 1] == "2"
 
 
-def test_placeholder_only_registry_keeps_base_vllm_command_unchanged() -> None:
-    registry = AdapterRegistry(PROJECT_ROOT / "configs/adapters.json")
-    assert build_vllm_lora_args(registry) == ()
+def test_placeholder_only_registry_keeps_base_vllm_command_unchanged(placeholder_registry: AdapterRegistry) -> None:
+    assert build_vllm_lora_args(placeholder_registry) == ()
 
 
-def test_vllm_args_reject_wrong_served_base_lineage() -> None:
-    registry = AdapterRegistry(PROJECT_ROOT / "configs/adapters.json")
+def test_vllm_args_reject_wrong_served_base_lineage(placeholder_registry: AdapterRegistry) -> None:
     with pytest.raises(AdapterRegistryError, match="base model name"):
         build_vllm_lora_args(
-            registry,
+            placeholder_registry,
             expected_base_model_name="wrong-base",
         )
 

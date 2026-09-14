@@ -14,6 +14,22 @@ from models.model_client_factory import ModelClientFactory
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _placeholder_payload() -> dict[str, object]:
+    payload = json.loads((PROJECT_ROOT / "configs/adapters.json").read_text())
+    for adapter in payload["adapters"].values():
+        adapter.update(status="placeholder", path=None, rank=None)
+        adapter.pop("generation", None)
+    payload["fallback_to_base"] = True
+    return payload
+
+
+@pytest.fixture
+def placeholder_registry(tmp_path: Path) -> AdapterRegistry:
+    config = tmp_path / "adapters.json"
+    config.write_text(json.dumps(_placeholder_payload()), encoding="utf-8")
+    return AdapterRegistry(config)
+
+
 class _Client:
     def __init__(self, **kwargs: object) -> None:
         self.model = kwargs["model"]
@@ -34,7 +50,7 @@ class _ChatClient(_Client):
 
 
 def test_factory_returns_new_role_bound_clients_and_logs_selection(tmp_path: Path) -> None:
-    payload = json.loads((PROJECT_ROOT / "configs/adapters.json").read_text())
+    payload = _placeholder_payload()
     for name, rank in (("fleet_planner", 8), ("spatial_mission", 16)):
         path = tmp_path / name
         path.mkdir()
@@ -68,10 +84,10 @@ def test_factory_returns_new_role_bound_clients_and_logs_selection(tmp_path: Pat
     assert all("secret-not-logged" not in json.dumps(row) for row in logs)
 
 
-def test_factory_records_real_call_usage_latency_and_trusted_routing() -> None:
+def test_factory_records_real_call_usage_latency_and_trusted_routing(placeholder_registry: AdapterRegistry) -> None:
     calls: list[dict[str, object]] = []
     factory = ModelClientFactory(
-        AdapterRegistry(PROJECT_ROOT / "configs/adapters.json"),
+        placeholder_registry,
         base_url="http://127.0.0.1:8000/v1",
         api_key="secret-not-logged",
         client_factory=_ChatClient,
@@ -106,10 +122,10 @@ def test_factory_records_real_call_usage_latency_and_trusted_routing() -> None:
     assert "secret-not-logged" not in json.dumps(record)
 
 
-def test_factory_supports_distinct_trusted_call_id_namespace() -> None:
+def test_factory_supports_distinct_trusted_call_id_namespace(placeholder_registry: AdapterRegistry) -> None:
     calls: list[dict[str, object]] = []
     factory = ModelClientFactory(
-        AdapterRegistry(PROJECT_ROOT / "configs/adapters.json"),
+        placeholder_registry,
         client_factory=_ChatClient,
         call_logger=calls.append,
         call_id_prefix="runtime_model_call",
@@ -122,10 +138,10 @@ def test_factory_supports_distinct_trusted_call_id_namespace() -> None:
 
 
 @pytest.mark.parametrize("prefix", ("", "bad prefix", "x" * 56, 1))
-def test_factory_rejects_untrusted_call_id_prefix(prefix: object) -> None:
+def test_factory_rejects_untrusted_call_id_prefix(prefix: object, placeholder_registry: AdapterRegistry) -> None:
     with pytest.raises((TypeError, ValueError), match="call_id_prefix"):
         ModelClientFactory(
-            AdapterRegistry(PROJECT_ROOT / "configs/adapters.json"),
+            placeholder_registry,
             client_factory=_Client,
             call_id_prefix=prefix,  # type: ignore[arg-type]
         )

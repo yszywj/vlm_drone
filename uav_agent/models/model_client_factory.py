@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import json
 from threading import Lock
 from time import perf_counter
 from typing import Any
@@ -11,6 +12,10 @@ from common.ids import validate_routing_id
 from models.adapter_registry import AdapterRegistry, AdapterSelection, ModelCallRole
 from models.base import ChatMessage, GenerationOptions, ModelResponse
 from models.openai_compatible_client import OpenAICompatibleClient
+from models.schema_order import (
+    JsonSchemaPropertyOrder,
+    apply_json_schema_property_order,
+)
 
 
 SelectionLogger = Callable[[dict[str, object]], None]
@@ -18,8 +23,8 @@ CallLogger = Callable[[dict[str, object]], None]
 ClientFactory = Callable[..., OpenAICompatibleClient]
 
 
-class _RecordedModelClient:
-    """Per-role client wrapper that records one row for every real chat call."""
+class _RoutedModelClient:
+    """Apply the active adapter's options and optionally audit each real call."""
 
     def __init__(
         self,
@@ -27,7 +32,7 @@ class _RecordedModelClient:
         selection: AdapterSelection,
         *,
         next_call_id: Callable[[], str],
-        call_logger: CallLogger,
+        call_logger: CallLogger | None,
         fleet_mission_id: str | None,
         assignment_id: str | None,
         uav_id: str | None,
@@ -52,6 +57,15 @@ class _RecordedModelClient:
             raise TypeError("model client must provide healthcheck()")
         healthcheck()
 
+    def prepare_options(
+        self, options: GenerationOptions | None,
+    ) -> GenerationOptions | None:
+        """Expose the same immutable options transformation used by chat()."""
+
+        return apply_json_schema_property_order(
+            options, self._selection.json_schema_property_order
+        )
+
     def chat(
         self,
         messages: Sequence[ChatMessage],
@@ -61,12 +75,15 @@ class _RecordedModelClient:
         chat = getattr(self._client, "chat", None)
         if not callable(chat):
             raise TypeError("model client must provide chat()")
+        effective_options = self.prepare_options(options)
+        if self._call_logger is None:
+            return chat(messages, options=effective_options)
         call_id = self._next_call_id()
         started = perf_counter()
         response: object | None = None
         error_code: str | None = None
         try:
-            response = chat(messages, options=options)
+            response = chat(messages, options=effective_options)
             return response  # type: ignore[return-value]
         except Exception as exc:
             error_code = type(exc).__name__
@@ -78,6 +95,16 @@ class _RecordedModelClient:
             )
             if response is not None and not isinstance(response, ModelResponse):
                 error_code = "INVALID_MODEL_RESPONSE"
+            logged_options = effective_options or GenerationOptions()
+            generation_options = {
+                "temperature": logged_options.temperature,
+                "max_tokens": logged_options.max_tokens,
+                "top_p": logged_options.top_p,
+                "response_format": (
+                    logged_options.response_format.to_dict()
+                    if logged_options.response_format is not None else None
+                ),
+            }
             self._call_logger(
                 {
                     "call_id": call_id,
@@ -87,6 +114,14 @@ class _RecordedModelClient:
                     "adapter_status": self._selection.adapter_status.value,
                     "effective_model": self._selection.effective_model,
                     "fallback_used": self._selection.fallback_used,
+                    "json_schema_property_order": self._selection.json_schema_property_order.value,
+                    "generation_options": generation_options,
+                    # Preserve actual schema order even if a downstream
+                    # structured log serializer itself uses sort_keys=True.
+                    "generation_options_json": json.dumps(
+                        generation_options, ensure_ascii=False, allow_nan=False,
+                        separators=(",", ":"),
+                    ),
                     "prompt_tokens": int(usage.get("prompt_tokens", 0)),
                     "completion_tokens": int(usage.get("completion_tokens", 0)),
                     "latency_s": max(0.0, perf_counter() - started),
@@ -162,9 +197,12 @@ class ModelClientFactory:
             max_retries=self._max_retries,
             **self._client_options,
         )
-        if self._call_logger is None:
+        if (
+            self._call_logger is None
+            and selection.json_schema_property_order is JsonSchemaPropertyOrder.PRESERVE
+        ):
             return client
-        return _RecordedModelClient(
+        return _RoutedModelClient(
             client,
             selection,
             next_call_id=self._next_call_id,

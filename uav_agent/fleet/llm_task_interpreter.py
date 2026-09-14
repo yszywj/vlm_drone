@@ -112,7 +112,7 @@ class LLMFleetTaskInterpreter:
         ),
         system_prompt_path: str | Path = DEFAULT_SYSTEM_PROMPT,
         logger: object | None = None,
-        max_tokens: int = 3072,
+        max_tokens: int = 6144,
         repair_budget: int = 1,
     ) -> None:
         if not callable(getattr(model_client, "chat", None)):

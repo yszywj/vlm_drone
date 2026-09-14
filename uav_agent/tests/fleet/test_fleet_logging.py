@@ -43,6 +43,8 @@ def test_logger_creates_expected_sparse_layout(tmp_path) -> None:
             "adapter_status": "placeholder",
             "effective_model": "Qwen3-VL-4B-Instruct",
             "fallback_used": True,
+            "json_schema_property_order": "preserve",
+            "generation_options_json": '{"response_format":{"schema":{"properties":{"z":{},"a":{}}}}}',
             "stale_reasons": [],
         }
     )
@@ -68,6 +70,8 @@ def test_logger_creates_expected_sparse_layout(tmp_path) -> None:
     assert row["requested_adapter"] == "fleet_planner"
     assert row["effective_model"] == "Qwen3-VL-4B-Instruct"
     assert row["priority"] == "P2_AGENT_RUNTIME_REPLAN"
+    assert row["json_schema_property_order"] == "preserve"
+    assert list(json.loads(row["generation_options_json"])["response_format"]["schema"]["properties"]) == ["z", "a"]
 
 
 def test_zero_event_logger_has_stable_streams_and_exact_model_fields(tmp_path) -> None:

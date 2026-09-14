@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import make_dataclass, replace
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import struct
@@ -17,6 +18,7 @@ from training.lora.train_fleet_planner_lora import (
 )
 from training.lora.trainer import (
     LoraTrainerError,
+    build_trainer,
     build_training_arguments,
     build_training_paths,
     get_adapter_only_trainer_class,
@@ -126,6 +128,81 @@ def test_training_arguments_map_config_and_checkpoint_root(tmp_path: Path) -> No
     assert args.values["save_total_limit"] == 2
     assert args.values["remove_unused_columns"] is False
     assert args.values["ddp_find_unused_parameters"] is False
+    assert args.values["prediction_loss_only"] is True
+    assert args.values["warmup_ratio"] == 0.1
+    assert args.values["save_safetensors"] is True
+
+
+def test_training_arguments_support_strict_transformers_five_signature(
+    tmp_path: Path,
+) -> None:
+    """Removed v4 keywords must never reach a strict v5 constructor."""
+
+    names = (
+        "output_dir num_train_epochs max_steps "
+        "per_device_train_batch_size per_device_eval_batch_size "
+        "gradient_accumulation_steps learning_rate weight_decay warmup_steps "
+        "lr_scheduler_type max_grad_norm bf16 gradient_checkpointing "
+        "logging_strategy logging_steps eval_strategy eval_steps save_strategy "
+        "save_steps save_total_limit dataloader_num_workers seed data_seed "
+        "report_to remove_unused_columns prediction_loss_only ddp_find_unused_parameters"
+    ).split()
+    modern_arguments = make_dataclass(
+        "ModernArguments", [(name, object) for name in names], kw_only=True
+    )
+    config = _active_config(tmp_path)
+    args = build_training_arguments(
+        config,
+        build_training_paths(config, "modern_run"),
+        arguments_class=modern_arguments,
+        has_validation=False,
+    )
+    assert args.warmup_steps == 0.1
+    assert args.eval_strategy == "no"
+    assert args.prediction_loss_only is True
+    assert not hasattr(args, "warmup_ratio")
+    assert not hasattr(args, "save_safetensors")
+    assert not hasattr(args, "logging_dir")
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_trainer_initializes_tensorboard_directory_and_restores_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: bool
+) -> None:
+    config = _active_config(tmp_path)
+    paths = build_training_paths(config, "tensorboard_run")
+    monkeypatch.setenv("TENSORBOARD_LOGGING_DIR", "caller-directory")
+
+    class Arguments:
+        def __init__(self, **kwargs: object):
+            self.values = kwargs
+
+    class Trainer:
+        def __init__(self, processing_class: object = None, **kwargs: object):
+            assert processing_class == "processor"
+            assert os.environ["TENSORBOARD_LOGGING_DIR"] == str(paths.tensorboard_dir)
+            if fails:
+                raise RuntimeError("construction failed")
+
+    def construct() -> object:
+        return build_trainer(
+            model=object(),
+            processor="processor",
+            config=config,
+            paths=paths,
+            train_dataset=[{}],
+            validation_dataset=None,
+            data_collator=lambda data: data,
+            trainer_class=Trainer,
+            arguments_class=Arguments,
+        )
+
+    if fails:
+        with pytest.raises(RuntimeError, match="construction failed"):
+            construct()
+    else:
+        construct()
+    assert os.environ["TENSORBOARD_LOGGING_DIR"] == "caller-directory"
 
 
 def test_adapter_only_trainer_ignores_full_state_dict_and_rejects_base_leak(

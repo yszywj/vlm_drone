@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from ipaddress import ip_address
 import json
 from math import isfinite
 from numbers import Real
@@ -309,7 +310,22 @@ class OpenAICompatibleClient:
         raise ModelHTTPError("model request exhausted its retry budget")
 
     def _send(self, request: urllib_request.Request) -> tuple[bytes | str, int]:
-        opener = self._transport or urllib_request.urlopen
+        opener = self._transport
+        if opener is None:
+            # Local vLLM requests must stay local even when the shell exports
+            # HTTP(S)_PROXY without NO_PROXY.  Parse the actual request host;
+            # prefix tests would incorrectly classify names like 127.evil.
+            host = urllib_parse.urlsplit(request.full_url).hostname
+            loopback = host == "localhost"
+            if host and not loopback:
+                try:
+                    loopback = ip_address(host).is_loopback
+                except ValueError:
+                    pass
+            opener = (
+                urllib_request.build_opener(urllib_request.ProxyHandler({})).open
+                if loopback else urllib_request.urlopen
+            )
         response: Any = opener(request, timeout=self.timeout_s)
         try:
             status_value = (

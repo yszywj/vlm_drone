@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "description": "无障碍四机四目标 Qwen 规划压力测试；gold 独立核对原始指令语义，Oracle 飞行配置用于隔离感知误差。",
+  "cases": [
+    {
+      "id": "explicit_4x4",
+      "description": "完整显式分配；四目标、四搜索区域、四种时长。",
+      "instruction": "无人机A前往世界坐标负二十、负二十附近八米范围搜索并跟踪目标i十五秒；无人机B前往世界坐标二十、负二十附近十米范围搜索并跟踪目标j二十秒；无人机C前往世界坐标二十、二十附近八米范围搜索并跟踪目标k二十五秒；无人机D前往世界坐标负二十、二十附近十米范围搜索并跟踪目标l三十秒；四架无人机并行执行，每架只负责自己的一个目标，完成后分别返回各自起点降落。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_i",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              -20,
+              -20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 15
+          },
+          {
+            "target_alias": "target_j",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              20,
+              -20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_k",
+            "uav_id": "uav_c",
+            "search_center_xyz_m": [
+              20,
+              20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 25
+          },
+          {
+            "target_alias": "target_l",
+            "uav_id": "uav_d",
+            "search_center_xyz_m": [
+              -20,
+              20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 30
+          }
+        ],
+        "return_home_and_land": true
+      },
+      "config": "../multi_uav_open_4x4.yaml"
+    },
+    {
+      "id": "shuffled_aliases",
+      "description": "同一语义打乱子句、混用已登记中文名称与稳定ID。",
+      "instruction": "四架无人机并行行动，每架只负责一个指定目标，完成后各自返回本机起点并降落。先说明D的任务：uav_d在世界坐标(-20,20)为中心、半径10米的圆形区域搜索target_l，发现后跟踪30秒。无人机B在世界坐标(20,-20)为中心、半径10米的圆形区域搜索目标j，发现后跟踪20秒。uav_a在世界坐标(-20,-20)为中心、半径8米的圆形区域搜索target_i，发现后跟踪15秒。无人机C在世界坐标(20,20)为中心、半径8米的圆形区域搜索目标k，发现后跟踪25秒。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_i",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              -20,
+              -20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 15
+          },
+          {
+            "target_alias": "target_j",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              20,
+              -20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_k",
+            "uav_id": "uav_c",
+            "search_center_xyz_m": [
+              20,
+              20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 25
+          },
+          {
+            "target_alias": "target_l",
+            "uav_id": "uav_d",
+            "search_center_xyz_m": [
+              -20,
+              20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 30
+          }
+        ],
+        "return_home_and_land": true
+      },
+      "config": "../multi_uav_open_4x4.yaml"
+    },
+    {
+      "id": "unit_conversion",
+      "description": "半分钟、四分之三分钟、一分钟、一分半钟转换为秒。",
+      "instruction": "四架无人机同时执行任务，每架只负责一个目标。无人机A在世界坐标(-20,-20)、半径8米的圆形区域搜索目标i，找到后跟踪半分钟；无人机B在世界坐标(20,-20)、半径10米的圆形区域搜索目标j，找到后跟踪四分之三分钟；无人机C在世界坐标(20,20)、半径8米的圆形区域搜索目标k，找到后跟踪一分钟；无人机D在世界坐标(-20,20)、半径10米的圆形区域搜索目标l，找到后跟踪一分半钟。各机完成后返回各自起点降落。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_i",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              -20,
+              -20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 30
+          },
+          {
+            "target_alias": "target_j",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              20,
+              -20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 45
+          },
+          {
+            "target_alias": "target_k",
+            "uav_id": "uav_c",
+            "search_center_xyz_m": [
+              20,
+              20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 60
+          },
+          {
+            "target_alias": "target_l",
+            "uav_id": "uav_d",
+            "search_center_xyz_m": [
+              -20,
+              20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 90
+          }
+        ],
+        "return_home_and_land": true
+      },
+      "config": "../multi_uav_open_4x4.yaml"
+    },
+    {
+      "id": "cross_assignment",
+      "description": "交叉分配检验绑定，不按列表顺序默认一一配对；主要用于纯规划测试。",
+      "instruction": "全部任务并行，各机只负责一个目标，结束后分别返回自己的起点降落。目标i必须由无人机C负责，在世界坐标(-20,-20)、半径8米的圆形区域搜索，找到后跟踪15秒。目标j必须由无人机D负责，在世界坐标(20,-20)、半径10米的圆形区域搜索，找到后跟踪20秒。目标k必须由无人机A负责，在世界坐标(20,20)、半径8米的圆形区域搜索，找到后跟踪25秒。目标l必须由无人机B负责，在世界坐标(-20,20)、半径10米的圆形区域搜索，找到后跟踪30秒。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_i",
+            "uav_id": "uav_c",
+            "search_center_xyz_m": [
+              -20,
+              -20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 15
+          },
+          {
+            "target_alias": "target_j",
+            "uav_id": "uav_d",
+            "search_center_xyz_m": [
+              20,
+              -20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_k",
+            "uav_id": "uav_a",
+            "search_center_xyz_m": [
+              20,
+              20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 25
+          },
+          {
+            "target_alias": "target_l",
+            "uav_id": "uav_b",
+            "search_center_xyz_m": [
+              -20,
+              20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 30
+          }
+        ],
+        "return_home_and_land": true
+      },
+      "config": "../multi_uav_open_4x4.yaml"
+    },
+    {
+      "id": "open_assignment",
+      "description": "自主一一分工，接受任何完整合法映射，不以距离最优评分。",
+      "instruction": "请自行给四架无人机A、B、C、D分工，每架恰好负责一个不同目标，四个任务全部并行，不能遗漏或重复负责目标。目标i：世界坐标(-20,-20)、半径8米的圆形区域搜索，找到后跟踪15秒。目标j：世界坐标(20,-20)、半径10米的圆形区域搜索，找到后跟踪20秒。目标k：世界坐标(20,20)、半径8米的圆形区域搜索，找到后跟踪25秒。目标l：世界坐标(-20,20)、半径10米的圆形区域搜索，找到后跟踪30秒。每架无人机完成自己的任务后返回自己的起点降落。",
+      "gold": {
+        "targets": [
+          {
+            "target_alias": "target_i",
+            "uav_id": null,
+            "search_center_xyz_m": [
+              -20,
+              -20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 15
+          },
+          {
+            "target_alias": "target_j",
+            "uav_id": null,
+            "search_center_xyz_m": [
+              20,
+              -20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 20
+          },
+          {
+            "target_alias": "target_k",
+            "uav_id": null,
+            "search_center_xyz_m": [
+              20,
+              20,
+              0
+            ],
+            "search_radius_m": 8,
+            "track_duration_s": 25
+          },
+          {
+            "target_alias": "target_l",
+            "uav_id": null,
+            "search_center_xyz_m": [
+              -20,
+              20,
+              0
+            ],
+            "search_radius_m": 10,
+            "track_duration_s": 30
+          }
+        ],
+        "return_home_and_land": true
+      },
+      "config": "../multi_uav_open_4x4.yaml"
+    }
+  ]
+}

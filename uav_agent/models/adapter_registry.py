@@ -9,6 +9,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from models.schema_order import JsonSchemaPropertyOrder
+
 
 DEFAULT_ADAPTER_CONFIG = Path(__file__).resolve().parents[1] / "configs/adapters.json"
 
@@ -40,6 +42,7 @@ class AdapterSpec:
     path: Path | None
     base_model_name: str
     rank: int | None
+    json_schema_property_order: JsonSchemaPropertyOrder = JsonSchemaPropertyOrder.PRESERVE
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +52,7 @@ class AdapterSelection:
     adapter_status: AdapterStatus
     effective_model: str
     fallback_used: bool
+    json_schema_property_order: JsonSchemaPropertyOrder = JsonSchemaPropertyOrder.PRESERVE
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -57,6 +61,7 @@ class AdapterSelection:
             "adapter_status": self.adapter_status.value,
             "effective_model": self.effective_model,
             "fallback_used": self.fallback_used,
+            "json_schema_property_order": self.json_schema_property_order.value,
         }
 
 
@@ -138,9 +143,32 @@ class AdapterRegistry:
                 raise AdapterRegistryError(f"adapter {name!r} must be an object")
             _exact_keys(
                 value,
-                {"status", "served_model_name", "path", "base_model_name", "rank"},
+                {"status", "served_model_name", "path", "base_model_name", "rank"}
+                | ({"generation"} if "generation" in value else set()),
                 f"adapter {name}",
             )
+            property_order = JsonSchemaPropertyOrder.PRESERVE
+            if "generation" in value:
+                generation = value["generation"]
+                if not isinstance(generation, Mapping):
+                    raise AdapterRegistryError(f"adapter {name}.generation must be an object")
+                _exact_keys(
+                    generation, {"json_schema_property_order"},
+                    f"adapter {name}.generation",
+                )
+                raw_order = generation["json_schema_property_order"]
+                if not isinstance(raw_order, str):
+                    raise AdapterRegistryError(
+                        f"adapter {name}.generation.json_schema_property_order "
+                        "must be preserve or alphabetical"
+                    )
+                try:
+                    property_order = JsonSchemaPropertyOrder(raw_order)
+                except ValueError as exc:
+                    raise AdapterRegistryError(
+                        f"adapter {name}.generation.json_schema_property_order "
+                        "must be preserve or alphabetical"
+                    ) from exc
             try:
                 status = AdapterStatus(value["status"])
             except (TypeError, ValueError) as exc:
@@ -201,7 +229,9 @@ class AdapterRegistry:
                     raise AdapterRegistryError(
                         f"{status.value} adapter {name} must use rank=null"
                     )
-            adapters[name] = AdapterSpec(name, status, served, path, lineage, rank)
+            adapters[name] = AdapterSpec(
+                name, status, served, path, lineage, rank, property_order
+            )
         served_names = [adapter.served_model_name for adapter in adapters.values()]
         duplicates = sorted(
             name for name in set(served_names) if served_names.count(name) > 1
@@ -245,7 +275,8 @@ class AdapterRegistry:
             )
         if adapter.status is AdapterStatus.ACTIVE:
             return AdapterSelection(
-                role, adapter_name, adapter.status, adapter.served_model_name, False
+                role, adapter_name, adapter.status, adapter.served_model_name, False,
+                adapter.json_schema_property_order,
             )
         if not self.fallback_to_base:
             raise AdapterRegistryError(

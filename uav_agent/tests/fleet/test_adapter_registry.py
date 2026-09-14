@@ -17,7 +17,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _payload() -> dict[str, object]:
-    return json.loads((PROJECT_ROOT / "configs/adapters.json").read_text(encoding="utf-8"))
+    payload = json.loads((PROJECT_ROOT / "configs/adapters.json").read_text(encoding="utf-8"))
+    for adapter in payload["adapters"].values():
+        adapter.update(status="placeholder", path=None, rank=None)
+        adapter.pop("generation", None)
+    payload["fallback_to_base"] = True
+    return payload
 
 
 def _write(tmp_path: Path, payload: dict[str, object]) -> Path:
@@ -26,8 +31,8 @@ def _write(tmp_path: Path, payload: dict[str, object]) -> Path:
     return path
 
 
-def test_committed_five_placeholders_fall_back_and_fleet_roles_share_slot() -> None:
-    registry = AdapterRegistry(PROJECT_ROOT / "configs/adapters.json")
+def test_five_placeholders_fall_back_and_fleet_roles_share_slot(tmp_path: Path) -> None:
+    registry = AdapterRegistry(_write(tmp_path, _payload()))
     assert set(registry.adapters) == {
         "mission_interpreter",
         "fleet_planner",

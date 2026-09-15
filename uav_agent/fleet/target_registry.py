@@ -180,6 +180,48 @@ class SharedTargetRegistry:
         self._events: list[TargetClaimDecision] = []
         self._event_count = 0
         self._lock = RLock()
+        self._staging_owner: SharedTargetRegistry | None = None
+        self._staging_consumed = False
+
+    def clone_for_staging(self) -> SharedTargetRegistry:
+        """Copy claim state for fallible binding before owner publication.
+
+        Records, claims and decisions are frozen values; only their containers
+        need copying. Locks are deliberately fresh. The single Fleet owner
+        must recheck dependencies before adopting this staged candidate.
+        """
+        with self._lock:
+            candidate = SharedTargetRegistry(self._policy)
+            candidate._records = dict(self._records)
+            candidate._assignments = dict(self._assignments)
+            candidate._events = list(self._events)
+            candidate._event_count = self._event_count
+            candidate._staging_owner = self
+            return candidate
+
+    def adopt_staged(self, staged: SharedTargetRegistry) -> None:
+        """Consume a same-owner candidate by constant-time container swaps.
+
+        Call only at the single owner's serial commit boundary. This preserves
+        this registry's identity for all consumers and performs no binding,
+        claim arbitration, event construction or callbacks during publication.
+        A consumed staging object cannot alias or republish the live containers.
+        """
+        if not isinstance(staged, SharedTargetRegistry):
+            raise TypeError("staged must be a SharedTargetRegistry")
+        if staged is self:
+            raise TargetClaimError("cannot adopt the live registry itself")
+        with self._lock, staged._lock:
+            if staged._policy is not self._policy:
+                raise TargetClaimError("staged registry claim policy mismatch")
+            if staged._staging_owner is not self or staged._staging_consumed:
+                raise TargetClaimError("staged registry is not an unused candidate of this owner")
+            self._records, staged._records = staged._records, self._records
+            self._assignments, staged._assignments = staged._assignments, self._assignments
+            self._events, staged._events = staged._events, self._events
+            self._event_count, staged._event_count = staged._event_count, self._event_count
+            staged._staging_consumed = True
+            staged._staging_owner = None
 
     @property
     def claim_policy(self) -> TargetClaimPolicy:

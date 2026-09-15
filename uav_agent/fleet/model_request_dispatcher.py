@@ -16,10 +16,10 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from math import isfinite
 from numbers import Real
-from threading import RLock
+from threading import RLock, Thread, get_ident
 from time import monotonic
 
 from common.ids import (
@@ -203,11 +203,30 @@ class ModelRequestDispatcher:
                 self._assignment_ids[normalized_uav] = normalized_assignment
             return facade
 
-    def close(self, timeout_s: float | None = None) -> None:
-        """Cancel queued work, drain active calls, and close every worker once."""
+    def prepare_worker_for(self, uav_id: str, *, assignment_id: str) -> BrokeredAsyncModelWorker:
+        """Construct an inert candidate facade without binding official routing.
 
-        if timeout_s is not None:
-            timeout_s = _timestamp(timeout_s, "timeout_s")
+        The candidate owner keeps it private until publication. No request can
+        be produced by an idle MissionAgent; rejected candidates leave the
+        dispatcher assignment map untouched.
+        """
+        normalized_uav = validate_uav_id(uav_id)
+        normalized_assignment = validate_routing_id(assignment_id, "assignment_id")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("model request dispatcher is closed")
+            if normalized_uav not in self._workers:
+                raise KeyError("no model worker is registered for " + normalized_uav)
+            existing = self._assignment_ids.get(normalized_uav)
+            if normalized_uav in self._assignment_ids and existing != normalized_assignment:
+                raise ValueError("candidate UAV already has another visual assignment")
+            return BrokeredAsyncModelWorker(self, normalized_uav, normalized_assignment)
+
+    def close(self, timeout_s: float | None = None) -> None:
+        """Cancel queued work and close workers within one shared time budget."""
+
+        timeout_s = 0.1 if timeout_s is None else _timestamp(timeout_s, "timeout_s")
+        shutdown_deadline = monotonic() + timeout_s
         with self._lock:
             if self._closed:
                 return
@@ -229,7 +248,9 @@ class ModelRequestDispatcher:
             first_error: BaseException | None = None
             for uav_id in sorted(self._workers):
                 try:
-                    self._workers[uav_id].close(timeout_s=timeout_s)
+                    self._workers[uav_id].close(
+                        timeout_s=max(0.0, shutdown_deadline - monotonic())
+                    )
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
@@ -327,23 +348,18 @@ class ModelRequestDispatcher:
         with self._lock:
             self._service()
             queue = self._results[facade.uav_id]
-            while queue:
+            for _ in range(len(queue)):
                 result = queue.popleft()
-                stale = (
-                    result.stale
-                    or (
-                        expected_request_id is not None
-                        and result.request_id != expected_request_id
-                    )
-                    or (
-                        expected_review_id is not None
-                        and result.review_id != expected_review_id
-                    )
-                    or (
-                        minimum_observation_timestamp_s is not None
-                        and result.observation_timestamp_s
-                        < minimum_observation_timestamp_s
-                    )
+                matches = (
+                    (expected_request_id is None or result.request_id == expected_request_id)
+                    and (expected_review_id is None or result.review_id == expected_review_id)
+                )
+                if not matches:
+                    queue.append(result)
+                    continue
+                stale = result.stale or (
+                    minimum_observation_timestamp_s is not None
+                    and result.observation_timestamp_s < minimum_observation_timestamp_s
                 )
                 if stale and not include_stale:
                     self._discarded_results[facade.uav_id] += 1
@@ -359,7 +375,7 @@ class ModelRequestDispatcher:
 
     def _pump(self) -> None:
         while True:
-            broker_request = self.broker.acquire_next()
+            broker_request = self.broker.acquire_next(request_ids=self._requests)
             if broker_request is None:
                 return
             request = self._requests.get(broker_request.request_id)
@@ -493,8 +509,311 @@ class ModelRequestDispatcher:
             return self._discarded_results[uav_id]
 
 
+
+@dataclass(frozen=True, slots=True)
+class TextTaskResult:
+    """A request-owned compute outcome; stale values must never be published.
+
+    Exceptions are returned only to the owner, never copied into Broker logs.
+    """
+
+    request_id: str
+    value: object = None
+    exception: BaseException | None = None
+    stale: bool = False
+    reason: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return not self.stale and self.exception is None
+
+
+@dataclass(frozen=True, slots=True)
+class _TextTask:
+    request: ModelBrokerRequest
+    prepare: Callable[[], Callable[[], object] | None]
+    deadline_at_s: float | None
+    adapter_selection: AdapterSelection | None
+
+
+class BrokeredTextTaskRunner:
+    """Bounded pure text computation using the visual dispatcher's Broker.
+
+    ``submit`` only queues. ``pump``/``poll`` run on the constructing thread;
+    immediately before launching an admitted task they call ``prepare`` there.
+    That callback refreshes and approves the owner's snapshot, and returns a
+    pure callable (or None to reject it). Only that callable runs off-thread.
+
+    Cancel and deadlines revoke publication eligibility. Running calls retain
+    their Broker resource leases until their threads actually return, even
+    after close. Results are consumed independently by request ID.
+    """
+
+    _ROLE_PRIORITIES = {
+        ModelCallRole.FLEET_REPLAN.value: ModelRequestPriority.P1_FLEET_REPLAN,
+        ModelCallRole.RUNTIME_REPLAN.value: ModelRequestPriority.P2_AGENT_RUNTIME_REPLAN,
+    }
+
+    def __init__(
+        self,
+        broker: GlobalModelRequestBroker,
+        *,
+        clock: Callable[[], float] = monotonic,
+        max_workers: int | None = None,
+        max_outstanding_tasks: int = 64,
+        record_logger: Callable[[Mapping[str, object]], None] | None = None,
+    ) -> None:
+        if not isinstance(broker, GlobalModelRequestBroker):
+            raise TypeError("broker must be a GlobalModelRequestBroker")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        if max_workers is None:
+            max_workers = broker.max_inflight_global
+        for value, name in ((max_workers, "max_workers"),
+                            (max_outstanding_tasks, "max_outstanding_tasks")):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if record_logger is not None and not callable(record_logger):
+            raise TypeError("record_logger must be callable or None")
+        self.broker = broker
+        self._clock = clock
+        self._max_workers = max_workers
+        self._max_outstanding_tasks = max_outstanding_tasks
+        self._record_logger = record_logger
+        self._owner_thread_id = get_ident()
+        self._tasks: dict[str, _TextTask] = {}
+        self._active: dict[str, Thread | None] = {}
+        self._done: deque[TextTaskResult] = deque()
+        self._results: dict[str, TextTaskResult] = {}
+        self._revoked: dict[str, str] = {}
+        self._emitted_record_ids: set[str] = set()
+        self._closed = False
+        self._lock = RLock()
+
+    def _assert_owner(self) -> None:
+        if get_ident() != self._owner_thread_id:
+            raise RuntimeError("text task admission must run on its owner thread")
+
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    @property
+    def inflight_count(self) -> int:
+        """Actual occupied/unacknowledged calls, including revoked calls."""
+        with self._lock:
+            return len(self._active)
+
+    @property
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._tasks) - len(self._active)
+
+    def submit(
+        self,
+        request: ModelBrokerRequest,
+        prepare: Callable[[], Callable[[], object] | None],
+        *,
+        deadline_at_s: float | None = None,
+        adapter_selection: AdapterSelection | None = None,
+    ) -> str:
+        self._assert_owner()
+        if not isinstance(request, ModelBrokerRequest):
+            raise TypeError("request must be a ModelBrokerRequest")
+        allowed_priority = self._ROLE_PRIORITIES.get(request.call_role)
+        if allowed_priority is None or request.priority != allowed_priority:
+            raise ValueError("text task role and priority must be trusted replanning roles")
+        if not request.control_related:
+            raise ValueError("text replanning tasks must be control_related")
+        if not callable(prepare):
+            raise TypeError("prepare must be callable")
+        if deadline_at_s is not None:
+            deadline_at_s = _timestamp(deadline_at_s, "deadline_at_s")
+        if adapter_selection is not None:
+            if not isinstance(adapter_selection, AdapterSelection):
+                raise TypeError("adapter_selection must be an AdapterSelection")
+            if adapter_selection.call_role.value != request.call_role:
+                raise ValueError("adapter_selection role does not match text task")
+            if (request.requested_adapter is not None
+                    and request.requested_adapter != adapter_selection.requested_adapter):
+                raise ValueError("adapter_selection does not match requested_adapter")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("text task runner is closed")
+            if len(self._tasks.keys() | self._results.keys()) >= self._max_outstanding_tasks:
+                raise ModelRequestDispatcherError("text task outstanding capacity is full")
+            self.broker.submit(request)
+            self._tasks[request.request_id] = _TextTask(
+                request, prepare, deadline_at_s, adapter_selection
+            )
+            return request.request_id
+
+    def pump(self) -> None:
+        """Nonblocking owner-thread admission, timeout and completion service."""
+        self._assert_owner()
+        with self._lock:
+            now = _timestamp(self._clock(), "clock result")
+            for request_id, task in tuple(self._tasks.items()):
+                if task.deadline_at_s is not None and now >= task.deadline_at_s:
+                    self._cancel_locked(request_id, "DEADLINE_EXCEEDED")
+            # Another Broker owner may have superseded/preempted our request.
+            for record in self.broker.logs:
+                if (record.state == BrokerRequestState.STALE
+                        and record.request_id in self._tasks):
+                    self._cancel_locked(record.request_id, record.stale_reason or "STALE")
+            self._collect_done()
+            while not self._closed and len(self._active) < self._max_workers:
+                request = self.broker.acquire_next(request_ids=self._tasks)
+                if request is None:
+                    break
+                task = self._tasks[request.request_id]
+                self._active[request.request_id] = None
+                try:
+                    compute = task.prepare()
+                    if compute is not None and not callable(compute):
+                        raise TypeError("prepare must return a callable or None")
+                except Exception as exc:
+                    self._finish(TextTaskResult(request.request_id, exception=exc))
+                    continue
+                if compute is None:
+                    self._cancel_locked(request.request_id, "SNAPSHOT_REJECTED")
+                if (task.deadline_at_s is not None
+                        and _timestamp(self._clock(), "clock result") >= task.deadline_at_s):
+                    self._cancel_locked(request.request_id, "DEADLINE_EXCEEDED")
+                if request.request_id in self._revoked:
+                    # No callable was started, so this reserved lease is free.
+                    self._finish(TextTaskResult(request.request_id))
+                    continue
+                thread = Thread(
+                    target=self._run_compute,
+                    args=(request.request_id, compute),
+                    name=f"text-model-{request.request_id}",
+                    daemon=True,
+                )
+                self._active[request.request_id] = thread
+                try:
+                    thread.start()
+                except Exception as exc:
+                    self._finish(TextTaskResult(request.request_id, exception=exc))
+
+    def poll(self, request_id: str) -> TextTaskResult | None:
+        request_id = validate_request_id(request_id)
+        self.pump()
+        with self._lock:
+            return self._results.pop(request_id, None)
+
+    def cancel(self, request_id: str, *, reason: str = "CANCELED") -> bool:
+        self._assert_owner()
+        request_id = validate_request_id(request_id)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        with self._lock:
+            return self._cancel_locked(request_id, reason.strip())
+
+    def _cancel_locked(self, request_id: str, reason: str) -> bool:
+        if request_id in self._revoked:
+            return False
+        task = self._tasks.get(request_id)
+        if task is None:
+            result = self._results.get(request_id)
+            if result is None or result.stale:
+                return False
+            self._results[request_id] = TextTaskResult(request_id, stale=True, reason=reason)
+            return True
+        if request_id in self._active:
+            record = self.broker.cancel_inflight(request_id, reason=reason)
+            self._revoked[request_id] = record.stale_reason or reason
+            self._emit_record(record)
+        else:
+            try:
+                self.broker.cancel_pending(request_id, reason=reason)
+            except ModelRequestBrokerError:
+                # A Broker replacement may already have removed queued work.
+                pass
+            self._tasks.pop(request_id)
+            for record in reversed(self.broker.logs):
+                if record.request_id == request_id:
+                    reason = record.stale_reason or reason
+                    self._emit_record(record)
+                    break
+        self._results[request_id] = TextTaskResult(request_id, stale=True, reason=reason)
+        return True
+
+    def _run_compute(self, request_id: str, compute: Callable[[], object]) -> None:
+        try:
+            result = TextTaskResult(request_id, value=compute())
+        except BaseException as exc:
+            result = TextTaskResult(request_id, exception=exc)
+        with self._lock:
+            self._done.append(result)
+
+    def _collect_done(self) -> None:
+        while self._done:
+            self._finish(self._done.popleft())
+
+    def _finish(self, result: TextTaskResult) -> None:
+        task = self._tasks.pop(result.request_id)
+        self._active.pop(result.request_id)
+        selection = task.adapter_selection
+        record = self.broker.complete(
+            result.request_id,
+            requested_adapter=(None if selection is None else selection.requested_adapter),
+            adapter_status=(None if selection is None else selection.adapter_status.value),
+            effective_model=(None if selection is None else selection.effective_model),
+            fallback_used=False if selection is None else selection.fallback_used,
+            error_code="TEXT_TASK_FAILED" if result.exception is not None else None,
+        )
+        revoked = self._revoked.pop(result.request_id, None)
+        if revoked is None:
+            self._results[result.request_id] = replace(
+                result,
+                stale=record.state == BrokerRequestState.STALE,
+                reason=record.stale_reason,
+            )
+        self._emit_record(record)
+
+    def _emit_record(self, record: ModelCallLogRecord) -> None:
+        if record.request_id in self._emitted_record_ids:
+            return
+        self._emitted_record_ids.add(record.request_id)
+        if self._record_logger is not None:
+            self._record_logger(record.to_dict())
+
+    def close(self, timeout_s: float | None = 0.1) -> None:
+        """Revoke work and wait at most one real monotonic shutdown budget.
+
+        A fake scheduling clock must not make shutdown wait forever. Daemon
+        threads still running after this budget keep their actual Broker slots;
+        a later owner-thread pump/close may acknowledge their completion.
+        """
+        self._assert_owner()
+        budget = 0.1 if timeout_s is None else _timestamp(timeout_s, "timeout_s")
+        deadline = monotonic() + budget
+        with self._lock:
+            self._closed = True
+            for request_id in tuple(self._tasks):
+                self._cancel_locked(request_id, "RUNNER_CLOSED")
+            threads = tuple(thread for thread in self._active.values() if thread is not None)
+        for thread in threads:
+            thread.join(max(0.0, deadline - monotonic()))
+        with self._lock:
+            self._collect_done()
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                "closed": self._closed,
+                "pending_request_ids": sorted(self._tasks.keys() - self._active.keys()),
+                "inflight_request_ids": sorted(self._active),
+                "revoked_request_ids": sorted(self._revoked),
+                "completed_request_ids": sorted(self._results),
+            }
+
 __all__ = [
     "BrokeredAsyncModelWorker",
+    "BrokeredTextTaskRunner",
+    "TextTaskResult",
     "ModelRequestDispatcher",
     "ModelRequestDispatcherError",
 ]

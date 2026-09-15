@@ -430,6 +430,7 @@ def build_oracle_target_perception_runtime(
     resolved_mode: ResolvedTargetPerceptionMode,
     environment: object,
     uav_id: str,
+    candidate_target_alias: str | None = None,
 ) -> object:
     """Construct the sole runtime allowed to receive evaluator capability."""
 
@@ -451,7 +452,17 @@ def build_oracle_target_perception_runtime(
         raise TargetPerceptionConfigurationError(
             "Oracle runtime requires assignment-scoped evaluator APIs"
         )
-    raw = make_oracle(uav_id)
+    if candidate_target_alias is None:
+        raw = make_oracle(uav_id)
+    else:
+        # This creates an inert evaluator binding. The frame_provider still
+        # checks the live environment assignment before serving any frame.
+        if candidate_target_alias not in {item.id for item in config.targets}:
+            raise TargetPerceptionConfigurationError("unknown trusted candidate target")
+        if uav_id not in {item.id for item in config.uavs}:
+            raise TargetPerceptionConfigurationError("unknown trusted candidate UAV")
+        from perception.oracle import OraclePerception
+        raw = OraclePerception(uav_id=uav_id, target_id=candidate_target_alias)
     guarded = GuardedPerceptionBackend(
         raw,
         profile=PerceptionRuntimeProfile.ORACLE_EVALUATION,

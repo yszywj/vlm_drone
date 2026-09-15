@@ -8,7 +8,7 @@ effective model names for auditable logging.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -284,7 +284,14 @@ class GlobalModelRequestBroker:
             self._pending.append(request)
             return request.request_id
 
-    def acquire_next(self) -> ModelBrokerRequest | None:
+    def acquire_next(
+        self, *, request_ids: Collection[str] | None = None
+    ) -> ModelBrokerRequest | None:
+        """Acquire the globally next eligible request only for its owner.
+
+        Filtering after priority selection prevents a visual dispatcher from
+        bypassing queued replanning work owned by a different dispatcher.
+        """
         with self._lock:
             if len(self._inflight) >= self.max_inflight_global:
                 return None
@@ -300,6 +307,8 @@ class GlobalModelRequestBroker:
                     item.request_id,
                 ),
             )
+            if request_ids is not None and selected.request_id not in request_ids:
+                return None
             self._pending.remove(selected)
             self._inflight[selected.request_id] = (selected, now)
             return selected
@@ -335,12 +344,10 @@ class GlobalModelRequestBroker:
         self,
         request: ModelBrokerRequest,
     ) -> None:
-        """Logically preempt stale visual work so P0/P1 can be dispatched.
+        """Revoke replaceable results without releasing occupied model slots.
 
-        An HTTP/model call may not be synchronously cancelable.  Removing only a
-        request explicitly marked ``replaceable`` makes its eventual response
-        stale and frees the broker slot immediately; :meth:`complete` then
-        returns the existing STALE record instead of resurrecting that result.
+        Priority cannot cancel an already running HTTP call. Its resource lease
+        remains in ``_inflight`` until the owner acknowledges real completion.
         """
 
         if request.priority > ModelRequestPriority.P1_FLEET_REPLAN:
@@ -351,12 +358,18 @@ class GlobalModelRequestBroker:
                 (request_id, item, started_at)
                 for request_id, (item, started_at) in self._inflight.items()
                 if request.uav_id is not None and item.uav_id == request.uav_id
+                and request_id not in self._preempted_inflight
             )
             per_uav_blocked = (
                 request.uav_id is not None
                 and len(same_uav) >= self.max_inflight_per_uav
             )
-            global_blocked = len(self._inflight) >= self.max_inflight_global
+            # Already revoked leases are still physically occupied, but do
+            # not justify invalidating more results for the same blocked slot.
+            global_blocked = (
+                len(self._inflight) - len(self._preempted_inflight)
+                >= self.max_inflight_global
+            )
             if not per_uav_blocked and not global_blocked:
                 return
             scope = same_uav if per_uav_blocked else tuple(
@@ -368,6 +381,7 @@ class GlobalModelRequestBroker:
                 for entry in scope
                 if entry[1].replaceable
                 and entry[1].priority > request.priority
+                and entry[0] not in self._preempted_inflight
             )
             if not candidates:
                 return
@@ -379,7 +393,6 @@ class GlobalModelRequestBroker:
                     entry[0],
                 ),
             )
-            self._inflight.pop(request_id)
             stale = self._record_stale(
                 victim,
                 "PREEMPTED_BY_HIGHER_PRIORITY",
@@ -405,10 +418,10 @@ class GlobalModelRequestBroker:
             try:
                 request, started_at = self._inflight.pop(request_id)
             except KeyError:
-                preempted = self._preempted_inflight.pop(request_id, None)
-                if preempted is not None:
-                    return preempted
                 raise ModelRequestBrokerError("request is not inflight") from None
+            preempted = self._preempted_inflight.pop(request_id, None)
+            if preempted is not None:
+                return preempted
             now = _finite_nonnegative(self._clock(), "clock result")
             record = ModelCallLogRecord(
                 request_id=request.request_id,
@@ -428,6 +441,28 @@ class GlobalModelRequestBroker:
                 error_code=error_code,
             )
             self._logs.append(record)
+            return record
+
+    def cancel_inflight(
+        self, request_id: str, *, reason: str = "CANCELED"
+    ) -> ModelCallLogRecord:
+        """Invalidate a result while retaining its actual resource occupancy."""
+
+        request_id = validate_request_id(request_id)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        with self._lock:
+            if request_id not in self._inflight:
+                raise ModelRequestBrokerError("request is not inflight")
+            existing = self._preempted_inflight.get(request_id)
+            if existing is not None:
+                return existing
+            request, started_at = self._inflight[request_id]
+            now = _finite_nonnegative(self._clock(), "clock result")
+            record = self._record_stale(
+                request, reason.strip(), latency_s=max(0.0, now - started_at)
+            )
+            self._preempted_inflight[request_id] = record
             return record
 
     def cancel_pending(self, request_id: str, *, reason: str = "CANCELED") -> None:

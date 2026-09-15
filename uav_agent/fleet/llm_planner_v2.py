@@ -72,6 +72,7 @@ class LLMFleetPlannerV2:
         # 2048 leaves safe prompt headroom without reducing schema limits.
         max_tokens: int = 2048,
         repair_budget: int = 2,
+        maximum_assignments: int | None = None,
     ) -> None:
         if not callable(getattr(model_client, "chat", None)):
             raise TypeError("model_client must provide chat()")
@@ -87,6 +88,10 @@ class LLMFleetPlannerV2:
             or not 0 <= repair_budget <= 2
         ):
             raise ValueError("repair_budget must be within [0, 2]")
+        if maximum_assignments is not None and (type(maximum_assignments) is not int or not 1 <= maximum_assignments <= 64):
+            raise ValueError("maximum_assignments must be within 1..64")
+        self._maximum_assignments = maximum_assignments
+        self.external_dependencies: tuple[dict, ...] = ()
         self._client = model_client
         self._logger = logger
         self._max_tokens = max_tokens
@@ -111,17 +116,23 @@ class LLMFleetPlannerV2:
         if not isinstance(request, FleetMissionRequestV2):
             raise TypeError("request must be a FleetMissionRequestV2")
         schema = build_fleet_mission_plan_v2_json_schema(request)
+        if self._maximum_assignments is not None:
+            schema["properties"]["assignments"]["minItems"] = 1
+            schema["properties"]["assignments"]["maxItems"] = self._maximum_assignments
         payload = {
             "task": "Create one FleetMissionPlanV2 goal assignment.",
             "trusted_request": request.to_dict(),
             "planner_limits": {
                 "max_active_assignments_per_uav": 1,
                 "maximum_assignments": min(
-                    len(request.available_uav_ids), len(request.task_spec.all_goal_ids)
+                    len(request.available_uav_ids), len(request.task_spec.all_goal_ids),
+                    self._maximum_assignments or 64,
                 ),
                 "semantic_deviations_are_recoverable": True,
             },
         }
+        if self.external_dependencies:
+            payload["external_dependencies_read_only"] = deepcopy(self.external_dependencies)
         initial_messages = (
             ChatMessage("system", self.SYSTEM_PROMPT),
             ChatMessage(

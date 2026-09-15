@@ -173,7 +173,10 @@ class AsyncModelWorkerTest(unittest.TestCase):
             self.assertEqual(result.request_id, "request_2")
             self.assertFalse(result.stale)
             self.assertEqual(client.max_active, 1)
-            self.assertEqual(worker.discarded_result_count, 1)
+            self.assertEqual(worker.discarded_result_count, 0)
+            old_result = worker.poll(expected_request_id="request_1", include_stale=True)
+            self.assertIsNotNone(old_result)
+            self.assertTrue(old_result.stale)
         finally:
             client.release_first.set()
             worker.close(timeout_s=2.0)
@@ -242,3 +245,24 @@ class AsyncModelWorkerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_filtered_async_worker_poll_retains_unrelated_valid_completion() -> None:
+    """Independent consumers must not drop or receive each other's results."""
+    client = ControlledModelClient(block_first=False)
+    worker = AsyncModelWorker(client, uav_id="uav_a")
+    first = request("request_first_independent", uav_id="uav_a")
+    second = request("request_second_independent", uav_id="uav_a")
+    try:
+        worker.submit(first)
+        with worker._condition:
+            assert worker._condition.wait_for(lambda: len(worker._completed) == 1, timeout=2.0)
+        assert worker.poll(expected_request_id=second.request_id, include_stale=True) is None
+        worker.submit(second)
+        with worker._condition:
+            assert worker._condition.wait_for(lambda: len(worker._completed) == 2, timeout=2.0)
+        assert worker.poll(expected_request_id=second.request_id).request_id == second.request_id
+        assert worker.poll(expected_request_id=first.request_id).request_id == first.request_id
+        assert worker.discarded_result_count == 0
+    finally:
+        worker.close(timeout_s=2.0)

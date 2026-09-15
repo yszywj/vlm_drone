@@ -11,6 +11,7 @@ from numbers import Real
 from typing import TYPE_CHECKING
 
 from common.ids import (
+    generate_routing_id,
     validate_invocation_id,
     validate_mission_id,
     validate_routing_id,
@@ -86,6 +87,21 @@ class ExecutionKind(str, Enum):
     RECOVERY = "RECOVERY"
     EMERGENCY = "EMERGENCY"
     SUPERVISORY = "SUPERVISORY"
+
+
+@dataclass(frozen=True, slots=True)
+class LocalRepairEvent:
+    """Trusted terminal evidence; a failed invocation is never a completed step."""
+
+    event_id: str
+    mission_id: str
+    uav_id: str
+    plan_version: int
+    step_id: str
+    invocation_id: str
+    execution_epoch: int
+    skill_name: SkillName
+    result: SkillResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +294,12 @@ class SkillManager:
         self._last_invocation: SkillInvocation | None = None
         self._execution_reports: list[SkillExecutionReport] = []
         self._invocation_counter = 0
+        self._execution_epoch = 0
+        self._started_invocations: list[SkillInvocation] = []
+        self._local_repair_enabled = False
+        self._local_repair_max_wait_s = 300.0
+        self._local_repair_event: LocalRepairEvent | None = None
+        self._local_repair_observation: Observation | None = None
         self._interrupted_execution: _InterruptedExecution | None = None
         self._supervisory_continuation: _SupervisoryContinuation | None = None
         self._pending_replacement_plan: TaskPlan | None = None
@@ -316,6 +338,170 @@ class SkillManager:
     @property
     def execution_reports(self) -> tuple[SkillExecutionReport, ...]:
         return tuple(_copy_report(report) for report in self._execution_reports)
+
+    @property
+    def execution_epoch(self) -> int:
+        """Monotonic task generation, including across reset/start cycles."""
+        return self._execution_epoch
+
+    @property
+    def started_invocations(self) -> tuple[SkillInvocation, ...]:
+        """Attempted starts, including calls which could have had side effects."""
+        return tuple(deepcopy(self._started_invocations))
+
+    @property
+    def local_repair_event(self) -> LocalRepairEvent | None:
+        return deepcopy(self._local_repair_event)
+
+    @property
+    def current_step_index(self) -> int | None:
+        return self._plan_index
+
+    @property
+    def local_repair_stable_hold(self) -> bool:
+        observation = self._local_repair_observation
+        invocation = self._active_invocation
+        if (
+            self._local_repair_event is None
+            or self._task_status is not TaskStatus.RUNNING
+            or self._pending_task_result is not None
+            or self._active_name is not SkillName.HOVER
+            or self.active_status is not SkillStatus.RUNNING
+            or not self._supervisory_hold_established
+            or self._supervisory_started_this_tick
+            or observation is None
+            or invocation is None
+            or not isinstance(invocation.goal, HoverGoal)
+        ):
+            return False
+        feedback = self._active_skill().get_feedback()
+        drift = feedback.data.get("position_drift_m")
+        speed_squared = sum(float(v) ** 2 for v in observation.uav_velocity)
+        return (
+            isinstance(drift, Real)
+            and isfinite(float(drift))
+            and float(drift) <= invocation.goal.position_tolerance_m
+            and isfinite(speed_squared)
+            and speed_squared <= 0.25 ** 2
+        )
+
+    def configure_local_repair(
+        self, *, enabled: bool = False, max_wait_s: float = 300.0
+    ) -> None:
+        """Opt in before task start; Fleet owns real wall-clock episode limits."""
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be a bool")
+        if self._task_status is not TaskStatus.IDLE:
+            raise SkillManagerError("configure local repair before task start")
+        wait = _positive_number(max_wait_s, "max_wait_s")
+        if enabled and not isinstance(self._skills.get(SkillName.HOVER), HoverSkill):
+            raise SkillManagerError("local repair requires the trusted HoverSkill")
+        self._local_repair_enabled = enabled
+        self._local_repair_max_wait_s = wait
+
+    def _require_local_repair(
+        self, event_id: str, plan_version: int, *, require_hold: bool = False
+    ) -> _InterruptedExecution:
+        event = self._local_repair_event
+        plan = self._task_plan
+        if (
+            not self._local_repair_enabled
+            or event is None
+            or event.event_id != event_id
+            or event.plan_version != plan_version
+            or event.execution_epoch != self._execution_epoch
+            or self._task_status is not TaskStatus.RUNNING
+            or self._pending_task_result is not None
+            or self._program_executor is not None
+            or plan is None
+            or plan.plan_version != plan_version
+            or plan.mission_id != event.mission_id
+            or plan.uav_id != event.uav_id
+        ):
+            raise SkillManagerError("local repair event/version is stale or canceled")
+        interrupted = self._require_supervisory_interruption()
+        if (
+            self._plan_index != interrupted.plan_index
+            or self._active_planned_step_id != event.step_id
+            or interrupted.step.step_id != event.step_id
+            or interrupted.plan.to_dict() != plan.to_dict()
+            or self._supervisory_continuation is not None
+        ):
+            raise SkillManagerError("local repair execution boundary changed")
+        if require_hold and not self.local_repair_stable_hold:
+            raise SkillManagerError("local repair requires fresh stable HOVER evidence")
+        return interrupted
+
+    def commit_local_repair(
+        self, plan: TaskPlan, *, expected_event_id: str, expected_plan_version: int,
+        final_guard: Callable[[], None] | None = None,
+    ) -> TaskStatus:
+        """Publish a protected suffix synchronously, starting but never ticking it.
+
+        HOVER cancellation is real cancellation evidence, never fabricated
+        success. Publication can precede a replacement Skill start failure;
+        callers must adopt the published version even when LAND then starts.
+        """
+        interrupted = self._require_local_repair(
+            expected_event_id, expected_plan_version, require_hold=True
+        )
+        owned = self._validate_replacement_plan(plan, interrupted)
+        step = owned.steps[interrupted.plan_index]
+        if (
+            step.step_id != interrupted.step.step_id
+            or step.skill is not interrupted.step.skill
+        ):
+            raise SkillManagerError(
+                "local repair must preserve current step identity and Skill"
+            )
+
+        def retire_hold() -> None:
+            # All goal resolution and owned-object preparation has finished.
+            # Check owner deadlines/dependencies at this last publication gate.
+            if final_guard is not None:
+                final_guard()
+            self._require_local_repair(
+                expected_event_id, expected_plan_version, require_hold=True
+            )
+            self._active_skill().cancel()
+            self._reset_active_internal()
+
+        self._pending_replacement_plan = owned
+        try:
+            self._start_replacement_after_interruption(
+                old_status=SkillStatus.CANCELED,
+                result_code=SkillResultCode.CANCELED,
+                before_publication=retire_hold,
+            )
+        except Exception:
+            event = self._local_repair_event
+            if event is not None and event.event_id == expected_event_id:
+                self._pending_replacement_plan = None
+            raise
+        return self._task_status
+
+    def fail_local_repair(self, *, expected_event_id: str, reason: str) -> bool:
+        """Close only this live event. Late failures cannot cancel a new task."""
+        event = self._local_repair_event
+        if event is None or event.event_id != expected_event_id:
+            return False
+        try:
+            self._require_local_repair(event.event_id, event.plan_version)
+        except SkillManagerError:
+            return False
+        self._task_failure_result = deepcopy(event.result)
+        self._pending_task_result = TaskStatus.FAILED
+        old_name = self._active_name
+        old_status = self.active_status
+        if old_name is not None:
+            if old_status is SkillStatus.RUNNING:
+                self._active_skill().cancel()
+            self._reset_active_internal()
+        self._begin_landing(
+            old_name, old_status, event.result, f"local_repair_failed:{reason}",
+            old_step_id=event.step_id,
+        )
+        return True
 
     @property
     def active_status(self) -> SkillStatus | None:
@@ -613,6 +799,9 @@ class SkillManager:
         :class:`ProgramPatch` may continue execution.
         """
 
+        if self._local_repair_enabled:
+            raise SkillManagerError("local repair supports linear TaskPlan execution only")
+
         from copy import deepcopy as _deepcopy
 
         from planner.mission_program import MissionProgram
@@ -746,6 +935,8 @@ class SkillManager:
             _reject_unknown_goal_fields(step.skill, step.params)
             self._goal_from_step(step, plan=owned_plan, validation_only=True)
 
+        self._execution_epoch += 1
+        self._started_invocations = []
         self._task_plan = owned_plan
         self._last_result = None
         self._plan_index = 0
@@ -1400,6 +1591,8 @@ class SkillManager:
             )
         self._active_name = name
         self._active_invocation = invocation
+        if self._local_repair_enabled:
+            self._started_invocations.append(deepcopy(invocation))
         try:
             skill.start(goal, self._context)
         except BaseException:
@@ -1434,6 +1627,8 @@ class SkillManager:
         )
 
     def _tick_task(self, observation: Observation) -> TaskStatus:
+        if self._local_repair_enabled:
+            self._local_repair_observation = observation
         if self._active_name is None:
             if self._supervisory_waiting and self._interrupted_execution is not None:
                 return self._task_status
@@ -1678,6 +1873,8 @@ class SkillManager:
                 and result.code is SkillResultCode.TARGET_LOST
                 and self._try_start_recovery(result, old_status, old_step_id)
             ):
+                return
+            if self._try_start_local_repair(old_name, old_kind, result, old_step_id):
                 return
             self._task_failure_result = result
             self._pending_task_result = TaskStatus.FAILED
@@ -2080,6 +2277,7 @@ class SkillManager:
         *,
         old_status: SkillStatus,
         result_code: SkillResultCode,
+        before_publication: Callable[[], None] | None = None,
     ) -> None:
         interrupted = self._require_supervisory_interruption()
         replacement = self._pending_replacement_plan
@@ -2150,6 +2348,10 @@ class SkillManager:
             self._last_result = failure
             self._task_failure_result = failure
             self._pending_task_result = TaskStatus.FAILED
+            if before_publication is not None and self._active_name is not None:
+                if self.active_status is SkillStatus.RUNNING:
+                    self._active_skill().cancel()
+                self._reset_active_internal()
             self._discard_supervisory_state()
             self._begin_landing(
                 SkillName.HOVER,
@@ -2170,6 +2372,9 @@ class SkillManager:
                     "replacement TRACK cannot change the active target identity"
                 )
             published_track_goals[step.step_id] = goal
+
+        if before_publication is not None:
+            before_publication()
 
         # Single graph publication point: ProgramExecutor.apply_patch performs
         # no callbacks, and every TaskPlan/state object above is already owned
@@ -2301,6 +2506,8 @@ class SkillManager:
         )
 
     def _discard_supervisory_state(self) -> None:
+        self._local_repair_event = None
+        self._local_repair_observation = None
         self._interrupted_execution = None
         self._supervisory_continuation = None
         self._pending_replacement_plan = None
@@ -2311,6 +2518,74 @@ class SkillManager:
         self._supervisory_started_this_tick = False
         self._supervisory_hold_established = False
         self._supervisory_defer_observation_timestamp_s = None
+
+    def _try_start_local_repair(
+        self, name: SkillName, kind: ExecutionKind | None,
+        result: SkillResult, step_id: str | None,
+    ) -> bool:
+        # Deterministic SEARCH fallback and TRACK REACQUIRE run first. Partial
+        # tracking, INSPECT, TAKEOFF and LAND have no generic replay contract.
+        supported = (
+            name is SkillName.SEARCH
+            and result.code in {SkillResultCode.SEARCH_EXHAUSTED, SkillResultCode.TIMEOUT}
+        ) or (
+            name in {SkillName.GOTO, SkillName.FOLLOW_ROUTE}
+            and result.code is SkillResultCode.TIMEOUT
+        )
+        invocation = self._last_invocation
+        if (
+            not self._local_repair_enabled or not supported
+            or kind is not ExecutionKind.PLANNED
+            or self._program_executor is not None
+            or self._pending_task_result is not None
+            or self._interrupted_execution is not None
+            or self._search_inspection_detour is not None
+            or self._task_plan is None or self._plan_index is None
+            or invocation is None or invocation.step_id != step_id
+        ):
+            return False
+        plan = self._task_plan
+        step = plan.steps[self._plan_index]
+        if (
+            step.step_id != step_id or step.skill is not name
+            or invocation.plan_version != plan.plan_version
+            or invocation.mission_id != plan.mission_id
+        ):
+            return False
+        self._interrupted_execution = _InterruptedExecution(
+            plan_index=self._plan_index, step=deepcopy(step),
+            resolved_goal=deepcopy(invocation.goal), plan=_copy_task_plan(plan),
+            step_outputs=deepcopy(self._step_outputs),
+            active_target_id=self._active_target_id,
+            recovery_attempts=dict(self._recovery_attempts),
+            saved_track_goals=deepcopy(self._saved_track_goal_by_step),
+            timeout_fallback=HoverTimeoutFallback.CANCEL_AND_LAND,
+        )
+        self._local_repair_event = LocalRepairEvent(
+            event_id=generate_routing_id("local_repair"), mission_id=plan.mission_id,
+            uav_id=self._uav_id, plan_version=plan.plan_version, step_id=step.step_id,
+            invocation_id=invocation.invocation_id, execution_epoch=self._execution_epoch,
+            skill_name=name, result=deepcopy(result),
+        )
+        observation = self._local_repair_observation
+        self._supervisory_defer_observation_timestamp_s = (
+            None if observation is None else float(observation.timestamp)
+        )
+        self._local_repair_observation = None
+        self._supervisory_hold_established = False
+        self._start_transition(
+            name, result.status, result.code, SkillName.HOVER,
+            HoverGoal(
+                mode=HoverMode.UNTIL_RELEASED, duration_s=None,
+                max_wait_s=self._local_repair_max_wait_s,
+                reason_code="LOCAL_REPAIR_PENDING",
+            ),
+            "local_repair_pending", old_step_id=step.step_id,
+            new_step_id=step.step_id, execution_kind=ExecutionKind.SUPERVISORY,
+        )
+        if self._active_name is SkillName.HOVER and self.active_status is SkillStatus.RUNNING:
+            self._supervisory_started_this_tick = True
+        return True
 
     def _try_start_recovery(
         self,
@@ -3458,6 +3733,7 @@ class SkillManager:
         self._execution_reports = []
         self._invocation_counter = 0
         self._search_inspection_detour = None
+        self._started_invocations = []
         self._discard_supervisory_state()
 
     def _active_skill_or_none(self) -> Skill | None:
@@ -3754,6 +4030,7 @@ def _name_or_none(name: SkillName | None) -> str:
 
 __all__ = [
     "ExecutionKind",
+    "LocalRepairEvent",
     "HoverTimeoutFallback",
     "RecoveryPolicy",
     "SkillManager",

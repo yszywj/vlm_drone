@@ -185,6 +185,8 @@ class ModelClientFactory:
         fleet_mission_id: str | None = None,
         assignment_id: str | None = None,
         uav_id: str | None = None,
+        request_timeout_s: float | None = None,
+        request_max_retries: int | None = None,
     ) -> OpenAICompatibleClient:
         selection = self.selection_for_role(role)
         if self._selection_logger is not None:
@@ -193,8 +195,8 @@ class ModelClientFactory:
             base_url=self._base_url,
             model=selection.effective_model,
             api_key=self._api_key,
-            timeout_s=self._timeout_s,
-            max_retries=self._max_retries,
+            timeout_s=self._timeout_s if request_timeout_s is None else request_timeout_s,
+            max_retries=self._max_retries if request_max_retries is None else request_max_retries,
             **self._client_options,
         )
         if (

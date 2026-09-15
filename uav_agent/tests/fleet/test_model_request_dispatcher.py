@@ -10,7 +10,9 @@ from fleet.model_request_broker import (
     ModelBrokerRequest,
     ModelRequestPriority,
 )
-from fleet.model_request_dispatcher import ModelRequestDispatcher
+from fleet.model_request_dispatcher import (
+    BrokeredTextTaskRunner, ModelRequestDispatcher, ModelRequestDispatcherError,
+)
 from models import (
     AdapterSelection,
     AdapterStatus,
@@ -216,6 +218,7 @@ def test_new_periodic_frame_stales_pending_request_before_worker_boundary() -> N
     visual.submit(old)
     visual.submit(new)
 
+    assert visual.poll(expected_request_id=new.request_id) is None
     stale = visual.poll(include_stale=True)
     assert stale is not None
     assert stale.request_id == old.request_id
@@ -277,11 +280,15 @@ def test_preempted_inflight_late_worker_result_remains_stale() -> None:
         submitted_at_s=clock.now,
     )
     broker.submit(urgent)
-    assert broker.acquire_next() == urgent
-    broker.complete(urgent.request_id, effective_model="trusted-replanner")
+    assert broker.acquire_next() is None
+    assert broker.inflight_count == 1
 
     workers["uav_a"].finish_next(usage={"prompt_tokens": 99})
+    # The visual dispatcher collects its late result without acquiring text
+    # work owned by another dispatcher, then the real slot can be reused.
     late = visual.poll(include_stale=True)
+    assert broker.acquire_next() == urgent
+    broker.complete(urgent.request_id, effective_model="trusted-replanner")
 
     assert late is not None
     assert late.request_id == request.request_id
@@ -399,3 +406,280 @@ def test_record_logger_receives_each_terminal_state_exactly_once() -> None:
         "SUPERSEDED_BY_NEWER_FRAME"
     ]
     assert set(by_id) == {record.request_id for record in broker.logs}
+
+
+def _text_request(request_id: str, uav_id: str = "uav_text", **kwargs: object) -> ModelBrokerRequest:
+    return ModelBrokerRequest(
+        request_id=request_id,
+        call_role=ModelCallRole.RUNTIME_REPLAN,
+        priority=ModelRequestPriority.P2_AGENT_RUNTIME_REPLAN,
+        uav_id=uav_id,
+        submitted_at_s=100.0,
+        **kwargs,
+    )
+
+
+def _join_text_thread(runner: BrokeredTextTaskRunner, request_id: str) -> None:
+    # Explicit synchronization in tests only: production poll never joins.
+    thread = runner._active[request_id]
+    assert thread is not None
+    thread.join(2.0)
+    assert not thread.is_alive()
+
+
+def test_dispatcher_filtered_poll_preserves_other_completed_requests() -> None:
+    dispatcher, _, workers, _ = _dispatcher(("uav_a",))
+    facade = dispatcher.worker_for("uav_a")
+    first = _request("request_first_owned", "uav_a", priority=3)
+    second = _request("request_second_owned", "uav_a", priority=3)
+    facade.submit(first)
+    workers["uav_a"].finish_next()
+    assert facade.poll(expected_request_id=second.request_id, include_stale=True) is None
+    facade.submit(second)
+    workers["uav_a"].finish_next()
+    assert facade.poll(expected_request_id=second.request_id).request_id == second.request_id
+    assert facade.poll(expected_request_id=first.request_id).request_id == first.request_id
+    assert facade.discarded_result_count == 0
+    dispatcher.close()
+
+
+def test_text_admission_refreshes_snapshot_on_owner_only_when_real_slot_is_ready() -> None:
+    clock = _Clock()
+    broker = GlobalModelRequestBroker(max_inflight_global=1, clock=clock)
+    blocker = _text_request("request_blocker", "uav_other")
+    broker.submit(blocker)
+    assert broker.acquire_next() == blocker
+    runner = BrokeredTextTaskRunner(broker, clock=clock)
+    state = {"version": 1}
+    preparations: list[tuple[int, int]] = []
+    owner = threading.get_ident()
+
+    def prepare():
+        version = state["version"]
+        preparations.append((version, threading.get_ident()))
+        return lambda: (version, threading.get_ident())
+
+    request = _text_request("request_refresh")
+    runner.submit(request, prepare)
+    runner.pump()
+    assert preparations == []
+    state["version"] = 2
+    broker.complete(blocker.request_id)
+    runner.pump()
+    assert preparations == [(2, owner)]
+    _join_text_thread(runner, request.request_id)
+    result = runner.poll(request.request_id)
+    assert result.succeeded
+    assert result.value[0] == 2
+    assert result.value[1] != owner
+    runner.close()
+
+
+def test_cancel_active_text_revokes_result_but_preserves_underlying_capacity() -> None:
+    clock = _Clock()
+    broker = GlobalModelRequestBroker(max_inflight_global=1, clock=clock)
+    runner = BrokeredTextTaskRunner(broker, clock=clock)
+    started, release, second_started = threading.Event(), threading.Event(), threading.Event()
+
+    def slow():
+        started.set()
+        assert release.wait(2.0)
+        return "late value"
+
+    first = _text_request("request_canceled", "uav_a")
+    second = _text_request("request_waits", "uav_b")
+    runner.submit(first, lambda: slow)
+    runner.pump()
+    assert started.wait(2.0)
+    runner.submit(second, lambda: lambda: second_started.set())
+    try:
+        assert runner.cancel(first.request_id)
+        canceled = runner.poll(first.request_id)
+        assert canceled.stale and canceled.reason == "CANCELED"
+        assert runner.inflight_count == broker.inflight_count == 1
+        assert not second_started.is_set()
+        runner.pump()
+        assert not second_started.is_set()
+    finally:
+        release.set()
+    _join_text_thread(runner, first.request_id)
+    runner.pump()
+    assert second_started.wait(2.0)
+    _join_text_thread(runner, second.request_id)
+    assert runner.poll(first.request_id) is None
+    assert runner.poll(second.request_id).succeeded
+    assert broker.inflight_count == 0
+    runner.close()
+
+
+def test_text_deadline_uses_injected_wall_clock_and_late_result_cannot_return() -> None:
+    clock = _Clock()
+    broker = GlobalModelRequestBroker(max_inflight_global=1, clock=clock)
+    runner = BrokeredTextTaskRunner(broker, clock=clock)
+    started, release = threading.Event(), threading.Event()
+
+    def slow():
+        started.set()
+        assert release.wait(2.0)
+        return "expired candidate"
+
+    request = _text_request("request_deadline")
+    runner.submit(request, lambda: slow, deadline_at_s=101.0)
+    runner.pump()
+    assert started.wait(2.0)
+    try:
+        clock.now = 101.0
+        result = runner.poll(request.request_id)
+        assert result.stale and result.reason == "DEADLINE_EXCEEDED"
+        assert runner.inflight_count == broker.inflight_count == 1
+    finally:
+        release.set()
+    _join_text_thread(runner, request.request_id)
+    assert runner.poll(request.request_id) is None
+    assert broker.inflight_count == 0
+    assert broker.logs[-1].state == "STALE"
+    runner.close()
+
+
+def test_queued_deadline_and_rejected_snapshot_do_not_invoke_compute() -> None:
+    clock = _Clock()
+    broker = GlobalModelRequestBroker(clock=clock)
+    runner = BrokeredTextTaskRunner(broker, clock=clock)
+    prepared: list[str] = []
+    expired = _text_request("request_expired")
+    rejected = _text_request("request_rejected")
+    runner.submit(expired, lambda: prepared.append("expired"), deadline_at_s=100.0)
+    runner.submit(rejected, lambda: prepared.append("rejected"))
+    assert runner.poll(expired.request_id).reason == "DEADLINE_EXCEEDED"
+    assert runner.poll(rejected.request_id).reason == "SNAPSHOT_REJECTED"
+    assert prepared == ["rejected"]
+    assert broker.inflight_count == 0
+    runner.close()
+
+
+def test_text_out_of_order_results_are_consumed_by_request_and_exceptions_are_private() -> None:
+    clock = _Clock()
+    broker = GlobalModelRequestBroker(max_inflight_global=2, clock=clock)
+    runner = BrokeredTextTaskRunner(broker, clock=clock)
+    release = threading.Event()
+    error = ValueError("private compute detail")
+
+    def slow():
+        assert release.wait(2.0)
+        return "first"
+
+    def fail():
+        raise error
+
+    first = _text_request("request_slow", "uav_a")
+    second = _text_request("request_failure", "uav_b")
+    runner.submit(first, lambda: slow)
+    runner.submit(second, lambda: fail)
+    runner.pump()
+    _join_text_thread(runner, second.request_id)
+    try:
+        assert runner.poll(first.request_id) is None
+        result = runner.poll(second.request_id)
+        assert result.exception is error and not result.succeeded
+        assert "private compute detail" not in str(broker.snapshot())
+    finally:
+        release.set()
+    _join_text_thread(runner, first.request_id)
+    assert runner.poll(first.request_id).value == "first"
+    runner.close()
+
+
+def test_text_and_visual_dispatchers_share_limits_without_acquiring_each_others_work() -> None:
+    dispatcher, broker, workers, clock = _dispatcher(("uav_a",))
+    runner = BrokeredTextTaskRunner(broker, clock=clock)
+    facade = dispatcher.worker_for("uav_a")
+    visual = _request("request_visual", "uav_a", priority=4)
+    facade.submit(visual)
+    text = _text_request("request_text")
+    runner.submit(text, lambda: lambda: "candidate")
+    runner.pump()
+    assert broker.inflight_count == 1
+    assert runner.inflight_count == 0
+    workers["uav_a"].finish_next()
+    assert facade.poll(expected_request_id=visual.request_id) is not None
+    assert broker.pending_count == 1
+    runner.pump()
+    _join_text_thread(runner, text.request_id)
+    assert runner.poll(text.request_id).value == "candidate"
+    assert broker.inflight_count == 0
+    runner.close()
+    dispatcher.close()
+
+
+def test_text_runner_rejects_visual_priority_escalation_and_nonowner_admission() -> None:
+    broker = GlobalModelRequestBroker(clock=_Clock())
+    runner = BrokeredTextTaskRunner(broker, clock=_Clock())
+    visual = ModelBrokerRequest(
+        request_id="request_no_escalation", call_role=ModelCallRole.RUNTIME_VISUAL_REVIEW,
+        priority=ModelRequestPriority.P1_FLEET_REPLAN, uav_id="uav_a",
+    )
+    with pytest.raises(ValueError, match="role and priority"):
+        runner.submit(visual, lambda: lambda: None)
+    errors: list[BaseException] = []
+
+    def wrong_thread():
+        try:
+            runner.pump()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=wrong_thread)
+    thread.start()
+    thread.join(2.0)
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "owner thread" in str(errors[0])
+    runner.close()
+
+
+def test_text_runner_shutdown_is_bounded_with_a_frozen_scheduling_clock() -> None:
+    clock = _Clock()
+    broker = GlobalModelRequestBroker(max_inflight_global=1, clock=clock)
+    runner = BrokeredTextTaskRunner(broker, clock=clock)
+    started, release = threading.Event(), threading.Event()
+
+    def slow():
+        started.set()
+        assert release.wait(2.0)
+        return "late"
+
+    request = _text_request("request_shutdown")
+    runner.submit(request, lambda: slow)
+    runner.pump()
+    assert started.wait(2.0)
+    try:
+        # No real waiting at all: this must return with the task still running.
+        runner.close(timeout_s=0.0)
+        assert not release.is_set()
+        assert runner.is_closed
+        assert runner.inflight_count == broker.inflight_count == 1
+        assert runner.poll(request.request_id).reason == "RUNNER_CLOSED"
+        with pytest.raises(RuntimeError, match="closed"):
+            runner.submit(_text_request("request_after_close"), lambda: lambda: None)
+    finally:
+        release.set()
+    _join_text_thread(runner, request.request_id)
+    runner.close(timeout_s=0.0)
+    assert broker.inflight_count == 0
+    assert runner.poll(request.request_id) is None
+
+
+def test_text_runner_bounds_unconsumed_results_without_silently_discarding_them() -> None:
+    clock = _Clock()
+    broker = GlobalModelRequestBroker(clock=clock)
+    runner = BrokeredTextTaskRunner(broker, clock=clock, max_outstanding_tasks=1)
+    first = _text_request("request_retained")
+    runner.submit(first, lambda: lambda: "retained")
+    runner.pump()
+    _join_text_thread(runner, first.request_id)
+    runner.pump()
+    with pytest.raises(ModelRequestDispatcherError, match="capacity"):
+        runner.submit(_text_request("request_capacity"), lambda: lambda: None)
+    assert runner.poll(first.request_id).value == "retained"
+    runner.submit(_text_request("request_capacity"), lambda: None)
+    runner.close()

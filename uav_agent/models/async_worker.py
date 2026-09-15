@@ -246,7 +246,7 @@ class AsyncModelWorker:
         minimum_observation_timestamp_s: float | None = None,
         include_stale: bool = False,
     ) -> AsyncModelResult | None:
-        """Return one ready result without blocking, discarding stale entries."""
+        """Consume one matching result, retaining other requests' completions."""
 
         if expected_request_id is not None:
             expected_request_id = validate_request_id(expected_request_id)
@@ -258,23 +258,20 @@ class AsyncModelWorker:
             )
 
         with self._condition:
-            while self._completed:
+            for _ in range(len(self._completed)):
                 result = self._completed.popleft()
-                stale = (
-                    result.stale
-                    or (
-                        expected_request_id is not None
-                        and result.request_id != expected_request_id
-                    )
-                    or (
-                        expected_review_id is not None
-                        and result.review_id != expected_review_id
-                    )
-                    or (
-                        minimum_observation_timestamp_s is not None
-                        and result.observation_timestamp_s
-                        < minimum_observation_timestamp_s
-                    )
+                matches = (
+                    (expected_request_id is None or result.request_id == expected_request_id)
+                    and (expected_review_id is None or result.review_id == expected_review_id)
+                )
+                if not matches:
+                    # A request-specific consumer must not consume another
+                    # completion, including a stale outcome it may inspect.
+                    self._completed.append(result)
+                    continue
+                stale = result.stale or (
+                    minimum_observation_timestamp_s is not None
+                    and result.observation_timestamp_s < minimum_observation_timestamp_s
                 )
                 if stale and not include_stale:
                     self._discarded_result_count += 1
@@ -329,8 +326,14 @@ class AsyncModelWorker:
         return discarded
 
     def close(self, timeout_s: float | None = None) -> None:
-        """Stop accepting work and wait for any active HTTP call to return."""
+        """Stop admission and wait within a bounded shutdown budget.
 
+        A running HTTP call retains the worker's busy state after a timeout;
+        Python threads cannot safely cancel it. ``None`` uses 0.1 seconds.
+        """
+
+        if timeout_s is None:
+            timeout_s = 0.1
         if timeout_s is not None:
             if isinstance(timeout_s, bool) or not isinstance(timeout_s, Real):
                 raise TypeError("timeout_s must be a finite number or None")

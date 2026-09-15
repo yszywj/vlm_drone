@@ -202,6 +202,9 @@ def test_production_handler_replans_compiles_audits_and_preserves_goal_mapping(
         "goal_land",
     )
     history = prepared.preparation_context["runtime_reassignments"]
+    assert history == []  # Candidate generation must not publish active routing.
+    assert publication.on_commit is not None
+    publication.on_commit()
     assert history == [
         {
             "schema_version": 1,

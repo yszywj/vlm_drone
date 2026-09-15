@@ -693,6 +693,45 @@ class ModelBrokerConfig:
 
 
 @dataclass(frozen=True)
+class FleetRecoveryConfig:
+    """Opt-in linear Spatial V3 recovery; all deadlines are monotonic seconds."""
+
+    enabled: bool = False
+    mode: str = "LOCAL_THEN_REASSIGN"
+    request_timeout_s: float = 30.0
+    episode_timeout_s: float = 90.0
+    retry_cooldown_s: float = 1.0
+    max_local_attempts: int = 2
+    max_reassign_attempts: int = 1
+    max_concurrent_requests: int = 2
+    max_pose_time_error_s: float = 0.05
+    max_anchor_age_s: float = 45.0
+    max_hold_drift_m: float = 2.0
+    max_suffix_steps: int = 10
+    shutdown_timeout_s: float = 0.1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("fleet_recovery.enabled must be bool")
+        if self.mode not in {"LOCAL_ONLY", "LOCAL_THEN_REASSIGN"}:
+            raise ValueError("fleet_recovery.mode must be LOCAL_ONLY or LOCAL_THEN_REASSIGN")
+        for name in ("request_timeout_s", "episode_timeout_s", "retry_cooldown_s",
+                     "max_pose_time_error_s", "max_anchor_age_s", "max_hold_drift_m",
+                     "shutdown_timeout_s"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
+                raise ValueError(f"fleet_recovery.{name} must be finite and positive")
+        for name in ("max_local_attempts", "max_reassign_attempts",
+                     "max_concurrent_requests", "max_suffix_steps"):
+            value = getattr(self, name)
+            maximum = 10 if name == "max_suffix_steps" else (1 if name == "max_reassign_attempts" else 8)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                raise ValueError(f"fleet_recovery.{name} must be within 1..{maximum}")
+        if self.request_timeout_s > self.episode_timeout_s:
+            raise ValueError("request timeout cannot exceed recovery episode deadline")
+
+
+@dataclass(frozen=True)
 class AppConfig:
     schema_version: int
     simulation: SimulationConfig
@@ -747,6 +786,7 @@ class AppConfig:
     camera_profiles: Mapping[str, CameraConfig] = field(default_factory=dict)
     fleet: FleetConfig = field(default_factory=FleetConfig)
     model_broker: ModelBrokerConfig = field(default_factory=ModelBrokerConfig)
+    fleet_recovery: FleetRecoveryConfig = field(default_factory=FleetRecoveryConfig)
 
     def __post_init__(self) -> None:
         raw_uav = object.__getattribute__(self, "uav")

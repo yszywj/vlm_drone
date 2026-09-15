@@ -35,11 +35,13 @@ from runtime.safety_supervisor import (
     SafetyDecision,
     SafetySupervisor,
 )
-from skills.manager import SkillManager, TaskStatus, TransitionRecord
+from skills.manager import LocalRepairEvent, SkillManager, TaskStatus, TransitionRecord
 from skills.plan import TaskPlan, TaskStep
 from skills.types import (
     Observation,
     SkillClock,
+    SkillExecutionReport,
+    SkillInvocation,
     SkillName,
     SkillResultCode,
     SkillStatus,
@@ -74,6 +76,23 @@ class AgentStatus(str, Enum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELED = "CANCELED"
+
+
+@dataclass(frozen=True, slots=True)
+class LocalRepairSnapshot:
+    """Owned local execution view for the single Fleet repair coordinator."""
+
+    event: LocalRepairEvent | None
+    stable_hold: bool
+    task_plan: TaskPlan | None
+    compiled_mission: CompiledMission | None
+    current_step_id: str | None
+    current_step_index: int | None
+    execution_epoch: int
+    completed_outputs: dict[str, dict[str, object]]
+    execution_reports: tuple[SkillExecutionReport, ...]
+    started_invocations: tuple[SkillInvocation, ...]
+    latest_observation: Observation | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +387,9 @@ class MissionAgent:
         self._plan_version: int | None = None
         self._original_instruction: str | None = None
         self._world_context: PlannerWorldContext | None = None
+        self._local_repair_enabled = False
+        self._local_repair_observation: Observation | None = None
+        self._local_repair_search_resume_step_id: str | None = None
 
     @property
     def uav_id(self) -> str:
@@ -384,10 +406,141 @@ class MissionAgent:
 
         return self._target_manager
 
+    def configure_local_repair(
+        self, *, enabled: bool = False, max_wait_s: float = 300.0
+    ) -> None:
+        """Enable the boundary only; Fleet constructs and ticks its coordinator."""
+        if self._status is not AgentStatus.IDLE:
+            raise MissionAgentError("configure local repair before Agent start")
+        if enabled and (
+            self._runtime_program != "linear"
+            or self._plan_revision_coordinator is not None
+            or self._program_patch_coordinator is not None
+        ):
+            raise MissionAgentError(
+                "local repair requires linear runtime without another plan coordinator"
+            )
+        self._skill_manager.configure_local_repair(enabled=enabled, max_wait_s=max_wait_s)
+        self._local_repair_enabled = enabled
+
+    @property
+    def local_repair_snapshot(self) -> LocalRepairSnapshot:
+        manager = self._skill_manager
+        compiled = self._compiled_mission
+        return LocalRepairSnapshot(
+            event=manager.local_repair_event,
+            stable_hold=(
+                self._status is AgentStatus.RUNNING
+                and self._shutdown_outcome is None
+                and manager.local_repair_stable_hold
+            ),
+            task_plan=manager.task_plan,
+            compiled_mission=(
+                None if compiled is None else _copy_local_repair_compiled(compiled)
+            ),
+            current_step_id=manager.active_planned_step_id,
+            current_step_index=manager.current_step_index,
+            execution_epoch=manager.execution_epoch,
+            completed_outputs=manager.step_outputs,
+            execution_reports=manager.execution_reports,
+            started_invocations=manager.started_invocations,
+            latest_observation=deepcopy(self._local_repair_observation),
+        )
+
+    def _check_local_repair_boundary(self, event_id: str, plan_version: int) -> None:
+        if (
+            not self._local_repair_enabled
+            or self._status is not AgentStatus.RUNNING
+            or self._shutdown_outcome is not None
+            or self._plan_version != plan_version
+        ):
+            raise MissionAgentError("local repair Agent boundary is stale or canceled")
+        self._skill_manager._require_local_repair(
+            event_id, plan_version, require_hold=True
+        )
+
+    def commit_local_repair(
+        self, task_plan: TaskPlan, *, expected_event_id: str,
+        expected_plan_version: int, compiled_mission: CompiledMission | None = None,
+        final_guard: Callable[[], None] | None = None,
+    ) -> MissionAgentSnapshot:
+        """Preflight then synchronously adopt a protected Manager replacement.
+
+        ``final_guard`` may reject a stale Fleet dependency or expired real
+        deadline after preflight. A Skill start failure after publication still
+        updates Agent metadata; physical cancellation/start is not rolled back.
+        """
+        self._check_local_repair_boundary(expected_event_id, expected_plan_version)
+        original = self._compiled_mission
+        assert original is not None
+        if not isinstance(task_plan, TaskPlan):
+            raise TypeError("task_plan must be a TaskPlan")
+        if compiled_mission is None:
+            compiled_mission = CompiledMission(
+                planner_output=original.planner_output,
+                task_plan=task_plan, source=original.source,
+                compiler_notes=(*original.compiler_notes, "trusted local suffix repair"),
+            )
+        if not isinstance(compiled_mission, CompiledMission):
+            raise TypeError("compiled_mission must be a CompiledMission")
+        if compiled_mission.task_plan.to_dict() != task_plan.to_dict():
+            raise MissionAgentError("local repair compiled TaskPlan mismatch")
+        if compiled_mission.target_spec != original.target_spec:
+            raise MissionAgentError("local repair cannot change the original TargetSpec")
+        owned = _copy_local_repair_compiled(compiled_mission)
+        if (
+            owned.task_plan.mission_id != self._mission_id
+            or owned.task_plan.uav_id != self._uav_id
+            or owned.task_plan.plan_version != expected_plan_version + 1
+        ):
+            raise MissionAgentError("local repair routing/version mismatch")
+        decision = self._safety.preflight(owned)
+        if not isinstance(decision, SafetyDecision) or decision.action is not SafetyAction.CONTINUE:
+            raise MissionAgentError("local repair safety preflight rejected TaskPlan")
+        self._check_local_repair_boundary(expected_event_id, expected_plan_version)
+        event = self._skill_manager.local_repair_event
+
+        def publication_guard() -> None:
+            if final_guard is not None:
+                final_guard()
+            self._check_local_repair_boundary(expected_event_id, expected_plan_version)
+
+        try:
+            self._skill_manager.commit_local_repair(
+                owned.task_plan, expected_event_id=expected_event_id,
+                expected_plan_version=expected_plan_version,
+                final_guard=publication_guard,
+            )
+        finally:
+            # This handoff cannot invoke safety/logging/model callbacks. A start
+            # hook may have failed after the Manager published the new version.
+            published = self._skill_manager.task_plan
+            if published is not None and published.to_dict() == owned.task_plan.to_dict():
+                self._compiled_mission = owned
+                self._plan_version = owned.task_plan.plan_version
+                if event is not None and event.skill_name is SkillName.SEARCH:
+                    self._local_repair_search_resume_step_id = event.step_id
+        # Target transitions are consumed by the next ordinary Agent tick, after
+        # the Fleet owner has synchronously adopted its corresponding metadata.
+        return self.snapshot()
+
+    def fail_local_repair(self, *, expected_event_id: str, reason: str) -> bool:
+        if self._status is not AgentStatus.RUNNING or self._shutdown_outcome is not None:
+            return False
+        accepted = self._skill_manager.fail_local_repair(
+            expected_event_id=expected_event_id, reason=reason
+        )
+        if accepted:
+            self._consume_transitions()
+            self._sync_status()
+        return accepted
+
     def start(
         self,
         instruction: str,
         world_context: PlannerWorldContext,
+        *,
+        plan_version: int = 1,
     ) -> CompiledMission:
         """Plan once, validate, preflight, and start the first Skill."""
 
@@ -410,10 +563,12 @@ class MissionAgent:
                     self._error_text("revision coordinator context rejected", exc)
                 ) from exc
 
+        if isinstance(plan_version, bool) or not isinstance(plan_version, int) or plan_version < 1:
+            raise MissionAgentError("initial plan_version must be a positive integer")
         self._status = AgentStatus.PLANNING
         self._last_error = None
         self._mission_id = generate_routing_id("mission")
-        self._plan_version = 1
+        self._plan_version = plan_version
         self._safe_log("[MissionAgent] planner_started")
         try:
             request = PlannerRequest(
@@ -692,6 +847,9 @@ class MissionAgent:
             decision = self._runtime_safety_decision(observation)
             self._log_safety(decision, phase="runtime")
             if decision.action is SafetyAction.CONTINUE:
+                if self._local_repair_enabled:
+                    self._local_repair_observation = observation
+                local_repair_owns_hold = self._skill_manager.local_repair_event is not None
                 patch_owned_tick = (
                     self._program_patch_coordinator is not None
                     and self._program_patch_coordinator.is_inflight
@@ -699,7 +857,11 @@ class MissionAgent:
                 if patch_owned_tick:
                     self._tick_program_patch(timestamp)
                 revision = self._plan_revision_coordinator
-                if patch_owned_tick:
+                if local_repair_owns_hold:
+                    # Fleet owns this event; keep safety and HOVER ticking while
+                    # its asynchronous model work is polled outside the Agent.
+                    pass
+                elif patch_owned_tick:
                     # ProgramPatch owns supervisory HOVER and its own routed
                     # worker result for this frame.
                     pass
@@ -806,6 +968,8 @@ class MissionAgent:
         self._plan_version = None
         self._original_instruction = None
         self._world_context = None
+        self._local_repair_observation = None
+        self._local_repair_search_resume_step_id = None
         self._status = AgentStatus.IDLE
         self._safe_log("[MissionAgent] reset status=IDLE")
         return self.snapshot()
@@ -1514,6 +1678,15 @@ class MissionAgent:
 
         if record.new_skill is SkillName.SEARCH:
             if (
+                record.old_skill is SkillName.HOVER
+                and record.reason == "interrupted_step_and_suffix_replaced"
+                and record.new_step_id == self._local_repair_search_resume_step_id
+                and self._target_manager.lifecycle
+                in {TargetLifecycle.SEARCHING, TargetLifecycle.CANDIDATE}
+            ):
+                self._local_repair_search_resume_step_id = None
+                return
+            if (
                 record.old_skill is SkillName.SEARCH
                 and self._target_manager.lifecycle is TargetLifecycle.SEARCHING
             ):
@@ -1815,6 +1988,18 @@ class MissionAgent:
     def _error_text(prefix: str, exc: BaseException) -> str:
         detail = str(exc).strip() or type(exc).__name__
         return f"{prefix}: {detail}"
+
+
+def _copy_local_repair_compiled(compiled: CompiledMission) -> CompiledMission:
+    """Own the semantic schema as well as the executable repair snapshot."""
+    owned = _copy_compiled_mission(compiled)
+    output = compiled.planner_output
+    return CompiledMission(
+        planner_output=type(output).from_dict(output.to_dict()),
+        task_plan=owned.task_plan,
+        source=owned.source,
+        compiler_notes=owned.compiler_notes,
+    )
 
 
 def _copy_compiled_mission(compiled: CompiledMission) -> CompiledMission:

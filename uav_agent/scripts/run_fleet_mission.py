@@ -857,8 +857,10 @@ def _lower_v2_target_plan_for_runtime(
 def _subset_task_spec_for_replan(
     task_spec: FleetTaskSpecV1,
     goal_ids: Sequence[str],
+    *,
+    external_dependencies: Sequence[object] = (),
 ) -> FleetTaskSpecV1:
-    """Retain exactly the unfinished Goals and their still-applicable constraints."""
+    """Project local goals only after cross-subset constraints have an owner."""
 
     selected = tuple(dict.fromkeys(str(value) for value in goal_ids))
     known = set(task_spec.all_goal_ids)
@@ -867,6 +869,12 @@ def _subset_task_spec_for_replan(
             "Fleet replan requires a non-empty set of known unfinished Goals"
         )
     selected_set = set(selected)
+    crossing = {edge.constraint_id for edge in task_spec.ordering_constraints
+                if (edge.before_goal_id in selected_set) != (edge.after_goal_id in selected_set)}
+    retained = {getattr(dep, "dependency_id", None) for dep in external_dependencies}
+    if crossing - retained:
+        raise FleetLaunchConfigurationError(
+            "COORDINATION_REQUIRED: cross-subset ordering constraints require trusted external dependencies")
     assignment_constraints = tuple(
         replace(
             constraint,
@@ -910,6 +918,7 @@ def _build_runtime_replan_request_v2(
     goal_ids: Sequence[str],
     available_uav_ids: Sequence[str],
     world_belief: object,
+    external_dependencies: Sequence[object] = (),
 ) -> FleetMissionRequestV2:
     if prepared.task_spec is None or prepared.fleet_request_v2 is None:
         raise FleetLaunchConfigurationError(
@@ -957,13 +966,31 @@ def _build_runtime_replan_request_v2(
     return replace(
         prepared.fleet_request_v2,
         fleet_plan_version=base_version + 1,
-        task_spec=_subset_task_spec_for_replan(prepared.task_spec, goal_ids),
+        task_spec=_subset_task_spec_for_replan(prepared.task_spec, goal_ids,
+                                               external_dependencies=external_dependencies),
         uav_inventory=tuple(
             replace(item, available=item.uav_id in available)
             for item in prepared.fleet_request_v2.uav_inventory
         ),
         trusted_fleet_state=tuple(evidence),
     )
+
+
+class _RecoveryModelClientFactory:
+    """Same role policy, isolated clients and explicitly bounded runtime HTTP."""
+
+    def __init__(self, factory, timeout_s):
+        self.factory, self.timeout_s = factory, timeout_s
+
+    def selection_for_role(self, role):
+        return self.factory.selection_for_role(role)
+
+    def for_role(self, role, **routing):
+        import inspect
+        method = self.factory.for_role
+        if "request_timeout_s" in inspect.signature(method).parameters:
+            routing.update(request_timeout_s=self.timeout_s, request_max_retries=0)
+        return method(role, **routing)
 
 
 def _build_runtime_fleet_replan_handler(
@@ -1004,9 +1031,16 @@ def _build_runtime_fleet_replan_handler(
     if not callable(agent_factory):
         raise TypeError("agent_factory must be callable")
     client_factory = prepared.model_client_factory
+    config = prepared.config
+    limits, policy = prepared.planner_limits, prepared.planner_policy
+    fleet_max_tokens = getattr(prepared, "fleet_planner_max_tokens", 2048)
+    recovery_config = getattr(config, "fleet_recovery", None)
+    if recovery_config is not None and recovery_config.enabled:
+        client_factory = _RecoveryModelClientFactory(client_factory, recovery_config.request_timeout_s)
     fleet_planner_factory = fleet_planner_factory or (
         lambda client: LLMFleetPlannerV2(
-            client, repair_budget=2, max_tokens=prepared.fleet_planner_max_tokens
+            client, repair_budget=2, max_tokens=fleet_max_tokens,
+            maximum_assignments=1,
         )
     )
     local_planner_factory = local_planner_factory or (
@@ -1015,8 +1049,8 @@ def _build_runtime_fleet_replan_handler(
             system_prompt_path=(
                 _PROJECT_ROOT / "prompts/dynamic_skill_planner_v3_system.txt"
             ),
-            planner_limits=prepared.planner_limits,
-            planner_policy=prepared.planner_policy,
+            planner_limits=limits,
+            planner_policy=policy,
             planning_contract="v3",
             repair_budget=0,
         )
@@ -1025,8 +1059,8 @@ def _build_runtime_fleet_replan_handler(
         lambda planners: FleetAssignmentCompiler(
             planners,
             validator=PlanValidator(
-                prepared.planner_limits,
-                prepared.planner_policy,
+                limits,
+                policy,
             ),
         )
     )
@@ -1037,15 +1071,6 @@ def _build_runtime_fleet_replan_handler(
     ):
         if not callable(factory):
             raise TypeError(f"{name} must be callable")
-
-    planning_service = FleetPlanningService(
-        prepared.config,
-        client_factory,
-        fleet_max_tokens=getattr(prepared, "fleet_planner_max_tokens", 2048),
-        # Retain the existing one-client factory seam; its closure owns the
-        # runtime generation settings, including the prepared token budget.
-        fleet_planner_factory=lambda client, **_options: fleet_planner_factory(client),
-    )
 
     active_v2: dict[str, FleetAssignmentV2] = {
         assignment.assignment_id: assignment
@@ -1068,41 +1093,58 @@ def _build_runtime_fleet_replan_handler(
             # flight authority.
             pass
 
-    def handler(record: object, world_belief: object) -> FleetReplanPublication:
+    def snapshot_request(record, world_belief, *, remaining_goal_ids=None, external_dependencies=(),
+                         deadline_wall_s=None, wall_clock=None):
         source_runtime = getattr(record, "assignment", None)
         source_id = getattr(source_runtime, "assignment_id", None)
-        if not isinstance(source_runtime, FleetAssignment) or not isinstance(
-            source_id, str
-        ):
-            raise FleetLaunchConfigurationError(
-                "Fleet replan received an invalid runtime assignment"
-            )
+        if not isinstance(source_runtime, FleetAssignment) or source_id not in active_v2:
+            raise FleetLaunchConfigurationError("Fleet replan lacks trusted source mapping")
         if source_id in attempted_sources:
-            raise FleetLaunchConfigurationError(
-                "Fleet replan budget exhausted for assignment " + source_id
-            )
+            raise FleetLaunchConfigurationError("Fleet replan budget exhausted")
         attempted_sources.add(source_id)
-        source_v2 = active_v2.get(source_id)
-        if source_v2 is None:
-            raise FleetLaunchConfigurationError(
-                "Fleet replan lacks the source Goal mapping: " + source_id
-            )
+        source_v2 = active_v2[source_id]
         raw_agents = getattr(world_belief, "agents", {})
-        belief_agents = raw_agents if isinstance(raw_agents, Mapping) else {}
-        occupied_uavs = {
-            str(getattr(summary, "uav_id", uav_id))
-            for uav_id, summary in belief_agents.items()
-        }
+        occupied = set(raw_agents) if isinstance(raw_agents, Mapping) else set()
         available_uavs = tuple(
-            capability.uav_id
-            for capability in prepared.fleet_request_v2.uav_inventory
-            if capability.available and capability.uav_id not in occupied_uavs
+            item.uav_id for item in prepared.fleet_request_v2.uav_inventory
+            if item.available and item.uav_id not in occupied
         )
+        goals = source_v2.goal_ids if remaining_goal_ids is None else tuple(remaining_goal_ids)
         request_v2 = _build_runtime_replan_request_v2(
-            prepared,
-            goal_ids=source_v2.goal_ids,
-            available_uav_ids=available_uavs,
-            world_belief=world_belief,
+            prepared, goal_ids=goals, available_uav_ids=available_uavs,
+            world_belief=world_belief, external_dependencies=external_dependencies,
+        )
+        from fleet.runtime import AssignmentRuntimeRecord
+        frozen_record = AssignmentRuntimeRecord(source_runtime,
+            required=getattr(record, "required", True),
+            status=getattr(record, "status", "WAITING_REASSIGNMENT"),
+            local_plan_version=record.local_plan_version,
+            last_error=getattr(record, "last_error", None))
+        return (frozen_record, source_runtime, source_id, source_v2, available_uavs, request_v2, tuple(external_dependencies),
+                deadline_wall_s, wall_clock)
+
+    def compute_candidate(snapshot):
+        record, source_runtime, source_id, source_v2, available_uavs, request_v2, external_dependencies, deadline_wall_s, wall_clock = snapshot
+        if deadline_wall_s is None:
+            runtime_clients = client_factory
+        else:
+            from models.runtime_deadline import DeadlineModelClient
+            class DeadlineFactory:
+                def selection_for_role(self, role):
+                    return client_factory.selection_for_role(role)
+                def for_role(self, role, **routing):
+                    return DeadlineModelClient(client_factory.for_role(role, **routing),
+                                               deadline_wall_s, clock=wall_clock)
+            runtime_clients = DeadlineFactory()
+        def bound_planner(client, **_options):
+            planner = fleet_planner_factory(client)
+            if isinstance(planner, LLMFleetPlannerV2):
+                planner.external_dependencies = tuple(dep.to_dict() for dep in external_dependencies)
+            return planner
+        request_planning_service = FleetPlanningService(
+            config, runtime_clients,
+            fleet_max_tokens=fleet_max_tokens,
+            fleet_planner_factory=bound_planner,
         )
         base_version = request_v2.fleet_plan_version - 1
         prompt_material = json.dumps(
@@ -1114,7 +1156,7 @@ def _build_runtime_fleet_replan_handler(
         )
         replan_audit: dict[str, object] = {}
         try:
-            global_result = planning_service.plan_request(
+            global_result = request_planning_service.plan_request(
                 request_v2,
                 replan=True,
                 assignment_id=source_id,
@@ -1181,7 +1223,7 @@ def _build_runtime_fleet_replan_handler(
                 "one failed runtime assignment requires exactly one replacement"
             )
         assignment_v2 = proposed_plan.assignments[0]
-        if set(assignment_v2.goal_ids) != set(source_v2.goal_ids):
+        if set(assignment_v2.goal_ids) != set(request_v2.task_spec.all_goal_ids):
             raise FleetLaunchConfigurationError(
                 "Fleet replan replacement changed unfinished Goal coverage"
             )
@@ -1203,11 +1245,11 @@ def _build_runtime_fleet_replan_handler(
             )
 
         contexts = build_agent_world_contexts_v2(
-            prepared.config, request_v2, proposed_plan
+            config, request_v2, proposed_plan
         )
         uav_id = assignment_v2.uav_id
         local_planner = local_planner_factory(
-            client_factory.for_role(
+            runtime_clients.for_role(
                 ModelCallRole.AGENT_SPATIAL_PLAN,
                 fleet_mission_id=request_v2.fleet_mission_id,
                 assignment_id=assignment_v2.assignment_id,
@@ -1236,7 +1278,7 @@ def _build_runtime_fleet_replan_handler(
                         + local_attempt
                         + 1
                     ),
-                    target_catalog=build_target_catalog(prepared.config),
+                    target_catalog=build_target_catalog(config),
                     spatial_resolver=_spatial_resolver(
                         contexts[uav_id], capability.home_name
                     ),
@@ -1313,7 +1355,7 @@ def _build_runtime_fleet_replan_handler(
             max_mission_time_s=86_520.0,
             position_margin_m=0.25,
             max_safe_altitude_m=contexts[uav_id].scene_max_xyz_m[2],
-            planner_limits=prepared.planner_limits,
+            planner_limits=limits,
         )
         decision = safety.preflight(compilation.compiled_mission)
         if decision.action is not SafetyAction.CONTINUE:
@@ -1333,24 +1375,6 @@ def _build_runtime_fleet_replan_handler(
                 proposals=tuple(local_proposals),
                 assignment_id=assignment_v2.assignment_id,
                 uav_id=uav_id,
-            )
-        )
-        safe_audit(
-            lambda: audit.write_final_plan(
-                stage="FLEET_REPLAN",
-                mission_id=request_v2.fleet_mission_id,
-                plan_version=request_v2.fleet_plan_version,
-                plan=proposed_plan.to_dict(),
-            )
-        )
-        safe_audit(
-            lambda: audit.write_final_plan(
-                stage="LOCAL_REPLAN",
-                mission_id=request_v2.fleet_mission_id,
-                assignment_id=assignment_v2.assignment_id,
-                uav_id=uav_id,
-                plan_version=compilation.agent_request.local_plan_version,
-                plan=compilation.planner_output.to_dict(),
             )
         )
         for finding in compilation.validation_report.findings:
@@ -1385,6 +1409,22 @@ def _build_runtime_fleet_replan_handler(
             contexts,
             {uav_id: compilation},
         )[uav_id]
+        return {
+            "record": record, "source_id": source_id, "assignment_v2": assignment_v2,
+            "compilation": compilation, "world_context": contexts[uav_id],
+            "runtime_assignment": runtime_assignment, "route": route,
+            "request_v2": request_v2, "base_version": base_version,
+        }
+
+    def prepare_candidate(candidate):
+        record = candidate["record"]
+        source_id = candidate["source_id"]
+        assignment_v2 = candidate["assignment_v2"]
+        compilation = candidate["compilation"]
+        runtime_assignment = candidate["runtime_assignment"]
+        uav_id = runtime_assignment.uav_id
+        contexts = {uav_id: candidate["world_context"]}
+        route = candidate["route"]
         replacement = agent_factory(
             record,
             assignment_v2,
@@ -1398,22 +1438,43 @@ def _build_runtime_fleet_replan_handler(
             or replacement.assignment_id != source_id
             or replacement.replacement_assignment != runtime_assignment
         ):
+            cleanup = getattr(replacement, "discard", None)
+            if callable(cleanup):
+                cleanup()
             raise FleetLaunchConfigurationError(
                 "agent_factory returned an invalid Fleet replan handoff"
             )
+        return FleetReplanPublication(
+            base_fleet_plan_version=candidate["base_version"],
+            new_fleet_plan_version=candidate["request_v2"].fleet_plan_version,
+            replacements=(replacement,),
+        )
+
+    def committed(candidate, publication):
+        source_id = candidate["source_id"]
+        base_version = candidate["base_version"]
+        uav_id = candidate["runtime_assignment"].uav_id
+        compilation = candidate["compilation"]
+        request_v2 = candidate["request_v2"]
+        assignment_v2 = candidate["assignment_v2"]
+        safe_audit(lambda: audit.write_final_plan(
+            stage="LOCAL_REPLAN", mission_id=request_v2.fleet_mission_id,
+            assignment_id=assignment_v2.assignment_id, uav_id=uav_id,
+            plan_version=compilation.agent_request.local_plan_version,
+            plan=compilation.planner_output.to_dict()))
         active_v2.pop(source_id, None)
-        active_v2[runtime_assignment.assignment_id] = assignment_v2
+        active_v2[candidate["runtime_assignment"].assignment_id] = candidate["assignment_v2"]
         if len(raw_history) < 64:
             raw_history.append(
                 {
                     "schema_version": 1,
                     "base_fleet_plan_version": base_version,
-                    "new_fleet_plan_version": request_v2.fleet_plan_version,
+                    "new_fleet_plan_version": candidate["request_v2"].fleet_plan_version,
                     "source_assignment_id": source_id,
-                    "replacement_assignment_id": runtime_assignment.assignment_id,
+                    "replacement_assignment_id": candidate["runtime_assignment"].assignment_id,
                     "uav_id": uav_id,
-                    "goal_ids": list(assignment_v2.goal_ids),
-                    "semantically_valid": compilation.semantically_valid,
+                    "goal_ids": list(candidate["assignment_v2"].goal_ids),
+                    "semantically_valid": candidate["compilation"].semantically_valid,
                 }
             )
         safe_audit(
@@ -1423,57 +1484,30 @@ def _build_runtime_fleet_replan_handler(
                         f"recovery_fleet_replan_{source_id}_{base_version}"
                     ),
                     timestamp_s=float(base_version),
-                    mission_id=request_v2.fleet_mission_id,
+                    mission_id=candidate["request_v2"].fleet_mission_id,
                     stage="FLEET_REPLAN",
                     action="REASSIGN_GOALS",
-                    outcome="PUBLISHED_FOR_RUNTIME_VALIDATION",
+                    outcome="COMMITTED",
                     assignment_id=source_id,
                     uav_id=uav_id,
-                    resulting_plan_version=request_v2.fleet_plan_version,
+                    resulting_plan_version=candidate["request_v2"].fleet_plan_version,
                 )
             )
         )
-        return FleetReplanPublication(
-            base_fleet_plan_version=base_version,
-            new_fleet_plan_version=request_v2.fleet_plan_version,
-            replacements=(replacement,),
-        )
 
-    def audited_handler(
-        record: object,
-        world_belief: object,
-    ) -> FleetReplanPublication:
-        try:
-            return handler(record, world_belief)
-        except Exception:
-            assignment = getattr(record, "assignment", None)
-            assignment_id = getattr(assignment, "assignment_id", None)
-            uav_id = getattr(assignment, "uav_id", None)
-            version = getattr(world_belief, "fleet_plan_version", 0)
-            if not isinstance(version, int) or isinstance(version, bool):
-                version = 0
-            if isinstance(assignment_id, str):
-                safe_audit(
-                    lambda: audit.log_recovery(
-                        RecoveryActionRecord(
-                            recovery_action_id=(
-                                f"recovery_fleet_replan_failed_{assignment_id}_"
-                                f"{max(0, version)}"
-                            ),
-                            timestamp_s=float(max(0, version)),
-                            mission_id=prepared.request.fleet_mission_id,
-                            stage="FLEET_REPLAN",
-                            action="REASSIGN_GOALS",
-                            outcome="REJECTED_FAIL_CLOSED",
-                            assignment_id=assignment_id,
-                            uav_id=uav_id if isinstance(uav_id, str) else None,
-                            resulting_plan_version=None,
-                        )
-                    )
-                )
-            raise
+    def handler(record, world_belief):
+        # Compatibility boundary: disabled recovery retains the existing caller.
+        # Enabled Fleet recovery calls snapshot/compute/prepare/committed separately.
+        candidate = compute_candidate(snapshot_request(record, world_belief))
+        publication = prepare_candidate(candidate)
+        return replace(publication, on_commit=lambda: committed(candidate, publication))
 
-    return audited_handler
+    handler.snapshot_request = snapshot_request
+    handler.compute_candidate = compute_candidate
+    handler.prepare_candidate = prepare_candidate
+    handler.committed = committed
+    handler.active_assignments = active_v2
+    return handler
 
 
 def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
@@ -1491,6 +1525,11 @@ def prepare_fleet_mission(args: argparse.Namespace) -> PreparedFleetMission:
         )
 
     config = load_config(args.config)
+    if config.fleet_recovery.enabled:
+        if getattr(args, "runtime_program", "linear") != "linear":
+            raise FleetLaunchConfigurationError("fleet_recovery supports only linear Spatial V3 runtime")
+        if getattr(args, "fleet_planner", "scripted") != "llm":
+            raise FleetLaunchConfigurationError("fleet_recovery requires the LLM Fleet/Spatial V3 path")
     resolved_target_perception_mode: ResolvedTargetPerceptionMode | None = None
     explicit_target_mode = getattr(args, "target_perception_mode", None)
     # A YOLO production YAML is itself an unambiguous request for the strict
@@ -2172,6 +2211,27 @@ def _spatial_resolver(context: PlannerWorldContext, home_name: str) -> object:
         home_pose=FramePose(home_xyz, 0.0),
         uav_start_pose=start,
         named_locations={home_name: home_xyz},
+    )
+
+
+def _build_fleet_recovery_controller(prepared, *, broker, geometry_provider,
+                                     replan_boundary, clock=None, runner=None):
+    if not prepared.config.fleet_recovery.enabled:
+        return None
+    if prepared.fleet_plan_v2 is None or prepared.task_spec is None or prepared.model_client_factory is None:
+        raise FleetLaunchConfigurationError("Fleet recovery needs the interpreted V2 task and V3 local plans")
+    from time import monotonic
+    from fleet.recovery_controller import FleetRecoveryController
+    return FleetRecoveryController(
+        config=prepared.config.fleet_recovery, broker=broker, task_spec=prepared.task_spec,
+        assignments=prepared.fleet_plan_v2.assignments, compilations=prepared.compilations,
+        world_contexts=prepared.world_contexts,
+        home_names={item.uav_id: item.home_name for item in prepared.request.uav_inventory},
+        client_factory=_RecoveryModelClientFactory(prepared.model_client_factory,
+                                                   prepared.config.fleet_recovery.request_timeout_s),
+        geometry_provider=geometry_provider, replan_boundary=replan_boundary,
+        planner_limits=prepared.planner_limits, planner_policy=prepared.planner_policy,
+        clock=monotonic if clock is None else clock, runner=runner,
     )
 
 
@@ -4254,7 +4314,7 @@ def run_prepared_fleet_mission(
                 # Explicit no-target input: never bind the synthetic envelope
                 # alias to Oracle, detector/tracker, or target metrics.
                 runtime_perception = DisabledTargetPerceptionBackend(uav_id=uav_id)
-                backend_name = "disabled_non_target_assignment"
+                backend_name = "disabled"
             elif prepared.resolved_target_perception_mode is not None:
                 if prepared.resolved_target_perception_mode.mode.value == "yolo":
                     runtime_perception = build_yolo_target_perception_runtime(
@@ -4413,18 +4473,13 @@ def run_prepared_fleet_mission(
             is_non_target_assignment = (
                 source_assignment.assignment_id in non_target_assignment_ids
             )
-            previous_assignments = dict(environment.assignments)
-            provisional_assignments = dict(previous_assignments)
-            provisional_assignments.pop(source_assignment.uav_id, None)
-            if not is_non_target_assignment:
-                provisional_assignments[uav_id] = runtime_assignment.target_alias
-            environment.set_assignments(provisional_assignments)
+            runtime_perception = None
             try:
                 if is_non_target_assignment:
                     runtime_perception = DisabledTargetPerceptionBackend(
                         uav_id=uav_id
                     )
-                    backend_name = "disabled_non_target_assignment"
+                    backend_name = "disabled"
                 elif prepared.resolved_target_perception_mode is not None:
                     if prepared.resolved_target_perception_mode.mode.value == "yolo":
                         runtime_perception = build_yolo_target_perception_runtime(
@@ -4440,10 +4495,12 @@ def run_prepared_fleet_mission(
                             resolved_mode=prepared.resolved_target_perception_mode,
                             environment=environment,
                             uav_id=uav_id,
+                            candidate_target_alias=runtime_assignment.target_alias,
                         )
                     backend_name = runtime_perception.backend_name
                 elif profile is PerceptionRuntimeProfile.ORACLE_EVALUATION:
-                    raw_perception = environment.make_oracle_perception(uav_id)
+                    from perception.oracle import OraclePerception
+                    raw_perception = OraclePerception(uav_id=uav_id, target_id=runtime_assignment.target_alias)
                     runtime_perception = GuardedPerceptionBackend(
                         raw_perception,
                         profile=profile,
@@ -4463,112 +4520,125 @@ def run_prepared_fleet_mission(
                     uav_id,
                     clock,
                     perception=runtime_perception,
+                    candidate_target_id=None if is_non_target_assignment else runtime_assignment.target_alias,
                 )
-            finally:
-                # No controller action occurs while the provisional Oracle
-                # routing is visible.  Runtime publishes the same mapping only
-                # after its own atomic validation gate succeeds.
-                environment.set_assignments(previous_assignments)
 
-            manager = SkillManager(
-                context,
-                registry=create_default_skill_registry(
-                    transit_yaw_mode=prepared.config.search.transit_yaw_mode,
-                ),
-                route_registry=RouteRegistry(),
-            )
-            target_manager = TargetManager()
-            visual_coordinator = None
-            if args.enable_qwen_vision and not is_non_target_assignment:
-                worker = brokered_visual_workers.get(uav_id)
-                if worker is None:
-                    worker_for = getattr(visual_dispatcher, "worker_for", None)
-                    if not callable(worker_for):
-                        raise FleetLaunchConfigurationError(
-                            "runtime visual dispatcher cannot bind idle UAV"
-                        )
-                    worker = worker_for(
-                        uav_id,
-                        assignment_id=runtime_assignment.assignment_id,
-                    )
-                    brokered_visual_workers[uav_id] = worker
-                visual_coordinator = _build_visual_review_coordinator(
-                    prepared=prepared,
-                    uav_id=uav_id,
-                    manager=manager,
-                    target_manager=target_manager,
-                    worker=worker,
-                    candidate_bank=(
-                        yolo_visual_components(runtime_perception)[0]
+                manager = SkillManager(
+                    context,
+                    registry=create_default_skill_registry(
+                        transit_yaw_mode=prepared.config.search.transit_yaw_mode,
                     ),
-                    frame_store=(
-                        yolo_visual_components(runtime_perception)[1]
-                    ),
-                    candidate_review_eligibility=(
-                        yolo_visual_components(runtime_perception)[2]
-                    ),
+                    route_registry=RouteRegistry(),
                 )
-                bind_yolo_visual_gate(runtime_perception, visual_coordinator)
-                visual_coordinators[uav_id] = visual_coordinator
-                visual_log_cursors[uav_id] = 0
-            home_name = next(
-                item.home_name
-                for item in prepared.fleet_request_v2.uav_inventory
-                if item.uav_id == uav_id
-            )
-            validator = PlanValidator(
-                prepared.planner_limits,
-                prepared.planner_policy,
-                spatial_resolver=_spatial_resolver(world_context, home_name),
-            )
-            safety = SafetySupervisor(
-                world_context.scene_min_xyz_m,
-                world_context.scene_max_xyz_m,
-                max_mission_time_s=float(args.max_sim_time) + 120.0,
-                position_margin_m=0.25,
-                max_safe_altitude_m=world_context.scene_max_xyz_m[2],
-                planner_limits=prepared.planner_limits,
-            )
-            replay = RoutedPreplannedSpatialPlanner(
-                compilation.planner_output,
-                source="dynamic_llm",
-                expected_instruction=compilation.planner_request.instruction,
-            )
-            agent = MissionAgent(
-                replay,
-                validator,
-                safety,
-                manager,
-                target_manager,
-                clock,
-                perception_runtime_profile=profile,
-                acknowledge_privileged_oracle=bool(
-                    args.acknowledge_privileged_oracle
-                ),
-                uav_id=uav_id,
-                visual_review_coordinator=visual_coordinator,
-                runtime_program=args.runtime_program,
-                target_perception_backend=backend_name,
-            )
-            # These are the same mutable containers drained by terminal logs
-            # and metric collection, so a dynamically assigned UAV is visible
-            # immediately after Runtime accepts the publication.
-            managers[uav_id] = manager
-            transition_log_cursors[uav_id] = 0
-            perceptions[uav_id] = runtime_perception
-            return ReplannedAssignment(
-                assignment_id=source_assignment.assignment_id,
-                replacement_assignment=runtime_assignment,
-                agent=agent,
-                start_input=(
-                    compilation.planner_request.instruction,
-                    compilation.planner_request.world_context,
-                ),
-                perception=runtime_perception,
-                planned_route=route,
-                degraded=not compilation.semantically_valid,
-                uncovered_goal_ids=compilation.uncovered_goal_ids,
-            )
+                target_manager = TargetManager()
+                visual_coordinator = None
+                if args.enable_qwen_vision and not is_non_target_assignment:
+                    worker = brokered_visual_workers.get(uav_id)
+                    if worker is None:
+                        worker_for = getattr(visual_dispatcher, "prepare_worker_for", None)
+                        if not callable(worker_for):
+                            raise FleetLaunchConfigurationError(
+                                "runtime visual dispatcher cannot bind idle UAV"
+                            )
+                        worker = worker_for(
+                            uav_id,
+                            assignment_id=runtime_assignment.assignment_id,
+                        )
+                    visual_coordinator = _build_visual_review_coordinator(
+                        prepared=prepared,
+                        uav_id=uav_id,
+                        manager=manager,
+                        target_manager=target_manager,
+                        worker=worker,
+                        candidate_bank=(
+                            yolo_visual_components(runtime_perception)[0]
+                        ),
+                        frame_store=(
+                            yolo_visual_components(runtime_perception)[1]
+                        ),
+                        candidate_review_eligibility=(
+                            yolo_visual_components(runtime_perception)[2]
+                        ),
+                    )
+                    bind_yolo_visual_gate(runtime_perception, visual_coordinator)
+                home_name = next(
+                    item.home_name
+                    for item in prepared.fleet_request_v2.uav_inventory
+                    if item.uav_id == uav_id
+                )
+                validator = PlanValidator(
+                    prepared.planner_limits,
+                    prepared.planner_policy,
+                    spatial_resolver=_spatial_resolver(world_context, home_name),
+                )
+                safety = SafetySupervisor(
+                    world_context.scene_min_xyz_m,
+                    world_context.scene_max_xyz_m,
+                    max_mission_time_s=float(args.max_sim_time) + 120.0,
+                    position_margin_m=0.25,
+                    max_safe_altitude_m=world_context.scene_max_xyz_m[2],
+                    planner_limits=prepared.planner_limits,
+                )
+                replay = RoutedPreplannedSpatialPlanner(
+                    compilation.planner_output,
+                    source="dynamic_llm",
+                    expected_instruction=compilation.planner_request.instruction,
+                )
+                agent = MissionAgent(
+                    replay,
+                    validator,
+                    safety,
+                    manager,
+                    target_manager,
+                    clock,
+                    perception_runtime_profile=profile,
+                    acknowledge_privileged_oracle=bool(
+                        args.acknowledge_privileged_oracle
+                    ),
+                    uav_id=uav_id,
+                    visual_review_coordinator=visual_coordinator,
+                    runtime_program=args.runtime_program,
+                    target_perception_backend=backend_name,
+                )
+                if prepared.config.fleet_recovery.enabled:
+                    agent.configure_local_repair(enabled=True, max_wait_s=max(
+                        300.0, prepared.config.fleet_recovery.episode_timeout_s * 2))
+                updates = [(managers, {uav_id: manager}), (transition_log_cursors, {uav_id: 0}),
+                           (perceptions, {uav_id: runtime_perception})]
+                if visual_coordinator is not None:
+                    updates.extend([(visual_coordinators, {uav_id: visual_coordinator}),
+                                    (visual_log_cursors, {uav_id: 0}),
+                                    (brokered_visual_workers, {uav_id: worker})])
+                def discard_candidate():
+                    # An idle candidate has never started and must not command LAND.
+                    close = getattr(runtime_perception, "close", None)
+                    if callable(close):
+                        close()
+                return ReplannedAssignment(
+                    assignment_id=source_assignment.assignment_id,
+                    replacement_assignment=runtime_assignment,
+                    agent=agent,
+                    start_input=(
+                        compilation.planner_request.instruction,
+                        compilation.planner_request.world_context,
+                    ),
+                    perception=runtime_perception,
+                    planned_route=route,
+                    degraded=not compilation.semantically_valid,
+                    uncovered_goal_ids=compilation.uncovered_goal_ids,
+                    metadata_updates=tuple(updates),
+                    discard=discard_candidate,
+                )
+            except BaseException:
+                # Candidate construction has no flight authority. Release only
+                # its new provider, never issue controller cancel/LAND.
+                close = getattr(runtime_perception, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+                raise
 
         replan_handler = _build_runtime_fleet_replan_handler(
             prepared,
@@ -4583,6 +4653,9 @@ def run_prepared_fleet_mission(
             prepared.plan.coordination_policy.minimum_uav_separation_m,
             policy=prepared.plan.coordination_policy.route_conflict_policy.value,
         )
+        recovery_controller = _build_fleet_recovery_controller(
+            prepared, broker=broker, geometry_provider=environment.recovery_geometry_snapshot,
+            replan_boundary=replan_handler)
         runtime = FleetMissionRuntime(
             environment,
             RoutedPreplannedFleetPlanner(
@@ -4616,6 +4689,7 @@ def run_prepared_fleet_mission(
                 prepared.runtime_envelope_metadata.required_by_assignment
             ),
             replan_handler=replan_handler,
+            recovery_controller=recovery_controller,
         )
         runtime.start(args.instruction.strip(), request=prepared.request)
 

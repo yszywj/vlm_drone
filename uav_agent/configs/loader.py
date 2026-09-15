@@ -21,6 +21,7 @@ from configs.schema import (
     EvaluationConfig,
     ExperimentConfig,
     FleetConfig,
+    FleetRecoveryConfig,
     FiguresConfig,
     FrameStoreConfig,
     LoggingConfig,
@@ -1871,6 +1872,19 @@ def load_config(path: str | Path) -> AppConfig:
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"invalid model_broker configuration: {exc}") from exc
 
+    recovery_raw = root.get("fleet_recovery", {})
+    if not isinstance(recovery_raw, Mapping):
+        raise ConfigError("fleet_recovery must be a mapping")
+    from dataclasses import fields
+    allowed_recovery = {item.name for item in fields(FleetRecoveryConfig)}
+    unknown_recovery = set(recovery_raw) - allowed_recovery
+    if unknown_recovery:
+        raise ConfigError("unknown fleet_recovery fields: " + ", ".join(sorted(unknown_recovery)))
+    try:
+        fleet_recovery = FleetRecoveryConfig(**dict(recovery_raw))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"invalid fleet_recovery configuration: {exc}") from exc
+
     visual_review_raw = _strict_optional_block(
         root,
         "qwen_visual_review",
@@ -2319,6 +2333,7 @@ def load_config(path: str | Path) -> AppConfig:
         results=results,
         model_worker=model_worker,
         model_broker=model_broker,
+        fleet_recovery=fleet_recovery,
         qwen_visual_review=qwen_visual_review,
         plan_revision=plan_revision,
         frame_store=frame_store,

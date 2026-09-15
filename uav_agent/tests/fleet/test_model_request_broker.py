@@ -249,7 +249,7 @@ def test_request_id_cannot_be_reused_after_completion() -> None:
         broker.submit(request)
 
 
-def test_urgent_request_preempts_replaceable_inflight_when_global_slot_is_full() -> None:
+def test_urgent_request_revokes_replaceable_result_but_waits_for_real_global_slot() -> None:
     clock = _Clock()
     broker = GlobalModelRequestBroker(max_inflight_global=1, clock=clock)
     periodic = _request(
@@ -270,7 +270,9 @@ def test_urgent_request_preempts_replaceable_inflight_when_global_slot_is_full()
 
     broker.submit(urgent)
 
-    assert broker.acquire_next() == urgent
+    assert broker.acquire_next() is None
+    assert broker.inflight_count == 1
+    assert broker.pending_count == 1
     stale = next(
         record for record in broker.logs if record.request_id == periodic.request_id
     )
@@ -279,9 +281,10 @@ def test_urgent_request_preempts_replaceable_inflight_when_global_slot_is_full()
     assert stale.latency_s == pytest.approx(2.5)
     # A late HTTP result is acknowledged as stale and cannot become COMPLETED.
     assert broker.complete(periodic.request_id) == stale
+    assert broker.acquire_next() == urgent
 
 
-def test_same_uav_urgent_request_preempts_its_replaceable_visual_slot() -> None:
+def test_same_uav_urgent_request_waits_for_revoked_visual_call_to_finish() -> None:
     broker = GlobalModelRequestBroker(max_inflight_global=4, clock=_Clock())
     periodic = _request(
         "RUNTIME_VISUAL_REVIEW",
@@ -300,8 +303,11 @@ def test_same_uav_urgent_request_preempts_its_replaceable_visual_slot() -> None:
 
     broker.submit(urgent)
 
-    assert broker.acquire_next() == urgent
+    assert broker.acquire_next() is None
+    assert broker.inflight_count == 1
     assert broker.logs[-1].stale_reason == "PREEMPTED_BY_HIGHER_PRIORITY"
+    broker.complete(periodic.request_id)
+    assert broker.acquire_next() == urgent
 
 
 def test_urgent_request_never_preempts_non_replaceable_inflight_work() -> None:
@@ -328,4 +334,53 @@ def test_urgent_request_never_preempts_non_replaceable_inflight_work() -> None:
     assert broker.pending_count == 1
     assert broker.logs == ()
     broker.complete(protected.request_id)
+    assert broker.acquire_next() == urgent
+
+
+def test_owner_acquisition_cannot_consume_or_bypass_another_owners_priority() -> None:
+    broker = GlobalModelRequestBroker(clock=_Clock())
+    visual = _request("RUNTIME_VISUAL_REVIEW", ModelRequestPriority.P4_PERIODIC_REVIEW, "uav_a")
+    text = _request("RUNTIME_REPLAN", ModelRequestPriority.P2_AGENT_RUNTIME_REPLAN, "uav_b")
+    broker.submit(visual)
+    broker.submit(text)
+    assert broker.acquire_next(request_ids={visual.request_id}) is None
+    assert broker.pending_count == 2
+    assert broker.inflight_count == 0
+    assert broker.acquire_next(request_ids={text.request_id}) == text
+    assert broker.acquire_next(request_ids={visual.request_id}) == visual
+
+
+def test_cancel_inflight_is_idempotent_and_keeps_real_lease_until_completion() -> None:
+    broker = GlobalModelRequestBroker(max_inflight_global=1, clock=_Clock())
+    first = _request("RUNTIME_REPLAN", ModelRequestPriority.P2_AGENT_RUNTIME_REPLAN, "uav_a")
+    second = _request("FLEET_REPLAN", ModelRequestPriority.P1_FLEET_REPLAN, "uav_b")
+    broker.submit(first)
+    assert broker.acquire_next() == first
+    record = broker.cancel_inflight(first.request_id, reason="DEADLINE_EXCEEDED")
+    assert broker.cancel_inflight(first.request_id, reason="CANCELED") is record
+    broker.submit(second)
+    assert broker.acquire_next() is None
+    assert broker.inflight_count == 1
+    assert broker.complete(first.request_id) is record
+    assert broker.acquire_next() == second
+    assert len(broker.logs) == 1
+
+
+def test_one_urgent_request_does_not_revoke_every_occupied_visual_call() -> None:
+    broker = GlobalModelRequestBroker(max_inflight_global=2, clock=_Clock())
+    visual_a = _request("RUNTIME_VISUAL_REVIEW", ModelRequestPriority.P4_PERIODIC_REVIEW,
+                        "uav_a", replaceable=True, control_related=False)
+    visual_b = _request("RUNTIME_VISUAL_REVIEW", ModelRequestPriority.P4_PERIODIC_REVIEW,
+                        "uav_b", replaceable=True, control_related=False)
+    broker.submit(visual_a)
+    broker.submit(visual_b)
+    assert broker.acquire_next() is not None
+    assert broker.acquire_next() is not None
+    urgent = _request("FLEET_REPLAN", ModelRequestPriority.P1_FLEET_REPLAN, "uav_c")
+    broker.submit(urgent)
+    assert broker.inflight_count == 2
+    assert broker.acquire_next() is None
+    assert len(broker.logs) == 1
+    revoked_id = broker.logs[0].request_id
+    broker.complete(revoked_id)
     assert broker.acquire_next() == urgent

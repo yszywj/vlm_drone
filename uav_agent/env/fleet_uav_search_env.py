@@ -179,6 +179,10 @@ class FleetUavSearchEnv:
         return self._last_tick_order
 
     def set_assignments(self, assignments: Mapping[str, str]) -> None:
+        self.commit_assignment_update(self.prepare_assignment_update(assignments))
+
+    def prepare_assignment_update(self, assignments: Mapping[str, str]) -> dict[str, str]:
+        """Validate a candidate route map without exposing it to perception."""
         if not isinstance(assignments, Mapping):
             raise TypeError("assignments must be a mapping of uav_id to target_id")
         known_uavs = {item.id for item in self.config.uavs}
@@ -197,8 +201,28 @@ class FleetUavSearchEnv:
             and len(set(normalized.values())) != len(normalized)
         ):
             raise ValueError("EXCLUSIVE target assignments must not share a target")
-        self._assignments = normalized
+        return normalized
+
+    def commit_assignment_update(self, prepared: dict[str, str]) -> None:
+        """Owner-only publication of an already validated map; no callbacks."""
+        self._assignments = prepared
         self.latest_evaluator_frames.clear()
+
+    def recovery_geometry_snapshot(self) -> dict[str, object]:
+        """Public obstacle map and world poses; excludes evaluator target state."""
+        from hashlib import sha256
+        from fleet.airspace_manager import coerce_fleet_pose_snapshot
+        registry = getattr(self.scene, "obstacle_registry", None)
+        if registry is None:
+            raise RuntimeError("Fleet recovery requires the configured obstacle registry")
+        obstacles = tuple(registry)
+        material = repr(tuple((o.obstacle_id, o.center_xyz_m, o.size_xyz_m, o.collidable) for o in obstacles))
+        return {
+            "map_version": int(sha256(material.encode()).hexdigest()[:12], 16),
+            "reference_version": int(getattr(self, "recovery_reference_version", 0)),
+            "obstacles": obstacles,
+            "fleet_pose_snapshot": coerce_fleet_pose_snapshot(self.get_fleet_pose_snapshot()),
+        }
 
     def _default_assignments(self) -> Mapping[str, str]:
         if len(self.config.uavs) == 1 and len(self.config.targets) == 1:
@@ -310,6 +334,8 @@ class FleetUavSearchEnv:
         uav_id: str,
         clock: object,
         perception: object | None = None,
+        *,
+        candidate_target_id: str | None = None,
     ) -> object:
         from skills.types import SkillContext
         from perception.runtime import PerceptionCapability
@@ -326,6 +352,10 @@ class FleetUavSearchEnv:
             # but inject the wrapper itself into SkillContext.
             routed_perception = getattr(perception, "backend", perception)
             assigned_target = self._assignments.get(normalized)
+            if candidate_target_id is not None:
+                if candidate_target_id not in self.target_ids:
+                    raise PermissionError("candidate target is not in the trusted inventory")
+                assigned_target = candidate_target_id
             if (
                 getattr(routed_perception, "uav_id", None) != normalized
                 or getattr(routed_perception, "target_id", None) != assigned_target

@@ -16,6 +16,7 @@ import inspect
 import json
 from math import dist, isfinite
 from types import MappingProxyType
+from threading import RLock, get_ident
 
 from common.ids import generate_routing_id, validate_routing_id, validate_uav_id
 from fleet.airspace_manager import (
@@ -365,6 +366,8 @@ class ReplannedAssignment:
     uncovered_goal_ids: tuple[str, ...] = ()
     schema_version: int = 1
     replacement_assignment: FleetAssignment | None = None
+    metadata_updates: tuple[tuple[dict, dict], ...] = ()
+    discard: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1 or isinstance(self.schema_version, bool):
@@ -406,6 +409,10 @@ class ReplannedAssignment:
         if len(goals) != len(set(goals)) or len(goals) > 64:
             raise ValueError("uncovered_goal_ids must be unique and bounded")
         object.__setattr__(self, "uncovered_goal_ids", goals)
+        if any(type(target) is not dict or type(values) is not dict for target, values in self.metadata_updates):
+            raise TypeError("metadata updates require plain owner dictionaries")
+        if self.discard is not None and not callable(self.discard):
+            raise TypeError("candidate discard must be callable")
         if self.replacement_assignment is not None:
             if not isinstance(self.replacement_assignment, FleetAssignment):
                 raise TypeError(
@@ -427,6 +434,7 @@ class FleetReplanPublication:
     new_fleet_plan_version: int
     replacements: tuple[ReplannedAssignment, ...]
     schema_version: int = 1
+    on_commit: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1 or isinstance(self.schema_version, bool):
@@ -685,6 +693,7 @@ class FleetMissionRuntime:
             ReplannedAssignment | FleetReplanPublication | None,
         ]
         | None = None,
+        recovery_controller: object | None = None,
     ) -> None:
         if not callable(getattr(fleet_planner, "plan", None)):
             raise TypeError("fleet_planner must provide plan()")
@@ -708,6 +717,9 @@ class FleetMissionRuntime:
             raise TypeError("assignment_compiler has an unsupported interface")
         if world_context_factory is not None and not callable(world_context_factory):
             raise TypeError("world_context_factory must be callable")
+        self._execution_owner = get_ident()
+        self._recovery_commit_lock = RLock()
+        self._recovery_controller = recovery_controller
         self.environment = environment
         self.fleet_planner = fleet_planner
         self.agents = dict(sorted(normalized_agents.items()))
@@ -825,6 +837,12 @@ class FleetMissionRuntime:
         self._retired_failsafe_agents: dict[
             str, tuple[object, FleetAssignment, str | None]
         ] = {}
+        if self._recovery_controller is not None:
+            self._recovery_controller.bind(self)
+
+    def _assert_execution_owner(self) -> None:
+        if self._recovery_controller is not None and get_ident() != self._execution_owner:
+            raise FleetRuntimeError("enabled Fleet recovery requires a single execution-state writer")
 
     @property
     def status(self) -> FleetStatus:
@@ -1053,6 +1071,7 @@ class FleetMissionRuntime:
         return plan
 
     def tick(self) -> FleetRuntimeSnapshot:
+        self._assert_execution_owner()
         if self._closed:
             raise FleetRuntimeError("runtime is closed")
         if self._status is not FleetStatus.RUNNING:
@@ -1104,7 +1123,20 @@ class FleetMissionRuntime:
             if record.status in _TERMINAL_ASSIGNMENT_STATES:
                 continue
             if record.status is AssignmentStatus.WAITING_REASSIGNMENT:
-                self._hold_uav(uav_id, "WAITING_FLEET_REPLAN")
+                if self._recovery_controller is not None:
+                    # Keep source Safety/HOVER or cancel-and-land moving while
+                    # replacement inference runs. Its terminal state does not
+                    # remove the outstanding handoff request.
+                    if observations_ready:
+                        try:
+                            waiting_agent = self.agents[uav_id]
+                            if _enum_text(_snapshot_value(waiting_agent.snapshot(), "status", "")) == "RUNNING":
+                                waiting_agent.tick(self._observation_for(uav_id, record.assignment, barrier))
+                        except Exception as exc:
+                            self._begin_local_failsafe_landing(record.assignment.assignment_id,
+                                "waiting source failed: " + type(exc).__name__)
+                else:
+                    self._hold_uav(uav_id, "WAITING_FLEET_REPLAN")
                 continue
             if uav_id in held_by_airspace:
                 if not (
@@ -1157,6 +1189,10 @@ class FleetMissionRuntime:
                 )
                 continue
 
+        if self._recovery_controller is not None:
+            self._refresh_world_belief()
+            self._recovery_controller.service_reassignments()
+            self._recovery_controller.tick()
         self._service_pending_reassignments()
         self._aggregate_status()
         self._refresh_world_belief()
@@ -1308,6 +1344,9 @@ class FleetMissionRuntime:
                 self._pending_ready_assignments.discard(assignment_id)
 
     def _service_pending_reassignments(self) -> None:
+        if self._recovery_controller is not None:
+            self._recovery_controller.service_reassignments()
+            return
         handler = self._replan_handler
         if handler is None:
             return
@@ -1391,6 +1430,8 @@ class FleetMissionRuntime:
         self,
         trigger_assignment_id: str,
         publication: FleetReplanPublication,
+        *,
+        final_guard: Callable[[], None] | None = None,
     ) -> tuple[str, ...]:
         """Validate and publish a trusted Fleet replacement bundle atomically."""
 
@@ -1587,6 +1628,38 @@ class FleetMissionRuntime:
                 staged_non_target_ids.remove(item.assignment_id)
                 staged_non_target_ids.add(replacement.assignment_id)
 
+        # Potentially failing registry and environment validation operates
+        # only on isolated candidates. No callback observes provisional maps.
+        staged_targets = self.targets.clone_for_staging()
+        for item in replacements:
+            assignment = proposed_by_source[item.assignment_id]
+            if assignment.assignment_id not in staged_non_target_ids:
+                staged_targets.bind_assignment(
+                    assignment_id=assignment.assignment_id, uav_id=assignment.uav_id,
+                    target_runtime_id=assignment.target_alias,
+                    semantic_alias=assignment.target_spec.original_description,
+                    priority=assignment.priority,
+                    timestamp_s=0.0 if self._last_airspace_decision is None else self._last_airspace_decision.timestamp_s,
+                    provisional=True,
+                )
+        staged_assignments = AssignmentRegistry()
+        staged_assignments._records = dict(self.assignments._records)
+        staged_assignments._active_by_uav = dict(self.assignments._active_by_uav)
+        staged_assignments.publish_replacements(staged_records)
+        next_environment_map = self._environment_assignments(
+            new_plan, non_target_assignment_ids=staged_non_target_ids)
+        prepare_environment = getattr(self.environment, "prepare_assignment_update", None)
+        commit_environment = getattr(self.environment, "commit_assignment_update", None)
+        if self._recovery_controller is not None and not (
+                callable(prepare_environment) and callable(commit_environment)):
+            raise FleetRuntimeError("async recovery requires staged environment assignment publication")
+        prepared_environment = prepare_environment(next_environment_map) if callable(prepare_environment) else None
+        if final_guard is not None:
+            final_guard()
+        if self._cancel_requested or self._plan is not plan or any(
+                self.assignments.by_id(key) != current_records[key] for key in source_ids):
+            raise FleetRuntimeError("Fleet changed during candidate validation")
+
         # A cross-UAV reassignment transfers Goal authority, not permission to
         # leave the failed aircraft hovering forever.  Start its already
         # trusted MissionAgent cancel-and-land before removing old routing; if
@@ -1603,7 +1676,9 @@ class FleetMissionRuntime:
                     "failed source UAV has no MissionAgent for cancel-and-land"
                 )
             try:
-                result = source_agent.cancel()
+                result = self._agent_snapshot(source_agent)
+                if _enum_text(_snapshot_value(result, "status", "RUNNING")) not in {"CANCELED", "FAILED", "SUCCEEDED"}:
+                    result = source_agent.cancel()
                 if result is None:
                     result = self._agent_snapshot(source_agent)
             except Exception as exc:
@@ -1621,18 +1696,22 @@ class FleetMissionRuntime:
                     source.last_error,
                 )
 
-        set_environment_assignments = getattr(
-            self.environment, "set_assignments", None
-        )
-        if callable(set_environment_assignments):
-            set_environment_assignments(
-                self._environment_assignments(
-                    new_plan,
-                    non_target_assignment_ids=staged_non_target_ids,
-                )
-            )
-
-        self.assignments.publish_replacements(staged_records)
+        # Cancel/landing is physical and cannot be rolled back. Recheck after
+        # this potentially reentrant boundary before exchanging software state.
+        if final_guard is not None:
+            final_guard()
+        if self._cancel_requested or self._plan is not plan or any(
+                self.assignments.by_id(key) != current_records[key] for key in source_ids):
+            raise FleetRuntimeError("Fleet changed before publication")
+        if callable(commit_environment):
+            commit_environment(prepared_environment)
+        else:
+            set_environment_assignments = getattr(self.environment, "set_assignments", None)
+            if callable(set_environment_assignments):
+                set_environment_assignments(next_environment_map)
+        self.assignments._records = staged_assignments._records
+        self.assignments._active_by_uav = staged_assignments._active_by_uav
+        self.targets.adopt_staged(staged_targets)
         self._non_target_assignment_ids = staged_non_target_ids
         self._assignment_requiredness = staged_requiredness
         self._plan = new_plan
@@ -1660,9 +1739,18 @@ class FleetMissionRuntime:
             if item.planned_route:
                 self._planned_routes[uav_id] = item.planned_route
                 self._route_progress[uav_id] = 0
-            self._bind_assignment_claim(assignment)
+            for target, updates in item.metadata_updates:
+                target.update(updates)
             self._pending_ready_assignments.add(assignment.assignment_id)
             self._pending_reassignments.discard(item.assignment_id)
+
+        if publication.on_commit is not None:
+            try:
+                publication.on_commit()
+            except Exception as exc:
+                # A post-commit observer cannot revoke or discard an already
+                # published flight route. It is not part of candidate validation.
+                self._event("POST_COMMIT_OBSERVER_FAILED", error=type(exc).__name__)
 
         try:
             self._event(
@@ -1753,7 +1841,7 @@ class FleetMissionRuntime:
         conflict decision and one-shot override event remain fully auditable.
         """
 
-        if not self._cancel_requested and not self._local_failsafe_landings:
+        if not self._cancel_requested and not self._local_failsafe_landings and not self._retired_failsafe_agents:
             return set()
         overrides: set[str] = set()
         for uav_id in held_uav_ids:
@@ -1811,6 +1899,9 @@ class FleetMissionRuntime:
                 )
 
     def cancel(self) -> FleetRuntimeSnapshot:
+        self._assert_execution_owner()
+        if self._recovery_controller is not None:
+            self._recovery_controller.cancel_all("USER_CANCEL")
         if self._status is not FleetStatus.RUNNING:
             raise FleetRuntimeError("cancel requires RUNNING")
         self._cancel_requested = True
@@ -1863,8 +1954,11 @@ class FleetMissionRuntime:
         return self.snapshot()
 
     def close(self) -> None:
+        self._assert_execution_owner()
         if self._closed:
             return
+        if self._recovery_controller is not None:
+            self._recovery_controller.close()
         seen_perceptions: set[int] = set()
         for uav_id, perception in self._perceptions.items():
             identity = id(perception)
@@ -2125,7 +2219,10 @@ class FleetMissionRuntime:
         if "world_context" in parameters:
             if context is None:
                 raise FleetRuntimeError(f"world context is required for {uav_id}")
-            start(focused, context)
+            kwargs = {}
+            if "plan_version" in parameters:
+                kwargs["plan_version"] = self.assignments.by_id(assignment.assignment_id).local_plan_version
+            start(focused, context, **kwargs)
         elif len(parameters) >= 2:
             start(focused, context)
         else:
@@ -2519,7 +2616,8 @@ class FleetMissionRuntime:
         status = (
             AssignmentStatus.WAITING_REASSIGNMENT
             if policy is AssignmentFailurePolicy.REPORT_AND_REPLAN
-            and self._replan_handler is not None
+            and (self._replan_handler is not None or (
+                self._recovery_controller is not None and self._recovery_controller.supports_reassignment))
             else AssignmentStatus.REASSIGNMENT_REQUIRED
             if policy is AssignmentFailurePolicy.REPORT_AND_REPLAN
             else AssignmentStatus.FAILED

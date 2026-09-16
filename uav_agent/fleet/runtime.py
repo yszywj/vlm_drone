@@ -1502,10 +1502,28 @@ class FleetMissionRuntime:
 
             # Replanning may transfer execution authority, but it may not
             # rewrite the unfinished target/region contract.
+            source_region = source.assignment.search_region
+            from planner.spatial import CoordinateFrame
+            if source_region.frame is not CoordinateFrame.WORLD_ENU:
+                # Reinterpret neither the old relative coordinates at the
+                # spare's start nor a pose supplied by the model/candidate.
+                # Independently derive the expected geometry from the owner's
+                # saved ORIGINAL launch context before any publication.
+                from fleet.handoff import task_spatial_resolver
+                source_context = self._agent_start_inputs.get(
+                    source.assignment.uav_id, ("", None))[1]
+                try:
+                    source_region = task_spatial_resolver(
+                        source_context, inventory[source.assignment.uav_id].home_name,
+                    ).resolve_region(source_region)
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise FleetRuntimeError(
+                        "Fleet handoff lacks a trusted original spatial reference"
+                    ) from exc
             if (
                 assignment.target_alias != source.assignment.target_alias
                 or assignment.target_spec != source.assignment.target_spec
-                or assignment.search_region != source.assignment.search_region
+                or assignment.search_region != source_region
                 or assignment.track_duration_s
                 != source.assignment.track_duration_s
                 or assignment.priority != source.assignment.priority
@@ -1591,7 +1609,7 @@ class FleetMissionRuntime:
             assignments=untouched + ordered_replacements,
         )
         reassigned_by_alias = {
-            assignment.target_alias: assignment.uav_id
+            assignment.target_alias: assignment
             for assignment in ordered_replacements
         }
         new_request = replace(
@@ -1600,10 +1618,12 @@ class FleetMissionRuntime:
             target_requests=tuple(
                 replace(
                     target,
-                    requested_uav_id=reassigned_by_alias.get(
-                        target.target_alias,
-                        target.requested_uav_id,
-                    ),
+                    requested_uav_id=(reassigned_by_alias[target.target_alias].uav_id
+                                      if target.target_alias in reassigned_by_alias
+                                      else target.requested_uav_id),
+                    search_region=(reassigned_by_alias[target.target_alias].search_region
+                                   if target.target_alias in reassigned_by_alias
+                                   else target.search_region),
                 )
                 for target in request.target_requests
             ),

@@ -479,9 +479,13 @@ def _coverage_for_goal(
         return _simple_coverage(goal_type, candidates)
 
     if goal_type == "TRACK_TARGET":
-        candidates = tuple(step for step in steps if step.skill == "TRACK")
+        basis = _value(goal, "completion_basis") or "valid_execution"
+        candidates = tuple(step for step in steps if step.skill == "TRACK"
+                           and step.args.get("completion_basis", "valid_execution") == basis)
         requested = _duration(goal)
-        actual = sum(_positive_arg(step.args, "duration_s", "track_duration") for step in candidates)
+        durations = tuple(_positive_arg(step.args, "duration_s", "track_duration") for step in candidates)
+        # Several short segments cannot satisfy one continuous requirement.
+        actual = max(durations, default=0.0) if basis == "continuous" else sum(durations)
         if candidates and (requested is None or actual + 1e-9 >= requested):
             return True, tuple(step.step_id for step in candidates), "TRACK goal has a realizable confirmed-target path", ValidationCode.GOAL_NOT_COVERED
         if candidates and requested is not None:

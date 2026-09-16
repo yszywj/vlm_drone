@@ -15,7 +15,7 @@ from math import isfinite
 from types import MappingProxyType
 
 from common.ids import validate_mission_id, validate_routing_id, validate_uav_id
-from fleet.task_spec import FleetTaskSpecV1, GoalType, MissionGoal, OrderingConstraint, TerminationGoal
+from fleet.task_spec import ConstraintStrength, FleetTaskSpecV1, GoalType, MissionGoal, OrderingConstraint, TerminationGoal
 from planner.goal_checker import GoalSatisfactionChecker
 from planner.schemas import CompiledMission, PlannerWorldContext
 from planner.schemas_v3 import PlanStepDraftV3, SkillPlanDraftV3
@@ -199,6 +199,47 @@ _SUCCESS = {"TAKEOFF": SkillResultCode.TAKEOFF_COMPLETE, "GOTO": SkillResultCode
             "LAND": SkillResultCode.LAND_COMPLETE}
 
 
+def _track_completion_credit(step, proof, invocations, *, completion_basis):
+    """Credit only the execution owner's duration ledger, never elapsed time.
+
+    Deterministic REACQUIRE can split one semantic TRACK into several Skill
+    invocations. Its terminal invocation may therefore request only the
+    remainder. Each invocation is counted once; continuous completion cannot
+    concatenate intervals across lost-target invocations.
+    """
+    required = float(step.args.get("duration_s", 0))
+    if required <= 0:
+        return None
+    mode = proof.result.data.get("completion_basis")
+    if (mode not in {"valid_execution", "continuous"} or mode != completion_basis
+            or step.args.get("completion_basis", "valid_execution") != completion_basis):
+        return None
+    valid = 0.0
+    final_continuous = 0.0
+    for item in invocations:
+        data = item.result.data
+        if (data.get("progress_schema") != "track_progress.v1"
+                or data.get("completion_basis") != mode
+                or data.get("target_id") != proof.result.data.get("target_id")):
+            return None
+        try:
+            elapsed, execution, continuous, invocation_required = (
+                _number(data.get(key), key) for key in
+                ("elapsed_s", "valid_execution_s", "continuous_execution_s", "required_duration_s")
+            )
+        except (ValueError, TypeError):
+            return None
+        if (invocation_required <= 0 or execution > elapsed + 1e-9
+                or continuous > execution + 1e-9):
+            return None
+        valid += min(execution, invocation_required)
+        if item.invocation_id == proof.invocation_id:
+            final_continuous = continuous
+    credited = final_continuous if mode == "continuous" else valid
+    # A success code alone cannot turn an incomplete Skill into goal credit.
+    return required if credited + 1e-9 >= required else None
+
+
 def _goal_steps(goal: Goal, steps: Sequence[PlanStepDraftV3], home_name: str):
     kind = goal.goal_type
     if kind is GoalType.NAVIGATE:
@@ -266,6 +307,7 @@ def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
             insufficient.append(goal.goal_id)
             continue
         done = []
+        duration_credit = {}
         unknown = False
         for step in matches:
             if step.id not in completed:
@@ -275,6 +317,14 @@ def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
                 unknown = True
             elif step.skill in {"SEARCH", "TRACK"} and not proof.result.data.get("target_id"):
                 unknown = True
+            elif step.skill == "TRACK":
+                credit = _track_completion_credit(step, proof, grouped[step.id],
+                    completion_basis=goal.completion_basis)
+                if credit is None:
+                    unknown = True
+                else:
+                    duration_credit[step.id] = credit
+                    done.append(step)
             else:
                 done.append(step)
         if unknown:
@@ -285,11 +335,13 @@ def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
             if requested is None:
                 insufficient.append(goal.goal_id)
                 continue
-            credit = sum(float(step.args.get("duration_s", 0)) for step in done)
+            credits = [duration_credit.get(step.id, float(step.args.get("duration_s", 0))) for step in done]
+            continuous = getattr(goal, "completion_basis", None) == "continuous"
+            credit = max(credits, default=0.0) if continuous else sum(credits)
             if credit >= requested:
                 confirmed.append(goal.goal_id)
             else:
-                pending.append(replace(goal, duration_s=requested - credit))
+                pending.append(replace(goal, duration_s=requested if continuous else requested - credit))
         elif goal.goal_type is GoalType.RETURN_HOME_AND_LAND:
             if done and any(step.skill == "LAND" for step in done) and any(step.skill == "GOTO" for step in done):
                 confirmed.append(goal.goal_id)
@@ -316,6 +368,9 @@ class ExternalDependencySnapshot:
     evidence_refs: tuple[str, ...] = ()
     before_goal_id: str | None = None
     after_goal_id: str | None = None
+    scope: str = "EXTERNAL"
+    strength: str = "MUST"
+    source_evidence_refs: tuple[str, ...] = ()
 
     def __post_init__(self):
         validate_routing_id(self.dependency_id, "dependency_id")
@@ -329,6 +384,13 @@ class ExternalDependencySnapshot:
             object.__setattr__(self, name, values)
         if self.state not in {"SATISFIED", "UNCHANGED", "BLOCKED", "UNKNOWN"}:
             raise ValueError("unknown dependency state")
+        if self.scope not in {"LOCAL", "EXTERNAL"}:
+            raise ValueError("unknown dependency scope")
+        object.__setattr__(self, "strength", ConstraintStrength(self.strength).value)
+        source_refs = tuple(self.source_evidence_refs)
+        if any(not isinstance(ref, str) or not ref or len(ref) > 64 for ref in source_refs):
+            raise ValueError("source evidence references must be nonempty strings of at most 64 characters")
+        object.__setattr__(self, "source_evidence_refs", source_refs)
 
     def to_dict(self):
         return {name: _thaw(getattr(self, name)) for name in self.__dataclass_fields__}
@@ -370,10 +432,17 @@ def extract_external_dependencies(task_spec: FleetTaskSpecV1, local_goal_ids: Se
     """Preserve every crossing edge; UNKNOWN evidence mandates coordination.
 
     goal_states are owner-produced CONFIRMED/PENDING/ACTIVE/UNKNOWN values.
-    Assignment restrictions spanning the subset remain read-only dependencies.
+    Assignment bindings come from the runtime owner, not source-text citations.
+    Local bindings are still versioned admission conditions, but are explicitly
+    labelled LOCAL. PREFER/OPEN do not turn an already accepted owner mapping
+    into a hard assignment restriction. A MUST mismatch remains blocked.
     """
     local = set(local_goal_ids)
-    owner = {goal: assignment.uav_id for assignment in assignments for goal in assignment.goal_ids}
+    assignments_by_goal = {}
+    for assignment in assignments:
+        for goal in assignment.goal_ids:
+            assignments_by_goal.setdefault(goal, []).append(assignment)
+    owner = {goal: items[0].uav_id for goal, items in assignments_by_goal.items() if len(items) == 1}
     result = list(shared_dependencies)
     for edge in task_spec.ordering_constraints:
         before_local, after_local = edge.before_goal_id in local, edge.after_goal_id in local
@@ -392,11 +461,21 @@ def extract_external_dependencies(task_spec: FleetTaskSpecV1, local_goal_ids: Se
     for constraint in task_spec.assignment_constraints:
         if not local.intersection(constraint.goal_ids):
             continue
-        correct = all(owner.get(goal) == constraint.uav_id for goal in constraint.goal_ids)
+        known = all(goal in owner for goal in constraint.goal_ids)
+        correct = known and all(owner[goal] == constraint.uav_id for goal in constraint.goal_ids)
+        state = ("UNKNOWN" if not known else "BLOCKED"
+                 if constraint.strength is ConstraintStrength.MUST and not correct else "UNCHANGED")
+        bindings = [{"goal_id": goal, "uav_id": owner[goal],
+                     "assignment_id": getattr(assignments_by_goal[goal][0], "assignment_id", None)}
+                    for goal in sorted(constraint.goal_ids) if goal in owner]
+        # Owner snapshots are reconstructed at final admission. The digest
+        # changes even if two goals exchange owners inside the same UAV set.
+        owner_proof = ("assignment_" + _digest(bindings)[:48],) if known else ()
         result.append(ExternalDependencySnapshot(constraint.constraint_id, "ASSIGNMENT", tuple(constraint.goal_ids),
             tuple(sorted({constraint.uav_id, *(owner[goal] for goal in constraint.goal_ids if goal in owner)})),
-            versions.get(constraint.constraint_id, 0), "UNCHANGED" if correct else "BLOCKED",
-            tuple(constraint.evidence_refs)))
+            versions.get(constraint.constraint_id, 0), state, owner_proof,
+            scope="LOCAL" if set(constraint.goal_ids).issubset(local) else "EXTERNAL",
+            strength=constraint.strength.value, source_evidence_refs=constraint.evidence_refs))
     return tuple(result)
 
 
@@ -608,6 +687,13 @@ def _check_protected_semantics(context, draft):
         raise LocalRepairError("UNSUPPORTED_SUFFIX_SKILL", "suffix cannot replay takeoff or use unsupported runtime skill contracts")
     if any(step.skill != "GOTO" and step.id not in old_by_id for step in draft.steps):
         raise LocalRepairError("UNAUTHORIZED_NEW_EFFECT", "new suffix steps may only be bounded transit GOTO waypoints")
+    current = old_suffix[0]
+    retained = new_by_id.get(current.id)
+    if retained is None or retained.skill != current.skill:
+        raise LocalRepairError("CURRENT_STEP_MUTATION", "repair must retain the interrupted step identity and Skill")
+    current_index = next(i for i, step in enumerate(draft.steps) if step.id == current.id)
+    if any(step.skill != "GOTO" or step.id in old_by_id for step in draft.steps[:current_index]):
+        raise LocalRepairError("INVALID_DETOUR_PREFIX", "only new transit GOTO steps may precede the interrupted step")
     for old in old_suffix:
         if old.skill in {"TRACK", "HOVER", "LAND"}:
             if old.id not in new_by_id or new_by_id[old.id].to_dict() != old.to_dict():

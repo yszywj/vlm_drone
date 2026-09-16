@@ -79,7 +79,7 @@ def fail(code: SkillResultCode, **data: object) -> Outcome:
     return Outcome(SkillStatus.FAILED, code, data)
 
 
-def lost(*, tracking_duration: float = 1.0) -> Outcome:
+def lost(*, tracking_duration: float = 1.0, **progress) -> Outcome:
     return fail(
         SkillResultCode.TARGET_LOST,
         target_id="target_7",
@@ -87,6 +87,7 @@ def lost(*, tracking_duration: float = 1.0) -> Outcome:
         last_seen_velocity=(0.2, 0.0, 0.0),
         last_seen_time=1.0,
         tracking_duration=tracking_duration,
+        **progress,
     )
 
 
@@ -306,7 +307,10 @@ class DynamicSkillManagerTests(unittest.TestCase):
         policy = RecoveryPolicy(SkillName.REACQUIRE, 2, 7.0, 11.0)
         ctx, clock = context()
         scripted, skills = registry(
-            track=[lost(tracking_duration=2.0), ok(SkillResultCode.TRACK_COMPLETE)]
+            track=[lost(tracking_duration=5.0, progress_schema="track_progress.v1",
+                        elapsed_s=5.0, valid_execution_s=2.0, continuous_execution_s=0.0,
+                        completion_basis="valid_execution", required_duration_s=10.0),
+                   ok(SkillResultCode.TRACK_COMPLETE)]
         )
         manager = SkillManager(ctx, registry=skills)
         manager.start_task(tracking_plan(policy))

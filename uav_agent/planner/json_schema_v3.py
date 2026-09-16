@@ -293,7 +293,7 @@ def build_skill_plan_v3_json_schema(
         _step("GOTO", uav, _object({"target": spatial_target_json_schema(include_route=False), **_yaw_properties()}, ["target"])),
         _step("HOVER", uav, _object({"duration_s": {"type": "number", "minimum": 1.0, "maximum": 60.0}, "yaw_mode": {"type": "string", "enum": ["KEEP_CURRENT", "FIXED"]}, "yaw_deg": _number()}, ["duration_s"])),
         _step("SEARCH", uav, _search_args_schema(capabilities)),
-        _step("TRACK", uav, _object({"target_ref": target_ref_schema, "duration_s": _number(exclusive_minimum=0.0), "desired_altitude_m": _number(exclusive_minimum=0.0), "desired_distance_m": _number(exclusive_minimum=0.0), "on_target_lost": {"type": "string", "enum": ["REACQUIRE", "FAIL"]}}, ["target_ref", "duration_s"]), recovery=True),
+        _step("TRACK", uav, _object({"target_ref": target_ref_schema, "duration_s": _number(exclusive_minimum=0.0), "completion_basis": {"type": "string", "enum": ["valid_execution", "continuous"]}, "desired_altitude_m": _number(exclusive_minimum=0.0), "desired_distance_m": _number(exclusive_minimum=0.0), "on_target_lost": {"type": "string", "enum": ["REACQUIRE", "FAIL"]}}, ["target_ref", "duration_s"]), recovery=True),
     ]
     # In Fleet goal mode the trusted compiler owns the bounded home/LAND
     # epilogue.  Hiding LAND at the wire boundary prevents a small model from

@@ -10,7 +10,7 @@ from fleet.local_repair import (
     assess_remaining_goals, build_local_repair_json_schema, check_external_dependencies, extract_external_dependencies,
     validate_local_repair,
 )
-from fleet.task_spec import ConstraintStrength, FleetTaskSpecV1, GoalType, MissionGoal, OrderingConstraint, TerminationGoal
+from fleet.task_spec import AssignmentConstraint, ConstraintStrength, FleetTaskSpecV1, GoalType, MissionGoal, OrderingConstraint, TerminationGoal, SourceEvidence
 from planner.schemas import LandingZoneSpec, PlannerWorldContext
 from planner.schemas_v3 import SkillPlanDraftV3
 from planner.spatial import CoordinateFrame, NamedLocationTarget, PointTarget
@@ -270,15 +270,154 @@ def test_target_duration_and_distance_cannot_be_weakened(field, value):
     assert error.value.code == "PROTECTED_STEP_MUTATION"
 
 
-def test_completed_track_credit_uses_terminal_step_requirements_not_wall_time():
+def test_completed_track_credit_requires_valid_execution_and_caps_at_step_requirement():
     ctx = search_track_context()
     raw = ctx.original.planner_output
     goal = ctx.goals[0]
-    proof = evidence("track", SkillResultCode.TRACK_COMPLETE, target_id="target_1", tracking_duration=999)
+    proof = track_evidence("invoke_track", SkillStatus.SUCCEEDED, valid=10, elapsed=999)
     assessment = assess_remaining_goals((replace(goal, duration_s=15),), raw,
         ("takeoff", "search", "goto", "track"), (*ctx.evidence, proof), current_step_id="home")
     assert assessment.pending_goals[0].duration_s == 5
     assert assessment.confirmed_goal_ids == ()
+
+
+def track_evidence(invocation, status, *, valid, elapsed=None, continuous=None,
+                   required=10, basis="valid_execution", **changes):
+    data = dict(progress_schema="track_progress.v1", target_id="target_1",
+        elapsed_s=valid if elapsed is None else elapsed, valid_execution_s=valid,
+        continuous_execution_s=valid if continuous is None else continuous,
+        required_duration_s=required, completion_basis=basis)
+    return SkillExecutionEvidence("track", invocation, 1,
+        SkillResult(status, SkillResultCode.TRACK_COMPLETE if status is SkillStatus.SUCCEEDED
+                    else SkillResultCode.TARGET_LOST, "", {**data, **changes}))
+
+
+def track_assessment(proofs, *, basis="valid_execution"):
+    ctx = search_track_context()
+    payload = ctx.original.planner_output.to_dict()
+    next(step for step in payload["steps"] if step["skill"] == "TRACK")["args"]["completion_basis"] = basis
+    original = SkillPlanDraftV3.from_dict(payload)
+    goals = tuple(replace(goal, completion_basis=basis) for goal in ctx.goals)
+    return assess_remaining_goals(goals, original,
+        ("takeoff", "search", "goto", "track"), (*ctx.evidence, *proofs), current_step_id="home")
+
+
+def test_legacy_elapsed_only_track_success_cannot_confirm_goal():
+    assessment = track_assessment((evidence("track", SkillResultCode.TRACK_COMPLETE,
+        target_id="target_1", tracking_duration=100),))
+    assert assessment.insufficient_goal_ids == ("goal_track",)
+    assert not assessment.confirmed_goal_ids
+
+
+@pytest.mark.parametrize("changes", [
+    {"valid_execution_s": 2}, {"elapsed_s": 9}, {"continuous_execution_s": 11},
+    {"valid_execution_s": float("nan")}, {"required_duration_s": 0},
+    {"progress_schema": "model_claim"}, {"completion_basis": "elapsed"},
+])
+def test_invalid_or_incomplete_track_ledger_is_not_terminal_goal_evidence(changes):
+    # Nonfinite evidence itself is rejected before assessment.
+    if changes.get("valid_execution_s") != changes.get("valid_execution_s"):
+        with pytest.raises(ValueError):
+            track_evidence("done", SkillStatus.SUCCEEDED, valid=10, **changes)
+    else:
+        assessment = track_assessment((track_evidence("done", SkillStatus.SUCCEEDED, valid=10, **changes),))
+        assert assessment.insufficient_goal_ids == ("goal_track",)
+
+
+def test_reacquire_progress_uses_each_trusted_invocation_once():
+    first = track_evidence("lost", SkillStatus.FAILED, valid=3, elapsed=8)
+    last = track_evidence("done", SkillStatus.SUCCEEDED, valid=7, required=7)
+    assessment = track_assessment((first, first, last))
+    assert assessment.confirmed_goal_ids == ("goal_track",)
+    assert assessment.supported
+    assert not track_assessment((last,)).supported
+
+
+def test_continuous_track_cannot_join_intervals_across_loss():
+    first = track_evidence("lost", SkillStatus.FAILED, valid=6, continuous=0, basis="continuous")
+    last = track_evidence("done", SkillStatus.SUCCEEDED, valid=4, basis="continuous")
+    assert not track_assessment((first, last), basis="continuous").supported
+    completed = track_evidence("done", SkillStatus.SUCCEEDED, valid=10, basis="continuous")
+    assert track_assessment((first, completed), basis="continuous").confirmed_goal_ids == ("goal_track",)
+
+
+def test_reacquire_credit_cannot_change_target_identity():
+    first = track_evidence("lost", SkillStatus.FAILED, valid=3, target_id="another_target")
+    last = track_evidence("done", SkillStatus.SUCCEEDED, valid=7, required=7)
+    assert not track_assessment((first, last)).supported
+
+
+@pytest.mark.parametrize("strength", tuple(ConstraintStrength))
+def test_local_assignment_uses_live_owner_evidence_not_optional_source_citation(strength):
+    spec = FleetTaskSpecV1(source_text="navigate", goals=(nav_goal(),),
+        assignment_constraints=(AssignmentConstraint("owner", "uav_3", ("goal_nav",), strength),))
+    assignments = (SimpleNamespace(assignment_id="assignment_3", goal_ids=("goal_nav",), uav_id="uav_3"),)
+    deps = extract_external_dependencies(spec, ("goal_nav",), assignments=assignments,
+        goal_states={}, goal_evidence_refs={}, versions={})
+    assert deps[0].scope == "LOCAL"
+    assert deps[0].strength == strength.value
+    assert deps[0].evidence_refs
+    assert deps[0].source_evidence_refs == ()
+    assert check_external_dependencies(deps, deps, {}, {}).allowed
+    validate(context(external_dependencies=deps))
+
+
+@pytest.mark.parametrize("strength,allowed", [(ConstraintStrength.MUST, False),
+    (ConstraintStrength.PREFER, True), (ConstraintStrength.OPEN, True)])
+def test_assignment_strength_respects_unchanged_accepted_owners(strength, allowed):
+    spec = FleetTaskSpecV1(source_text="navigate", goals=(nav_goal(),),
+        source_evidence=(SourceEvidence("source_1", "navigate"),),
+        assignment_constraints=(AssignmentConstraint("owner", "uav_1", ("goal_nav",), strength,
+            evidence_refs=("source_1",)),))
+    deps = extract_external_dependencies(spec, ("goal_nav",),
+        assignments=(SimpleNamespace(goal_ids=("goal_nav",), uav_id="uav_3"),),
+        goal_states={}, goal_evidence_refs={}, versions={})
+    assert deps[0].source_evidence_refs == ("source_1",)
+    assert check_external_dependencies(deps, deps, {}, {}).allowed is allowed
+
+
+@pytest.mark.parametrize("assignments", [(),
+    (SimpleNamespace(goal_ids=("goal_nav",), uav_id="uav_3"),
+     SimpleNamespace(goal_ids=("goal_nav",), uav_id="uav_3"))])
+def test_missing_or_duplicate_live_owners_are_not_authorized_by_source_citation(assignments):
+    spec = FleetTaskSpecV1(source_text="navigate", goals=(nav_goal(),),
+        source_evidence=(SourceEvidence("source_1", "navigate"),),
+        assignment_constraints=(AssignmentConstraint("owner", "uav_3", ("goal_nav",),
+            ConstraintStrength.OPEN, evidence_refs=("source_1",)),))
+    deps = extract_external_dependencies(spec, ("goal_nav",), assignments=assignments,
+        goal_states={}, goal_evidence_refs={}, versions={})
+    assert deps[0].state == "UNKNOWN"
+    assert not check_external_dependencies(deps, deps, {}, {}).allowed
+
+
+def test_cross_assignment_binding_is_retained_and_detects_owner_swaps():
+    a, b = nav_goal("goal_a"), nav_goal("goal_b", (20, 0, 10))
+    spec = FleetTaskSpecV1(source_text="navigate", goals=(a, b),
+        assignment_constraints=(AssignmentConstraint("owner", "uav_3", ("goal_a", "goal_b"), ConstraintStrength.PREFER),))
+    def dependencies(owners):
+        return extract_external_dependencies(spec, ("goal_a",),
+            assignments=tuple(SimpleNamespace(goal_ids=(goal,), uav_id=uav) for goal, uav in owners),
+            goal_states={}, goal_evidence_refs={}, versions={})
+    before = dependencies((("goal_a", "uav_3"), ("goal_b", "uav_4")))
+    after = dependencies((("goal_a", "uav_4"), ("goal_b", "uav_3")))
+    assert before[0].scope == "EXTERNAL"
+    assert before[0].uav_ids == after[0].uav_ids
+    assert not check_external_dependencies(before, after, {}, {}).allowed
+
+
+@pytest.mark.parametrize("change", ("remove_current", "rename_current", "move_existing_step"))
+def test_detour_must_retain_interrupted_boundary_without_moving_existing_effects(change):
+    ctx = context()
+    steps = draft(ctx).to_dict()["steps"]
+    if change == "remove_current":
+        steps.pop(0)
+    elif change == "rename_current":
+        steps[0]["id"] = "different_boundary"
+    else:
+        steps[0], steps[1] = steps[1], steps[0]
+    with pytest.raises(LocalRepairError) as error:
+        validate(ctx, draft(ctx, steps))
+    assert error.value.code in {"CURRENT_STEP_MUTATION", "INVALID_DETOUR_PREFIX"}
 
 
 def test_suffix_wire_schema_binds_scope_without_disguising_v3_as_v2():
@@ -359,7 +498,7 @@ def test_local_ordering_cannot_be_reversed_while_preserving_both_goals():
     edge = OrderingConstraint("order_two", "goal_nav", "goal_second", ConstraintStrength.MUST)
     ctx = context(original=compiled, goals=(nav_goal(), second), ordering_constraints=(edge,))
     values = draft(ctx).to_dict()["steps"]
-    values[0], values[1] = values[1], values[0]
+    values[0]["args"]["target"], values[1]["args"]["target"] = values[1]["args"]["target"], values[0]["args"]["target"]
     with pytest.raises(LocalRepairError) as error:
         validate(ctx, draft(ctx, values))
     assert error.value.code == "ORDERING_CONSTRAINT_VIOLATION"

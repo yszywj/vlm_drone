@@ -463,6 +463,7 @@ class MissionAgent:
         self, task_plan: TaskPlan, *, expected_event_id: str,
         expected_plan_version: int, compiled_mission: CompiledMission | None = None,
         final_guard: Callable[[], None] | None = None,
+        allow_goto_detour_prefix: bool = False,
     ) -> MissionAgentSnapshot:
         """Preflight then synchronously adopt a protected Manager replacement.
 
@@ -510,6 +511,7 @@ class MissionAgent:
                 owned.task_plan, expected_event_id=expected_event_id,
                 expected_plan_version=expected_plan_version,
                 final_guard=publication_guard,
+                allow_goto_detour_prefix=allow_goto_detour_prefix,
             )
         finally:
             # This handoff cannot invoke safety/logging/model callbacks. A start

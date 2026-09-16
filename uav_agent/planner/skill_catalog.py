@@ -55,6 +55,7 @@ _MODEL_VISIBLE_ARGUMENTS: dict[str, frozenset[str]] = {
             "desired_altitude_m",
             "desired_distance_m",
             "on_target_lost",
+            "completion_basis",
         }
     ),
     "REACQUIRE": frozenset(
@@ -535,7 +536,12 @@ def build_default_skill_catalog() -> SkillCatalog:
                         "声明已锁定目标时才可使用 $trusted_target.target_id。",
                         "string",
                     ),
-                    _argument("duration_s", "跟踪持续时间。", "number"),
+                    _argument("duration_s", "有效跟踪时间；不计失锁等待或预测时间。", "number"),
+                    _argument(
+                        "completion_basis", "valid_execution 累计有效跟踪；continuous 要求不中断，失锁后重新计时。必须保持任务指定的模式。",
+                        "string", required=False,
+                        allowed_values=("valid_execution", "continuous"),
+                    ),
                     _argument(
                         "desired_altitude_m",
                         "期望跟踪高度；省略时由可信编译器选择。",

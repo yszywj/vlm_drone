@@ -41,7 +41,7 @@ def test_unsupported_enabled_paths_fail_before_model_or_simulator(flags, expecte
 @pytest.mark.parametrize("values", [
     {"enabled":"true"}, {"mode":"GRAPH"}, {"request_timeout_s":float("nan")},
     {"retry_cooldown_s":0}, {"max_local_attempts":True},
-    {"max_reassign_attempts":2}, {"max_suffix_steps":11},
+    {"max_reassign_attempts":9}, {"max_suffix_steps":11},
     {"request_timeout_s":100, "episode_timeout_s":90},
 ])
 def test_recovery_config_rejects_invalid_or_unsupported_budgets(values):

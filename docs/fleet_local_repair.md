@@ -5,6 +5,7 @@
 原机无法恢复时，才进入有界备用机接管或安全退出。
 
 基线与测试环境见 [fleet_local_repair_baseline.md](fleet_local_repair_baseline.md)。
+2026-09-16 审查问题修复、增量测试及当前边界见 [fleet_recovery_audit_fixes.md](fleet_recovery_audit_fixes.md)。
 本说明中的命令是按实际 CLI/配置编写的操作方法；本轮没有运行真实模型、Isaac 或飞行实验。
 
 ## 开关和配置
@@ -22,7 +23,7 @@ fleet_recovery:
   episode_timeout_s: 90.0
   retry_cooldown_s: 1.0
   max_local_attempts: 2
-  max_reassign_attempts: 1
+  max_reassign_attempts: 2
   max_concurrent_requests: 2
   max_pose_time_error_s: 0.05
   max_anchor_age_s: 45.0
@@ -257,7 +258,7 @@ D = test_model_request_dispatcher.py，F = test_recovery_configuration.py。
 | 18 失效底层调用仍在运行 | D 撤销后实际名额仍占用、后续请求不得越额、有界 close；F 过期流水线不发起下一次 HTTP |
 | 19 Graph/scripted/关闭开关 | F 默认关闭和早失败、A Graph 拒绝；原 Fleet、Graph、旧修订器及全 Python 回归通过 |
 
-## 实际测试命令与结果
+## 首轮实现时的测试命令与结果（历史记录）
 
 工作目录必须是 uav_agent。以下命令均实际运行，测试临时文件位于项目内。
 
@@ -316,11 +317,15 @@ TMPDIR=/home/amax/ry/vlm_drones/outputs/dev_local_repair/root_tmp \
 
 首轮支持本机 GOTO/SEARCH 授权后缀闭环及备用机升级。
 TAKEOFF/LAND 紧急失败、部分 TRACK/HOVER、缺少原 V3 语义或可信证据均保守处置。
-已完成目标可以通过证据识别，但首轮换机不转移已有输出及部分时间义务；
-此类 handoff 明确拒绝并安全退出，不让备用机重做已确认目标。
+已完成目标通过可信执行证据识别。后续修复已允许在剩余任务包含独立导航目标时，
+保留已完成目标及其依赖证据，仅将剩余导航和可独立执行的终止要求交给备用机。
+不转移原机的目标锁或步骤输出；部分 TRACK/HOVER 证据不足、仅剩原机退出动作，
+或剩余目标依赖原机感知输出时，仍明确拒绝，不让备用机重做已确认目标。
 
-max_reassign_attempts 首轮只支持 **1**，与原单次接管边界一致；更大值配置早失败。
-该次接管内部保留现有有限结构/语义修复次数，各调用共用同一墙钟期限。
+max_reassign_attempts 支持 **1 至 8**，默认及示例为 **2**。
+仅当全局 Fleet 版本竞争导致候选过期，且源任务归属仍有效时，才按冷却刷新快照重试；
+不重新获得完整 episode 预算。无备用机、取消或不安全候选不会无限重试。
+每次接管内部保留现有有限结构/语义修复次数，各调用共用同一墙钟期限。
 本机的 max_local_attempts、冷却与 episode 总期限可以配置。
 
 备用机按原 Fleet 规则递增全局版本，启动时显式传入已发布的局部版本；

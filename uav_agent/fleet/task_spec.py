@@ -209,13 +209,14 @@ def _exact(
     *,
     name: str,
     required: frozenset[str],
+    optional: frozenset[str] = frozenset(),
 ) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise TypeError(f"{name} must be an object")
     if any(not isinstance(key, str) for key in value):
         raise TypeError(f"{name} field names must be strings")
     fields = frozenset(value)
-    unknown = fields - required
+    unknown = fields - required - optional
     missing = required - fields
     if unknown:
         raise FleetTaskSpecError(
@@ -286,6 +287,7 @@ class MissionGoal:
     distance_m: float | None
     strength: ConstraintStrength
     evidence_refs: tuple[str, ...] = ()
+    completion_basis: str = "valid_execution"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -298,6 +300,10 @@ class MissionGoal:
                 "FleetTaskSpecV1.termination_goals, not goals"
             )
         object.__setattr__(self, "goal_type", goal_type)
+        if self.completion_basis not in {"valid_execution", "continuous"}:
+            raise FleetTaskSpecError("completion_basis must be valid_execution or continuous")
+        if goal_type is not GoalType.TRACK_TARGET and self.completion_basis != "valid_execution":
+            raise FleetTaskSpecError("continuous completion_basis is supported only for TRACK_TARGET")
         target_alias = _optional_text(
             self.target_alias, "target_alias", maximum=64
         )
@@ -365,6 +371,7 @@ class MissionGoal:
             "distance_m": self.distance_m,
             "strength": self.strength.value,
             "evidence_refs": list(self.evidence_refs),
+            **({"completion_basis": self.completion_basis} if self.completion_basis != "valid_execution" else {}),
         }
 
     @classmethod
@@ -372,6 +379,7 @@ class MissionGoal:
         data = _exact(
             value,
             name="MissionGoal",
+            optional=frozenset({"completion_basis"}),
             required=frozenset(
                 {
                     "goal_id",
@@ -396,6 +404,7 @@ class MissionGoal:
             evidence_refs=_array(
                 data["evidence_refs"], "evidence_refs", maximum=16
             ),  # type: ignore[arg-type]
+            completion_basis=data.get("completion_basis", "valid_execution"),  # type: ignore[arg-type]
         )
 
 

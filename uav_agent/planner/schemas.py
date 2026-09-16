@@ -538,6 +538,7 @@ _STEP_ARGUMENT_FIELDS: dict[
                 "desired_altitude_m",
                 "desired_distance_m",
                 "on_target_lost",
+                "completion_basis",
             }
         ),
     ),
@@ -564,6 +565,7 @@ def _validated_step_args(skill: str, value: object) -> Mapping[str, object]:
         "target_description",
         "target_ref",
         "on_target_lost",
+        "completion_basis",
         "zone",
         "candidate_id",
         "approach_policy",
@@ -597,6 +599,8 @@ def _validated_step_args(skill: str, value: object) -> Mapping[str, object]:
                 raise ValueError(
                     "TRACK.args.on_target_lost must be REACQUIRE or FAIL"
                 )
+            if key == "completion_basis" and text not in {"valid_execution", "continuous"}:
+                raise ValueError("TRACK.args.completion_basis must be valid_execution or continuous")
             if key == "candidate_id":
                 try:
                     text = validate_routing_id(

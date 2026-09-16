@@ -131,6 +131,7 @@ class ModelFactory:
                 event.set()
         self.calls = []
         self.invalid = False
+        self.transform = None
 
     def selection_for_role(self, role):
         return AdapterSelection(role, "runtime_replan" if role is ModelCallRole.RUNTIME_REPLAN else "fleet_planner",
@@ -147,6 +148,8 @@ class ModelFactory:
                 assert factory.release[uav].wait(2.0)
                 payload = json.loads(messages[1].content)
                 data = {**payload["authorized_output"], "steps": payload["original_suffix"]}
+                if factory.transform is not None:
+                    data = factory.transform(data, payload)
                 return ModelResponse(content="invalid JSON" if factory.invalid else json.dumps(data),
                     model="base_test_model", finish_reason="stop", usage={})
         return Client()
@@ -781,3 +784,129 @@ def test_yaw_change_does_not_rebind_the_admitted_hold_reference(harness):
     assert anchor.pose.yaw_rad == 0
     assert item.manager.task_plan.plan_version == 2
     assert h.runtime._planned_routes["uav_1"][1] == (10, 0, 10)
+
+
+def test_five_uavs_changed_detour_reaches_real_manager_commit():
+    scenario = RealFleetScenario()
+    third = scenario.items[2]
+    def detour(data, payload):
+        data["steps"].insert(0, {"id": "repair_detour", "uav_id": third.assignment.uav_id,
+            "skill": "GOTO", "args": {"target": PointTarget(
+                CoordinateFrame.WORLD_ENU, (2, 3, 10)).to_dict()}})
+        return data
+    scenario.factory.transform = detour
+    try:
+        episode = scenario.submit_fault()
+        scenario.factory.release[third.assignment.uav_id].set()
+        scenario.finish_request(episode)
+        assert third.manager.task_plan.plan_version == 2, scenario.runtime._events
+        assert third.manager.active_planned_step_id == "repair_detour"
+        assert third.manager.task_plan.steps[0] == scenario.original_plans[third.assignment.uav_id].steps[0]
+        assert len(third.takeoff.started_goals) == 1
+        for item in scenario.items:
+            if item is not third:
+                assert item.manager.task_plan == scenario.original_plans[item.assignment.uav_id]
+        assert scenario.runtime._planned_routes[third.assignment.uav_id][1] == (2, 3, 10)
+    finally:
+        scenario.close()
+
+
+def test_time_domain_change_rejects_completed_candidate(harness):
+    h = harness(config=FleetRecoveryConfig(enabled=True, mode="LOCAL_ONLY", max_local_attempts=1))
+    episode = h.submit()
+    item = h.locals[0]
+    item.agent._local_repair_observation = replace(
+        item.agent._local_repair_observation, time_domain="localization_epoch_2")
+    h.complete(episode)
+    assert item.manager.task_plan.plan_version == 1
+    assert h.exits[0][1] == "REFERENCE_CHANGED"
+
+
+@pytest.mark.parametrize("budget", [1, 2])
+def test_stale_handoff_refreshes_snapshot_within_existing_budget(tmp_path, budget):
+    source, spare = local("uav_a", -30), local("uav_b", 30)
+    scenario = RealFleetScenario([source], spare=spare,
+        boundary_builder=lambda s: production_boundary(s, tmp_path, spare=spare))
+    scenario.controller.config = replace(scenario.controller.config,
+        max_reassign_attempts=budget)
+    try:
+        scenario.factory.invalid = True
+        episode = scenario.submit_fault()
+        scenario.factory.release["uav_a"].set()
+        scenario.finish_request(episode)
+        scenario.runtime.tick()
+        assert scenario.fleet_started.wait(2)
+        first_request = episode.request_id
+        # An independent owner publication advances the Fleet version while
+        # this model is still computing. No source-local ownership changes.
+        scenario.runtime._plan = replace(scenario.runtime.fleet_plan, fleet_plan_version=2)
+        scenario.runtime._request = replace(scenario.runtime._request, fleet_plan_version=2)
+        scenario.fleet_release.set()
+        scenario.finish_request(episode)
+        assert not scenario.created
+        if budget == 1:
+            assert not scenario.controller.episodes
+            assert "uav_b" not in scenario.runtime.agents
+        else:
+            assert episode.phase == "REASSIGN_QUEUED"
+            assert episode.reassign_attempts == 1
+            scenario.wall.value += scenario.controller.config.retry_cooldown_s
+            scenario.runtime.tick()
+            assert episode.request_id != first_request
+            scenario.finish_request(episode)
+            assert scenario.runtime.fleet_plan.fleet_plan_version == 3, scenario.runtime._events
+            assert scenario.runtime.agents["uav_b"] is spare.agent
+            assert episode.reassign_attempts == 2
+            assert len(scenario.created) == 1
+            assert scenario.controller.episodes == {}
+    finally:
+        scenario.fleet_release.set()
+        scenario.close()
+
+
+def test_handoff_keeps_confirmed_navigation_and_transfers_only_independent_remainder(tmp_path):
+    from collections import deque
+    source, spare = local("uav_a", -30), local("uav_b", 30)
+    second_goal = replace(source.goal, goal_id="goal_second",
+                          spatial_constraint=NamedLocationTarget(source.home))
+    def boundary(scenario):
+        spec = replace(scenario.prepared.task_spec,
+            goals=(source.goal, second_goal), ordering_constraints=(OrderingConstraint(
+                "first_before_second", source.goal.goal_id, second_goal.goal_id, ConstraintStrength.MUST),))
+        assignment = replace(scenario.prepared.fleet_plan_v2.assignments[0],
+            goal_ids=(source.goal.goal_id, second_goal.goal_id))
+        scenario.prepared.task_spec = spec
+        scenario.prepared.fleet_request_v2 = replace(scenario.prepared.fleet_request_v2, task_spec=spec)
+        scenario.prepared.fleet_plan_v2 = replace(scenario.prepared.fleet_plan_v2, assignments=(assignment,))
+        return production_boundary(scenario, tmp_path, spare=spare)
+    scenario = RealFleetScenario([source], spare=spare, boundary_builder=boundary)
+    source.goto._outcomes = deque([succeeded(SkillResultCode.GOAL_REACHED),
+                                   failed(SkillResultCode.TIMEOUT), *[running() for _ in range(20)]])
+    try:
+        scenario.factory.invalid = True
+        for index in range(4):
+            if index == 2:
+                source.uav.set_pose(-30, 20, 10, 0)
+            scenario.runtime.tick()
+        assert scenario.factory.started["uav_a"].wait(2)
+        episode = scenario.controller.episodes[source.assignment.assignment_id]
+        scenario.factory.release["uav_a"].set()
+        scenario.finish_request(episode)
+        scenario.runtime.tick()
+        assert scenario.fleet_started.wait(2), scenario.runtime._events
+        assert episode.remaining_goal_ids == ("goal_second",)
+        assert episode.external_dependencies[0].kind == "PREDECESSOR"
+        scenario.fleet_release.set()
+        scenario.finish_request(episode)
+        assert scenario.runtime.fleet_plan.fleet_plan_version == 2, scenario.controller._last_error
+        new_assignment = scenario.controller.assignments["assignment_handoff"]
+        assert new_assignment.goal_ids == ("goal_second",)
+        task = scenario.controller.assignment_task_specs["assignment_handoff"]
+        assert task.goals[0].spatial_constraint == PointTarget(CoordinateFrame.WORLD_ENU, (-30, 0, 10))
+        states, evidence = scenario.controller._goal_state()
+        assert states[source.goal.goal_id] == "CONFIRMED"
+        assert evidence[source.goal.goal_id]
+        assert len(source.goto.started_goals) == 2  # original completed goal was never replayed
+    finally:
+        scenario.fleet_release.set()
+        scenario.close()

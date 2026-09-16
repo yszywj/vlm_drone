@@ -273,7 +273,10 @@ class AgentLocalRepairTest(unittest.TestCase):
             SkillResultCode.TARGET_LOST, {
                 "target_id": "target_0", "last_seen_position": (7.0, 8.0, 0.0),
                 "last_seen_velocity": (0.5, 0.0, 0.0), "last_seen_time": 3.5,
-                "tracking_duration": 0.5,
+                "tracking_duration": 2.5,
+                "progress_schema": "track_progress.v1", "elapsed_s": 2.5,
+                "valid_execution_s": 0.5, "continuous_execution_s": 0.0,
+                "completion_basis": "valid_execution", "required_duration_s": 30.0,
             }), running()]})
         h.manager.register(SkillName.HOVER, HoverSkill())
         h.agent.configure_local_repair(enabled=True)

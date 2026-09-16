@@ -435,6 +435,7 @@ class SkillManager:
     def commit_local_repair(
         self, plan: TaskPlan, *, expected_event_id: str, expected_plan_version: int,
         final_guard: Callable[[], None] | None = None,
+        allow_goto_detour_prefix: bool = False,
     ) -> TaskStatus:
         """Publish a protected suffix synchronously, starting but never ticking it.
 
@@ -446,14 +447,25 @@ class SkillManager:
             expected_event_id, expected_plan_version, require_hold=True
         )
         owned = self._validate_replacement_plan(plan, interrupted)
-        step = owned.steps[interrupted.plan_index]
-        if (
-            step.step_id != interrupted.step.step_id
-            or step.skill is not interrupted.step.skill
-        ):
-            raise SkillManagerError(
-                "local repair must preserve current step identity and Skill"
-            )
+        if not isinstance(allow_goto_detour_prefix, bool):
+            raise TypeError("allow_goto_detour_prefix must be a bool")
+        suffix = owned.steps[interrupted.plan_index:]
+        retained_index = next((index for index, step in enumerate(suffix)
+                               if step.step_id == interrupted.step.step_id), None)
+        retained = None if retained_index is None else suffix[retained_index]
+        if retained is None or retained.skill is not interrupted.step.skill:
+            raise SkillManagerError("local repair must preserve current step identity and Skill")
+        if retained_index:
+            original_ids = {step.step_id for step in interrupted.plan.steps}
+            if (
+                not allow_goto_detour_prefix
+                or interrupted.step.skill not in {SkillName.GOTO, SkillName.SEARCH}
+                or any(step.skill is not SkillName.GOTO or step.step_id in original_ids
+                       for step in suffix[:retained_index])
+            ):
+                raise SkillManagerError(
+                    "local repair must preserve current step identity; only authorized new GOTO detours may precede it"
+                )
 
         def retire_hold() -> None:
             # All goal resolution and owned-object preparation has finished.
@@ -2537,7 +2549,7 @@ class SkillManager:
             not self._local_repair_enabled or not supported
             or kind is not ExecutionKind.PLANNED
             or self._program_executor is not None
-            or self._pending_task_result is not None
+            or self._pending_task_result not in {None, TaskStatus.SUCCEEDED}
             or self._interrupted_execution is not None
             or self._search_inspection_detour is not None
             or self._task_plan is None or self._plan_index is None
@@ -2552,6 +2564,10 @@ class SkillManager:
             or invocation.mission_id != plan.mission_id
         ):
             return False
+        # TRACK success is a provisional goal result, not a task shutdown.
+        # A later navigation failure still owns the normal repair lifecycle.
+        # Its successful TRACK evidence remains in step_outputs/reports.
+        self._pending_task_result = None
         self._interrupted_execution = _InterruptedExecution(
             plan_index=self._plan_index, step=deepcopy(step),
             resolved_goal=deepcopy(invocation.goal), plan=_copy_task_plan(plan),
@@ -3239,12 +3255,27 @@ class SkillManager:
         goal = self._saved_track_goal_by_step.get(step_id)
         if goal is None or goal.track_duration is None:
             return
-        elapsed = _nonnegative_number_or_none(result.data.get("tracking_duration"))
-        if elapsed is None:
+        # Only explicit execution evidence is transferable across REACQUIRE.
+        # Legacy tracking_duration is elapsed time and may include loss grace.
+        # A continuous requirement must restart in full after every loss.
+        data = result.data
+        if goal.completion_basis == "continuous" or data.get("progress_schema") != "track_progress.v1":
+            return
+        elapsed = _nonnegative_number_or_none(data.get("elapsed_s"))
+        valid = _nonnegative_number_or_none(data.get("valid_execution_s"))
+        continuous = _nonnegative_number_or_none(data.get("continuous_execution_s"))
+        required = _nonnegative_number_or_none(data.get("required_duration_s"))
+        if (
+            elapsed is None or valid is None or continuous is None or required is None
+            or data.get("completion_basis") != goal.completion_basis
+            or continuous > valid + 1e-9 or valid > elapsed + 1e-9
+            or abs(required - float(goal.track_duration)) > 1e-9
+            or valid >= required
+        ):
             return
         self._saved_track_goal_by_step[step_id] = replace(
             goal,
-            track_duration=max(1e-9, float(goal.track_duration) - elapsed),
+            track_duration=max(1e-9, float(goal.track_duration) - valid),
         )
 
     def _effective_recovery_policy(self, step: TaskStep) -> RecoveryPolicy | None:

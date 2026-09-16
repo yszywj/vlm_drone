@@ -29,6 +29,7 @@ class TrackGoal(SkillGoal):
     max_target_lost_time: float = 2.0
     timeout: float | None = None
     track_duration: float | None = None
+    completion_basis: str = "valid_execution"
 
 
 class TrackSkill(Skill):
@@ -50,6 +51,10 @@ class TrackSkill(Skill):
         self._tracker_id: str | None = None
         self._measurement_age_s: float | None = None
         self._predicted_only = False
+        self._valid_execution_s = 0.0
+        self._continuous_execution_s = 0.0
+        self._last_progress_measurement_time: float | None = None
+        self._previous_progress_visible = False
 
     def _validate_goal(self, goal: SkillGoal) -> None:
         typed_goal = goal
@@ -68,6 +73,10 @@ class TrackSkill(Skill):
             require_positive(typed_goal.timeout, "timeout")
         if typed_goal.track_duration is not None:
             require_positive(typed_goal.track_duration, "track_duration")
+        if typed_goal.completion_basis not in {"valid_execution", "continuous"}:
+            raise SkillGoalValidationError(
+                "completion_basis must be valid_execution or continuous"
+            )
 
     def _on_start(self, goal: SkillGoal, context: SkillContext) -> None:
         typed_goal = self._track_goal(goal)
@@ -78,6 +87,7 @@ class TrackSkill(Skill):
         self._last_observation_timestamp = None
         self._stand_off_direction_xy = None
         self._clear_last_seen()
+        self._reset_progress()
         self._set_feedback(
             0.0 if typed_goal.track_duration is not None else None,
             "TRACK initialized",
@@ -87,7 +97,7 @@ class TrackSkill(Skill):
                 "target_visible": False,
                 "target_relative_bearing": None,
                 "last_seen_age": 0.0,
-                "tracking_duration": 0.0,
+                **self._progress_data(typed_goal, 0.0),
                 "perception_source": None,
                 "tracker_id": None,
                 "measurement_age_s": None,
@@ -206,11 +216,6 @@ class TrackSkill(Skill):
             if goal.timeout is None
             else self._start_time + goal.timeout
         )
-        completion_deadline = (
-            None
-            if goal.track_duration is None
-            else self._start_time + goal.track_duration
-        )
         visible_frame_precedes_loss = (
             observation_time <= previous_loss_deadline + 1e-12
         )
@@ -218,16 +223,11 @@ class TrackSkill(Skill):
             timeout_deadline is None
             or observation_time <= timeout_deadline + 1e-12
         )
-        visible_frame_precedes_completion = (
-            completion_deadline is None
-            or observation_time <= completion_deadline + 1e-12
-        )
         if (
             target_visible
             and is_new_frame
             and visible_frame_precedes_loss
             and visible_frame_precedes_timeout
-            and visible_frame_precedes_completion
         ):
             assert estimate is not None
             self._last_seen_time = max(
@@ -236,6 +236,48 @@ class TrackSkill(Skill):
             )
             self._last_seen_position = target_position.copy()
             self._last_seen_velocity = target_velocity.copy()
+
+        # Progress is measured between successive fresh, visible measurements.
+        # Prediction, missing frames, duplicate samples, and wall-clock waiting
+        # never earn execution credit. A new invisible observation breaks the
+        # continuous segment even while the loss-grace timer permits control.
+        completion_deadline = None
+        accepted_visible = bool(
+            target_visible and is_new_frame
+            and visible_frame_precedes_loss and visible_frame_precedes_timeout
+        )
+        measurement_time = (None if estimate is None else
+                            min(observation_time, estimate.timestamp_s - estimate.measurement_age_s))
+        prior_measurement = self._last_progress_measurement_time
+        accepted_visible = bool(accepted_visible and measurement_time is not None
+            and measurement_time >= self._start_time
+            and (prior_measurement is None or measurement_time > prior_measurement + 1e-12))
+        if is_new_frame:
+            if accepted_visible:
+                assert measurement_time is not None
+                if (
+                    self._previous_progress_visible
+                    and prior_measurement is not None
+                    and measurement_time > prior_measurement + 1e-12
+                ):
+                    interval = measurement_time - prior_measurement
+                    self._valid_execution_s += interval
+                    self._continuous_execution_s += interval
+                elif not self._previous_progress_visible:
+                    self._continuous_execution_s = 0.0
+                if not self._previous_progress_visible:
+                    # Do not bridge a missing interval with a delayed first
+                    # reappearance sample whose timestamp predates that gap.
+                    self._last_progress_measurement_time = observation_time
+                elif prior_measurement is None or measurement_time > prior_measurement:
+                    self._last_progress_measurement_time = measurement_time
+                self._previous_progress_visible = True
+                credited = self._completion_credit(goal)
+                if goal.track_duration is not None and credited + 1e-12 >= goal.track_duration:
+                    completion_deadline = measurement_time - max(0.0, credited - goal.track_duration)
+            else:
+                self._previous_progress_visible = False
+                self._continuous_execution_s = 0.0
 
         seen_anchor = (
             self._start_time
@@ -267,7 +309,7 @@ class TrackSkill(Skill):
             "target_visible": target_visible,
             "target_relative_bearing": relative_bearing,
             "last_seen_age": last_seen_age,
-            "tracking_duration": tracking_duration,
+            **self._progress_data(goal, tracking_duration),
             "perception_source": self._perception_source,
             "tracker_id": self._tracker_id,
             "measurement_age_s": self._measurement_age_s,
@@ -276,7 +318,7 @@ class TrackSkill(Skill):
             "velocity_available": velocity_available,
         }
         progress = (
-            min(1.0, tracking_duration / goal.track_duration)
+            min(1.0, self._completion_credit(goal) / goal.track_duration)
             if goal.track_duration is not None
             else (
                 None
@@ -294,7 +336,7 @@ class TrackSkill(Skill):
         )
         track_complete = (
             completion_deadline is not None
-            and effective_time >= completion_deadline
+            and effective_time + 1e-12 >= completion_deadline
         )
 
         # Sampling may observe several expired deadlines at once. Resolve them
@@ -411,7 +453,7 @@ class TrackSkill(Skill):
             ),
             "last_seen_time": self._last_seen_time,
             "last_seen_age": last_seen_age,
-            "tracking_duration": tracking_duration,
+            **self._progress_data(goal, tracking_duration),
             "track_duration": goal.track_duration,
             "perception_source": self._perception_source,
             "tracker_id": self._tracker_id,
@@ -420,6 +462,29 @@ class TrackSkill(Skill):
             "position_available": self._last_seen_position is not None,
             "velocity_available": self._last_seen_velocity is not None,
         }
+
+    def _completion_credit(self, goal: TrackGoal) -> float:
+        return (self._continuous_execution_s if goal.completion_basis == "continuous"
+                else self._valid_execution_s)
+
+    def _progress_data(self, goal: TrackGoal, elapsed_s: float) -> dict[str, object]:
+        return {
+            "progress_schema": "track_progress.v1",
+            # Compatibility telemetry only; consumers must use the explicit
+            # valid/continuous fields to decide completion or remaining work.
+            "tracking_duration": elapsed_s,
+            "elapsed_s": elapsed_s,
+            "valid_execution_s": self._valid_execution_s,
+            "continuous_execution_s": self._continuous_execution_s,
+            "completion_basis": goal.completion_basis,
+            "required_duration_s": goal.track_duration,
+        }
+
+    def _reset_progress(self) -> None:
+        self._valid_execution_s = 0.0
+        self._continuous_execution_s = 0.0
+        self._last_progress_measurement_time = None
+        self._previous_progress_visible = False
 
     @staticmethod
     def _initial_stand_off_direction(
@@ -452,6 +517,7 @@ class TrackSkill(Skill):
         self._last_observation_timestamp = None
         self._stand_off_direction_xy = None
         self._clear_last_seen()
+        self._reset_progress()
 
     @staticmethod
     def _track_goal(goal: SkillGoal) -> TrackGoal:

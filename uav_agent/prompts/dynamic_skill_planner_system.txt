@@ -29,6 +29,6 @@
 - GOTO args: destination（必需）, altitude_m（可选）, yaw_mode（KEEP_CURRENT、COURSE_ALIGNED、FACE_POINT 或 FIXED，可选）, yaw_deg（条件可选）。
 - HOVER args: duration_s（必需，1 至 60 秒）, yaw_mode（KEEP_CURRENT 或 FIXED，可选）, yaw_deg（条件可选）。HOVER 始终为 TIMED。
 - SEARCH args: region（必需）, target_description（必需）, altitude_m（可选）。
-- TRACK args: target_ref（必需）, duration_s（必需）, desired_altitude_m（可选）, desired_distance_m（可选）, on_target_lost（REACQUIRE 或 FAIL，可选）。
+- TRACK args: target_ref（必需）, duration_s（必需）, completion_basis（valid_execution 或 continuous，可选；连续跟踪要求必须使用 continuous，不能把多个短段相加）, desired_altitude_m（可选）, desired_distance_m（可选）, on_target_lost（REACQUIRE 或 FAIL，可选）。时长不计失锁等待或仅预测的时间。
 - LAND args: zone（必需）, yaw_mode（KEEP_CURRENT 或 FIXED，可选）, yaw_deg（条件可选）。
 - TRACK recovery: skill 和 max_attempts 必需；search_radius_m 与 timeout_s 可选，省略时由可信编译器补默认值。新输出的 max_attempts 为 1 至 2 的整数；如果提供，search_radius_m 必须为 3 至 20，timeout_s 必须为 5 至 60。

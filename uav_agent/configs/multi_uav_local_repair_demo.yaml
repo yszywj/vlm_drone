@@ -108,7 +108,7 @@ fleet_recovery:
   episode_timeout_s: 90.0
   retry_cooldown_s: 1.0
   max_local_attempts: 2
-  max_reassign_attempts: 1
+  max_reassign_attempts: 2
   max_concurrent_requests: 2
   max_pose_time_error_s: 0.05
   max_anchor_age_s: 45.0

@@ -702,6 +702,18 @@ class PlanRevisionCoordinator:
             # Re-check immediately before the only state-changing call.  This
             # keeps the original Manager plan intact if another trusted path
             # canceled, landed, or advanced the task while validation ran.
+            now = self._now()
+            if now < pending.submitted_timestamp_s:
+                raise PlanRevisionCoordinatorError("revision clock regressed during validation")
+            if now >= pending.deadline_timestamp_s:
+                self._finish_rejected(
+                    state=PlanRevisionState.TIMED_OUT,
+                    code="REVISION_TIMEOUT",
+                    message="plan revision deadline expired during validation",
+                    now=now,
+                    apply_fallback=bool(self._skill_manager.is_supervisory_paused),
+                )
+                return self.snapshot()
             stale_after_validation = self._pending_route_error(
                 pending,
                 current_plan,

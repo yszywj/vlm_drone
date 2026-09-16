@@ -702,7 +702,7 @@ class FleetRecoveryConfig:
     episode_timeout_s: float = 90.0
     retry_cooldown_s: float = 1.0
     max_local_attempts: int = 2
-    max_reassign_attempts: int = 1
+    max_reassign_attempts: int = 2
     max_concurrent_requests: int = 2
     max_pose_time_error_s: float = 0.05
     max_anchor_age_s: float = 45.0
@@ -724,7 +724,7 @@ class FleetRecoveryConfig:
         for name in ("max_local_attempts", "max_reassign_attempts",
                      "max_concurrent_requests", "max_suffix_steps"):
             value = getattr(self, name)
-            maximum = 10 if name == "max_suffix_steps" else (1 if name == "max_reassign_attempts" else 8)
+            maximum = 10 if name == "max_suffix_steps" else 8
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
                 raise ValueError(f"fleet_recovery.{name} must be within 1..{maximum}")
         if self.request_timeout_s > self.episode_timeout_s:

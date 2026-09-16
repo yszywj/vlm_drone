@@ -212,10 +212,19 @@ class Observation:
     # Kept keyword-only so a frame cannot silently inherit another UAV's
     # identity from positional compatibility or a process-wide default.
     uav_id: str = field(kw_only=True)
+    frame_id: str | None = field(default=None, kw_only=True)
+    time_domain: str = field(default="simulation", kw_only=True)
+    pose_timestamp_s: float | None = field(default=None, kw_only=True)
 
     def validate(self) -> None:
         validate_uav_id(getattr(self, "uav_id", None))
         _finite_scalar(self.timestamp, "Observation.timestamp")
+        if not isinstance(self.time_domain, str) or not self.time_domain.strip():
+            raise ValueError("Observation.time_domain must be non-empty")
+        if self.frame_id is not None and (not isinstance(self.frame_id, str) or not self.frame_id.strip()):
+            raise ValueError("Observation.frame_id must be non-empty when provided")
+        if self.pose_timestamp_s is not None:
+            _finite_scalar(self.pose_timestamp_s, "Observation.pose_timestamp_s")
         if not isinstance(self.uav_pose, UAVState):
             raise TypeError("Observation.uav_pose must be a UAVState")
         _validate_pose(self.uav_pose, "Observation.uav_pose")

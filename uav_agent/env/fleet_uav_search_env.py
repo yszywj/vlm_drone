@@ -109,6 +109,7 @@ class FleetUavSearchEnv:
         self.config = config
         self.world: object | None = None
         self.scene: object | None = None
+        self.recovery_reference_version = 0
         self.uav_controllers: dict[str, object] = {}
         self.target_motions: dict[str, object] = {}
         self.camera_sensors: dict[str, object] = {}
@@ -219,10 +220,19 @@ class FleetUavSearchEnv:
         material = repr(tuple((o.obstacle_id, o.center_xyz_m, o.size_xyz_m, o.collidable) for o in obstacles))
         return {
             "map_version": int(sha256(material.encode()).hexdigest()[:12], 16),
-            "reference_version": int(getattr(self, "recovery_reference_version", 0)),
+            "reference_version": self.recovery_reference_version,
             "obstacles": obstacles,
             "fleet_pose_snapshot": coerce_fleet_pose_snapshot(self.get_fleet_pose_snapshot()),
         }
+
+    def invalidate_recovery_reference(self) -> None:
+        """Owner hook for a world reset or an unaligned localization rebase.
+
+        Call before applying the reference change. Existing model candidates
+        retain their old version and cannot acquire flight authority again.
+        """
+        self.recovery_reference_version += 1
+        self._invalidate_caches()
 
     def _default_assignments(self) -> Mapping[str, str]:
         if len(self.config.uavs) == 1 and len(self.config.targets) == 1:
@@ -416,6 +426,9 @@ class FleetUavSearchEnv:
         return Observation(
             uav_id=normalized,
             timestamp=float(agent.camera_timestamp_s),
+            pose_timestamp_s=getattr(agent, "pose_timestamp_s", None),
+            frame_id=getattr(agent, "frame_id", None),
+            time_domain=getattr(agent, "time_domain", "simulation"),
             uav_pose=agent.uav_state,
             uav_velocity=np.asarray(agent.uav_velocity_mps).copy(),
             camera_rgb=np.asarray(agent.rgb).copy(),
@@ -445,6 +458,9 @@ class FleetUavSearchEnv:
         base = Observation(
             uav_id=normalized,
             timestamp=float(agent.camera_timestamp_s),
+            pose_timestamp_s=getattr(agent, "pose_timestamp_s", None),
+            frame_id=getattr(agent, "frame_id", None),
+            time_domain=getattr(agent, "time_domain", "simulation"),
             uav_pose=agent.uav_state,
             uav_velocity=np.asarray(agent.uav_velocity_mps).copy(),
             camera_rgb=np.asarray(camera_sample.rgb).copy(),
@@ -895,6 +911,9 @@ class FleetUavSearchEnv:
                 ).copy(),
                 camera_timestamp_s=float(sample.timestamp_s),
                 camera_sample=sample,
+                pose_timestamp_s=float(snapshot.timestamp_s),
+                frame_id=f"fleet_{self.recovery_reference_version}_{snapshot.tick_index}_{uav_id}",
+                time_domain="simulation",
             )
             pending_agent_observations[uav_id] = observation
             target_id = self._assignments.get(uav_id)
@@ -945,7 +964,7 @@ class FleetUavSearchEnv:
                 raise ValueError(
                     f"target_seeds[{target_id!r}] must be a non-negative integer"
                 )
-        self._invalidate_caches()
+        self.invalidate_recovery_reference()
         world.reset()
         for uav in self.config.uavs:
             self._require_uav_controller(uav.id).set_pose(

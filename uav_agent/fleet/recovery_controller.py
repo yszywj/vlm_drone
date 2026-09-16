@@ -53,6 +53,7 @@ class RecoveryEpisode:
     external_dependencies: tuple = ()
     dependency_versions: object | None = None
     remaining_goal_ids: tuple[str, ...] = ()
+    confirmed_goal_evidence: tuple = ()
     source_uav_id: str | None = None
 
 
@@ -69,6 +70,10 @@ class FleetRecoveryController:
             raise TypeError("recovery requires a trusted geometry provider and monotonic clock")
         self.config, self.clock = config, clock
         self.task_spec = task_spec
+        # A handoff's WORLD-bound goal meanings must survive subsequent local
+        # repairs and another handoff, independently of the spare's home/start.
+        self.assignment_task_specs = {}
+        self.confirmed_goal_evidence = {}
         self.assignments = {a.assignment_id: a for a in assignments}
         self.compilations = dict(compilations)
         self.world_contexts, self.home_names = dict(world_contexts), dict(home_names)
@@ -128,6 +133,9 @@ class FleetRecoveryController:
     def _record(self, episode):
         return self.runtime.assignments.by_id(episode.assignment_id)
 
+    def _task_spec_for(self, assignment_id):
+        return self.assignment_task_specs.get(assignment_id, self.task_spec)
+
     def _state(self, episode):
         record = self._record(episode)
         agent = self.runtime.agents[record.assignment.uav_id]
@@ -182,7 +190,8 @@ class FleetRecoveryController:
 
     def _goal_state(self):
         states = {goal.goal_id: "UNKNOWN" for goal in self.task_spec.goals + self.task_spec.termination_goals}
-        refs = {}
+        refs = dict(self.confirmed_goal_evidence)
+        states.update({goal_id: "CONFIRMED" for goal_id in refs})
         for assignment_id, assignment in self.assignments.items():
             try:
                 record = self.runtime.assignments.by_id(assignment_id)
@@ -191,7 +200,7 @@ class FleetRecoveryController:
                 original = state.compiled_mission
                 if original is None or not isinstance(original.planner_output, SkillPlanDraftV3):
                     continue
-                goals = tuple(self.task_spec.goal(goal) for goal in assignment.goal_ids)
+                goals = tuple(self._task_spec_for(assignment_id).goal(goal) for goal in assignment.goal_ids)
                 completed = tuple(step.step_id for step in state.task_plan.steps[:state.current_step_index])
                 assessment = assess_remaining_goals(goals, original.planner_output, completed,
                     self._evidence(state), current_step_id=state.current_step_id,
@@ -203,8 +212,12 @@ class FleetRecoveryController:
                     refs[goal.goal_id] = (f"pending_{assignment_id}_v{record.local_plan_version}",)
                 for goal_id in assessment.confirmed_goal_ids:
                     states[goal_id] = "CONFIRMED"
+                    from fleet.local_repair import _goal_steps
+                    goal_steps = {step.id for step in _goal_steps(
+                        self._task_spec_for(assignment_id).goal(goal_id),
+                        original.planner_output.steps, self.home_names[record.assignment.uav_id])}
                     refs[goal_id] = tuple(e.invocation_id for e in self._evidence(state)
-                                          if e.step_id in completed)
+                                          if e.step_id in completed and e.step_id in goal_steps)
                 # Incomplete/active external successors must not be called pending.
                 if state.current_step_id is not None:
                     from fleet.local_repair import _goal_steps
@@ -219,7 +232,7 @@ class FleetRecoveryController:
                 continue
         return states, refs
 
-    def _dependencies(self, assignment_id):
+    def _dependencies(self, assignment_id, *, goal_ids=None):
         states, refs = self._goal_state()
         geometry = self.geometry_provider()
         versions = {"fleet": self.runtime.fleet_plan.fleet_plan_version,
@@ -227,7 +240,7 @@ class FleetRecoveryController:
         versions["reference"] = int(geometry["reference_version"])
         versions["map"] = int(geometry["map_version"])
         dependencies = extract_external_dependencies(
-            self.task_spec, self.assignments[assignment_id].goal_ids,
+            self.task_spec, self.assignments[assignment_id].goal_ids if goal_ids is None else goal_ids,
             assignments=tuple(self.assignments.values()), goal_states=states,
             goal_evidence_refs=refs, versions=versions,
             shared_dependencies=tuple(geometry.get("shared_dependencies", ())))
@@ -373,7 +386,7 @@ class FleetRecoveryController:
             try:
                 agent.commit_local_repair(candidate.task_plan, expected_event_id=episode.event_id,
                     expected_plan_version=episode.base_version, compiled_mission=candidate.compiled_mission,
-                    final_guard=guard)
+                    final_guard=guard, allow_goto_detour_prefix=True)
             finally:
                 # A physical Skill start can fail after Manager publication.
                 # Agent adopts that version in its own finally block; Fleet
@@ -423,7 +436,8 @@ class FleetRecoveryController:
             request_id=episode.request_id, episode_id=episode.episode_id, execution_generation=state.execution_epoch,
             original=state.compiled_mission, current_step_id=event.step_id, completed_step_ids=completed,
             completed_step_outputs=state.completed_outputs,
-            goals=tuple(self.task_spec.goal(goal) for goal in self.assignments[episode.assignment_id].goal_ids),
+            goals=tuple(self._task_spec_for(episode.assignment_id).goal(goal)
+                        for goal in self.assignments[episode.assignment_id].goal_ids),
             evidence=self._evidence(state), anchor=anchor, submitted_wall_s=self.clock(), deadline_wall_s=deadline,
             external_dependencies=deps, dependency_versions=versions, home_name=self.home_names[uav],
             max_suffix_steps=min(self.config.max_suffix_steps, 10),
@@ -484,6 +498,8 @@ class FleetRecoveryController:
         observation = state.latest_observation
         if observation is None or float(observation.timestamp) < context.anchor.observation_time_s:
             raise LocalRepairError("OBSERVATION_TIME_MISMATCH", "observation time moved backwards")
+        if getattr(observation, "time_domain", "simulation") != context.anchor.time_domain:
+            raise LocalRepairError("REFERENCE_CHANGED", "observation time domain changed")
         pose_stamp = getattr(observation, "pose_timestamp_s", None)
         pose_stamp = float(observation.timestamp) if pose_stamp is None else float(pose_stamp)
         if (not isfinite(pose_stamp) or not isfinite(float(observation.timestamp))
@@ -540,6 +556,8 @@ class FleetRecoveryController:
             self._finish(episode, "STALE_REASSIGNMENT")
             return
         if episode.request_id is None:
+            if self.clock() < episode.next_attempt_wall_s:
+                return
             if not self.supports_reassignment or episode.reassign_attempts >= self.config.max_reassign_attempts:
                 self._exit(episode, "NO_REASSIGNMENT_BUDGET")
                 return
@@ -574,6 +592,7 @@ class FleetRecoveryController:
             assignment_v2 = candidate["assignment_v2"]
             world_context = candidate["world_context"]
             compilation = candidate["compilation"]
+            task_spec = candidate["request_v2"].task_spec
             if assignment_v2.assignment_id != item.replacement_assignment.assignment_id:
                 raise LocalRepairError("ROUTING_MISMATCH", "replacement metadata differs from prepared publication")
             def guard():
@@ -588,6 +607,9 @@ class FleetRecoveryController:
                 published = True
                 self.assignments.pop(episode.assignment_id)
                 self.assignments[assignment_v2.assignment_id] = assignment_v2
+                self.assignment_task_specs.pop(episode.assignment_id, None)
+                self.assignment_task_specs[assignment_v2.assignment_id] = task_spec
+                self.confirmed_goal_evidence.update(dict(episode.confirmed_goal_evidence))
                 self.world_contexts[item.replacement_assignment.uav_id] = world_context
                 self.compilations[item.replacement_assignment.uav_id] = compilation
             # This is a post-publication bookkeeping notification. Failure may
@@ -616,27 +638,49 @@ class FleetRecoveryController:
 
     def _prepare_reassignment(self,episode,deadline):
         record=self._record(episode)
-        if not self._owns_execution(episode) or self.runtime.cancel_requested or (record.local_plan_version,self.runtime.fleet_plan.fleet_plan_version)!=episode.queue_signature:
+        if not self._owns_execution(episode) or self.runtime.cancel_requested:
             return None
-        deps,versions=self._dependencies(episode.assignment_id)
-        decision=check_external_dependencies(deps,deps,versions,versions)
-        if not decision.allowed:
-            raise LocalRepairError("COORDINATION_REQUIRED",";".join(decision.reasons),affected_uav_ids=decision.affected_uav_ids)
+        if (record.local_plan_version,self.runtime.fleet_plan.fleet_plan_version)!=episode.queue_signature:
+            raise LocalRepairError("STALE_VERSION", "Fleet changed before model admission")
         # Failed source.goal_ids are never silently treated as remaining goals.
         record,agent,state=self._state(episode)
         if state.compiled_mission is None:
             raise LocalRepairError("EVIDENCE_INSUFFICIENT","source lacks a trusted executable plan")
-        goals=tuple(self.task_spec.goal(g) for g in self.assignments[episode.assignment_id].goal_ids)
+        goals=tuple(self._task_spec_for(episode.assignment_id).goal(g)
+                    for g in self.assignments[episode.assignment_id].goal_ids)
         completed=tuple(step.step_id for step in state.task_plan.steps[:state.current_step_index])
         assessment=assess_remaining_goals(goals,state.compiled_mission.planner_output,completed,self._evidence(state),
             current_step_id=state.current_step_id,current_step_started=True,home_name=self.home_names[record.assignment.uav_id])
-        if not assessment.supported or assessment.confirmed_goal_ids:
-            # First release cannot safely transfer retained output references
-            # or partial temporal obligations to a fresh aircraft.
-            raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED","partial/completed goal handoff requires coordination")
+        if not assessment.supported:
+            raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "remaining execution evidence is insufficient")
+        if not assessment.pending_goal_ids:
+            raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "no independently executable remaining goal")
+        if assessment.confirmed_goal_ids:
+            from fleet.task_spec import GoalType
+            # A fresh aircraft cannot inherit a SEARCH lock or replay a
+            # completed perception action merely to manufacture target refs.
+            independent = {GoalType.NAVIGATE, GoalType.RETURN_HOME, GoalType.LAND,
+                           GoalType.RETURN_HOME_AND_LAND, GoalType.WAIT}
+            if any(goal.goal_type not in independent for goal in assessment.pending_goals):
+                raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "remaining goals require source-local outputs")
+            if not any(goal.goal_type is GoalType.NAVIGATE for goal in assessment.pending_goals):
+                raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "source termination alone cannot be delegated")
+        deps,versions=self._dependencies(episode.assignment_id, goal_ids=assessment.pending_goal_ids)
+        decision=check_external_dependencies(deps,deps,versions,versions)
+        if not decision.allowed:
+            raise LocalRepairError("COORDINATION_REQUIRED",";".join(decision.reasons),affected_uav_ids=decision.affected_uav_ids)
+        states, refs = self._goal_state()
+        episode.confirmed_goal_evidence = tuple(
+            (goal_id, refs[goal_id]) for goal_id in assessment.confirmed_goal_ids
+            if states.get(goal_id) == "CONFIRMED" and refs.get(goal_id))
+        if len(episode.confirmed_goal_evidence) != len(assessment.confirmed_goal_ids):
+            raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "completed goals lack stable owner evidence")
         snapshot=self.replan_boundary.snapshot_request(record,self.runtime.world_belief,
                                                        remaining_goal_ids=assessment.pending_goal_ids,
+                                                       remaining_goals=assessment.pending_goals,
+                                                       source_compiled_mission=state.compiled_mission,
                                                        external_dependencies=deps,
+                                                       recovery_request_id=episode.request_id,
                                                        deadline_wall_s=deadline, wall_clock=self.clock)
         episode.external_dependencies=deps
         episode.dependency_versions=versions
@@ -656,7 +700,7 @@ class FleetRecoveryController:
             raise LocalRepairError("STALE_VERSION","Fleet changed while reassignment was computed")
         if self.clock()>=min(episode.deadline_wall_s,float(episode.candidate)):
             raise LocalRepairError("DEADLINE_EXPIRED","reassignment validation exceeded deadline")
-        deps,versions=self._dependencies(episode.assignment_id)
+        deps,versions=self._dependencies(episode.assignment_id, goal_ids=episode.remaining_goal_ids)
         decision=check_external_dependencies(episode.external_dependencies,deps,episode.dependency_versions,versions)
         if not decision.allowed:
             raise LocalRepairError("COORDINATION_REQUIRED","external dependency changed",affected_uav_ids=decision.affected_uav_ids)
@@ -675,7 +719,22 @@ class FleetRecoveryController:
                 self._log("RECOVERY_COORDINATION_REQUIRED",episode,reason=reason,affected_uav_ids=list(affected))
             self._exit(episode,reason)
         elif episode.phase.startswith("REASSIGN"):
-            self._exit(episode,reason)
+            # A concurrent handoff may change only the global Fleet version.
+            # Discard this candidate and re-snapshot under the SAME episode's
+            # bounded budget; never publish it against refreshed metadata.
+            if (reason == "STALE_VERSION"
+                    and episode.reassign_attempts < self.config.max_reassign_attempts
+                    and self.clock() < episode.deadline_wall_s):
+                if episode.request_id:
+                    self.runner.cancel(episode.request_id, reason=reason)
+                episode.request_id = None
+                episode.context = None
+                episode.candidate = None
+                episode.phase = "REASSIGN_QUEUED"
+                episode.next_attempt_wall_s = self.clock() + self.config.retry_cooldown_s
+                self._log("RECOVERY_REASSIGNMENT_RETRY", episode, reason=reason)
+            else:
+                self._exit(episode,reason)
         elif reason in {"STALE_EPISODE","STALE_EVENT","STALE_EXECUTION","STALE_VERSION","STALE_STEP"}:
             # A late request cannot act on or fall back a newer execution.
             self._finish(episode,reason)
@@ -699,6 +758,7 @@ class FleetRecoveryController:
             self.runner.cancel(episode.request_id,reason=reason)
         episode.request_id=None
         episode.phase="REASSIGN_QUEUED"
+        episode.next_attempt_wall_s = self.clock()
         self.runtime._mark_local_failure(episode.assignment_id,reason)
         self._log("RECOVERY_ESCALATED",episode,reason=reason)
 

@@ -172,6 +172,8 @@ def build_fleet_task_spec_json_schema(
         properties = deepcopy(common_goal_properties)
         properties["goal_type"] = {"const": goal_type.value}
         properties["spatial_constraint"] = spatial_constraint
+        if goal_type is GoalType.TRACK_TARGET:
+            properties["completion_basis"] = {"type": "string", "enum": ["valid_execution", "continuous"]}
         return _object(properties, goal_required)
 
     # Keep the semantic distinction in the wire grammar.  In particular, a

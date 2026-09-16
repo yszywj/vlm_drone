@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 import unittest
 
 import numpy as np
@@ -218,6 +219,7 @@ class TrackSkillTest(unittest.TestCase):
             TrackGoal(target_id="target", max_target_lost_time=0.0),
             TrackGoal(target_id="target", timeout=0.0),
             TrackGoal(target_id="target", track_duration=0.0),
+            TrackGoal(target_id="target", completion_basis="elapsed"),
         )
         for invalid_goal in invalid_goals:
             with self.subTest(goal=invalid_goal):
@@ -645,16 +647,16 @@ class TrackSkillTest(unittest.TestCase):
         self.assertEqual(skill.get_feedback().progress, 1.0)
         np.testing.assert_array_equal(uav.get_velocity(), np.zeros(3))
 
-    def test_terminal_code_uses_the_earliest_absolute_deadline(self) -> None:
+    def test_missing_target_never_completes_by_elapsed_deadline(self) -> None:
         cases = (
             (
-                "completion first",
+                "elapsed completion is not execution evidence",
                 2.0,
                 2.0,
                 1.0,
                 3.0,
-                SkillStatus.SUCCEEDED,
-                SkillResultCode.TRACK_COMPLETE,
+                SkillStatus.FAILED,
+                SkillResultCode.TIMEOUT,
             ),
             (
                 "timeout first",
@@ -684,22 +686,22 @@ class TrackSkillTest(unittest.TestCase):
                 SkillResultCode.TIMEOUT,
             ),
             (
-                "completion and timeout tie",
+                "elapsed completion and timeout tie",
                 2.0,
                 1.0,
                 1.0,
                 1.0,
-                SkillStatus.SUCCEEDED,
-                SkillResultCode.TRACK_COMPLETE,
+                SkillStatus.FAILED,
+                SkillResultCode.TIMEOUT,
             ),
             (
-                "completion and loss tie",
+                "grace boundary remains running without progress",
                 1.0,
                 2.0,
                 1.0,
                 1.0,
-                SkillStatus.SUCCEEDED,
-                SkillResultCode.TRACK_COMPLETE,
+                SkillStatus.RUNNING,
+                None,
             ),
         )
         for (
@@ -751,7 +753,91 @@ class TrackSkillTest(unittest.TestCase):
                     ),
                     expected_status,
                 )
-                self.assertIs(skill.get_result().code, expected_code)
+                if expected_code is None:
+                    self.assertIsNone(skill.get_result())
+                else:
+                    self.assertIs(skill.get_result().code, expected_code)
+                self.assertEqual(skill.get_feedback().data["valid_execution_s"], 0.0)
+
+    def test_valid_and_continuous_progress_exclude_loss_grace(self) -> None:
+        for basis in ("valid_execution", "continuous"):
+            with self.subTest(basis=basis):
+                target = make_target("STATIC")
+                uav = make_uav((-6.0, 0.0, 8.0))
+                clock = ManualClock()
+                skill = TrackSkill()
+                skill.start(TrackGoal(target_id="target", track_duration=2.0,
+                                      max_target_lost_time=5.0, completion_basis=basis),
+                            make_context(uav, clock))
+                for timestamp, visible in ((0, True), (1, True), (2, False), (3, True)):
+                    clock.time_s = timestamp
+                    self.assertIs(skill.tick(make_observation(uav, clock, target.get_pose(),
+                                                             target.get_velocity(), visible=visible)),
+                                  SkillStatus.RUNNING)
+                progress = skill.get_feedback().data
+                self.assertEqual(progress["elapsed_s"], 3.0)
+                self.assertEqual(progress["valid_execution_s"], 1.0)
+                self.assertEqual(progress["continuous_execution_s"], 0.0)
+                clock.time_s = 4.0
+                status = skill.tick(make_observation(uav, clock, target.get_pose(), target.get_velocity(), visible=True))
+                if basis == "continuous":
+                    self.assertIs(status, SkillStatus.RUNNING)
+                    clock.time_s = 5.0
+                    status = skill.tick(make_observation(uav, clock, target.get_pose(), target.get_velocity(), visible=True))
+                self.assertIs(status, SkillStatus.SUCCEEDED)
+                result = skill.get_result().data
+                self.assertEqual(result["progress_schema"], "track_progress.v1")
+                self.assertEqual(result["completion_basis"], basis)
+                self.assertEqual(result["required_duration_s"], 2.0)
+                self.assertEqual(result["continuous_execution_s"], 2.0 if basis == "continuous" else 1.0)
+
+    def test_duplicate_and_predicted_samples_do_not_earn_credit(self) -> None:
+        target = make_target("STATIC")
+        uav = make_uav((-6.0, 0.0, 8.0))
+        clock = ManualClock()
+        skill = TrackSkill()
+        skill.start(TrackGoal(target_id="target", track_duration=1.0, max_target_lost_time=5.0), make_context(uav, clock))
+        first = make_observation(uav, clock, target.get_pose(), target.get_velocity(), visible=True)
+        skill.tick(first)
+        clock.time_s = 1.0
+        self.assertIs(skill.tick(first), SkillStatus.RUNNING)
+        self.assertEqual(skill.get_feedback().data["valid_execution_s"], 0.0)
+        clock.time_s = 2.0
+        predicted = make_observation(uav, clock, target.get_pose(), target.get_velocity(), visible=True)
+        predicted.validate()
+        predicted = replace(predicted, target_estimate=replace(predicted.target_estimate, visible=False, predicted_only=True))
+        self.assertIs(skill.tick(predicted), SkillStatus.RUNNING)
+        self.assertEqual(skill.get_feedback().data["valid_execution_s"], 0.0)
+        self.assertEqual(skill.get_feedback().data["continuous_execution_s"], 0.0)
+
+    def test_replayed_measurement_inside_new_frames_cannot_bridge_continuous_gap(self) -> None:
+        target = make_target("STATIC")
+        uav = make_uav((-6.0, 0.0, 8.0))
+        clock = ManualClock()
+        skill = TrackSkill()
+        skill.start(TrackGoal(target_id="target", track_duration=2.0,
+            completion_basis="continuous", max_target_lost_time=5.0), make_context(uav, clock))
+        first = make_observation(uav, clock, target.get_pose(), target.get_velocity(), visible=True)
+        skill.tick(first)
+        clock.time_s = 1.0
+        replay = replace(first, timestamp=1.0)
+        self.assertIs(skill.tick(replay), SkillStatus.RUNNING)
+        clock.time_s = 2.0
+        fresh = make_observation(uav, clock, target.get_pose(), target.get_velocity(), visible=True)
+        self.assertIs(skill.tick(fresh), SkillStatus.RUNNING)
+        self.assertEqual(skill.get_feedback().data["valid_execution_s"], 0.0)
+        self.assertEqual(skill.get_feedback().data["continuous_execution_s"], 0.0)
+
+    def test_visible_progress_completion_wins_timeout_tie(self) -> None:
+        target = make_target("STATIC")
+        uav = make_uav((-6.0, 0.0, 8.0))
+        clock = ManualClock()
+        skill = TrackSkill()
+        skill.start(TrackGoal(target_id="target", track_duration=1.0, timeout=1.0), make_context(uav, clock))
+        skill.tick(make_observation(uav, clock, target.get_pose(), target.get_velocity(), visible=True))
+        clock.time_s = 1.0
+        self.assertIs(skill.tick(make_observation(uav, clock, target.get_pose(), target.get_velocity(), visible=True)), SkillStatus.SUCCEEDED)
+        self.assertEqual(skill.get_result().data["valid_execution_s"], 1.0)
 
     def test_optional_timeout_fails_and_stops(self) -> None:
         target = make_target("STATIC")

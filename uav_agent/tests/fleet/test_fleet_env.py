@@ -572,8 +572,10 @@ def test_reset_clears_all_snapshot_camera_and_evaluator_caches() -> None:
     assert environment.get_fleet_pose_snapshot().tick_index == 1
 
     sensors = tuple(environment.camera_sensors.values())
+    old_reference = environment.recovery_reference_version
     environment._last_camera_timestamps_s = {"uav_a": 0.1, "uav_b": 0.1}
     environment.reset(target_seeds={"target_i": 11, "target_j": 12})
+    assert environment.recovery_reference_version == old_reference + 1
 
     assert environment.latest_agent_observations == {}
     assert environment.latest_evaluator_frames == {}
@@ -584,6 +586,21 @@ def test_reset_clears_all_snapshot_camera_and_evaluator_caches() -> None:
     assert environment.last_tick_order == ()
     assert all(sensor.invalidations >= 2 for sensor in sensors)
     assert "reset_world" in events
+
+
+def test_fleet_observation_binds_pose_frame_and_reference_epoch():
+    environment, snapshot = _camera_batch_environment(1.2, 1.2)
+    environment._refresh_all_observations(snapshot)
+    first = environment.get_skill_observation("uav_a")
+    assert first.pose_timestamp_s == snapshot.timestamp_s
+    assert first.time_domain == "simulation"
+    assert first.frame_id.startswith("fleet_0_")
+    environment.invalidate_recovery_reference()
+    assert not environment.latest_agent_observations
+    environment._refresh_all_observations(snapshot)
+    second = environment.get_skill_observation("uav_a")
+    assert second.frame_id.startswith("fleet_1_")
+    assert second.frame_id != first.frame_id
 
 
 def test_close_destroys_every_camera_before_clearing_owned_state() -> None:

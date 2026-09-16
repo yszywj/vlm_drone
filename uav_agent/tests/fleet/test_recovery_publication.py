@@ -163,6 +163,44 @@ def test_environment_prepare_failure_does_not_publish_or_cancel_source():
     assert env.committed_maps == []
 
 
+@pytest.mark.parametrize("candidate_uses_source_frame", [True, False])
+def test_publication_independently_checks_source_relative_region(candidate_uses_source_frame):
+    from planner.schemas import LandingZoneSpec, PlannerWorldContext
+    from planner.spatial import CircleRegion
+    runtime, env, old, _, source = _runtime()
+    relative = CircleRegion("HOME_ENU", (3, 4, 0), 5)
+    source = replace(source, search_region=relative)
+    row = runtime.assignments.by_id(source.assignment_id)
+    runtime.assignments._records[source.assignment_id] = replace(row, assignment=source)
+    runtime._plan = replace(runtime._plan, assignments=tuple(
+        source if item.assignment_id == source.assignment_id else item for item in runtime._plan.assignments))
+    runtime._request = replace(runtime._request, target_requests=tuple(
+        replace(item, search_region=relative) if item.target_alias == source.target_alias else item
+        for item in runtime._request.target_requests))
+    home = next(item.home_name for item in runtime._request.uav_inventory if item.uav_id == source.uav_id)
+    context = PlannerWorldContext((-100, -100, 0), (100, 100, 30), (-20, 10, 0), {},
+        {home: LandingZoneSpec(home, (-20, 10))}, 10, 10, 60)
+    runtime._agent_start_inputs[source.uav_id] = ("original source task", context)
+    publication, candidate = _publication(runtime, source)
+    expected = CircleRegion("WORLD_ENU", (-17, 14, 0), 5)
+    region = expected if candidate_uses_source_frame else CircleRegion("WORLD_ENU", (43, 4, 0), 5)
+    item = publication.replacements[0]
+    publication = replace(publication, replacements=(replace(item,
+        replacement_assignment=replace(item.replacement_assignment, search_region=region)),))
+    before = _published_state(runtime, env)
+    if candidate_uses_source_frame:
+        runtime._publish_fleet_replan(source.assignment_id, publication)
+        assert runtime.assignments.for_uav("uav_c").assignment.search_region == expected
+        assert next(item for item in runtime._request.target_requests
+                    if item.target_alias == source.target_alias).search_region == expected
+    else:
+        with pytest.raises(FleetRuntimeError, match="contract|region|rewrite|semantics"):
+            runtime._publish_fleet_replan(source.assignment_id, publication)
+        assert _published_state(runtime, env) == before
+        assert old.cancels == 0
+        assert candidate.started == 0
+
+
 def test_target_bind_failure_stays_in_staging_registry(monkeypatch):
     runtime, env, old, _, source = _runtime()
     publication, candidate = _publication(runtime, source)

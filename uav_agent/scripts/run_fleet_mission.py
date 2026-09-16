@@ -919,6 +919,7 @@ def _build_runtime_replan_request_v2(
     available_uav_ids: Sequence[str],
     world_belief: object,
     external_dependencies: Sequence[object] = (),
+    task_spec: FleetTaskSpecV1 | None = None,
 ) -> FleetMissionRequestV2:
     if prepared.task_spec is None or prepared.fleet_request_v2 is None:
         raise FleetLaunchConfigurationError(
@@ -966,7 +967,7 @@ def _build_runtime_replan_request_v2(
     return replace(
         prepared.fleet_request_v2,
         fleet_plan_version=base_version + 1,
-        task_spec=_subset_task_spec_for_replan(prepared.task_spec, goal_ids,
+        task_spec=_subset_task_spec_for_replan(task_spec or prepared.task_spec, goal_ids,
                                                external_dependencies=external_dependencies),
         uav_inventory=tuple(
             replace(item, available=item.uav_id in available)
@@ -1076,7 +1077,9 @@ def _build_runtime_fleet_replan_handler(
         assignment.assignment_id: assignment
         for assignment in prepared.fleet_plan_v2.assignments
     }
-    attempted_sources: set[str] = set()
+    active_task_specs = {key: prepared.task_spec for key in active_v2}
+    active_contexts = dict(getattr(prepared, "world_contexts", {}))
+    attempted_sources: set[tuple[str, str | None]] = set()
     runtime_context = prepared.preparation_context
     if runtime_context is None:
         runtime_context = {}
@@ -1094,14 +1097,23 @@ def _build_runtime_fleet_replan_handler(
             pass
 
     def snapshot_request(record, world_belief, *, remaining_goal_ids=None, external_dependencies=(),
-                         deadline_wall_s=None, wall_clock=None):
+                         deadline_wall_s=None, wall_clock=None, recovery_request_id=None,
+                         remaining_goals=None, source_compiled_mission=None):
         source_runtime = getattr(record, "assignment", None)
         source_id = getattr(source_runtime, "assignment_id", None)
         if not isinstance(source_runtime, FleetAssignment) or source_id not in active_v2:
             raise FleetLaunchConfigurationError("Fleet replan lacks trusted source mapping")
-        if source_id in attempted_sources:
+        # The legacy caller has one attempt per source. The enabled recovery
+        # owner may retry a stale Fleet snapshot with a NEW request identity,
+        # under its episode budget/cooldown/deadline. Duplicate requests never
+        # receive another attempt.
+        if recovery_request_id is not None and (
+                not isinstance(recovery_request_id, str) or not recovery_request_id.strip()):
+            raise FleetLaunchConfigurationError("Fleet replan requires a valid recovery request identity")
+        attempt_key = (source_id, recovery_request_id)
+        if attempt_key in attempted_sources:
             raise FleetLaunchConfigurationError("Fleet replan budget exhausted")
-        attempted_sources.add(source_id)
+        attempted_sources.add(attempt_key)
         source_v2 = active_v2[source_id]
         raw_agents = getattr(world_belief, "agents", {})
         occupied = set(raw_agents) if isinstance(raw_agents, Mapping) else set()
@@ -1110,10 +1122,40 @@ def _build_runtime_fleet_replan_handler(
             if item.available and item.uav_id not in occupied
         )
         goals = source_v2.goal_ids if remaining_goal_ids is None else tuple(remaining_goal_ids)
+        task = active_task_specs[source_id]
+        if remaining_goals is not None:
+            pending = {goal.goal_id: goal for goal in remaining_goals}
+            if set(pending) != set(goals) or not set(pending).issubset(source_v2.goal_ids):
+                raise FleetLaunchConfigurationError("remaining goal evidence differs from source assignment")
+            for goal_id, goal in pending.items():
+                original_goal = task.goal(goal_id)
+                if replace(goal, duration_s=original_goal.duration_s) != original_goal:
+                    raise FleetLaunchConfigurationError("remaining goals changed protected task semantics")
+                if original_goal.duration_s is not None and (
+                        goal.duration_s is None or not 0 < goal.duration_s <= original_goal.duration_s):
+                    raise FleetLaunchConfigurationError("remaining duration is not supported by the original task")
+            task = replace(task,
+                goals=tuple(pending.get(goal.goal_id, goal) for goal in task.goals),
+                termination_goals=tuple(pending.get(goal.goal_id, goal) for goal in task.termination_goals))
         request_v2 = _build_runtime_replan_request_v2(
             prepared, goal_ids=goals, available_uav_ids=available_uavs,
             world_belief=world_belief, external_dependencies=external_dependencies,
+            task_spec=task,
         )
+        from fleet.handoff import freeze_handoff_task
+        source_context = active_contexts.get(source_runtime.uav_id)
+        if not isinstance(source_context, PlannerWorldContext):
+            raise FleetLaunchConfigurationError("Fleet handoff lacks the trusted original spatial reference")
+        source_home = next(item.home_name for item in request_v2.uav_inventory
+                           if item.uav_id == source_runtime.uav_id)
+        resolver = _spatial_resolver(source_context, source_home)
+        from planner.spatial import NamedLocationTarget
+        if any(isinstance(goal.spatial_constraint, NamedLocationTarget) for goal in request_v2.task_spec.goals):
+            if source_compiled_mission is None:
+                raise FleetLaunchConfigurationError("named handoff goal needs the trusted source executable position")
+        request_v2 = replace(request_v2, task_spec=freeze_handoff_task(
+            request_v2.task_spec, resolver, compiled_mission=source_compiled_mission))
+        source_world_region = resolver.resolve_region(source_runtime.search_region)
         from fleet.runtime import AssignmentRuntimeRecord
         frozen_record = AssignmentRuntimeRecord(source_runtime,
             required=getattr(record, "required", True),
@@ -1121,10 +1163,10 @@ def _build_runtime_fleet_replan_handler(
             local_plan_version=record.local_plan_version,
             last_error=getattr(record, "last_error", None))
         return (frozen_record, source_runtime, source_id, source_v2, available_uavs, request_v2, tuple(external_dependencies),
-                deadline_wall_s, wall_clock)
+                deadline_wall_s, wall_clock, source_world_region)
 
     def compute_candidate(snapshot):
-        record, source_runtime, source_id, source_v2, available_uavs, request_v2, external_dependencies, deadline_wall_s, wall_clock = snapshot
+        record, source_runtime, source_id, source_v2, available_uavs, request_v2, external_dependencies, deadline_wall_s, wall_clock, source_world_region = snapshot
         if deadline_wall_s is None:
             runtime_clients = client_factory
         else:
@@ -1404,6 +1446,7 @@ def _build_runtime_fleet_replan_handler(
             source_runtime,
             assignment_id=assignment_v2.assignment_id,
             uav_id=uav_id,
+            search_region=source_world_region,
         )
         route = _build_planned_routes(
             contexts,
@@ -1464,6 +1507,9 @@ def _build_runtime_fleet_replan_handler(
             plan=compilation.planner_output.to_dict()))
         active_v2.pop(source_id, None)
         active_v2[candidate["runtime_assignment"].assignment_id] = candidate["assignment_v2"]
+        active_task_specs.pop(source_id, None)
+        active_task_specs[candidate["runtime_assignment"].assignment_id] = request_v2.task_spec
+        active_contexts[uav_id] = candidate["world_context"]
         if len(raw_history) < 64:
             raw_history.append(
                 {
@@ -1507,6 +1553,7 @@ def _build_runtime_fleet_replan_handler(
     handler.prepare_candidate = prepare_candidate
     handler.committed = committed
     handler.active_assignments = active_v2
+    handler.active_task_specs = active_task_specs
     return handler
 
 
@@ -2198,20 +2245,9 @@ class _FleetSimulationClock:
 
 
 def _spatial_resolver(context: PlannerWorldContext, home_name: str) -> object:
-    from planner.spatial_resolver import FramePose, SpatialResolver
+    from fleet.handoff import task_spatial_resolver
 
-    home = context.landing_zones[home_name]
-    home_xyz = (
-        home.position_xy_m[0],
-        home.position_xy_m[1],
-        home.ground_altitude_m,
-    )
-    start = FramePose(context.initial_uav_xyz_m, 0.0)
-    return SpatialResolver(
-        home_pose=FramePose(home_xyz, 0.0),
-        uav_start_pose=start,
-        named_locations={home_name: home_xyz},
-    )
+    return task_spatial_resolver(context, home_name)
 
 
 def _build_fleet_recovery_controller(prepared, *, broker, geometry_provider,

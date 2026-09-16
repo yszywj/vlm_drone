@@ -20,6 +20,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
+from time import monotonic
 from typing import Sequence
 
 
@@ -3113,7 +3114,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 world_context=world_context,
                 safety_preflight=safety,
                 original_instruction=args.instruction,
-                clock=clock.now,
+                # Request/cooldown deadlines keep advancing when physics pauses.
+                # Observation timestamps remain bound inside WorldBelief/request.
+                clock=monotonic,
                 request_timeout_s=config.model_worker.request_timeout_s,
             )
             visual_runtime.revision_coordinator = plan_revision_coordinator

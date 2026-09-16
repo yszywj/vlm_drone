@@ -738,6 +738,22 @@ class PlanRevisionCoordinatorTest(unittest.TestCase):
                 self.assertEqual(self.manager.task_plan.to_dict(), before)
                 self.assertFalse(self.manager.is_supervisory_paused)
 
+    def test_validation_crossing_deadline_cannot_publish(self) -> None:
+        _event_value, belief = self._submit()
+        before = self.manager.task_plan.to_dict()
+        self.worker.complete(_revision_payload())
+        original = self.revision_validator.validate_and_apply
+        def slow_validation(*args, **kwargs):
+            result = original(*args, **kwargs)
+            self.clock.value = 15.0
+            return result
+        self.revision_validator.validate_and_apply = slow_validation
+        result = self.coordinator.tick(current_plan=self.plan, world_belief=belief)
+        self.assertIs(result.state, PlanRevisionState.TIMED_OUT)
+        self.assertEqual(self.manager.replace_count, 0)
+        self.assertEqual(self.manager.task_plan.to_dict(), before)
+        self.assertEqual(self.manager.resume_count, 1)
+
     def test_timeout_uses_trusted_resume_or_cancel_land_fallback(self) -> None:
         _event_value, belief = self._submit()
         self.clock.value = 15.0

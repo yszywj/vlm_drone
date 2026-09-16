@@ -550,7 +550,10 @@ class SkillManagerTaskTest(unittest.TestCase):
             "last_seen_position": (11.0, 12.0, 0.5),
             "last_seen_velocity": (0.4, -0.2, 0.0),
             "last_seen_time": 3.5,
-            "tracking_duration": 1.25,
+            "tracking_duration": 4.0,
+            "progress_schema": "track_progress.v1", "elapsed_s": 4.0,
+            "valid_execution_s": 1.25, "continuous_execution_s": 0.0,
+            "completion_basis": "valid_execution", "required_duration_s": 5.0,
         }
         overrides = {
             SkillName.TRACK: [

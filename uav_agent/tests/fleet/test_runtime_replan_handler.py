@@ -5,9 +5,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from configs.loader import load_config
 from experiments.planning_audit_logger import PlanningAuditLogger
 from fleet.runtime import FleetReplanPublication, ReplannedAssignment
+from fleet.request_builder import build_agent_world_contexts_v2
 from fleet.types_v2 import (
     AssignmentDeviation,
     FleetAssignmentV2,
@@ -15,6 +18,7 @@ from fleet.types_v2 import (
 )
 from models.adapter_registry import ModelCallRole
 from planner.policy import PlannerLimits, PlannerPolicy
+from planner.spatial import CircleRegion, CoordinateFrame
 from scripts.run_fleet_mission import (
     _build_runtime_fleet_replan_handler,
     _finalize_bounded_results,
@@ -112,6 +116,7 @@ def _prepared():
         fleet_plan_v2=plan_v2,
         request=runtime_request,
         plan=runtime_plan,
+        world_contexts=build_agent_world_contexts_v2(config, request_v2, plan_v2),
         model_client_factory=_ClientFactory(),
         local_planner_source="dynamic_llm",
         planner_limits=limits,
@@ -421,3 +426,72 @@ def test_terminal_goal_metrics_follow_successful_runtime_reassignment() -> None:
     }
     assert {item.uav_id for item in recorder.goals} == {"uav_b"}
     assert all(item.completed for item in recorder.goals)
+
+
+def test_handoff_compiles_original_home_region_and_spares_own_return_home(tmp_path):
+    prepared = _prepared()
+    original_region = CircleRegion("HOME_ENU", (20, 20, 0), 5)
+    task = replace(prepared.task_spec, goals=(
+        replace(prepared.task_spec.goals[0], spatial_constraint=original_region),
+        prepared.task_spec.goals[1],
+    ))
+    prepared.task_spec = task
+    prepared.fleet_request_v2 = replace(prepared.fleet_request_v2, task_spec=task)
+    prepared.request, prepared.plan = _lower_v2_target_plan_for_runtime(
+        prepared.config, prepared.fleet_request_v2, prepared.fleet_plan_v2)
+    source = prepared.plan.assignments[0]
+    record = SimpleNamespace(assignment=source, local_plan_version=1)
+    belief = SimpleNamespace(fleet_plan_version=1, agents={
+        "uav_a": SimpleNamespace(status="WAITING_REASSIGNMENT")})
+    local = _GoalDrivenSpatialPlanner()
+    handler = _build_runtime_fleet_replan_handler(
+        prepared, audit=PlanningAuditLogger(tmp_path), agent_factory=lambda *args: None,
+        fleet_planner_factory=lambda client: _FleetReplanner(),
+        local_planner_factory=lambda client, uav_id: local,
+    )
+    candidate = handler.compute_candidate(handler.snapshot_request(
+        record, belief, recovery_request_id="request_handoff"))
+    expected = CircleRegion("WORLD_ENU", (17, 20, 0), 5)
+    assert candidate["request_v2"].task_spec.goals[0].spatial_constraint == expected
+    assert candidate["runtime_assignment"].search_region == expected
+    focused = json.loads(local.requests[0].instruction)
+    assert focused["assigned_goals"][0]["spatial_constraint"] == expected.to_dict()
+    assert focused["own_home"] == "home_b"
+    runtime_plan = candidate["compilation"].compiled_mission.task_plan
+    home_step = next(step for step in runtime_plan.steps if step.step_id == "goto_home")
+    assert tuple(home_step.params["position"][:2]) == (3.0, 0.0)
+    assert source.search_region == original_region
+    assert handler.active_task_specs[source.assignment_id] == task
+    handler.committed(candidate, None)
+    replacement_id = candidate["assignment_v2"].assignment_id
+    assert handler.active_task_specs[replacement_id].goals[0].spatial_constraint == expected
+
+
+def test_handoff_without_original_context_rejects_before_model_call(tmp_path):
+    prepared = _prepared()
+    prepared.world_contexts = {}
+    handler = _build_runtime_fleet_replan_handler(
+        prepared, audit=PlanningAuditLogger(tmp_path), agent_factory=lambda *args: None,
+        fleet_planner_factory=lambda client: _FleetReplanner())
+    record = SimpleNamespace(assignment=prepared.plan.assignments[0], local_plan_version=1)
+    belief = SimpleNamespace(fleet_plan_version=1, agents={"uav_a": SimpleNamespace(status="FAILED")})
+    with pytest.raises(ValueError, match="trusted original spatial reference"):
+        handler.snapshot_request(record, belief)
+    assert prepared.model_client_factory.roles == []
+
+
+def test_new_owner_request_can_refresh_stale_fleet_snapshot_but_duplicate_cannot(tmp_path):
+    prepared = _prepared()
+    handler = _build_runtime_fleet_replan_handler(
+        prepared, audit=PlanningAuditLogger(tmp_path), agent_factory=lambda *args: None,
+        fleet_planner_factory=lambda client: _FleetReplanner())
+    record = SimpleNamespace(assignment=prepared.plan.assignments[0], local_plan_version=1)
+    belief = SimpleNamespace(fleet_plan_version=1, agents={"uav_a": SimpleNamespace(status="FAILED")})
+    first = handler.snapshot_request(record, belief, recovery_request_id="request_first")
+    with pytest.raises(ValueError, match="budget exhausted"):
+        handler.snapshot_request(record, belief, recovery_request_id="request_first")
+    belief.fleet_plan_version = 2
+    refreshed = handler.snapshot_request(record, belief, recovery_request_id="request_refreshed")
+    assert first[5].fleet_plan_version == 2
+    assert refreshed[5].fleet_plan_version == 3
+    assert prepared.model_client_factory.roles == []

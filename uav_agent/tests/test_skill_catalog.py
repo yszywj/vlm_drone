@@ -105,6 +105,7 @@ class SkillCatalogTest(unittest.TestCase):
                 "desired_altitude_m",
                 "desired_distance_m",
                 "on_target_lost",
+                "completion_basis",
             },
             "REACQUIRE": {"max_attempts", "search_radius_m", "timeout_s"},
             "LAND": {"zone", "yaw_mode", "yaw_deg"},

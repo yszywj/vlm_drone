@@ -31,6 +31,9 @@ class AgentObservation:
     camera_orientation_wxyz: np.ndarray
     camera_timestamp_s: float
     camera_sample: CameraSample | None = None
+    pose_timestamp_s: float | None = None
+    frame_id: str | None = None
+    time_domain: str = "simulation"
 
 
 @dataclass(frozen=True)

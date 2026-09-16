@@ -925,6 +925,11 @@ class PlanValidator:
                     "track_duration": duration,
                     "timeout": duration + self.TRUSTED_TRACK_TIMEOUT_GRACE_S,
                 }
+                if "completion_basis" in args:
+                    basis = args["completion_basis"]
+                    if basis not in {"valid_execution", "continuous"}:
+                        raise PlanValidationError("TRACK completion_basis must be valid_execution or continuous")
+                    params["completion_basis"] = basis
                 compiled_recovery, recovery_note = self._compile_track_recovery(
                     args=args,
                     recovery=recovery,
@@ -1569,6 +1574,11 @@ class PlanValidator:
                     "track_duration": duration,
                     "timeout": duration + self.TRUSTED_TRACK_TIMEOUT_GRACE_S,
                 }
+                if "completion_basis" in args:
+                    basis = args["completion_basis"]
+                    if basis not in {"valid_execution", "continuous"}:
+                        raise PlanValidationError("TRACK completion_basis must be valid_execution or continuous")
+                    params["completion_basis"] = basis
                 current_altitude = desired_altitude
                 compiled_recovery, recovery_note = self._compile_track_recovery(
                     args=args,

@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import json
-from math import dist, isfinite
+from math import isfinite
 from threading import get_ident
 from time import monotonic
 from typing import Callable
@@ -17,9 +17,11 @@ from common.ids import generate_routing_id
 from configs.schema import FleetRecoveryConfig
 from fleet.airspace_manager import FleetAirspaceManager, FleetPoseSnapshot, coerce_fleet_pose_snapshot
 from fleet.local_repair import (
-    LocalRepairCandidate, LocalRepairContextV3, LocalRepairDraftV3, LocalRepairError, RepairAnchor,
-    SkillExecutionEvidence, assess_remaining_goals, check_external_dependencies,
-    build_local_repair_json_schema, extract_external_dependencies, validate_local_repair,
+    DependencyVerdict, LocalRepairCandidate, LocalRepairContextV3, LocalRepairDraftV3, LocalRepairError,
+    RepairAnchor, SkillExecutionEvidence, SpatialReferenceVerdict, Transferability,
+    build_remaining_task_contract, check_cross_uav_dependencies, evaluate_spatial_reference,
+    build_local_repair_json_schema, extract_external_dependencies, reproject_world_route,
+    validate_local_repair,
 )
 from fleet.model_request_broker import ModelBrokerRequest, ModelRequestPriority
 from fleet.model_request_dispatcher import BrokeredTextTaskRunner
@@ -202,22 +204,23 @@ class FleetRecoveryController:
                     continue
                 goals = tuple(self._task_spec_for(assignment_id).goal(goal) for goal in assignment.goal_ids)
                 completed = tuple(step.step_id for step in state.task_plan.steps[:state.current_step_index])
-                assessment = assess_remaining_goals(goals, original.planner_output, completed,
+                contract = build_remaining_task_contract(goals, original.planner_output, completed,
                     self._evidence(state), current_step_id=state.current_step_id,
-                    current_step_started=True, home_name=self.home_names[record.assignment.uav_id])
-                for goal in assessment.pending_goals:
+                    current_step_started=True, home_name=self.home_names[record.assignment.uav_id],
+                    consumer="FLEET_STATE")
+                for goal in contract.pending_goals:
                     states[goal.goal_id] = "PENDING"
                     # Owner-produced assignment/version evidence, not a model
                     # completion claim. ACTIVE below removes this permission.
                     refs[goal.goal_id] = (f"pending_{assignment_id}_v{record.local_plan_version}",)
-                for goal_id in assessment.confirmed_goal_ids:
+                for entry in contract.goals:
+                    if entry.status != "CONFIRMED":
+                        continue
+                    goal_id = entry.goal_id
                     states[goal_id] = "CONFIRMED"
-                    from fleet.local_repair import _goal_steps
-                    goal_steps = {step.id for step in _goal_steps(
-                        self._task_spec_for(assignment_id).goal(goal_id),
-                        original.planner_output.steps, self.home_names[record.assignment.uav_id])}
-                    refs[goal_id] = tuple(e.invocation_id for e in self._evidence(state)
-                                          if e.step_id in completed and e.step_id in goal_steps)
+                    # Terminal invocation references only; a confirmed goal
+                    # without them keeps no stable owner evidence downstream.
+                    refs[goal_id] = entry.evidence_refs
                 # Incomplete/active external successors must not be called pending.
                 if state.current_step_id is not None:
                     from fleet.local_repair import _goal_steps
@@ -372,17 +375,20 @@ class FleetRecoveryController:
             raise LocalRepairError("ROUTING_MISMATCH", "candidate does not belong to the admitted request")
         episode.phase = "LOCAL_VALIDATING"
         self._log("RECOVERY_MODEL_COMPLETED", episode)
-        self._check_local_live(episode)
-        self._check_space(record.assignment.uav_id, candidate.world_route, episode.context)
-        self._log("RECOVERY_VALIDATION_COMPLETED", episode)
         # Agent repeats its Safety preflight, then invokes this final guard,
         # then performs its own event/version/hold comparison before publish.
+        # A REPROJECTABLE reference reconnects the live position onto the
+        # admitted WORLD route by trusted code only; no new model request.
         def guard():
             self._check_local_live(episode)
-            self._check_space(record.assignment.uav_id, candidate.world_route, episode.context)
+            route = self._admitted_route(episode, candidate.world_route)
+            self._check_space(record.assignment.uav_id, route, episode.context)
             self._check_local_live(episode)
+            return tuple(route)
+        route = guard()
+        self._log("RECOVERY_VALIDATION_COMPLETED", episode)
         with self.runtime._recovery_commit_lock:
-            guard()
+            route = guard()
             try:
                 agent.commit_local_repair(candidate.task_plan, expected_event_id=episode.event_id,
                     expected_plan_version=episode.base_version, compiled_mission=candidate.compiled_mission,
@@ -393,7 +399,7 @@ class FleetRecoveryController:
                 # must publish matching metadata even on that exception path.
                 published = agent.local_repair_snapshot.task_plan
                 if published is not None and published.to_dict() == candidate.task_plan.to_dict():
-                    self.runtime._planned_routes[record.assignment.uav_id] = candidate.world_route
+                    self.runtime._planned_routes[record.assignment.uav_id] = route
                     self.runtime._route_progress[record.assignment.uav_id] = 0
                     from fleet.runtime import AssignmentStatus
                     self.runtime.assignments.update(episode.assignment_id, AssignmentStatus.RUNNING,
@@ -442,11 +448,14 @@ class FleetRecoveryController:
             external_dependencies=deps, dependency_versions=versions, home_name=self.home_names[uav],
             max_suffix_steps=min(self.config.max_suffix_steps, 10),
             ordering_constraints=self.task_spec.ordering_constraints)
-        check = check_external_dependencies(deps, deps, versions, versions)
+        check = check_cross_uav_dependencies(deps, deps, versions, versions)
+        if check.verdict is DependencyVerdict.INVALID:
+            raise LocalRepairError("DEPENDENCY_INVALID", ";".join(check.reasons), affected_uav_ids=check.affected_uav_ids)
         if not check.allowed:
             raise LocalRepairError("COORDINATION_REQUIRED", ";".join(check.reasons), affected_uav_ids=check.affected_uav_ids)
-        if not context.assessment.supported:
-            raise LocalRepairError("EVIDENCE_INSUFFICIENT", ";".join(context.assessment.reasons))
+        contract = context.remaining_task_contract
+        if not contract.supported:
+            raise LocalRepairError("EVIDENCE_INSUFFICIENT", ";".join(contract.assessment.reasons))
         episode.context = context
         episode.submitted_wall_s = self.clock()
         episode.phase = "LOCAL_INFLIGHT"
@@ -474,14 +483,45 @@ class FleetRecoveryController:
         named[self.home_names[uav]] = home_pose.xyz_m
         return SpatialResolver(home_pose=home_pose, uav_start_pose=start, named_locations=named)
 
+    def _reference_validity(self, episode):
+        """Code-only spatial-reference verdict for the episode's frozen anchor."""
+        context = episode.context
+        state = self._state(episode)[2]
+        observation = state.latest_observation
+        if observation is None:
+            return SpatialReferenceValidity(SpatialReferenceVerdict.INVALID,
+                                            ("OBSERVATION_UNAVAILABLE",), "OBSERVATION_TIME_MISMATCH")
+        pose_stamp = getattr(observation, "pose_timestamp_s", None)
+        pose_stamp = float(observation.timestamp) if pose_stamp is None else float(pose_stamp)
+        pose = observation.uav_pose
+        geometry = self.geometry_provider()
+        return evaluate_spatial_reference(
+            context.anchor, observation_time_s=float(observation.timestamp), pose_time_s=pose_stamp,
+            time_domain=getattr(observation, "time_domain", "simulation"),
+            current_pose_xyz_m=(pose.x, pose.y, pose.z),
+            now_wall_s=self.clock(), submitted_wall_s=context.submitted_wall_s,
+            max_anchor_age_s=self.config.max_anchor_age_s,
+            max_pose_time_error_s=self.config.max_pose_time_error_s,
+            max_hold_drift_m=self.config.max_hold_drift_m,
+            valid_pose_tolerance_m=self.config.valid_pose_tolerance_m,
+            map_version=int(geometry["map_version"]), reference_version=int(geometry["reference_version"]))
+
+    def _admitted_route(self, episode, admitted_route):
+        """VALID keeps the admitted route; REPROJECTABLE reconnects by trusted code."""
+        validity = self._reference_validity(episode)
+        if validity.verdict is SpatialReferenceVerdict.INVALID:
+            raise LocalRepairError(validity.code or "REFERENCE_CHANGED", ";".join(validity.reasons))
+        if validity.verdict is SpatialReferenceVerdict.VALID:
+            return tuple(admitted_route)
+        pose = self._state(episode)[2].latest_observation.uav_pose
+        return reproject_world_route(admitted_route, (pose.x, pose.y, pose.z))
+
     def _check_local_live(self, episode):
         context = episode.context
         if context is None or self.episodes.get(episode.assignment_id) is not episode:
             raise LocalRepairError("STALE_EPISODE", "episode no longer owns this result")
         if self.runtime.cancel_requested or self.clock() >= min(episode.deadline_wall_s, context.deadline_wall_s):
             raise LocalRepairError("DEADLINE_OR_CANCEL", "candidate lost execution eligibility")
-        if self.clock() - context.submitted_wall_s > self.config.max_anchor_age_s:
-            raise LocalRepairError("ANCHOR_EXPIRED", "bound reference is too old")
         record, agent, state = self._state(episode)
         if state.event is None or state.event.event_id != episode.event_id:
             raise LocalRepairError("STALE_EVENT", "safe wait no longer belongs to this fault")
@@ -492,22 +532,14 @@ class FleetRecoveryController:
         if state.current_step_id != context.current_step_id or state.task_plan.plan_version != episode.base_version:
             raise LocalRepairError("STALE_STEP", "authorized step has changed")
         deps, versions = self._dependencies(episode.assignment_id)
-        decision = check_external_dependencies(context.external_dependencies, deps, context.dependency_versions, versions)
+        decision = check_cross_uav_dependencies(context.external_dependencies, deps, context.dependency_versions, versions)
+        if decision.verdict is DependencyVerdict.INVALID:
+            raise LocalRepairError("DEPENDENCY_INVALID", ";".join(decision.reasons), affected_uav_ids=decision.affected_uav_ids)
         if not decision.allowed:
             raise LocalRepairError("COORDINATION_REQUIRED", ";".join(decision.reasons), affected_uav_ids=decision.affected_uav_ids)
-        observation = state.latest_observation
-        if observation is None or float(observation.timestamp) < context.anchor.observation_time_s:
-            raise LocalRepairError("OBSERVATION_TIME_MISMATCH", "observation time moved backwards")
-        if getattr(observation, "time_domain", "simulation") != context.anchor.time_domain:
-            raise LocalRepairError("REFERENCE_CHANGED", "observation time domain changed")
-        pose_stamp = getattr(observation, "pose_timestamp_s", None)
-        pose_stamp = float(observation.timestamp) if pose_stamp is None else float(pose_stamp)
-        if (not isfinite(pose_stamp) or not isfinite(float(observation.timestamp))
-                or abs(pose_stamp - float(observation.timestamp)) > self.config.max_pose_time_error_s):
-            raise LocalRepairError("OBSERVATION_TIME_MISMATCH", "live pose and observation are not aligned")
-        pose = observation.uav_pose
-        if dist((pose.x, pose.y, pose.z), context.anchor.pose.xyz_m) > self.config.max_hold_drift_m:
-            raise LocalRepairError("HOLD_DRIFT", "vehicle left the admitted safe waiting region")
+        validity = self._reference_validity(episode)
+        if validity.verdict is SpatialReferenceVerdict.INVALID:
+            raise LocalRepairError(validity.code or "REFERENCE_CHANGED", ";".join(validity.reasons))
 
     def _check_space(self, uav, route, context=None):
         geometry = self.geometry_provider()
@@ -537,10 +569,13 @@ class FleetRecoveryController:
                 poses[other] = replace(other_pose, route_xyz_m=remainder if len(remainder)>1 else ())
         checker = FleetAirspaceManager(self.runtime.fleet_plan.coordination_policy.minimum_uav_separation_m)
         decision = checker.evaluate(FleetPoseSnapshot(snapshot.timestamp_s, poses))
-        involved = [p for p in decision.conflicts if uav in {p.uav_a_id,p.uav_b_id} and p.is_conflict]
+        involved = sorted({tuple(sorted((p.uav_a_id, p.uav_b_id))) for p in decision.conflicts
+                           if p.is_conflict and uav in {p.uav_a_id, p.uav_b_id}})
         if involved:
-            affected = tuple(sorted({x for p in involved for x in (p.uav_a_id,p.uav_b_id)}))
-            raise LocalRepairError("SHARED_SPACE_CONFLICT", "replacement conflicts with shared world space", affected_uav_ids=affected)
+            # Route contention is a cross-UAV dependency outcome, not a private
+            # spatial failure; the loser must coordinate, never both commit.
+            check = check_cross_uav_dependencies((), (), {}, {}, route_conflicts=involved)
+            raise LocalRepairError("SHARED_SPACE_CONFLICT", ";".join(check.reasons), affected_uav_ids=check.affected_uav_ids)
 
     def _broker_request(self, episode, role, selection):
         uav = self._record(episode).assignment.uav_id
@@ -649,42 +684,46 @@ class FleetRecoveryController:
         goals=tuple(self._task_spec_for(episode.assignment_id).goal(g)
                     for g in self.assignments[episode.assignment_id].goal_ids)
         completed=tuple(step.step_id for step in state.task_plan.steps[:state.current_step_index])
-        assessment=assess_remaining_goals(goals,state.compiled_mission.planner_output,completed,self._evidence(state),
-            current_step_id=state.current_step_id,current_step_started=True,home_name=self.home_names[record.assignment.uav_id])
-        if not assessment.supported:
+        # Handoff consumes the SAME remaining-task computation as local repair;
+        # it never re-derives completion amounts or goal identity itself.
+        contract=build_remaining_task_contract(goals,state.compiled_mission.planner_output,completed,self._evidence(state),
+            current_step_id=state.current_step_id,current_step_started=True,
+            home_name=self.home_names[record.assignment.uav_id],consumer="HANDOFF")
+        if not contract.supported:
             raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "remaining execution evidence is insufficient")
-        if not assessment.pending_goal_ids:
+        if not contract.pending_goal_ids:
             raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "no independently executable remaining goal")
-        if assessment.confirmed_goal_ids:
+        if contract.confirmed_goal_ids:
             from fleet.task_spec import GoalType
             # A fresh aircraft cannot inherit a SEARCH lock or replay a
-            # completed perception action merely to manufacture target refs.
-            independent = {GoalType.NAVIGATE, GoalType.RETURN_HOME, GoalType.LAND,
-                           GoalType.RETURN_HOME_AND_LAND, GoalType.WAIT}
-            if any(goal.goal_type not in independent for goal in assessment.pending_goals):
+            # completed perception action merely to manufacture target refs;
+            # only world-anchored TRANSFERABLE obligations may change owner.
+            if any(entry.transferability is not Transferability.TRANSFERABLE for entry in contract.pending_entries):
                 raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "remaining goals require source-local outputs")
-            if not any(goal.goal_type is GoalType.NAVIGATE for goal in assessment.pending_goals):
+            if not any(goal.goal_type is GoalType.NAVIGATE for goal in contract.pending_goals):
                 raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "source termination alone cannot be delegated")
-        deps,versions=self._dependencies(episode.assignment_id, goal_ids=assessment.pending_goal_ids)
-        decision=check_external_dependencies(deps,deps,versions,versions)
+        deps,versions=self._dependencies(episode.assignment_id, goal_ids=contract.pending_goal_ids)
+        decision=check_cross_uav_dependencies(deps,deps,versions,versions)
+        if decision.verdict is DependencyVerdict.INVALID:
+            raise LocalRepairError("DEPENDENCY_INVALID",";".join(decision.reasons),affected_uav_ids=decision.affected_uav_ids)
         if not decision.allowed:
             raise LocalRepairError("COORDINATION_REQUIRED",";".join(decision.reasons),affected_uav_ids=decision.affected_uav_ids)
         states, refs = self._goal_state()
         episode.confirmed_goal_evidence = tuple(
-            (goal_id, refs[goal_id]) for goal_id in assessment.confirmed_goal_ids
+            (goal_id, refs[goal_id]) for goal_id in contract.confirmed_goal_ids
             if states.get(goal_id) == "CONFIRMED" and refs.get(goal_id))
-        if len(episode.confirmed_goal_evidence) != len(assessment.confirmed_goal_ids):
+        if len(episode.confirmed_goal_evidence) != len(contract.confirmed_goal_ids):
             raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "completed goals lack stable owner evidence")
         snapshot=self.replan_boundary.snapshot_request(record,self.runtime.world_belief,
-                                                       remaining_goal_ids=assessment.pending_goal_ids,
-                                                       remaining_goals=assessment.pending_goals,
+                                                       remaining_goal_ids=contract.pending_goal_ids,
+                                                       remaining_goals=contract.pending_goals,
                                                        source_compiled_mission=state.compiled_mission,
                                                        external_dependencies=deps,
                                                        recovery_request_id=episode.request_id,
                                                        deadline_wall_s=deadline, wall_clock=self.clock)
         episode.external_dependencies=deps
         episode.dependency_versions=versions
-        episode.remaining_goal_ids=assessment.pending_goal_ids
+        episode.remaining_goal_ids=contract.pending_goal_ids
         episode.submitted_wall_s=self.clock()
         episode.candidate=deadline
         episode.phase="REASSIGN_INFLIGHT"
@@ -701,7 +740,9 @@ class FleetRecoveryController:
         if self.clock()>=min(episode.deadline_wall_s,float(episode.candidate)):
             raise LocalRepairError("DEADLINE_EXPIRED","reassignment validation exceeded deadline")
         deps,versions=self._dependencies(episode.assignment_id, goal_ids=episode.remaining_goal_ids)
-        decision=check_external_dependencies(episode.external_dependencies,deps,episode.dependency_versions,versions)
+        decision=check_cross_uav_dependencies(episode.external_dependencies,deps,episode.dependency_versions,versions)
+        if decision.verdict is DependencyVerdict.INVALID:
+            raise LocalRepairError("DEPENDENCY_INVALID","dependency evidence is structurally invalid",affected_uav_ids=decision.affected_uav_ids)
         if not decision.allowed:
             raise LocalRepairError("COORDINATION_REQUIRED","external dependency changed",affected_uav_ids=decision.affected_uav_ids)
 
@@ -714,7 +755,7 @@ class FleetRecoveryController:
         self._last_error[episode.assignment_id]=reason
         self._log("RECOVERY_REJECTED",episode,reason=reason,affected_uav_ids=list(affected))
         if reason in {"COORDINATION_REQUIRED","SHARED_SPACE_CONFLICT","REFERENCE_CHANGED","EVIDENCE_INSUFFICIENT",
-                      "HANDOFF_EVIDENCE_UNSUPPORTED"}:
+                      "HANDOFF_EVIDENCE_UNSUPPORTED","DEPENDENCY_INVALID"}:
             if affected:
                 self._log("RECOVERY_COORDINATION_REQUIRED",episode,reason=reason,affected_uav_ids=list(affected))
             self._exit(episode,reason)
@@ -806,7 +847,7 @@ def _generate_suffix(client, context):
     payload={"trusted_repair_context":context.to_dict(),"authorized_output":constants,
              "original_suffix":[step.to_dict() for step in output.steps[len(context.completed_step_ids):]]}
     response=client.chat((
-        ChatMessage("system","Return one authorized Spatial V3 suffix JSON only. Preserve retained step IDs, target references, durations, goal conditions and termination. Never replay completed steps or TAKEOFF. Do not rewrite another UAV or reinterpret the original user instruction. Relative geometry uses only the supplied immutable anchor. Routing, versions, permissions and deadlines are trusted constants."),
+        ChatMessage("system","Return one authorized Spatial V3 suffix JSON only. Preserve retained step IDs, target references, durations, goal conditions and termination. Never replay completed steps or TAKEOFF. Do not rewrite another UAV or reinterpret the original user instruction. Relative geometry uses only the supplied immutable anchor. Routing, versions, permissions and deadlines are trusted constants. The remaining_task_contract in trusted_repair_context is trusted read-only evidence computed from execution proof: never dispute, recompute, reduce or restate its completion amounts, goal identity, target bindings or completion conditions."),
         ChatMessage("user",json.dumps(payload,ensure_ascii=False,allow_nan=False,separators=(",",":")))),
         options=GenerationOptions(temperature=0.0,max_tokens=4096,
             response_format=JsonSchemaResponseFormat("local_repair_v3",suffix_schema)))

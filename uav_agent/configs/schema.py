@@ -707,6 +707,7 @@ class FleetRecoveryConfig:
     max_pose_time_error_s: float = 0.05
     max_anchor_age_s: float = 45.0
     max_hold_drift_m: float = 2.0
+    valid_pose_tolerance_m: float = 0.05
     max_suffix_steps: int = 10
     shutdown_timeout_s: float = 0.1
 
@@ -717,10 +718,12 @@ class FleetRecoveryConfig:
             raise ValueError("fleet_recovery.mode must be LOCAL_ONLY or LOCAL_THEN_REASSIGN")
         for name in ("request_timeout_s", "episode_timeout_s", "retry_cooldown_s",
                      "max_pose_time_error_s", "max_anchor_age_s", "max_hold_drift_m",
-                     "shutdown_timeout_s"):
+                     "valid_pose_tolerance_m", "shutdown_timeout_s"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
                 raise ValueError(f"fleet_recovery.{name} must be finite and positive")
+        if self.valid_pose_tolerance_m > self.max_hold_drift_m:
+            raise ValueError("fleet_recovery.valid_pose_tolerance_m cannot exceed max_hold_drift_m")
         for name in ("max_local_attempts", "max_reassign_attempts",
                      "max_concurrent_requests", "max_suffix_steps"):
             value = getattr(self, name)

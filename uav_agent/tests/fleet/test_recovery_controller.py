@@ -910,3 +910,59 @@ def test_handoff_keeps_confirmed_navigation_and_transfers_only_independent_remai
     finally:
         scenario.fleet_release.set()
         scenario.close()
+
+
+def test_small_pose_change_reprojects_admitted_route_without_new_model_request(harness):
+    h = harness()
+    item = h.locals[0]
+    episode = h.submit()
+    # A deterministic small position change after model completion must be
+    # reprojected by trusted code, not re-asked from the model. 0.2m stays
+    # inside the hold tolerance yet exceeds the VALID reference tolerance.
+    moved = (item.world.initial_uav_xyz_m[0] + 0.2, 0.0, 10.0)
+    item.uav.set_pose(*moved, 0.0)
+    item.tick(4.0)
+    assert item.agent.local_repair_snapshot.stable_hold
+    h.complete(episode)
+    assert item.agent.snapshot().plan_version == 2
+    assert h.exits == []
+    assert len(h.factory.calls) == 1
+    route = h.runtime._planned_routes[item.assignment.uav_id]
+    assert route[0] == pytest.approx(moved)
+    assert route[1:] == route[1:]  # admitted tail preserved beyond the access point
+    for _ in range(2):
+        h.controller.tick()
+    assert len(h.factory.calls) == 1
+
+
+def test_unrelated_uav_version_change_does_not_discard_active_repair(harness):
+    h = harness(count=2, blocked=True)
+    episode = h.submit(0)
+    # uav_2 shares no ordering, assignment or resource edge with uav_1: its
+    # local version must not enter uav_1's dependency digest.
+    h.runtime.assignments.by_id(h.locals[1].assignment.assignment_id).local_plan_version = 9
+    h.factory.release["uav_1"].set()
+    h.complete(episode)
+    assert h.locals[0].agent.snapshot().plan_version == 2
+    assert h.exits == []
+
+
+def test_shared_channel_contention_lets_only_one_committer_through(harness):
+    h = harness(count=2, blocked=True)
+    h.shared_dependencies = (ExternalDependencySnapshot("channel", "SHARED_RESOURCE",
+        (h.locals[0].goal.goal_id, h.locals[1].goal.goal_id), ("uav_1", "uav_2"), 1,
+        "UNCHANGED", ("reservation_open",)),)
+    first = h.submit(0)
+    second = h.submit(1)
+    h.factory.release["uav_1"].set()
+    h.complete(first)
+    assert h.locals[0].agent.snapshot().plan_version == 2
+    # The winning publication flips the shared reservation; the loser's
+    # compare-and-commit must observe the change and stop, not also commit.
+    h.shared_dependencies = (ExternalDependencySnapshot("channel", "SHARED_RESOURCE",
+        (h.locals[0].goal.goal_id, h.locals[1].goal.goal_id), ("uav_1", "uav_2"), 2,
+        "UNCHANGED", ("reservation_uav_1",)),)
+    h.factory.release["uav_2"].set()
+    h.complete(second)
+    assert h.locals[1].agent.snapshot().plan_version == 1
+    assert ("assignment_uav_2", "COORDINATION_REQUIRED") in h.exits

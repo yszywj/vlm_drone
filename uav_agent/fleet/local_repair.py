@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from hashlib import sha256
 import json
-from math import isfinite
+from math import dist, isfinite
 from types import MappingProxyType
 
 from common.ids import validate_mission_id, validate_routing_id, validate_uav_id
@@ -151,6 +152,113 @@ class RepairAnchor:
                 "max_pose_time_error_s": self.max_pose_time_error_s}
 
 
+class SpatialReferenceVerdict(str, Enum):
+    VALID = "VALID"
+    REPROJECTABLE = "REPROJECTABLE"
+    INVALID = "INVALID"
+
+
+@dataclass(frozen=True, slots=True)
+class SpatialReferenceValidity:
+    """Code-only verdict on whether an admitted reference still carries meaning."""
+    verdict: SpatialReferenceVerdict
+    reasons: tuple[str, ...]
+    code: str | None = None
+    position_delta_m: float | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.verdict, SpatialReferenceVerdict):
+            raise TypeError("verdict must be a SpatialReferenceVerdict")
+        reasons = tuple(dict.fromkeys(self.reasons))
+        if any(not isinstance(item, str) or not item for item in reasons):
+            raise ValueError("reasons must be nonempty strings")
+        object.__setattr__(self, "reasons", reasons)
+        if self.verdict is SpatialReferenceVerdict.VALID and (reasons or self.code is not None):
+            raise ValueError("VALID carries no rejection reason")
+        if self.verdict is not SpatialReferenceVerdict.VALID and not reasons:
+            raise ValueError("non-VALID verdicts must state reasons")
+        if self.position_delta_m is not None:
+            object.__setattr__(self, "position_delta_m", _number(self.position_delta_m, "position_delta_m"))
+
+
+def evaluate_spatial_reference(anchor: RepairAnchor, *, observation_time_s: float, pose_time_s: float,
+                               time_domain: str, current_pose_xyz_m: Sequence[float], now_wall_s: float,
+                               submitted_wall_s: float, max_anchor_age_s: float,
+                               max_pose_time_error_s: float, max_hold_drift_m: float,
+                               valid_pose_tolerance_m: float, map_version: int | None = None,
+                               reference_version: int | None = None, route: Sequence[Sequence[float]] = (),
+                               segment_blocked=None, route_conflicts: Sequence[Sequence[str]] = ()) \
+        -> SpatialReferenceValidity:
+    """Classify an admitted anchor against current trusted state, by code only.
+
+    VALID: nothing meaning-bearing changed; the candidate proceeds to final checks.
+    REPROJECTABLE: only a deterministically known pose change occurred; trusted
+    code may reconnect the current position onto the existing admitted WORLD
+    polyline (reproject_world_route). No target is re-resolved, so a later
+    heading change can never reinterpret historical HOLD-relative geometry.
+    INVALID: version, time-domain, alignment, drift, obstacle or cross-UAV
+    changes destroyed the reference; the candidate must be discarded.
+    """
+    def reject(code, reason, delta=None):
+        return SpatialReferenceValidity(SpatialReferenceVerdict.INVALID, (reason,), code, delta)
+
+    try:
+        observation = _number(float(observation_time_s), "observation_time_s")
+        pose_stamp = _number(float(pose_time_s), "pose_time_s")
+    except (TypeError, ValueError):
+        return reject("OBSERVATION_TIME_MISMATCH", "OBSERVATION_NOT_FINITE")
+    if not all(isinstance(value, (int, float)) and isfinite(value) for value in current_pose_xyz_m) \
+            or len(tuple(current_pose_xyz_m)) != 3:
+        return reject("OBSERVATION_TIME_MISMATCH", "POSE_NOT_FINITE")
+    if time_domain != anchor.time_domain:
+        return reject("REFERENCE_CHANGED", "TIME_DOMAIN_CHANGED")
+    if observation < anchor.observation_time_s:
+        return reject("OBSERVATION_TIME_MISMATCH", "OBSERVATION_TIME_REGRESSED")
+    if abs(observation - pose_stamp) > max(max_pose_time_error_s, anchor.max_pose_time_error_s):
+        return reject("OBSERVATION_TIME_MISMATCH", "OBSERVATION_POSE_MISALIGNED")
+    if map_version is not None and _version(map_version, "map_version") != anchor.map_version:
+        return reject("REFERENCE_CHANGED", "MAP_VERSION_CHANGED")
+    if reference_version is not None and _version(reference_version, "reference_version") != anchor.reference_version:
+        return reject("REFERENCE_CHANGED", "REFERENCE_VERSION_CHANGED")
+    now = _number(float(now_wall_s), "now_wall_s")
+    if now < submitted_wall_s:
+        return reject("WALL_CLOCK_REGRESSION", "NOW_PREDATES_SUBMISSION")
+    if now - submitted_wall_s > max_anchor_age_s:
+        return reject("ANCHOR_EXPIRED", "ANCHOR_OLDER_THAN_LIMIT")
+    current = tuple(float(value) for value in current_pose_xyz_m)
+    delta = dist(current, tuple(anchor.pose.xyz_m))
+    if delta > max_hold_drift_m:
+        return reject("HOLD_DRIFT", "VEHICLE_LEFT_ADMITTED_WAITING_REGION", delta)
+    points = tuple(tuple(float(value) for value in point) for point in route)
+    if segment_blocked is not None:
+        for a, b in zip(points, points[1:]):
+            if segment_blocked(a, b):
+                return reject("UNSAFE_ENTRY_OR_ROUTE", "ROUTE_CROSSES_CURRENT_OBSTACLE", delta)
+    conflicts = tuple((str(pair[0]), str(pair[1])) for pair in route_conflicts if len(pair) == 2)
+    if conflicts:
+        return reject("SHARED_SPACE_CONFLICT", "ROUTE_CONFLICTS_WITH_ANOTHER_UAV", delta)
+    if delta <= valid_pose_tolerance_m:
+        return SpatialReferenceValidity(SpatialReferenceVerdict.VALID, (), None, delta)
+    return SpatialReferenceValidity(SpatialReferenceVerdict.REPROJECTABLE,
+                                    ("POSE_WITHIN_DRIFT_LIMIT",), None, delta)
+
+
+def reproject_world_route(route: Sequence[Sequence[float]], current_xyz_m: Sequence[float]):
+    """Reconnect current position onto the admitted WORLD polyline, by code only.
+
+    The admitted polyline beyond its first point is preserved byte-for-byte:
+    no anchor reinterpretation, no HOLD-relative re-resolution and no new model
+    request. Obstacle/separation validity of the new access segment remains
+    the owner's live check.
+    """
+    points = tuple(tuple(float(value) for value in point) for point in route)
+    if not points or not all(len(point) == 3 for point in points):
+        raise LocalRepairError("UNSUPPORTED_CONTRACT", "world route must be a nonempty 3D polyline")
+    if len(tuple(current_xyz_m)) != 3 or not all(isfinite(float(value)) for value in current_xyz_m):
+        raise LocalRepairError("UNSUPPORTED_CONTRACT", "reprojection requires a finite current position")
+    return (tuple(float(value) for value in current_xyz_m),) + points[1:]
+
+
 @dataclass(frozen=True, slots=True)
 class SkillExecutionEvidence:
     """A copied terminal result supplied by the Skill execution owner only."""
@@ -263,13 +371,9 @@ def _goal_steps(goal: Goal, steps: Sequence[PlanStepDraftV3], home_name: str):
     return ()
 
 
-def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
-                           completed_step_ids: Sequence[str], evidence: Sequence[SkillExecutionEvidence],
-                           *, current_step_id: str | None, current_step_started: bool = True,
-                           home_name: str = "home") -> RemainingGoalAssessment:
-    """Subtract only terminal Skill evidence; elapsed/feedback time is not credit."""
-    goals, evidence = tuple(goals), tuple(evidence)
-    completed = set(completed_step_ids)
+def _terminal_evidence_index(evidence: Sequence[SkillExecutionEvidence], original: SkillPlanDraftV3,
+                             completed: set[str]):
+    """Single trusted grouping of terminal evidence; shared by every consumer."""
     by_step, grouped, invocations = {}, {}, {}
     for item in evidence:
         prior = invocations.get(item.invocation_id)
@@ -286,6 +390,17 @@ def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
         if step_id in completed and (len(successes) > 1 or (successes and any(item.plan_version > successes[0].plan_version for item in items))):
             raise LocalRepairError("AMBIGUOUS_EXECUTION_EVIDENCE", "completed step has repeated or superseded success evidence")
         by_step[step_id] = successes[0] if successes else items[-1]
+    return by_step, grouped
+
+
+def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
+                           completed_step_ids: Sequence[str], evidence: Sequence[SkillExecutionEvidence],
+                           *, current_step_id: str | None, current_step_started: bool = True,
+                           home_name: str = "home") -> RemainingGoalAssessment:
+    """Subtract only terminal Skill evidence; elapsed/feedback time is not credit."""
+    goals, evidence = tuple(goals), tuple(evidence)
+    completed = set(completed_step_ids)
+    by_step, grouped = _terminal_evidence_index(evidence, original, completed)
     current = next((step for step in original.steps if step.id == current_step_id), None)
     confirmed, pending, insufficient, reasons = [], [], [], []
     terminal_complete = current_step_id is None and set(step.id for step in original.steps).issubset(completed)
@@ -357,6 +472,235 @@ def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
     return RemainingGoalAssessment(tuple(confirmed), tuple(pending), tuple(insufficient), tuple(reasons))
 
 
+class RestartPolicy(str, Enum):
+    COMPLETED = "COMPLETED"
+    CONTINUE = "CONTINUE"
+    RESTART = "RESTART"
+    CANNOT_RESUME = "CANNOT_RESUME"
+
+
+class Transferability(str, Enum):
+    SAME_UAV_ONLY = "SAME_UAV_ONLY"
+    TRANSFERABLE = "TRANSFERABLE"
+    REQUIRES_SHARED_EVIDENCE = "REQUIRES_SHARED_EVIDENCE"
+
+
+# A replacement aircraft can only own obligations whose meaning is entirely
+# world-anchored; this mirrors the handoff admission set exactly.
+_TRANSFERABLE_GOAL_TYPES = frozenset({GoalType.NAVIGATE, GoalType.RETURN_HOME, GoalType.LAND,
+                                      GoalType.RETURN_HOME_AND_LAND, GoalType.WAIT})
+_SHARED_EVIDENCE_GOAL_TYPES = frozenset({GoalType.TRACK_TARGET, GoalType.INSPECT_TARGET})
+
+
+def _original_condition(goal: Goal) -> Mapping[str, object]:
+    if isinstance(goal, TerminationGoal):
+        return _freeze({"uav_id": goal.uav_id, "duration_s": goal.duration_s, "strength": goal.strength.value})
+    return _freeze({"target_alias": goal.target_alias,
+                    "spatial_constraint": None if goal.spatial_constraint is None else goal.spatial_constraint.to_dict(),
+                    "duration_s": goal.duration_s, "distance_m": goal.distance_m,
+                    "strength": goal.strength.value, "completion_basis": goal.completion_basis})
+
+
+@dataclass(frozen=True, slots=True)
+class GoalTaskContract:
+    """One goal's trusted remaining obligation; never model-generated or editable."""
+    goal_id: str
+    goal_type: GoalType
+    status: str  # CONFIRMED / PENDING / INSUFFICIENT
+    target_binding: str | None
+    original_condition: Mapping[str, object]
+    completion_basis: str
+    confirmed_amount: float | None
+    remaining_amount: float | None
+    evidence_refs: tuple[str, ...]
+    remaining_goal: Goal | None
+    restart_policy: RestartPolicy
+    transferability: Transferability
+    reasons: tuple[str, ...]
+
+    def __post_init__(self):
+        if self.status not in {"CONFIRMED", "PENDING", "INSUFFICIENT"}:
+            raise ValueError("unknown goal contract status")
+        if not isinstance(self.restart_policy, RestartPolicy) or not isinstance(self.transferability, Transferability):
+            raise TypeError("restart_policy and transferability are trusted enum verdicts")
+        if self.goal_id in {"", None} or not isinstance(self.goal_id, str):
+            raise ValueError("goal contract requires a goal_id")
+        object.__setattr__(self, "original_condition", _freeze(dict(self.original_condition)))
+        _json(self.original_condition)
+        for name in ("confirmed_amount", "remaining_amount"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _number(value, name))
+        refs = tuple(dict.fromkeys(self.evidence_refs))
+        if any(not isinstance(ref, str) or not ref for ref in refs):
+            raise ValueError("evidence refs must be nonempty strings")
+        object.__setattr__(self, "evidence_refs", refs)
+
+    def to_dict(self):
+        return {"goal_id": self.goal_id, "goal_type": self.goal_type.value, "status": self.status,
+                "target_binding": self.target_binding, "original_condition": _thaw(self.original_condition),
+                "completion_basis": self.completion_basis,
+                "confirmed_amount": self.confirmed_amount, "remaining_amount": self.remaining_amount,
+                "evidence_refs": list(self.evidence_refs),
+                "remaining_obligation": None if self.remaining_goal is None else self.remaining_goal.to_dict(),
+                "restart_policy": self.restart_policy.value, "transferability": self.transferability.value,
+                "reasons": list(self.reasons)}
+
+
+@dataclass(frozen=True, slots=True)
+class RemainingTaskContract:
+    """The single remaining-task computation shared by local repair and takeover.
+
+    Built only from SkillManager terminal evidence via assess_remaining_goals.
+    Elapsed time, model claims and feedback never enter this contract. Qwen
+    consumers may read it; no consumer may write completion amounts, goal
+    identity or completion conditions back through it.
+    """
+    schema_version: int
+    mission_id: str
+    uav_id: str
+    plan_version: int
+    goals: tuple[GoalTaskContract, ...]
+    assessment: RemainingGoalAssessment
+    shared_target_ids: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if type(self.schema_version) is not int or self.schema_version != 1:
+            raise ValueError("remaining task contract must use schema 1")
+        validate_mission_id(self.mission_id)
+        validate_uav_id(self.uav_id)
+        _version(self.plan_version, "plan_version")
+        goals = tuple(self.goals)
+        if any(not isinstance(item, GoalTaskContract) for item in goals):
+            raise TypeError("contract goals must be GoalTaskContract entries")
+        if len({item.goal_id for item in goals}) != len(goals):
+            raise ValueError("duplicate goal ID in remaining task contract")
+        object.__setattr__(self, "goals", goals)
+        if not isinstance(self.assessment, RemainingGoalAssessment):
+            raise TypeError("contract wraps exactly one RemainingGoalAssessment")
+        object.__setattr__(self, "shared_target_ids", tuple(sorted(set(self.shared_target_ids))))
+
+    @property
+    def computed_by(self):
+        return "skill_terminal_evidence"
+
+    @property
+    def supported(self):
+        return self.assessment.supported
+
+    @property
+    def confirmed_goal_ids(self):
+        return self.assessment.confirmed_goal_ids
+
+    @property
+    def pending_goals(self):
+        return self.assessment.pending_goals
+
+    @property
+    def pending_goal_ids(self):
+        return self.assessment.pending_goal_ids
+
+    @property
+    def insufficient_goal_ids(self):
+        return self.assessment.insufficient_goal_ids
+
+    @property
+    def pending_entries(self):
+        return tuple(item for item in self.goals if item.status == "PENDING")
+
+    @property
+    def handoff_entries(self):
+        """Pending obligations a replacement aircraft may own without shared evidence."""
+        return tuple(item for item in self.goals
+                     if item.status == "PENDING" and item.transferability is Transferability.TRANSFERABLE)
+
+    @property
+    def digest(self):
+        return _digest(self.to_dict())
+
+    def entry(self, goal_id):
+        return next((item for item in self.goals if item.goal_id == goal_id), None)
+
+    def to_dict(self):
+        return {"schema_version": self.schema_version, "computed_by": self.computed_by,
+                "mission_id": self.mission_id, "uav_id": self.uav_id, "plan_version": self.plan_version,
+                "read_only": True, "shared_target_ids": list(self.shared_target_ids),
+                "goals": [item.to_dict() for item in self.goals],
+                "global_reasons": list(self.assessment.reasons)}
+
+
+def build_remaining_task_contract(goals: Sequence[Goal], original: SkillPlanDraftV3,
+                                  completed_step_ids: Sequence[str], evidence: Sequence[SkillExecutionEvidence], *,
+                                  current_step_id: str | None, current_step_started: bool = True,
+                                  home_name: str = "home", shared_target_ids: Sequence[str] = (),
+                                  consumer: str = "LOCAL_REPAIR") -> RemainingTaskContract:
+    """The only remaining-task computation; both repair and handoff consume this.
+
+    consumer is logging context only: it never changes amounts, identity or
+    transferability. Insufficient evidence fails closed to CANNOT_RESUME.
+    """
+    if consumer not in {"LOCAL_REPAIR", "HANDOFF", "FLEET_STATE"}:
+        raise ValueError("unknown remaining task contract consumer")
+    goals = tuple(goals)
+    assessment = assess_remaining_goals(goals, original, completed_step_ids, evidence,
+        current_step_id=current_step_id, current_step_started=current_step_started, home_name=home_name)
+    completed = set(completed_step_ids)
+    by_step, grouped = _terminal_evidence_index(evidence, original, completed)
+    shared = frozenset(shared_target_ids)
+    pending_by_id = {goal.goal_id: goal for goal in assessment.pending_goals}
+    confirmed, insufficient = set(assessment.confirmed_goal_ids), set(assessment.insufficient_goal_ids)
+    entries = []
+    for goal in goals:
+        matched = _goal_steps(goal, original.steps, home_name)
+        refs = []
+        for step in matched:
+            if step.id not in completed:
+                continue
+            proof = by_step.get(step.id)
+            credited_step = (proof is not None and proof.result.status is SkillStatus.SUCCEEDED
+                             and proof.result.code is _SUCCESS.get(step.skill)
+                             and (step.skill not in {"SEARCH", "TRACK"} or proof.result.data.get("target_id")))
+            if credited_step:
+                refs.extend(item.invocation_id for item in grouped[step.id])
+        status = ("CONFIRMED" if goal.goal_id in confirmed
+                  else "PENDING" if goal.goal_id in pending_by_id else "INSUFFICIENT")
+        confirmed_amount = remaining_amount = None
+        requested = goal.duration_s if isinstance(goal, (MissionGoal, TerminationGoal)) else None
+        if status == "CONFIRMED" and requested is not None:
+            confirmed_amount, remaining_amount = float(requested), 0.0
+        elif status == "PENDING" and requested is not None:
+            remaining_amount = float(pending_by_id[goal.goal_id].duration_s)
+            confirmed_amount = max(0.0, float(requested) - remaining_amount)
+        if status == "CONFIRMED":
+            restart = RestartPolicy.COMPLETED
+            transferable = Transferability.SAME_UAV_ONLY
+        elif status == "INSUFFICIENT":
+            restart = RestartPolicy.CANNOT_RESUME
+            transferable = Transferability.SAME_UAV_ONLY
+        else:
+            restart = (RestartPolicy.CONTINUE
+                       if confirmed_amount is not None and confirmed_amount > 1e-9 else RestartPolicy.RESTART)
+            if goal.goal_type in _TRANSFERABLE_GOAL_TYPES:
+                transferable = Transferability.TRANSFERABLE
+            elif (goal.goal_type in _SHARED_EVIDENCE_GOAL_TYPES
+                  and getattr(goal, "target_alias", None) in shared):
+                transferable = Transferability.REQUIRES_SHARED_EVIDENCE
+            else:
+                transferable = Transferability.SAME_UAV_ONLY
+        entries.append(GoalTaskContract(
+            goal_id=goal.goal_id, goal_type=goal.goal_type, status=status,
+            target_binding=getattr(goal, "target_alias", None),
+            original_condition=_original_condition(goal),
+            completion_basis=getattr(goal, "completion_basis", "valid_execution"),
+            confirmed_amount=confirmed_amount, remaining_amount=remaining_amount,
+            evidence_refs=tuple(refs),
+            remaining_goal=pending_by_id.get(goal.goal_id),
+            restart_policy=restart, transferability=transferable,
+            reasons=() if status != "INSUFFICIENT" else ("INSUFFICIENT_COMPLETION_EVIDENCE",)))
+    return RemainingTaskContract(1, original.mission_id, original.uav_id, original.plan_version,
+                                 tuple(entries), assessment, tuple(sorted(shared)))
+
+
 @dataclass(frozen=True, slots=True)
 class ExternalDependencySnapshot:
     dependency_id: str
@@ -410,19 +754,94 @@ def dependency_digest(dependencies, versions):
                     "versions": dict(versions)})
 
 
-def check_external_dependencies(expected_dependencies, current_dependencies, expected_versions, current_versions) -> DependencyCheck:
+class DependencyVerdict(str, Enum):
+    LOCAL_OK = "LOCAL_OK"
+    COORDINATION_REQUIRED = "COORDINATION_REQUIRED"
+    INVALID = "INVALID"
+
+
+@dataclass(frozen=True, slots=True)
+class CrossUAVDependencyCheck:
+    """The unified cross-UAV dependency outcome for local repair and handoff.
+
+    LOCAL_OK: the faulted UAV may proceed alone. COORDINATION_REQUIRED names
+    the affected UAVs and dependencies that must be resolved first; it is an
+    admission to stop, not an automatic joint replan, and the affected set is
+    a sound over-approximation rather than a proven minimal set. INVALID means
+    the dependency evidence itself is structurally unusable.
+    """
+    verdict: DependencyVerdict
+    reasons: tuple[str, ...]
+    affected_uav_ids: tuple[str, ...]
+    goal_ids: tuple[str, ...]
+    dependency_ids: tuple[str, ...]
+    digest: str
+
+    @property
+    def allowed(self):
+        return self.verdict is DependencyVerdict.LOCAL_OK
+
+
+def check_cross_uav_dependencies(expected_dependencies, current_dependencies, expected_versions,
+                                 current_versions, *, route_conflicts: Sequence[Sequence[str]] = (),
+                                 shared_resource_ids: Sequence[str] = ()) -> CrossUAVDependencyCheck:
+    """One dependency decision; structural corruption is INVALID, everything
+    blocking is COORDINATION_REQUIRED, otherwise LOCAL_OK."""
     expected, current = tuple(expected_dependencies), tuple(current_dependencies)
     digest = dependency_digest(current, current_versions)
-    reasons = []
-    if len({item.dependency_id for item in current}) != len(current):
-        reasons.append("DUPLICATE_DEPENDENCY")
-    if digest != dependency_digest(expected, expected_versions):
-        reasons.append("DEPENDENCY_SNAPSHOT_CHANGED")
+    hard, coordination, cited = [], [], set()
+    seen = set()
+    for item in current:
+        if item.dependency_id in seen:
+            hard.append("DUPLICATE_DEPENDENCY")
+        seen.add(item.dependency_id)
+    expected_by_id = {item.dependency_id: item for item in expected}
+    current_by_id = {item.dependency_id: item for item in current}
+    for dependency_id in sorted(expected_by_id):
+        expected_version = _version(dict(expected_versions).get(dependency_id, expected_by_id[dependency_id].version), "version")
+        present = current_by_id.get(dependency_id)
+        if present is None:
+            hard.append("MISSING_DEPENDENCY:" + dependency_id)
+            cited.add(dependency_id)
+            continue
+        current_version = _version(dict(current_versions).get(dependency_id, present.version), "version")
+        if current_version < expected_version:
+            hard.append("VERSION_REGRESSION:" + dependency_id)
+            cited.add(dependency_id)
+    changed_digest = digest != dependency_digest(expected, expected_versions)
+    if changed_digest:
+        coordination.append("DEPENDENCY_SNAPSHOT_CHANGED")
+        for dependency_id in sorted(set(expected_by_id) | set(current_by_id)):
+            before, after = expected_by_id.get(dependency_id), current_by_id.get(dependency_id)
+            if dependency_id in shared_resource_ids or (before is not None and after is not None
+                    and (before.to_dict() != after.to_dict()
+                         or dict(expected_versions).get(dependency_id) != dict(current_versions).get(dependency_id))):
+                cited.add(dependency_id)
     for item in current:
         if item.state not in {"SATISFIED", "UNCHANGED"} or not item.evidence_refs:
-            reasons.append("EXTERNAL_DEPENDENCY_REQUIRES_COORDINATION:" + item.dependency_id)
-    return DependencyCheck(not reasons, tuple(reasons), tuple(sorted({uav for item in (*expected, *current) for uav in item.uav_ids})),
-                           tuple(sorted({goal for item in (*expected, *current) for goal in item.goal_ids})), digest)
+            coordination.append("EXTERNAL_DEPENDENCY_REQUIRES_COORDINATION:" + item.dependency_id)
+            cited.add(item.dependency_id)
+    participants = set()
+    for pair in route_conflicts:
+        pair = tuple(str(value) for value in pair)
+        if len(pair) != 2 or pair[0] == pair[1]:
+            raise ValueError("route conflicts must name two distinct UAVs")
+        coordination.append("ROUTE_CONFLICT:" + pair[0] + ":" + pair[1])
+        participants.update(pair)
+    verdict = (DependencyVerdict.INVALID if hard
+               else DependencyVerdict.COORDINATION_REQUIRED if coordination else DependencyVerdict.LOCAL_OK)
+    affected = tuple(sorted({uav for item in (*expected, *current) for uav in item.uav_ids} | participants))
+    goals = tuple(sorted({goal for item in (*expected, *current) for goal in item.goal_ids}))
+    return CrossUAVDependencyCheck(verdict, tuple(dict.fromkeys((*hard, *coordination))), affected, goals,
+                                   tuple(sorted(cited)) if verdict is not DependencyVerdict.LOCAL_OK else (), digest)
+
+
+def check_external_dependencies(expected_dependencies, current_dependencies, expected_versions,
+                                current_versions) -> DependencyCheck:
+    """Compatibility view over the unified cross-UAV dependency check."""
+    check = check_cross_uav_dependencies(expected_dependencies, current_dependencies,
+                                         expected_versions, current_versions)
+    return DependencyCheck(check.allowed, check.reasons, check.affected_uav_ids, check.goal_ids, check.digest)
 
 
 def extract_external_dependencies(task_spec: FleetTaskSpecV1, local_goal_ids: Sequence[str], *,
@@ -571,9 +990,19 @@ class LocalRepairContextV3:
             validate_routing_id(self.trusted_target_id, "trusted_target_id")
 
     @property
+    def remaining_task_contract(self) -> RemainingTaskContract:
+        # The single shared computation; local repair never re-derives amounts.
+        # shared_target_ids stays empty here: a locally tracked target is not
+        # automatically fleet-shared evidence. Transfer decisions belong to the
+        # handoff consumer with its own trusted shared-evidence source.
+        return build_remaining_task_contract(self.goals, self.original.planner_output,
+            self.completed_step_ids, self.evidence, current_step_id=self.current_step_id,
+            current_step_started=self.current_step_started, home_name=self.home_name,
+            consumer="LOCAL_REPAIR")
+
+    @property
     def assessment(self):
-        return assess_remaining_goals(self.goals, self.original.planner_output, self.completed_step_ids, self.evidence,
-            current_step_id=self.current_step_id, current_step_started=self.current_step_started, home_name=self.home_name)
+        return self.remaining_task_contract.assessment
 
     @property
     def digest(self):
@@ -588,6 +1017,7 @@ class LocalRepairContextV3:
                 "completed_step_ids": list(self.completed_step_ids), "completed_step_outputs": _thaw(self.completed_step_outputs),
                 "original_plan": original.to_dict(), "original_task_plan": self.original.task_plan.to_dict(),
                 "goals": [goal.to_dict() for goal in self.goals], "evidence": [item.to_dict() for item in self.evidence],
+                "remaining_task_contract": self.remaining_task_contract.to_dict(),
                 "external_dependencies": [item.to_dict() for item in self.external_dependencies],
                 "dependency_versions": dict(self.dependency_versions), "anchor": self.anchor.to_dict(),
                 "submitted_wall_s": self.submitted_wall_s, "deadline_wall_s": self.deadline_wall_s,
@@ -713,7 +1143,7 @@ def _check_protected_semantics(context, draft):
                     raise LocalRepairError("COMPLETED_OUTPUT_INVALID", "a retained target reference has no trusted prefix output")
                 if context.trusted_target_id is not None and output["target_id"] != context.trusted_target_id:
                     raise LocalRepairError("TARGET_IDENTITY_MISMATCH", "prefix output and current trusted target differ")
-    confirmed = set(context.assessment.confirmed_goal_ids)
+    confirmed = set(context.remaining_task_contract.confirmed_goal_ids)
     for goal in context.goals:
         if goal.goal_id in confirmed and _goal_steps(goal, draft.steps, context.home_name):
             raise LocalRepairError("COMPLETED_GOAL_REPLAY", "suffix repeats a confirmed user goal", goal_ids=(goal.goal_id,))
@@ -808,14 +1238,16 @@ def validate_local_repair(draft: LocalRepairDraftV3, context: LocalRepairContext
         raise LocalRepairError("WALL_CLOCK_REGRESSION", "validation wall clock predates submission")
     if now >= context.deadline_wall_s:
         raise LocalRepairError("DEADLINE_EXPIRED", "repair candidate expired on the monotonic wall clock")
-    deps = check_external_dependencies(context.external_dependencies, external_dependencies,
-                                       context.dependency_versions, dependency_versions)
-    if not deps.allowed:
+    deps = check_cross_uav_dependencies(context.external_dependencies, external_dependencies,
+                                        context.dependency_versions, dependency_versions)
+    if deps.verdict is DependencyVerdict.INVALID:
+        raise LocalRepairError("DEPENDENCY_INVALID", ";".join(deps.reasons), affected_uav_ids=deps.affected_uav_ids, goal_ids=deps.goal_ids)
+    if deps.verdict is DependencyVerdict.COORDINATION_REQUIRED:
         raise LocalRepairError("COORDINATION_REQUIRED", ";".join(deps.reasons), affected_uav_ids=deps.affected_uav_ids, goal_ids=deps.goal_ids)
-    assessment = context.assessment
-    if not assessment.supported:
-        raise LocalRepairError("EVIDENCE_INSUFFICIENT", ";".join(assessment.reasons) or "remaining goals lack trustworthy completion evidence",
-                               affected_uav_ids=(original.uav_id,), goal_ids=assessment.insufficient_goal_ids)
+    contract = context.remaining_task_contract
+    if not contract.supported:
+        raise LocalRepairError("EVIDENCE_INSUFFICIENT", ";".join(contract.assessment.reasons) or "remaining goals lack trustworthy completion evidence",
+                               affected_uav_ids=(original.uav_id,), goal_ids=contract.insufficient_goal_ids)
     if len(draft.steps) > context.max_suffix_steps:
         raise LocalRepairError("SUFFIX_BUDGET_EXCEEDED", "repair exceeds authorized suffix step budget")
     _check_protected_semantics(context, draft)

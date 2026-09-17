@@ -6,6 +6,7 @@
 
 基线与测试环境见 [fleet_local_repair_baseline.md](fleet_local_repair_baseline.md)。
 2026-09-16 审查问题修复、增量测试及当前边界见 [fleet_recovery_audit_fixes.md](fleet_recovery_audit_fixes.md)。
+2026-09-17 剩余任务契约、空间参考有效性与跨机依赖统一判定见 [fleet_remaining_task_contract.md](fleet_remaining_task_contract.md)。
 本说明中的命令是按实际 CLI/配置编写的操作方法；本轮没有运行真实模型、Isaac 或飞行实验。
 
 ## 开关和配置

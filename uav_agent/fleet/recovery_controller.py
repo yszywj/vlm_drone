@@ -693,13 +693,14 @@ class FleetRecoveryController:
             raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "remaining execution evidence is insufficient")
         if not contract.pending_goal_ids:
             raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "no independently executable remaining goal")
+        # Handoff accepts only fully world-anchored TRANSFERABLE obligations.
+        # There is no trusted shared-target evidence source yet, so both
+        # SAME_UAV_ONLY and REQUIRES_SHARED_EVIDENCE must stop here, with or
+        # without confirmed goals on the source.
+        if any(entry.transferability is not Transferability.TRANSFERABLE for entry in contract.pending_entries):
+            raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "remaining goals require source-local outputs")
         if contract.confirmed_goal_ids:
             from fleet.task_spec import GoalType
-            # A fresh aircraft cannot inherit a SEARCH lock or replay a
-            # completed perception action merely to manufacture target refs;
-            # only world-anchored TRANSFERABLE obligations may change owner.
-            if any(entry.transferability is not Transferability.TRANSFERABLE for entry in contract.pending_entries):
-                raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "remaining goals require source-local outputs")
             if not any(goal.goal_type is GoalType.NAVIGATE for goal in contract.pending_goals):
                 raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "source termination alone cannot be delegated")
         deps,versions=self._dependencies(episode.assignment_id, goal_ids=contract.pending_goal_ids)

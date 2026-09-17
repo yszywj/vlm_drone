@@ -14,7 +14,9 @@ from common.obstacle_types import ObstacleAABB
 from configs.schema import FleetRecoveryConfig
 from env.kinematic_uav import KinematicUAV, UAVState
 from fleet.airspace_manager import FleetPoseSnapshot, FleetUavPose
-from fleet.local_repair import ExternalDependencySnapshot, LocalRepairError
+from fleet.local_repair import (
+    ExternalDependencySnapshot, LocalRepairError, Transferability, build_remaining_task_contract,
+)
 from fleet.local_spatial_planner import RoutedPreplannedSpatialPlanner
 from fleet.model_request_broker import GlobalModelRequestBroker, ModelBrokerRequest, ModelRequestPriority
 from fleet.recovery_controller import FleetRecoveryController
@@ -30,7 +32,7 @@ from runtime.plan_validator import PlanValidator
 from runtime.safety_supervisor import SafetySupervisor
 from skills.hover import HoverSkill
 from skills.manager import SkillManager
-from skills.types import Observation, SkillContext, SkillName, SkillResultCode
+from skills.types import Observation, SkillContext, SkillName, SkillResultCode, SkillStatus
 from target.target_manager import TargetManager
 from tests.test_mission_agent import FakeCamera, FakeClock, ScriptedSkill, failed, running, succeeded
 
@@ -95,6 +97,48 @@ def local(uav_id="uav_1", x=0.0):
     manager = SkillManager(SkillContext(uav=uav, camera=FakeCamera(), perception=None, clock=clock, uav_id=uav_id),
         registry={SkillName.TAKEOFF: takeoff, SkillName.GOTO: goto, SkillName.HOVER: HoverSkill(),
                   SkillName.LAND: ScriptedSkill(succeeded(SkillResultCode.LAND_COMPLETE))})
+    agent = MissionAgent(planner=planner, validator=PlanValidator(), skill_manager=manager,
+        safety=SafetySupervisor(world.scene_min_xyz_m, world.scene_max_xyz_m,
+            max_mission_time_s=300, max_safe_altitude_m=25), target_manager=TargetManager(), clock=clock)
+    assignment = SimpleNamespace(assignment_id="assignment_" + uav_id, uav_id=uav_id, goal_ids=(goal.goal_id,))
+    return Local(agent, manager, clock, uav, world, home, goal, assignment, goto, takeoff, instruction)
+
+
+def track_local(uav_id="uav_1", x=0.0):
+    """The assignment's only goal is a TRACK that never started; the injected
+    fault sits on the first transit GOTO in front of it, so the TRACK remains
+    a pending, unexecuted obligation."""
+    home = "home_" + uav_id
+    world = PlannerWorldContext((-100, -100, 0), (100, 100, 30), (x, 0, 0), {},
+        {home: LandingZoneSpec(home, (x, 0))}, 10, 10, 60)
+    goal = MissionGoal("goal_track_" + uav_id, GoalType.TRACK_TARGET, "target_a", None, 10, None, ConstraintStrength.MUST)
+    steps = [
+        {"id": "takeoff", "skill": "TAKEOFF", "args": {"altitude_m": 10}},
+        {"id": "goto", "skill": "GOTO", "args": {"target": PointTarget(CoordinateFrame.WORLD_ENU, (x + 12, 0, 10)).to_dict()}},
+        {"id": "search", "skill": "SEARCH", "args": {
+            "region": {"shape": "RECTANGLE", "frame": "WORLD_ENU", "center_xyz_m": [x + 10, 0, 0],
+                "width_m": 6, "height_m": 6},
+            "strategy": {"kind": "LAWNMOWER", "spacing_m": 3},
+            "entry_policy": "START_IN_PLACE_IF_INSIDE", "target_description": "a moving person",
+            "search_altitude_m": 10, "timeout_s": 30}},
+        {"id": "track", "skill": "TRACK", "args": {"target_ref": "$search.target_id", "duration_s": 10}},
+        {"id": "home", "skill": "GOTO", "args": {"target": NamedLocationTarget(home).to_dict()}},
+        {"id": "land", "skill": "LAND", "args": {"zone": home}},
+    ]
+    draft = SkillPlanDraftV3.from_dict({"schema_version": 3, "mission_id": "mission_template", "uav_id": uav_id,
+        "plan_version": 1, "assumptions": [], "steps": [{**step, "uav_id": uav_id} for step in steps]})
+    instruction = json.dumps({"schema_version": 2, "uav_id": uav_id, "assigned_goals": [goal.to_dict()]})
+    planner = RoutedPreplannedSpatialPlanner(draft, source="dynamic_scripted", expected_instruction=instruction)
+    clock = FakeClock()
+    uav = KinematicUAV(UAVState(x, 0, 0, 0), max_speed_mps=5, max_yaw_rate_rad_s=2)
+    takeoff = ScriptedSkill(succeeded(SkillResultCode.TAKEOFF_COMPLETE))
+    goto = ScriptedSkill(failed(SkillResultCode.TIMEOUT), *[running() for _ in range(20)])
+    manager = SkillManager(SkillContext(uav=uav, camera=FakeCamera(), perception=None, clock=clock, uav_id=uav_id),
+        registry={SkillName.TAKEOFF: takeoff, SkillName.GOTO: goto,
+                  SkillName.SEARCH: ScriptedSkill(succeeded(SkillResultCode.TARGET_FOUND, {"target_id": "target_1"})),
+                  SkillName.TRACK: ScriptedSkill(succeeded(SkillResultCode.TRACK_COMPLETE)),
+                  SkillName.REACQUIRE: ScriptedSkill(succeeded(SkillResultCode.TRACK_COMPLETE)),
+                  SkillName.HOVER: HoverSkill(), SkillName.LAND: ScriptedSkill(succeeded(SkillResultCode.LAND_COMPLETE))})
     agent = MissionAgent(planner=planner, validator=PlanValidator(), skill_manager=manager,
         safety=SafetySupervisor(world.scene_min_xyz_m, world.scene_max_xyz_m,
             max_mission_time_s=300, max_safe_altitude_m=25), target_manager=TargetManager(), clock=clock)
@@ -912,9 +956,19 @@ def test_handoff_keeps_confirmed_navigation_and_transfers_only_independent_remai
         scenario.close()
 
 
-def test_small_pose_change_reprojects_admitted_route_without_new_model_request(harness):
+def test_small_pose_change_reprojects_admitted_route_without_new_model_request(harness, monkeypatch):
+    import fleet.recovery_controller as controller_module
     h = harness()
     item = h.locals[0]
+    # Capture the candidate's original world_route inside the worker thread,
+    # before the post-model pose change is applied.
+    captured = {}
+    original_validate = controller_module.validate_local_repair
+    def spy(draft, context, world_context, **kwargs):
+        candidate = original_validate(draft, context, world_context, **kwargs)
+        captured["world_route"] = tuple(tuple(point) for point in candidate.world_route)
+        return candidate
+    monkeypatch.setattr(controller_module, "validate_local_repair", spy)
     episode = h.submit()
     # A deterministic small position change after model completion must be
     # reprojected by trusted code, not re-asked from the model. 0.2m stays
@@ -928,11 +982,47 @@ def test_small_pose_change_reprojects_admitted_route_without_new_model_request(h
     assert h.exits == []
     assert len(h.factory.calls) == 1
     route = h.runtime._planned_routes[item.assignment.uav_id]
+    admitted = captured["world_route"]
+    assert len(route) == len(admitted)
+    assert admitted[0] == pytest.approx((item.world.initial_uav_xyz_m[0], 0.0, 10.0))
+    # Only the current access point changed; the admitted WORLD_ENU tail and
+    # every later waypoint are preserved verbatim.
     assert route[0] == pytest.approx(moved)
-    assert route[1:] == route[1:]  # admitted tail preserved beyond the access point
+    assert route[0] != pytest.approx(admitted[0])
+    assert route[1:] == admitted[1:]
     for _ in range(2):
         h.controller.tick()
-    assert len(h.factory.calls) == 1
+    assert len(h.factory.calls) == 1  # no second Qwen call after reproject
+
+
+def test_pending_track_only_task_is_not_transferable_to_a_replacement(harness, monkeypatch):
+    # pytest imports this file as uav_agent.tests.fleet.*; patch the running
+    # module's globals so the Harness builder sees the track-only local.
+    monkeypatch.setitem(globals(), "local", track_local)
+    h = harness(blocked=True)
+    item = h.locals[0]
+    item.fail()  # TIMEOUT on the first transit GOTO; SEARCH/TRACK never start
+    state = item.agent.local_repair_snapshot
+    assert state.event is not None and state.stable_hold
+    h.controller.tick()
+    episode = h.controller.episodes[item.assignment.assignment_id]
+    # The shared contract for this fault: one pending TRACK, zero confirmed.
+    completed = tuple(step.step_id for step in state.task_plan.steps[:state.current_step_index])
+    contract = build_remaining_task_contract((item.goal,), state.compiled_mission.planner_output, completed,
+        h.controller._evidence(state), current_step_id=state.current_step_id,
+        current_step_started=True, home_name=item.home, consumer="HANDOFF")
+    assert contract.confirmed_goal_ids == ()
+    assert [entry.status for entry in contract.goals] == ["PENDING"]
+    assert [entry.transferability for entry in contract.pending_entries] == [Transferability.SAME_UAV_ONLY]
+    # Escalate the same episode to the reassignment gate: a pending TRACK
+    # with no completed goal must be refused even though nothing is confirmed.
+    record = h.runtime.assignments.by_id(item.assignment.assignment_id)
+    record.status = AssignmentStatus.WAITING_REASSIGNMENT
+    episode.phase = "REASSIGN_QUEUED"
+    episode.queue_signature = (record.local_plan_version, h.runtime.fleet_plan.fleet_plan_version)
+    with pytest.raises(LocalRepairError) as error:
+        h.controller._prepare_reassignment(episode, h.clock() + 10.0)
+    assert error.value.code == "HANDOFF_EVIDENCE_UNSUPPORTED"
 
 
 def test_unrelated_uav_version_change_does_not_discard_active_repair(harness):

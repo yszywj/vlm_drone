@@ -710,15 +710,20 @@ class FleetRecoveryConfig:
     valid_pose_tolerance_m: float = 0.05
     max_suffix_steps: int = 10
     shutdown_timeout_s: float = 0.1
+    joint_repair_enabled: bool = False
+    max_joint_repair_scope_uavs: int = 3
+    max_joint_peer_drift_m: float = 30.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise TypeError("fleet_recovery.enabled must be bool")
+        if not isinstance(self.joint_repair_enabled, bool):
+            raise TypeError("fleet_recovery.joint_repair_enabled must be bool")
         if self.mode not in {"LOCAL_ONLY", "LOCAL_THEN_REASSIGN"}:
             raise ValueError("fleet_recovery.mode must be LOCAL_ONLY or LOCAL_THEN_REASSIGN")
         for name in ("request_timeout_s", "episode_timeout_s", "retry_cooldown_s",
                      "max_pose_time_error_s", "max_anchor_age_s", "max_hold_drift_m",
-                     "valid_pose_tolerance_m", "shutdown_timeout_s"):
+                     "valid_pose_tolerance_m", "shutdown_timeout_s", "max_joint_peer_drift_m"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value <= 0:
                 raise ValueError(f"fleet_recovery.{name} must be finite and positive")
@@ -730,6 +735,12 @@ class FleetRecoveryConfig:
             maximum = 10 if name == "max_suffix_steps" else 8
             if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
                 raise ValueError(f"fleet_recovery.{name} must be within 1..{maximum}")
+        # First-round joint repair is deliberately bounded to small scopes;
+        # larger conflicts must escalate/exit, never become a fleet-wide replan.
+        if (isinstance(self.max_joint_repair_scope_uavs, bool)
+                or not isinstance(self.max_joint_repair_scope_uavs, int)
+                or not 2 <= self.max_joint_repair_scope_uavs <= 3):
+            raise ValueError("fleet_recovery.max_joint_repair_scope_uavs must be within 2..3")
         if self.request_timeout_s > self.episode_timeout_s:
             raise ValueError("request timeout cannot exceed recovery episode deadline")
 

@@ -56,6 +56,8 @@ class SkillResultCode(Enum):
     TARGET_FOUND = auto()
     TARGET_LOST = auto()
 
+    INSPECT_COMPLETE = auto()
+
     SEARCH_EXHAUSTED = auto()
 
     TIMEOUT = auto()
@@ -75,6 +77,7 @@ _SUCCESS_RESULT_CODES = frozenset(
         SkillResultCode.HOVER_COMPLETE,
         SkillResultCode.TRACK_COMPLETE,
         SkillResultCode.TARGET_FOUND,
+        SkillResultCode.INSPECT_COMPLETE,
     }
 )
 _FAILURE_RESULT_CODES = frozenset(

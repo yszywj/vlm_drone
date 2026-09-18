@@ -17,11 +17,12 @@ from common.ids import generate_routing_id
 from configs.schema import FleetRecoveryConfig
 from fleet.airspace_manager import FleetAirspaceManager, FleetPoseSnapshot, coerce_fleet_pose_snapshot
 from fleet.local_repair import (
-    DependencyVerdict, LocalRepairCandidate, LocalRepairContextV3, LocalRepairDraftV3, LocalRepairError,
-    RepairAnchor, SkillExecutionEvidence, SpatialReferenceVerdict, Transferability,
+    DependencyVerdict, JointRepairRequest, LocalRepairCandidate, LocalRepairContextV3,
+    LocalRepairDraftV3, LocalRepairError, RepairAnchor, SkillExecutionEvidence,
+    SpatialReferenceVerdict, Transferability, build_joint_repair_json_schema,
     build_remaining_task_contract, check_cross_uav_dependencies, evaluate_spatial_reference,
-    build_local_repair_json_schema, extract_external_dependencies, reproject_world_route,
-    validate_local_repair,
+    build_local_repair_json_schema, extract_external_dependencies, parse_joint_repair_drafts,
+    reproject_world_route, validate_joint_repair, validate_local_repair,
 )
 from fleet.model_request_broker import ModelBrokerRequest, ModelRequestPriority
 from fleet.model_request_dispatcher import BrokeredTextTaskRunner
@@ -57,6 +58,8 @@ class RecoveryEpisode:
     remaining_goal_ids: tuple[str, ...] = ()
     confirmed_goal_evidence: tuple = ()
     source_uav_id: str | None = None
+    joint_scope: tuple[str, ...] = ()
+    joint_contexts: object | None = None
 
 
 class FleetRecoveryController:
@@ -65,12 +68,16 @@ class FleetRecoveryController:
     def __init__(self, *, config: FleetRecoveryConfig, broker, task_spec,
                  assignments, compilations, world_contexts, home_names, client_factory,
                  geometry_provider: Callable, replan_boundary=None, planner_limits=None,
-                 planner_policy=None, clock=monotonic, runner=None):
+                 planner_policy=None, clock=monotonic, runner=None, goal_contracts=None):
         if not config.enabled:
             raise ValueError("FleetRecoveryController requires explicit enabled configuration")
         if not callable(geometry_provider) or not callable(clock):
             raise TypeError("recovery requires a trusted geometry provider and monotonic clock")
         self.config, self.clock = config, clock
+        # Every completion semantic is registry-driven; adding task types does
+        # not modify this controller.
+        from fleet.contract_registry import DEFAULT_GOAL_CONTRACT_REGISTRY
+        self._goal_contracts = DEFAULT_GOAL_CONTRACT_REGISTRY if goal_contracts is None else goal_contracts
         self.task_spec = task_spec
         # A handoff's WORLD-bound goal meanings must survive subsequent local
         # repairs and another handoff, independently of the spare's home/start.
@@ -223,9 +230,9 @@ class FleetRecoveryController:
                     refs[goal_id] = entry.evidence_refs
                 # Incomplete/active external successors must not be called pending.
                 if state.current_step_id is not None:
-                    from fleet.local_repair import _goal_steps
+                    from fleet.local_repair import matching_steps_for
                     for goal in goals:
-                        if any(step.id == state.current_step_id for step in _goal_steps(
+                        if any(step.id == state.current_step_id for step in matching_steps_for(
                                 goal, original.planner_output.steps, self.home_names[record.assignment.uav_id])):
                             if states[goal.goal_id] != "CONFIRMED":
                                 states[goal.goal_id] = "ACTIVE"
@@ -292,6 +299,8 @@ class FleetRecoveryController:
                     continue
                 if episode.phase.startswith("REASSIGN"):
                     self._tick_reassignment(episode)
+                elif episode.phase.startswith("JOINT"):
+                    self._tick_joint(episode)
                 else:
                     self._tick_local(episode)
             except Exception as exc:
@@ -577,6 +586,400 @@ class FleetRecoveryController:
             check = check_cross_uav_dependencies((), (), {}, {}, route_conflicts=involved)
             raise LocalRepairError("SHARED_SPACE_CONFLICT", ";".join(check.reasons), affected_uav_ids=check.affected_uav_ids)
 
+    # ------------------------------------------------------------------
+    # Bounded related-group joint repair (COORDINATION_REQUIRED follow-up)
+    # ------------------------------------------------------------------
+
+    def _record_for_uav(self, uav_id):
+        for row in self.runtime.assignments.records:
+            if row.assignment.uav_id == uav_id:
+                return row
+        return None
+
+    def _require_joint_peer(self, uav_id, episode):
+        """Trusted suitability gate for a healthy UAV joining a repair scope."""
+        row = self._record_for_uav(uav_id)
+        if row is None or row.status.value != "RUNNING":
+            raise LocalRepairError("JOINT_PEER_NOT_RUNNING", "peer is not executing a plan")
+        if row.assignment.assignment_id in self.episodes:
+            raise LocalRepairError("JOINT_PEER_BUSY", "peer already owns a recovery episode")
+        agent = self.runtime.agents.get(uav_id)
+        state = getattr(agent, "local_repair_snapshot", None)
+        if agent is None or state is None or state.event is not None:
+            raise LocalRepairError("JOINT_PEER_NOT_HEALTHY", "peer is itself under repair")
+        if state.compiled_mission is None or not isinstance(state.compiled_mission.planner_output, SkillPlanDraftV3):
+            raise LocalRepairError("JOINT_PEER_NO_V3_PLAN", "peer lacks a linear V3 plan")
+        if state.task_plan is None or state.current_step_id is None:
+            raise LocalRepairError("JOINT_PEER_NO_V3_PLAN", "peer lacks an active step boundary")
+        current = next((step for step in state.compiled_mission.planner_output.steps
+                        if step.id == state.current_step_id), None)
+        if current is None or current.skill != "GOTO":
+            raise LocalRepairError("JOINT_PEER_NOT_AT_TRANSIT", "only a transit GOTO boundary may be coordinated")
+        if state.task_plan.plan_version != row.local_plan_version:
+            raise LocalRepairError("JOINT_PEER_VERSION_MISMATCH", "peer plan version disagrees with records")
+        return row
+
+    def _try_enter_joint_repair(self, episode, reason, affected):
+        """Select a bounded repair scope from trusted conflict evidence only.
+
+        The scope is {faulted UAV} plus the conflict-affected set: a sound
+        over-approximation, not a proven minimal set. Anything above the
+        configured bound escalates/exits instead of becoming a fleet replan.
+        """
+        if not self.config.joint_repair_enabled or episode.phase.startswith(("REASSIGN", "JOINT")):
+            return False
+        scope = {episode.source_uav_id, *affected}
+        scope.discard(None)
+        if not 2 <= len(scope) <= self.config.max_joint_repair_scope_uavs:
+            self._log("RECOVERY_JOINT_SCOPE_REJECTED", episode, reason=reason,
+                      scope_size=len(scope), max_scope=self.config.max_joint_repair_scope_uavs)
+            return False
+        for uav_id in sorted(scope):
+            if uav_id == episode.source_uav_id:
+                continue
+            try:
+                self._require_joint_peer(uav_id, episode)
+            except LocalRepairError as exc:
+                self._log("RECOVERY_JOINT_PEER_REJECTED", episode, uav_id=uav_id, reason=exc.code)
+                return False
+        if episode.request_id:
+            self.runner.cancel(episode.request_id, reason=reason)
+            self.runner.poll(episode.request_id)
+        episode.request_id = None
+        episode.joint_scope = tuple(sorted(scope))
+        episode.joint_contexts = None
+        episode.phase = "JOINT_QUEUED"
+        episode.next_attempt_wall_s = self.clock()
+        self._log("RECOVERY_JOINT_SCOPE_SELECTED", episode, reason=reason,
+                  joint_scope=list(episode.joint_scope))
+        return True
+
+    def _joint_peer_context(self, row, episode, deadline):
+        """Frozen per-peer trusted context for the joint model request."""
+        agent = self.runtime.agents[row.assignment.uav_id]
+        state = agent.local_repair_snapshot
+        observation = state.latest_observation
+        if observation is None:
+            raise LocalRepairError("OBSERVATION_UNAVAILABLE", "peer has no aligned observation")
+        stamp = float(observation.timestamp)
+        raw_pose_stamp = getattr(observation, "pose_timestamp_s", None)
+        pose_stamp = stamp if raw_pose_stamp is None else float(raw_pose_stamp)
+        if not isfinite(stamp) or not isfinite(pose_stamp) or abs(stamp - pose_stamp) > self.config.max_pose_time_error_s:
+            raise LocalRepairError("OBSERVATION_TIME_MISMATCH", "peer observation and pose do not align")
+        geometry = self.geometry_provider()
+        resolver = self._initial_resolver(row.assignment.uav_id)
+        pose = observation.uav_pose
+        anchor = RepairAnchor(generate_routing_id("anchor"), getattr(observation, "frame_id", None) or
+            generate_routing_id("observation"), stamp, pose_stamp,
+            getattr(observation, "time_domain", "simulation"), FramePose((pose.x, pose.y, pose.z), pose.yaw),
+            resolver._home_pose, resolver._uav_start_pose, int(geometry["map_version"]),
+            int(geometry["reference_version"]), resolver.named_locations, self.config.max_pose_time_error_s)
+        deps, versions = self._dependencies(row.assignment.assignment_id)
+        completed = tuple(step.step_id for step in state.task_plan.steps[:state.current_step_index])
+        context = LocalRepairContextV3(
+            fleet_mission_id=self.runtime.fleet_plan.fleet_mission_id,
+            assignment_id=row.assignment.assignment_id,
+            request_id=episode.request_id, episode_id=episode.episode_id,
+            execution_generation=state.execution_epoch,
+            original=state.compiled_mission, current_step_id=state.current_step_id,
+            completed_step_ids=completed, completed_step_outputs=state.completed_outputs,
+            goals=tuple(self._task_spec_for(row.assignment.assignment_id).goal(goal)
+                        for goal in row.assignment.goal_ids),
+            evidence=self._evidence(state), anchor=anchor,
+            submitted_wall_s=self.clock(), deadline_wall_s=deadline,
+            external_dependencies=deps, dependency_versions=versions,
+            home_name=self.home_names[row.assignment.uav_id],
+            max_suffix_steps=min(self.config.max_suffix_steps, 10),
+            ordering_constraints=self.task_spec.ordering_constraints)
+        return context, deps, versions
+
+    def _prepare_joint(self, episode, deadline):
+        if self.episodes.get(episode.assignment_id) is not episode or episode.phase != "JOINT_QUEUED":
+            return None
+        record, agent, state = self._state(episode)
+        if not state.stable_hold or self.runtime.cancel_requested:
+            return None
+        if episode.context is None:
+            raise LocalRepairError("STALE_EPISODE", "joint repair needs the admitted single-repair context")
+        # The faulted UAV must still pass every live single-repair check.
+        self._check_local_live(episode)
+        contexts = {episode.source_uav_id: episode.context}
+        deps_map = {episode.source_uav_id: (episode.context.external_dependencies,
+                                            episode.context.dependency_versions)}
+        for uav_id in episode.joint_scope:
+            if uav_id == episode.source_uav_id:
+                continue
+            row = self._require_joint_peer(uav_id, episode)
+            context, deps, versions = self._joint_peer_context(row, episode, deadline)
+            check = check_cross_uav_dependencies(deps, deps, versions, versions)
+            if check.verdict is DependencyVerdict.INVALID:
+                raise LocalRepairError("DEPENDENCY_INVALID", ";".join(check.reasons), affected_uav_ids=check.affected_uav_ids)
+            if not check.allowed:
+                raise LocalRepairError("COORDINATION_REQUIRED", ";".join(check.reasons), affected_uav_ids=check.affected_uav_ids)
+            if not context.remaining_task_contract.supported:
+                raise LocalRepairError("EVIDENCE_INSUFFICIENT", "peer remaining goals lack trusted evidence")
+            contexts[uav_id] = context
+            deps_map[uav_id] = (deps, versions)
+        geometry = self.geometry_provider()
+        snapshot = coerce_fleet_pose_snapshot(geometry["fleet_pose_snapshot"])
+        readonly_routes = {}
+        for row in self.runtime.assignments.records:
+            uav_id = row.assignment.uav_id
+            if uav_id in contexts or uav_id not in snapshot.poses:
+                continue
+            current = self.runtime._planned_routes.get(uav_id, ())
+            index = self.runtime._route_progress.get(uav_id, 0)
+            remainder = (snapshot.poses[uav_id].position_xyz_m,) + tuple(current[index + 1:])
+            if len(remainder) > 1:
+                readonly_routes[uav_id] = remainder
+        request = JointRepairRequest(request_id=episode.request_id, episode_id=episode.episode_id,
+            faulted_uav_id=episode.source_uav_id, scope=tuple(contexts), contexts=contexts,
+            readonly_uav_routes=readonly_routes)
+        episode.joint_contexts = dict(contexts)
+        episode.submitted_wall_s = self.clock()
+        episode.phase = "JOINT_INFLIGHT"
+        self._log("RECOVERY_JOINT_MODEL_SUBMITTED", episode, joint_scope=list(request.scope),
+                  **self.local_selection.to_dict())
+        from models.runtime_deadline import DeadlineModelClient
+        client = DeadlineModelClient(self.client_factory.for_role(ModelCallRole.RUNTIME_REPLAN,
+            fleet_mission_id=episode.context.fleet_mission_id, assignment_id=episode.context.assignment_id,
+            uav_id=episode.source_uav_id), deadline_wall_s=deadline, clock=self.clock)
+        worlds = {uav_id: self.world_contexts[uav_id] for uav_id in request.scope}
+        versions_map = {uav_id: deps_map[uav_id][1] for uav_id in request.scope}
+        deps_only = {uav_id: deps_map[uav_id][0] for uav_id in request.scope}
+        limits, policy, clock = self.limits, self.policy, self.clock
+        def compute():
+            drafts = _generate_joint_suffix(client, request)
+            return validate_joint_repair(drafts, request, worlds,
+                dependency_versions=versions_map, external_dependencies=deps_only,
+                now_wall_s=clock(), plan_validator=PlanValidator(limits, policy))
+        return compute
+
+    def _check_joint_space(self, routes, contexts):
+        """Live obstacle/separation check for every scope candidate at once."""
+        geometry = self.geometry_provider()
+        snapshot = coerce_fleet_pose_snapshot(geometry["fleet_pose_snapshot"])
+        scope = set(routes)
+        full_points = {}
+        for uav_id, route in routes.items():
+            if uav_id not in snapshot.poses:
+                raise LocalRepairError("POSE_UNAVAILABLE", "missing trusted current world pose")
+            context = contexts.get(uav_id)
+            if context is not None and (geometry["map_version"] != context.anchor.map_version or
+                                        geometry["reference_version"] != context.anchor.reference_version):
+                raise LocalRepairError("REFERENCE_CHANGED", "map or coordinate reference changed")
+            points = (snapshot.poses[uav_id].position_xyz_m,) + tuple(route[1:])
+            full_points[uav_id] = points
+            for obstacle in geometry["obstacles"]:
+                if not obstacle.collidable:
+                    continue
+                aabb = obstacle.aabb.expanded(geometry.get("uav_half_extent_xyz_m", (0.25, 0.25, 0.25)))
+                if any(aabb.segment_intersection_fraction(a, b) is not None for a, b in zip(points, points[1:])):
+                    raise LocalRepairError("UNSAFE_ENTRY_OR_ROUTE", "joint candidate crosses an obstacle")
+        poses = dict(snapshot.poses)
+        for other, other_pose in poses.items():
+            if other in scope:
+                points = full_points[other]
+                poses[other] = replace(other_pose, route_xyz_m=points if len(points) > 1 else ())
+            else:
+                current = self.runtime._planned_routes.get(other, ())
+                index = self.runtime._route_progress.get(other, 0)
+                remainder = (other_pose.position_xyz_m,) + tuple(current[index + 1:])
+                poses[other] = replace(other_pose, route_xyz_m=remainder if len(remainder) > 1 else ())
+        checker = FleetAirspaceManager(self.runtime.fleet_plan.coordination_policy.minimum_uav_separation_m)
+        decision = checker.evaluate(FleetPoseSnapshot(snapshot.timestamp_s, poses))
+        involved = sorted({tuple(sorted((p.uav_a_id, p.uav_b_id))) for p in decision.conflicts
+                           if p.is_conflict and scope & {p.uav_a_id, p.uav_b_id}})
+        if involved:
+            check = check_cross_uav_dependencies((), (), {}, {}, route_conflicts=involved)
+            raise LocalRepairError("SHARED_SPACE_CONFLICT", ";".join(check.reasons), affected_uav_ids=check.affected_uav_ids)
+
+    def _check_joint_live(self, episode, candidates, committed=()):
+        """Full live guard for every scope UAV; returns the routes to publish.
+
+        UAVs already published inside this coordinated commit are consistency
+        checked against their candidate instead of their request-time state.
+        """
+        if self.runtime.cancel_requested or self.clock() >= episode.deadline_wall_s:
+            raise LocalRepairError("DEADLINE_OR_CANCEL", "joint candidate lost execution eligibility")
+        # Faulted UAV keeps every single-repair liveness requirement.
+        self._check_local_live(episode)
+        routes = {}
+        for uav_id in episode.joint_scope:
+            candidate = candidates[uav_id]
+            if uav_id == episode.source_uav_id:
+                routes[uav_id] = self._admitted_route(episode, candidate.world_route)
+                continue
+            row = self._record_for_uav(uav_id)
+            context = episode.joint_contexts[uav_id]
+            agent = self.runtime.agents[uav_id]
+            state = agent.local_repair_snapshot
+            if row is None or row.status.value != "RUNNING":
+                raise LocalRepairError("STALE_VERSION", "peer left the running state")
+            if uav_id in committed:
+                # Already published by this coordinated commit: verify the
+                # published plan is exactly the admitted candidate.
+                if (state.task_plan is None
+                        or state.task_plan.to_dict() != candidate.task_plan.to_dict()):
+                    raise LocalRepairError("STALE_STEP", "published peer plan diverged from the candidate")
+                routes[uav_id] = tuple(candidate.world_route)
+                continue
+            if row.local_plan_version != context.original.planner_output.plan_version:
+                raise LocalRepairError("STALE_VERSION", "peer local plan version changed")
+            if state.event is not None:
+                raise LocalRepairError("STALE_EVENT", "peer entered its own repair")
+            if (state.current_step_id != context.current_step_id
+                    or state.task_plan is None or state.task_plan.plan_version != row.local_plan_version):
+                raise LocalRepairError("STALE_STEP", "peer authorized step changed")
+            observation = state.latest_observation
+            if observation is None:
+                raise LocalRepairError("OBSERVATION_TIME_MISMATCH", "peer observation disappeared")
+            pose_stamp = getattr(observation, "pose_timestamp_s", None)
+            pose_stamp = float(observation.timestamp) if pose_stamp is None else float(pose_stamp)
+            pose = observation.uav_pose
+            validity = evaluate_spatial_reference(
+                context.anchor, observation_time_s=float(observation.timestamp), pose_time_s=pose_stamp,
+                time_domain=getattr(observation, "time_domain", "simulation"),
+                current_pose_xyz_m=(pose.x, pose.y, pose.z),
+                now_wall_s=self.clock(), submitted_wall_s=context.submitted_wall_s,
+                max_anchor_age_s=self.config.max_anchor_age_s,
+                max_pose_time_error_s=self.config.max_pose_time_error_s,
+                max_hold_drift_m=self.config.max_joint_peer_drift_m,
+                valid_pose_tolerance_m=self.config.valid_pose_tolerance_m,
+                map_version=int(self.geometry_provider()["map_version"]),
+                reference_version=int(self.geometry_provider()["reference_version"]))
+            if validity.verdict is SpatialReferenceVerdict.INVALID:
+                raise LocalRepairError(validity.code or "REFERENCE_CHANGED", ";".join(validity.reasons))
+            if validity.verdict is SpatialReferenceVerdict.VALID:
+                routes[uav_id] = tuple(candidate.world_route)
+            else:
+                routes[uav_id] = reproject_world_route(candidate.world_route, (pose.x, pose.y, pose.z))
+            deps, versions = self._dependencies(row.assignment.assignment_id)
+            decision = check_cross_uav_dependencies(context.external_dependencies, deps,
+                                                     context.dependency_versions, versions)
+            if decision.verdict is DependencyVerdict.INVALID:
+                raise LocalRepairError("DEPENDENCY_INVALID", ";".join(decision.reasons), affected_uav_ids=decision.affected_uav_ids)
+            if not decision.allowed:
+                raise LocalRepairError("COORDINATION_REQUIRED", ";".join(decision.reasons), affected_uav_ids=decision.affected_uav_ids)
+        self._check_joint_space(routes, episode.joint_contexts)
+        return routes
+
+    def _tick_joint(self, episode):
+        record, agent, state = self._state(episode)
+        if not self._owns_execution(episode):
+            self._finish(episode, "STALE_EXECUTION")
+            return
+        if episode.request_id is None:
+            if not state.stable_hold or self.clock() < episode.next_attempt_wall_s:
+                return
+            episode.request_id = generate_routing_id("request")
+            episode.queue_signature = self._signature(episode)
+            request = self._broker_request(episode, ModelCallRole.RUNTIME_REPLAN, self.local_selection)
+            deadline = min(episode.deadline_wall_s, self.clock() + self.config.request_timeout_s)
+            self.runner.submit(request, lambda: self._prepare_joint(episode, deadline),
+                               deadline_at_s=deadline, adapter_selection=self.local_selection)
+            self._log("RECOVERY_JOINT_QUEUED", episode, joint_scope=list(episode.joint_scope))
+            return
+        result = self.runner.poll(episode.request_id)
+        if result is None:
+            return
+        if result.exception is not None:
+            if isinstance(result.exception, LocalRepairError):
+                raise result.exception
+            raise LocalRepairError("MODEL_REQUEST_REJECTED", type(result.exception).__name__)
+        if result.stale:
+            raise LocalRepairError("MODEL_REQUEST_REJECTED", result.reason or "STALE_RESULT")
+        candidates = result.value
+        if (not isinstance(candidates, dict) or episode.joint_contexts is None
+                or set(candidates) != set(episode.joint_scope)
+                or any(not isinstance(item, LocalRepairCandidate) for item in candidates.values())):
+            raise LocalRepairError("ROUTING_MISMATCH", "joint candidate does not belong to the admitted request")
+        episode.phase = "JOINT_VALIDATING"
+        self._log("RECOVERY_MODEL_COMPLETED", episode)
+        def guard():
+            return self._check_joint_live(episode, candidates)
+        routes = guard()
+        self._log("RECOVERY_VALIDATION_COMPLETED", episode)
+        with self.runtime._recovery_commit_lock:
+            routes = guard()
+            self._commit_joint(episode, candidates, routes)
+        self._log("RECOVERY_COMMITTED", episode, joint_scope=list(episode.joint_scope))
+        self._finish(episode, "JOINT_REPAIR_SUCCEEDED")
+
+    def _commit_joint(self, episode, candidates, routes):
+        """All-or-none coordinated publication of the joint candidates.
+
+        Every check runs before any mutation; peers commit first and the
+        faulted UAV last. If anything fails after a peer published, the peer
+        is restored to its original suffix at the next version, so plan
+        software state never advances for only part of the scope.
+        """
+        faulted = episode.source_uav_id
+        peers = tuple(uav_id for uav_id in episode.joint_scope if uav_id != faulted)
+        committed = set()
+        def joint_guard():
+            return self._check_joint_live(episode, candidates, committed)
+        published = []
+        try:
+            for uav_id in peers:
+                peer_agent = self.runtime.agents[uav_id]
+                old_plan = peer_agent.local_repair_snapshot.task_plan
+                peer_agent.begin_coordinated_repair_hold(
+                    max_wait_s=max(30.0, episode.deadline_wall_s - self.clock()))
+                try:
+                    peer_agent.commit_coordinated_suffix(
+                        candidates[uav_id].task_plan,
+                        expected_plan_version=candidates[uav_id].task_plan.plan_version - 1,
+                        compiled_mission=candidates[uav_id].compiled_mission,
+                        final_guard=joint_guard)
+                except Exception:
+                    # This peer never published: undo its soft-pause only.
+                    try:
+                        peer_agent.resume_coordinated_interruption()
+                    except Exception as exc:
+                        self._log("RECOVERY_JOINT_RESUME_FAILED", episode, uav_id=uav_id,
+                                  error_code=type(exc).__name__)
+                    raise
+                published.append((uav_id, old_plan))
+                committed.add(uav_id)
+            faulted_agent = self.runtime.agents[faulted]
+            faulted_agent.commit_local_repair(candidates[faulted].task_plan,
+                expected_event_id=episode.event_id, expected_plan_version=episode.base_version,
+                compiled_mission=candidates[faulted].compiled_mission,
+                final_guard=joint_guard, allow_goto_detour_prefix=True)
+        except Exception:
+            self._rollback_joint_peers(episode, published)
+            raise
+        for uav_id in episode.joint_scope:
+            agent_now = self.runtime.agents[uav_id]
+            snapshot_plan = agent_now.local_repair_snapshot.task_plan
+            if snapshot_plan is None or snapshot_plan.to_dict() != candidates[uav_id].task_plan.to_dict():
+                continue
+            row = self._record_for_uav(uav_id)
+            self.runtime._planned_routes[uav_id] = routes[uav_id]
+            self.runtime._route_progress[uav_id] = 0
+            from fleet.runtime import AssignmentStatus
+            self.runtime.assignments.update(row.assignment.assignment_id, AssignmentStatus.RUNNING,
+                local_plan_version=candidates[uav_id].task_plan.plan_version, last_error=None)
+            self.compilations[uav_id] = candidates[uav_id].compiled_mission
+
+    def _rollback_joint_peers(self, episode, published):
+        if not published:
+            return
+        self._log("RECOVERY_JOINT_ROLLBACK", episode, uav_ids=[uav_id for uav_id, _ in published])
+        from skills.plan import TaskPlan
+        for uav_id, old_plan in reversed(published):
+            agent = self.runtime.agents[uav_id]
+            try:
+                current = agent.local_repair_snapshot.task_plan
+                restore = TaskPlan(old_plan.steps, old_plan.mission_id, old_plan.uav_id,
+                                   current.plan_version + 1)
+                agent.commit_coordinated_suffix(restore,
+                    expected_plan_version=current.plan_version, final_guard=None)
+            except Exception as exc:
+                self._log("RECOVERY_JOINT_ROLLBACK_FAILED", episode, uav_id=uav_id,
+                          error_code=type(exc).__name__)
+
     def _broker_request(self, episode, role, selection):
         uav = self._record(episode).assignment.uav_id
         return ModelBrokerRequest(call_role=role.value,
@@ -700,8 +1103,10 @@ class FleetRecoveryController:
         if any(entry.transferability is not Transferability.TRANSFERABLE for entry in contract.pending_entries):
             raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "remaining goals require source-local outputs")
         if contract.confirmed_goal_ids:
-            from fleet.task_spec import GoalType
-            if not any(goal.goal_type is GoalType.NAVIGATE for goal in contract.pending_goals):
+            # Delegation anchors come from the contract registry, not from
+            # goal_type branches in the controller.
+            if not any(self._goal_contracts.is_delegation_anchor(goal.goal_type)
+                       for goal in contract.pending_goals):
                 raise LocalRepairError("HANDOFF_EVIDENCE_UNSUPPORTED", "source termination alone cannot be delegated")
         deps,versions=self._dependencies(episode.assignment_id, goal_ids=contract.pending_goal_ids)
         decision=check_cross_uav_dependencies(deps,deps,versions,versions)
@@ -757,8 +1162,15 @@ class FleetRecoveryController:
         self._log("RECOVERY_REJECTED",episode,reason=reason,affected_uav_ids=list(affected))
         if reason in {"COORDINATION_REQUIRED","SHARED_SPACE_CONFLICT","REFERENCE_CHANGED","EVIDENCE_INSUFFICIENT",
                       "HANDOFF_EVIDENCE_UNSUPPORTED","DEPENDENCY_INVALID"}:
+            if (reason in {"COORDINATION_REQUIRED", "SHARED_SPACE_CONFLICT"}
+                    and self._try_enter_joint_repair(episode, reason, affected)):
+                return
             if affected:
                 self._log("RECOVERY_COORDINATION_REQUIRED",episode,reason=reason,affected_uav_ids=list(affected))
+            self._exit(episode,reason)
+        elif episode.phase.startswith("JOINT"):
+            # Joint repair is one bounded attempt: a rejected candidate exits
+            # safely instead of falling back into unbounded local retries.
             self._exit(episode,reason)
         elif episode.phase.startswith("REASSIGN"):
             # A concurrent handoff may change only the global Fleet version.
@@ -855,3 +1267,19 @@ def _generate_suffix(client, context):
     if not isinstance(response,ModelResponse) or len(response.content.encode("utf-8"))>65536:
         raise LocalRepairError("INVALID_MODEL_RESPONSE","invalid or oversized repair response")
     return LocalRepairDraftV3.from_dict(strict_json_object_loads(response.content))
+
+
+def _generate_joint_suffix(client, request):
+    """One Qwen request for the whole editable scope; readonly UAVs are geometry."""
+    joint_schema = build_joint_repair_json_schema(request)
+    payload={"trusted_joint_context":request.to_dict(),
+             "authorized_output":{uav:{key:value["const"] for key,value in joint_schema["properties"][uav]["properties"].items()
+                                    if "const" in value} for uav in request.scope}}
+    response=client.chat((
+        ChatMessage("system","Return one JSON object whose keys are exactly the editable UAV IDs in editable_uavs. For each UAV return only its authorized Spatial V3 suffix. You may modify ONLY those UAVs; every readonly UAV, its route and its resources are fixed constraints that must be avoided, never rewritten or released. Preserve each UAV's retained step IDs, target references, durations, goal conditions and termination. Each UAV's remaining_task_contract is trusted read-only evidence computed from execution proof: never dispute, recompute, reduce or restate completion amounts, goal identity, target bindings or completion conditions. Routing, versions, permissions and deadlines are trusted constants."),
+        ChatMessage("user",json.dumps(payload,ensure_ascii=False,allow_nan=False,separators=(",",":")))),
+        options=GenerationOptions(temperature=0.0,max_tokens=8192,
+            response_format=JsonSchemaResponseFormat("joint_repair_v3",joint_schema)))
+    if not isinstance(response,ModelResponse) or len(response.content.encode("utf-8"))>262144:
+        raise LocalRepairError("INVALID_MODEL_RESPONSE","invalid or oversized joint repair response")
+    return parse_joint_repair_drafts(strict_json_object_loads(response.content), request)

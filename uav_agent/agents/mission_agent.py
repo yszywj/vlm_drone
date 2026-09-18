@@ -526,6 +526,98 @@ class MissionAgent:
         # the Fleet owner has synchronously adopted its corresponding metadata.
         return self.snapshot()
 
+    def begin_coordinated_repair_hold(self, *, max_wait_s: float) -> None:
+        """Trusted soft-pause for a HEALTHY UAV entering a bounded joint repair.
+
+        Called only by the Fleet recovery owner at its serial tick boundary;
+        never by model output. Physical hover is real execution, and a suffix
+        that is never published is undone by resume_coordinated_interruption.
+        """
+        if self._status is not AgentStatus.RUNNING or self._shutdown_outcome is not None:
+            raise MissionAgentError("coordinated repair requires a RUNNING agent")
+        if self._skill_manager.local_repair_event is not None:
+            raise MissionAgentError(
+                "coordinated repair conflicts with an active fault repair"
+            )
+        self._skill_manager.interrupt_with_hover(
+            "COORDINATED_REPAIR_PENDING",
+            max_wait_s=max_wait_s,
+        )
+
+    def resume_coordinated_interruption(self) -> None:
+        """Undo a coordinated hold whose suffix was never published."""
+        if self._status is not AgentStatus.RUNNING:
+            raise MissionAgentError("coordinated resume requires a RUNNING agent")
+        self._skill_manager.resume_coordinated_interruption()
+
+    def commit_coordinated_suffix(
+        self, task_plan: TaskPlan, *, expected_plan_version: int,
+        compiled_mission: CompiledMission | None = None,
+        final_guard: Callable[[], None] | None = None,
+    ) -> MissionAgentSnapshot:
+        """Preflight then synchronously adopt a coordinated joint-repair suffix.
+
+        Same protected-suffix contract as commit_local_repair, minus the fault
+        event: immutable prefix, retained current step, authorized GOTO
+        detours only. Software plan state advances by exactly one version.
+        """
+        if (
+            self._status is not AgentStatus.RUNNING
+            or self._shutdown_outcome is not None
+            or self._plan_version != expected_plan_version
+        ):
+            raise MissionAgentError("coordinated repair Agent boundary is stale or canceled")
+        original = self._compiled_mission
+        assert original is not None
+        if not isinstance(task_plan, TaskPlan):
+            raise TypeError("task_plan must be a TaskPlan")
+        if compiled_mission is None:
+            compiled_mission = CompiledMission(
+                planner_output=original.planner_output,
+                task_plan=task_plan, source=original.source,
+                compiler_notes=(*original.compiler_notes, "trusted coordinated suffix repair"),
+            )
+        if not isinstance(compiled_mission, CompiledMission):
+            raise TypeError("compiled_mission must be a CompiledMission")
+        if compiled_mission.task_plan.to_dict() != task_plan.to_dict():
+            raise MissionAgentError("coordinated repair compiled TaskPlan mismatch")
+        if compiled_mission.target_spec != original.target_spec:
+            raise MissionAgentError("coordinated repair cannot change the original TargetSpec")
+        owned = _copy_local_repair_compiled(compiled_mission)
+        if (
+            owned.task_plan.mission_id != self._mission_id
+            or owned.task_plan.uav_id != self._uav_id
+            or owned.task_plan.plan_version != expected_plan_version + 1
+        ):
+            raise MissionAgentError("coordinated repair routing/version mismatch")
+        decision = self._safety.preflight(owned)
+        if not isinstance(decision, SafetyDecision) or decision.action is not SafetyAction.CONTINUE:
+            raise MissionAgentError("coordinated repair safety preflight rejected TaskPlan")
+
+        def publication_guard() -> None:
+            if final_guard is not None:
+                final_guard()
+            if (
+                self._status is not AgentStatus.RUNNING
+                or self._shutdown_outcome is not None
+                or self._plan_version != expected_plan_version
+            ):
+                raise MissionAgentError("coordinated repair Agent boundary is stale at publication")
+
+        try:
+            self._skill_manager.commit_coordinated_suffix(
+                owned.task_plan,
+                expected_plan_version=expected_plan_version,
+                final_guard=publication_guard,
+                allow_goto_detour_prefix=True,
+            )
+        finally:
+            published = self._skill_manager.task_plan
+            if published is not None and published.to_dict() == owned.task_plan.to_dict():
+                self._compiled_mission = owned
+                self._plan_version = owned.task_plan.plan_version
+        return self.snapshot()
+
     def fail_local_repair(self, *, expected_event_id: str, reason: str) -> bool:
         if self._status is not AgentStatus.RUNNING or self._shutdown_outcome is not None:
             return False

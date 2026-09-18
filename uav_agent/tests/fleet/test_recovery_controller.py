@@ -191,7 +191,13 @@ class ModelFactory:
                 factory.started[uav].set()
                 assert factory.release[uav].wait(2.0)
                 payload = json.loads(messages[1].content)
-                data = {**payload["authorized_output"], "steps": payload["original_suffix"]}
+                if "trusted_joint_context" in payload:
+                    joint = payload["trusted_joint_context"]
+                    data = {uav_id: {**payload["authorized_output"][uav_id],
+                                     "steps": joint["original_suffixes"][uav_id]}
+                            for uav_id in joint["editable_uavs"]}
+                else:
+                    data = {**payload["authorized_output"], "steps": payload["original_suffix"]}
                 if factory.transform is not None:
                     data = factory.transform(data, payload)
                 return ModelResponse(content="invalid JSON" if factory.invalid else json.dumps(data),
@@ -1056,3 +1062,197 @@ def test_shared_channel_contention_lets_only_one_committer_through(harness):
     h.complete(second)
     assert h.locals[1].agent.snapshot().plan_version == 1
     assert ("assignment_uav_2", "COORDINATION_REQUIRED") in h.exits
+
+
+# ---------------------------------------------------------------------------
+# Bounded related-group joint repair
+# ---------------------------------------------------------------------------
+
+def joint_config():
+    return FleetRecoveryConfig(enabled=True, mode="LOCAL_ONLY", joint_repair_enabled=True)
+
+
+def healthy_peers(h, indexes):
+    """Remove the injected TIMEOUT and advance peers onto their transit GOTO."""
+    for index in indexes:
+        item = h.locals[index]
+        item.goto._outcomes.popleft()
+        item.uav.set_pose(*item.world.initial_uav_xyz_m[:2], 10.0, 0.0)
+        for ts in range(1, 4):
+            item.tick(float(ts))
+        assert item.agent.local_repair_snapshot.current_step_id == "goto"
+
+
+def occupy_corridor(h, uav_id, waypoint):
+    """Publish a committed route for a healthy UAV crossing uav_1's corridor."""
+    h.runtime._planned_routes[uav_id] = (waypoint, (10.0, 0.0, 10.0))
+    h.runtime._route_progress[uav_id] = 0
+
+
+def test_corridor_conflict_routes_bounded_joint_repair_without_touching_outsiders(harness):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    outsiders_before = {item.assignment.uav_id: item.manager.task_plan.to_dict()
+                        for item in h.locals[2:]}
+    episode = h.submit(0)
+    # The single-UAV candidate enters uav_2's occupied corridor and must be
+    # rejected, then re-planned as a bounded {uav_1, uav_2} joint repair.
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+    scope_event = next(event for event in h.events if event["event"] == "RECOVERY_JOINT_SCOPE_SELECTED")
+    assert scope_event["joint_scope"] == ["uav_1", "uav_2"]
+    h.complete(episode)  # submit the joint request
+    h.complete(episode)  # join, validate and coordinate-commit
+    assert h.locals[0].agent.snapshot().plan_version == 2
+    assert h.locals[1].agent.snapshot().plan_version == 2
+    for item in h.locals[2:]:
+        assert item.agent.snapshot().plan_version == 1
+        assert item.manager.task_plan.to_dict() == outsiders_before[item.assignment.uav_id]
+    assert h.exits == []
+    assert episode.assignment_id not in h.controller.episodes
+    assert h.runtime._planned_routes["uav_1"][1] == (10.0, 0.0, 10.0)
+    assert h.runtime._planned_routes["uav_2"][1] == (40.0, 0.0, 10.0)
+    assert [role for role, _ in h.factory.calls] == [ModelCallRole.RUNTIME_REPLAN] * 2
+    assert h.runtime._pending_reassignments == set()
+
+
+def test_local_ok_conflict_free_repair_stays_on_the_single_uav_path(harness):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    episode = h.submit(0)
+    h.complete(episode)
+    assert h.locals[0].agent.snapshot().plan_version == 2
+    assert h.exits == []
+    assert len(h.factory.calls) == 1
+    assert not any("JOINT" in event["event"] for event in h.events)
+
+
+def test_joint_model_touching_a_readonly_uav_is_strictly_rejected(harness):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    episode = h.submit(0)
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+
+    def add_readonly_edit(data, payload):
+        # The model tries to rewrite readonly uav_3 alongside the scope.
+        return {**data, "uav_3": {**data["uav_1"]}}
+
+    h.factory.transform = add_readonly_edit
+    h.complete(episode)  # submit the joint request with the hostile output
+    h.complete(episode)  # poll and reject
+    assert h.locals[0].agent.snapshot().plan_version == 1
+    assert h.locals[1].agent.snapshot().plan_version == 1
+    assert h.exits == [(episode.assignment_id, "JOINT_SCOPE_MUTATED")]
+    assert episode.assignment_id not in h.controller.episodes
+
+
+def test_joint_candidates_colliding_as_a_combination_reject_the_whole_commit(harness):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    episode = h.submit(0)
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+
+    def collide(data, payload):
+        # uav_1 accepts a detour waypoint that crosses uav_2's candidate
+        # route: each candidate alone is fine, together they still collide.
+        steps = [step for step in data["uav_1"]["steps"] if step["skill"] != "TAKEOFF"]
+        detour = {"id": "detour", "uav_id": "uav_1", "skill": "GOTO",
+                  "args": {"target": {"kind": "POINT", "frame": "WORLD_ENU",
+                                      "xyz_m": [35.0, 0.0, 10.0]}}}
+        data["uav_1"]["steps"] = [detour, *steps]
+        return data
+
+    h.factory.transform = collide
+    h.complete(episode)  # submit the colliding joint candidates
+    h.complete(episode)  # poll and reject
+    assert h.locals[0].agent.snapshot().plan_version == 1
+    assert h.locals[1].agent.snapshot().plan_version == 1
+    assert h.exits == [(episode.assignment_id, "SHARED_SPACE_CONFLICT")]
+
+
+def test_peer_plan_version_change_invalidates_the_whole_joint_candidate(harness):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    episode = h.submit(0)
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+    h.controller.tick()  # submit the joint request; worker completes
+    # uav_2's local plan version moves while the joint candidate is in flight.
+    h.runtime.assignments.by_id(h.locals[1].assignment.assignment_id).local_plan_version = 5
+    h.complete(episode)
+    assert h.locals[0].agent.snapshot().plan_version == 1
+    assert h.locals[1].agent.snapshot().plan_version == 1
+    assert h.exits and h.exits[0][1] == "STALE_VERSION"
+
+
+def test_newly_occupied_shared_resource_rejects_the_joint_commit(harness):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    h.shared_dependencies = (ExternalDependencySnapshot("channel", "SHARED_RESOURCE",
+        (h.locals[0].goal.goal_id, h.locals[1].goal.goal_id), ("uav_1", "uav_2"), 1,
+        "UNCHANGED", ("reservation_open",)),)
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    episode = h.submit(0)
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+    h.controller.tick()  # joint request submitted and computed
+    # Another UAV takes the shared channel while the joint candidate waits.
+    h.shared_dependencies = (ExternalDependencySnapshot("channel", "SHARED_RESOURCE",
+        (h.locals[0].goal.goal_id, h.locals[1].goal.goal_id), ("uav_1", "uav_2"), 2,
+        "UNCHANGED", ("reservation_other",)),)
+    h.complete(episode)
+    assert h.locals[0].agent.snapshot().plan_version == 1
+    assert h.locals[1].agent.snapshot().plan_version == 1
+    assert h.exits and h.exits[0][1] == "COORDINATION_REQUIRED"
+
+
+def test_one_uav_validation_failure_rejects_the_whole_joint_submission(harness):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    episode = h.submit(0)
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+
+    def break_peer_draft(data, payload):
+        # uav_2's suffix renames its LAND step: a protected-semantics attack
+        # that only fails for one UAV, which must reject the whole submission.
+        for step in data["uav_2"]["steps"]:
+            if step["skill"] == "LAND":
+                step["id"] = "renamed_land"
+        return data
+
+    h.factory.transform = break_peer_draft
+    h.complete(episode)  # submit the broken joint candidates
+    h.complete(episode)  # poll and reject
+    assert h.locals[0].agent.snapshot().plan_version == 1
+    assert h.locals[1].agent.snapshot().plan_version == 1
+    assert h.exits and h.exits[0][1] in {"PROTECTED_STEP_MUTATION", "UNAUTHORIZED_NEW_EFFECT"}
+    assert not any(event["event"] == "RECOVERY_COMMITTED" for event in h.events)
+
+
+def test_oversized_conflict_scope_exits_instead_of_fleet_wide_replanning(harness):
+    h = harness(count=3, config=FleetRecoveryConfig(enabled=True, mode="LOCAL_ONLY",
+        joint_repair_enabled=True, max_joint_repair_scope_uavs=2))
+    healthy_peers(h, (1, 2))
+    # uav_2 and uav_3 both cross uav_1's corridor: a three-UAV conflict
+    # exceeds the configured bound of two.
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    occupy_corridor(h, "uav_3", (60.0, 0.0, 10.0))
+    episode = h.submit(0)
+    h.complete(episode)
+    # A four-UAV conflict exceeds the configured scope bound: safe exit, no
+    # joint request and no fallback to a full-Fleet replan.
+    assert h.exits == [(episode.assignment_id, "SHARED_SPACE_CONFLICT")]
+    assert not any(event["event"].startswith("RECOVERY_JOINT")
+                   and event["event"] != "RECOVERY_JOINT_SCOPE_REJECTED"
+                   for event in h.events)
+    assert len(h.factory.calls) == 1
+    assert all(item.agent.snapshot().plan_version == 1 for item in h.locals)
+    assert h.runtime._pending_reassignments == set()

@@ -16,11 +16,15 @@ from math import dist, isfinite
 from types import MappingProxyType
 
 from common.ids import validate_mission_id, validate_routing_id, validate_uav_id
+from fleet.contract_registry import (
+    DEFAULT_GOAL_CONTRACT_REGISTRY, DEFAULT_SKILL_CONTRACTS, GoalContractRegistry,
+    RestartPolicy, Transferability,
+)
 from fleet.task_spec import ConstraintStrength, FleetTaskSpecV1, GoalType, MissionGoal, OrderingConstraint, TerminationGoal
 from planner.goal_checker import GoalSatisfactionChecker
 from planner.schemas import CompiledMission, PlannerWorldContext
 from planner.schemas_v3 import PlanStepDraftV3, SkillPlanDraftV3
-from planner.spatial import CoordinateFrame, NamedLocationTarget, PointTarget
+from planner.spatial import CoordinateFrame, PointTarget
 from planner.spatial_resolver import FramePose, SpatialResolver
 from skills.plan import TaskPlan, TaskStep
 from skills.types import SkillName, SkillResult, SkillResultCode, SkillStatus
@@ -301,74 +305,19 @@ class RemainingGoalAssessment:
         return not self.insufficient_goal_ids and not self.reasons
 
 
-_SUCCESS = {"TAKEOFF": SkillResultCode.TAKEOFF_COMPLETE, "GOTO": SkillResultCode.GOAL_REACHED,
-            "FOLLOW_ROUTE": SkillResultCode.ROUTE_COMPLETE, "HOVER": SkillResultCode.HOVER_COMPLETE,
-            "SEARCH": SkillResultCode.TARGET_FOUND, "TRACK": SkillResultCode.TRACK_COMPLETE,
-            "LAND": SkillResultCode.LAND_COMPLETE}
+_SUCCESS = {name: contract.success_code for name, contract in DEFAULT_SKILL_CONTRACTS.items()}
 
 
-def _track_completion_credit(step, proof, invocations, *, completion_basis):
-    """Credit only the execution owner's duration ledger, never elapsed time.
-
-    Deterministic REACQUIRE can split one semantic TRACK into several Skill
-    invocations. Its terminal invocation may therefore request only the
-    remainder. Each invocation is counted once; continuous completion cannot
-    concatenate intervals across lost-target invocations.
-    """
-    required = float(step.args.get("duration_s", 0))
-    if required <= 0:
-        return None
-    mode = proof.result.data.get("completion_basis")
-    if (mode not in {"valid_execution", "continuous"} or mode != completion_basis
-            or step.args.get("completion_basis", "valid_execution") != completion_basis):
-        return None
-    valid = 0.0
-    final_continuous = 0.0
-    for item in invocations:
-        data = item.result.data
-        if (data.get("progress_schema") != "track_progress.v1"
-                or data.get("completion_basis") != mode
-                or data.get("target_id") != proof.result.data.get("target_id")):
-            return None
-        try:
-            elapsed, execution, continuous, invocation_required = (
-                _number(data.get(key), key) for key in
-                ("elapsed_s", "valid_execution_s", "continuous_execution_s", "required_duration_s")
-            )
-        except (ValueError, TypeError):
-            return None
-        if (invocation_required <= 0 or execution > elapsed + 1e-9
-                or continuous > execution + 1e-9):
-            return None
-        valid += min(execution, invocation_required)
-        if item.invocation_id == proof.invocation_id:
-            final_continuous = continuous
-    credited = final_continuous if mode == "continuous" else valid
-    # A success code alone cannot turn an incomplete Skill into goal credit.
-    return required if credited + 1e-9 >= required else None
+def _goal_steps(goal: Goal, steps: Sequence[PlanStepDraftV3], home_name: str, *,
+                registry: GoalContractRegistry | None = None):
+    """Compatibility wrapper: step matching now lives in the contract registry."""
+    return matching_steps_for(goal, steps, home_name, registry=registry)
 
 
-def _goal_steps(goal: Goal, steps: Sequence[PlanStepDraftV3], home_name: str):
-    kind = goal.goal_type
-    if kind is GoalType.NAVIGATE:
-        expected = goal.spatial_constraint.to_dict()
-        return tuple(step for step in steps if step.skill == "GOTO" and step.to_dict()["args"].get("target") == expected)
-    if kind is GoalType.SEARCH_TARGET:
-        expected = None if goal.spatial_constraint is None else goal.spatial_constraint.to_dict()
-        return tuple(step for step in steps if step.skill == "SEARCH" and
-                     (expected is None or step.to_dict()["args"].get("region") == expected))
-    if kind in {GoalType.TRACK_TARGET, GoalType.WAIT, GoalType.LAND}:
-        skill = {GoalType.TRACK_TARGET: "TRACK", GoalType.WAIT: "HOVER", GoalType.LAND: "LAND"}[kind]
-        return tuple(step for step in steps if step.skill == skill)
-    if kind in {GoalType.RETURN_HOME, GoalType.RETURN_HOME_AND_LAND}:
-        returns = tuple(step for step in steps if step.skill == "GOTO" and isinstance(step.spatial_target, NamedLocationTarget)
-                        and step.spatial_target.name == home_name)
-        if kind is GoalType.RETURN_HOME:
-            return returns
-        if returns:
-            last_index = steps.index(returns[-1])
-            return returns + tuple(step for step in steps[last_index + 1:] if step.skill == "LAND")
-    return ()
+def matching_steps_for(goal: Goal, steps: Sequence[PlanStepDraftV3], home_name: str, *,
+                       registry: GoalContractRegistry | None = None):
+    registry = DEFAULT_GOAL_CONTRACT_REGISTRY if registry is None else registry
+    return registry.matching_steps(goal, steps, home_name)
 
 
 def _terminal_evidence_index(evidence: Sequence[SkillExecutionEvidence], original: SkillPlanDraftV3,
@@ -396,8 +345,16 @@ def _terminal_evidence_index(evidence: Sequence[SkillExecutionEvidence], origina
 def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
                            completed_step_ids: Sequence[str], evidence: Sequence[SkillExecutionEvidence],
                            *, current_step_id: str | None, current_step_started: bool = True,
-                           home_name: str = "home") -> RemainingGoalAssessment:
-    """Subtract only terminal Skill evidence; elapsed/feedback time is not credit."""
+                           home_name: str = "home",
+                           registry: GoalContractRegistry | None = None) -> RemainingGoalAssessment:
+    """Subtract only terminal Skill evidence; elapsed/feedback time is not credit.
+
+    Completion semantics are looked up in the contract registry; an
+    unregistered goal type is recorded as insufficient with an explicit
+    UNREGISTERED_GOAL_CONTRACT reason instead of guessing a completion state.
+    """
+    registry = DEFAULT_GOAL_CONTRACT_REGISTRY if registry is None else registry
+    skills = registry.skill_contracts
     goals, evidence = tuple(goals), tuple(evidence)
     completed = set(completed_step_ids)
     by_step, grouped = _terminal_evidence_index(evidence, original, completed)
@@ -412,8 +369,15 @@ def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
         reasons.append("PARTIAL_DURATION_EVIDENCE_INSUFFICIENT")
     target_aliases = {getattr(goal, "target_alias", None) for goal in goals} - {None}
     for goal in goals:
-        matches = _goal_steps(goal, original.steps, home_name)
-        ambiguous = (goal.goal_type in {GoalType.TRACK_TARGET, GoalType.WAIT} and
+        evaluator = registry.evaluator_for(goal.goal_type)
+        if evaluator is None:
+            insufficient.append(goal.goal_id)
+            reason = "UNREGISTERED_GOAL_CONTRACT:" + goal.goal_type.value
+            if reason not in reasons:
+                reasons.append(reason)
+            continue
+        matches = evaluator.matching_steps(goal, original.steps, home_name)
+        ambiguous = (evaluator.ambiguous_with_sibling and
                      sum(other.goal_type is goal.goal_type for other in goals) > 1)
         if not matches or ambiguous or (len(target_aliases) > 1 and getattr(goal, "target_alias", None)):
             insufficient.append(goal.goal_id)
@@ -421,75 +385,23 @@ def assess_remaining_goals(goals: Sequence[Goal], original: SkillPlanDraftV3,
         if current is not None and current_step_started and current.skill in {"TRACK", "HOVER"} and current in matches:
             insufficient.append(goal.goal_id)
             continue
-        done = []
-        duration_credit = {}
-        unknown = False
-        for step in matches:
-            if step.id not in completed:
-                continue
-            proof = by_step.get(step.id)
-            if proof is None or proof.result.status is not SkillStatus.SUCCEEDED or proof.result.code is not _SUCCESS.get(step.skill):
-                unknown = True
-            elif step.skill in {"SEARCH", "TRACK"} and not proof.result.data.get("target_id"):
-                unknown = True
-            elif step.skill == "TRACK":
-                credit = _track_completion_credit(step, proof, grouped[step.id],
-                    completion_basis=goal.completion_basis)
-                if credit is None:
-                    unknown = True
-                else:
-                    duration_credit[step.id] = credit
-                    done.append(step)
-            else:
-                done.append(step)
+        done, credits, unknown = evaluator.evaluate_evidence(goal, matches, completed,
+                                                             by_step, grouped, skills)
         if unknown:
             insufficient.append(goal.goal_id)
             continue
-        if goal.goal_type in {GoalType.TRACK_TARGET, GoalType.WAIT}:
-            requested = goal.duration_s
-            if requested is None:
-                insufficient.append(goal.goal_id)
-                continue
-            credits = [duration_credit.get(step.id, float(step.args.get("duration_s", 0))) for step in done]
-            continuous = getattr(goal, "completion_basis", None) == "continuous"
-            credit = max(credits, default=0.0) if continuous else sum(credits)
-            if credit >= requested:
-                confirmed.append(goal.goal_id)
-            else:
-                pending.append(replace(goal, duration_s=requested if continuous else requested - credit))
-        elif goal.goal_type is GoalType.RETURN_HOME_AND_LAND:
-            if done and any(step.skill == "LAND" for step in done) and any(step.skill == "GOTO" for step in done):
-                confirmed.append(goal.goal_id)
-            elif done:
-                # A completed return must not be reissued as a new user action.
-                insufficient.append(goal.goal_id)
-            else:
-                pending.append(goal)
-        elif done:
+        verdict, remaining_goal = evaluator.compute_remaining(goal, done, credits, skills)
+        if verdict == "CONFIRMED":
             confirmed.append(goal.goal_id)
+        elif verdict == "PENDING":
+            pending.append(remaining_goal)
         else:
-            pending.append(goal)
+            insufficient.append(goal.goal_id)
     return RemainingGoalAssessment(tuple(confirmed), tuple(pending), tuple(insufficient), tuple(reasons))
 
 
-class RestartPolicy(str, Enum):
-    COMPLETED = "COMPLETED"
-    CONTINUE = "CONTINUE"
-    RESTART = "RESTART"
-    CANNOT_RESUME = "CANNOT_RESUME"
-
-
-class Transferability(str, Enum):
-    SAME_UAV_ONLY = "SAME_UAV_ONLY"
-    TRANSFERABLE = "TRANSFERABLE"
-    REQUIRES_SHARED_EVIDENCE = "REQUIRES_SHARED_EVIDENCE"
-
-
-# A replacement aircraft can only own obligations whose meaning is entirely
-# world-anchored; this mirrors the handoff admission set exactly.
-_TRANSFERABLE_GOAL_TYPES = frozenset({GoalType.NAVIGATE, GoalType.RETURN_HOME, GoalType.LAND,
-                                      GoalType.RETURN_HOME_AND_LAND, GoalType.WAIT})
-_SHARED_EVIDENCE_GOAL_TYPES = frozenset({GoalType.TRACK_TARGET, GoalType.INSPECT_TARGET})
+# RestartPolicy/Transferability are re-exported from the contract registry so
+# existing imports keep working; the registry owns every completion semantic.
 
 
 def _original_condition(goal: Goal) -> Mapping[str, object]:
@@ -517,6 +429,7 @@ class GoalTaskContract:
     restart_policy: RestartPolicy
     transferability: Transferability
     reasons: tuple[str, ...]
+    required_resources: tuple[str, ...] = ()
 
     def __post_init__(self):
         if self.status not in {"CONFIRMED", "PENDING", "INSUFFICIENT"}:
@@ -535,6 +448,10 @@ class GoalTaskContract:
         if any(not isinstance(ref, str) or not ref for ref in refs):
             raise ValueError("evidence refs must be nonempty strings")
         object.__setattr__(self, "evidence_refs", refs)
+        resources = tuple(dict.fromkeys(self.required_resources))
+        if any(not isinstance(item, str) or not item for item in resources):
+            raise ValueError("required resources must be nonempty strings")
+        object.__setattr__(self, "required_resources", resources)
 
     def to_dict(self):
         return {"goal_id": self.goal_id, "goal_type": self.goal_type.value, "status": self.status,
@@ -544,6 +461,7 @@ class GoalTaskContract:
                 "evidence_refs": list(self.evidence_refs),
                 "remaining_obligation": None if self.remaining_goal is None else self.remaining_goal.to_dict(),
                 "restart_policy": self.restart_policy.value, "transferability": self.transferability.value,
+                "required_resources": list(self.required_resources),
                 "reasons": list(self.reasons)}
 
 
@@ -633,17 +551,23 @@ def build_remaining_task_contract(goals: Sequence[Goal], original: SkillPlanDraf
                                   completed_step_ids: Sequence[str], evidence: Sequence[SkillExecutionEvidence], *,
                                   current_step_id: str | None, current_step_started: bool = True,
                                   home_name: str = "home", shared_target_ids: Sequence[str] = (),
-                                  consumer: str = "LOCAL_REPAIR") -> RemainingTaskContract:
+                                  consumer: str = "LOCAL_REPAIR",
+                                  registry: GoalContractRegistry | None = None) -> RemainingTaskContract:
     """The only remaining-task computation; both repair and handoff consume this.
 
     consumer is logging context only: it never changes amounts, identity or
     transferability. Insufficient evidence fails closed to CANNOT_RESUME.
+    Completion semantics come from the contract registry; unregistered goal
+    types stay INSUFFICIENT with CANNOT_RESUME.
     """
-    if consumer not in {"LOCAL_REPAIR", "HANDOFF", "FLEET_STATE"}:
+    if consumer not in {"LOCAL_REPAIR", "HANDOFF", "FLEET_STATE", "JOINT_REPAIR"}:
         raise ValueError("unknown remaining task contract consumer")
+    registry = DEFAULT_GOAL_CONTRACT_REGISTRY if registry is None else registry
+    skills = registry.skill_contracts
     goals = tuple(goals)
     assessment = assess_remaining_goals(goals, original, completed_step_ids, evidence,
-        current_step_id=current_step_id, current_step_started=current_step_started, home_name=home_name)
+        current_step_id=current_step_id, current_step_started=current_step_started,
+        home_name=home_name, registry=registry)
     completed = set(completed_step_ids)
     by_step, grouped = _terminal_evidence_index(evidence, original, completed)
     shared = frozenset(shared_target_ids)
@@ -651,16 +575,15 @@ def build_remaining_task_contract(goals: Sequence[Goal], original: SkillPlanDraf
     confirmed, insufficient = set(assessment.confirmed_goal_ids), set(assessment.insufficient_goal_ids)
     entries = []
     for goal in goals:
-        matched = _goal_steps(goal, original.steps, home_name)
+        evaluator = registry.evaluator_for(goal.goal_type)
+        matched = () if evaluator is None else evaluator.matching_steps(goal, original.steps, home_name)
         refs = []
         for step in matched:
             if step.id not in completed:
                 continue
+            contract = skills.get(step.skill)
             proof = by_step.get(step.id)
-            credited_step = (proof is not None and proof.result.status is SkillStatus.SUCCEEDED
-                             and proof.result.code is _SUCCESS.get(step.skill)
-                             and (step.skill not in {"SEARCH", "TRACK"} or proof.result.data.get("target_id")))
-            if credited_step:
+            if contract is not None and contract.validate_completion(step, proof):
                 refs.extend(item.invocation_id for item in grouped[step.id])
         status = ("CONFIRMED" if goal.goal_id in confirmed
                   else "PENDING" if goal.goal_id in pending_by_id else "INSUFFICIENT")
@@ -671,22 +594,11 @@ def build_remaining_task_contract(goals: Sequence[Goal], original: SkillPlanDraf
         elif status == "PENDING" and requested is not None:
             remaining_amount = float(pending_by_id[goal.goal_id].duration_s)
             confirmed_amount = max(0.0, float(requested) - remaining_amount)
-        if status == "CONFIRMED":
-            restart = RestartPolicy.COMPLETED
-            transferable = Transferability.SAME_UAV_ONLY
-        elif status == "INSUFFICIENT":
-            restart = RestartPolicy.CANNOT_RESUME
-            transferable = Transferability.SAME_UAV_ONLY
+        if evaluator is None:
+            restart, transferable = RestartPolicy.CANNOT_RESUME, Transferability.SAME_UAV_ONLY
         else:
-            restart = (RestartPolicy.CONTINUE
-                       if confirmed_amount is not None and confirmed_amount > 1e-9 else RestartPolicy.RESTART)
-            if goal.goal_type in _TRANSFERABLE_GOAL_TYPES:
-                transferable = Transferability.TRANSFERABLE
-            elif (goal.goal_type in _SHARED_EVIDENCE_GOAL_TYPES
-                  and getattr(goal, "target_alias", None) in shared):
-                transferable = Transferability.REQUIRES_SHARED_EVIDENCE
-            else:
-                transferable = Transferability.SAME_UAV_ONLY
+            restart = evaluator.restart_policy(status, confirmed_amount)
+            transferable = evaluator.transferability(goal, status, shared)
         entries.append(GoalTaskContract(
             goal_id=goal.goal_id, goal_type=goal.goal_type, status=status,
             target_binding=getattr(goal, "target_alias", None),
@@ -696,6 +608,7 @@ def build_remaining_task_contract(goals: Sequence[Goal], original: SkillPlanDraf
             evidence_refs=tuple(refs),
             remaining_goal=pending_by_id.get(goal.goal_id),
             restart_policy=restart, transferability=transferable,
+            required_resources=() if evaluator is None else evaluator.required_resources(goal),
             reasons=() if status != "INSUFFICIENT" else ("INSUFFICIENT_COMPLETION_EVIDENCE",)))
     return RemainingTaskContract(1, original.mission_id, original.uav_id, original.plan_version,
                                  tuple(entries), assessment, tuple(sorted(shared)))
@@ -1102,6 +1015,106 @@ def build_local_repair_json_schema(context: LocalRepairContextV3) -> dict[str, o
     properties = {name: {"const": value} for name, value in envelope.items()}
     properties["steps"] = steps
     return {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+
+
+@dataclass(frozen=True, slots=True)
+class JointRepairRequest:
+    """One bounded multi-UAV repair request; editable scope is trusted-only.
+
+    The scope and readonly routes are decided by trusted code from dependency
+    snapshots, route conflicts and resource ownership. The model may propose
+    suffixes for scope UAVs only; every other UAV is read-only geometry.
+    """
+    request_id: str
+    episode_id: str
+    faulted_uav_id: str
+    scope: tuple[str, ...]
+    contexts: Mapping[str, LocalRepairContextV3]
+    readonly_uav_routes: Mapping[str, tuple[tuple[float, float, float], ...]] = field(default_factory=dict)
+
+    def __post_init__(self):
+        validate_routing_id(self.request_id, "request_id")
+        validate_routing_id(self.episode_id, "episode_id")
+        validate_uav_id(self.faulted_uav_id)
+        scope = tuple(sorted(set(self.scope)))
+        if self.faulted_uav_id not in scope:
+            raise ValueError("joint scope must contain the faulted UAV")
+        object.__setattr__(self, "scope", scope)
+        contexts = dict(self.contexts)
+        if set(contexts) != set(scope) or not scope:
+            raise LocalRepairError("JOINT_SCOPE_INVALID", "joint request needs one context per scope UAV")
+        for uav, context in contexts.items():
+            if not isinstance(context, LocalRepairContextV3) or context.original.planner_output.uav_id != uav:
+                raise LocalRepairError("JOINT_SCOPE_INVALID", "joint context routing mismatch")
+        object.__setattr__(self, "contexts", _freeze(contexts))
+        routes = {}
+        for uav, route in dict(self.readonly_uav_routes).items():
+            validate_uav_id(uav)
+            if uav in scope:
+                raise ValueError("readonly routes must not name an editable scope UAV")
+            points = tuple(tuple(float(value) for value in point) for point in route)
+            if not points or not all(len(point) == 3 for point in points):
+                raise ValueError("readonly route must be a nonempty 3D polyline")
+            routes[uav] = points
+        object.__setattr__(self, "readonly_uav_routes", _freeze(routes))
+
+    @property
+    def digest(self):
+        return _digest({"request_id": self.request_id, "episode_id": self.episode_id,
+                        "faulted_uav_id": self.faulted_uav_id, "scope": list(self.scope),
+                        "contexts": {uav: context.digest for uav, context in self.contexts.items()},
+                        "readonly": {uav: [list(p) for p in route] for uav, route in self.readonly_uav_routes.items()}})
+
+    def to_dict(self):
+        return {"request_id": self.request_id, "episode_id": self.episode_id,
+                "faulted_uav_id": self.faulted_uav_id, "editable_uavs": list(self.scope),
+                "readonly_uavs": sorted(self.readonly_uav_routes),
+                "readonly_routes": {uav: [list(point) for point in route]
+                                    for uav, route in self.readonly_uav_routes.items()},
+                "per_uav_trusted_context": {uav: context.to_dict() for uav, context in self.contexts.items()},
+                "original_suffixes": {uav: [step.to_dict() for step in context.original.planner_output.steps[len(context.completed_step_ids):]]
+                                      for uav, context in self.contexts.items()}}
+
+
+def build_joint_repair_json_schema(request: JointRepairRequest) -> dict[str, object]:
+    """One authorized suffix grammar per editable UAV; readonly UAVs have no key."""
+    properties = {uav: build_local_repair_json_schema(request.contexts[uav]) for uav in request.scope}
+    return {"type": "object", "properties": properties, "required": list(request.scope),
+            "additionalProperties": False,
+            "properties_order_note": "keys are exactly the editable UAV IDs"}
+
+
+def parse_joint_repair_drafts(value, request: JointRepairRequest) -> Mapping[str, LocalRepairDraftV3]:
+    """Strictly bind the model response to the trusted repair scope."""
+    if not isinstance(value, Mapping):
+        raise LocalRepairError("INVALID_MODEL_RESPONSE", "joint response must be a JSON object keyed by UAV")
+    if set(value) != set(request.scope):
+        raise LocalRepairError("JOINT_SCOPE_MUTATED",
+                               "model returned edits outside the authorized repair scope",
+                               affected_uav_ids=tuple(sorted(set(value) - set(request.scope))) or request.scope)
+    return {uav: LocalRepairDraftV3.from_dict(value[uav]) for uav in request.scope}
+
+
+def validate_joint_repair(drafts: Mapping[str, LocalRepairDraftV3], request: JointRepairRequest,
+                          world_contexts: Mapping[str, PlannerWorldContext], *,
+                          dependency_versions: Mapping[str, Mapping[str, int]],
+                          external_dependencies: Mapping[str, Sequence[ExternalDependencySnapshot]],
+                          now_wall_s: float, plan_validator=None) -> Mapping[str, LocalRepairCandidate]:
+    """Per-UAV validation of a joint proposal; pure preparation only.
+
+    Each editable UAV passes the full single-repair pipeline against its own
+    frozen context. Cross-UAV space/resource freshness remains the owner's
+    live compare-and-commit guard; this never grants execution permission.
+    """
+    if set(drafts) != set(request.scope):
+        raise LocalRepairError("JOINT_SCOPE_MUTATED", "draft set does not match the repair scope")
+    candidates = {}
+    for uav in request.scope:
+        context = request.contexts[uav]
+        candidates[uav] = validate_local_repair(drafts[uav], context, world_contexts[uav],
+            dependency_versions=dependency_versions[uav], external_dependencies=external_dependencies[uav],
+            now_wall_s=now_wall_s, plan_validator=plan_validator)
+    return candidates
 
 
 def _check_protected_semantics(context, draft):

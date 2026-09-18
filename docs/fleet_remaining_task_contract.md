@@ -91,3 +91,51 @@ cd /home/amax/ry/vlm_drones/uav_agent
   遇到新障碍仍判 INVALID 并走新一轮候选。
 - WAIT(HOVER) 部分时长没有可信部分账本，中途故障即 INSUFFICIENT。
 - 不支持 Graph 计划、多目标别名混排、一次移交多替换机的 publication。
+
+## 2026-09-18 增量：Contract Registry 与有界小组联合修复
+
+### Contract Registry（`fleet/contract_registry.py`）
+
+- `SkillContractEvaluator`：每个 Skill 的终态证据语义（成功码、目标身份要求、
+  时长账本）；`TrackSkillContractEvaluator` 原样承载 TRACK 有效时长/连续时长账本。
+- `GoalContractEvaluator` 基类提供
+  `evaluate_evidence / compute_progress / compute_remaining / restart_policy /
+  transferability / required_resources / validate_completion`；
+  NAVIGATE/SEARCH/TRACK/INSPECT/WAIT/RETURN_HOME/LAND/RHAL 各一个 evaluator。
+- `GoalContractRegistry` + `DEFAULT_GOAL_CONTRACT_REGISTRY`：`assess_remaining_goals`
+  与 `build_remaining_task_contract` 改为查表；未注册（如 REPORT）显式
+  `UNREGISTERED_GOAL_CONTRACT:<type>` fail-closed。新增任务只需注册 evaluator；
+  `FleetRecoveryController` 已无任何 goal_type 分支（测试做源码级断言）。
+- 链路不变：Execution Evidence → Contract Registry → RemainingTaskContract
+  → Recovery/Repair；TRACK 连续/有效时长与 handoff 约束语义逐字保留。
+
+### 有界相关小组联合修复（`recovery_controller._tick_joint` 等）
+
+- 触发：单机候选提交 guard 报 `SHARED_SPACE_CONFLICT/COORDINATION_REQUIRED`
+  且受影响集合（含故障机）在 `[2, max_joint_repair_scope_uavs]`（2..3）内、
+  每个 peer 健康（RUNNING、GOTO 转移边界、无在途 episode）→ 同一 episode 进入
+  `JOINT_*`；超限或 peer 不合适 → 原有安全退出，绝不全队重规划。scope 为
+  可靠超集，不声称最小。
+- 请求：`JointRepairRequest`（scope 内每机冻结 `LocalRepairContextV3`——含各自
+  RemainingTaskContract/前缀/anchor/依赖；组外 UAV 只读路线）。响应 schema
+  `additionalProperties:false` 且键恰为 editable UAV；`parse_joint_repair_drafts`
+  严格比对键集合（`JOINT_SCOPE_MUTATED`）。
+- 验证：逐机 `validate_local_repair` 全流水线 + `_check_joint_live`
+  （故障机全量 `_check_local_live`；peer 版本/步骤/锚点/依赖重验；组内组外
+  统一空域与障碍检查 `ROUTE_CONFLICT`）。
+- 提交（all-or-none，仅软件计划状态）：全部检查先于任何变更；peer 先经
+  `interrupt_with_hover` → `commit_coordinated_suffix`（受保护后缀规则同故障
+  修复），故障机最后走原 `commit_local_repair`；任一失败 → 未发布 peer 立即
+  `resume_coordinated_interruption`，已发布 peer 以原后缀在下一版本补偿恢复，
+  全部元数据（路线/版本/记录）仅在两机均已发布后统一写入。
+- 配置：`joint_repair_enabled`（默认关）、`max_joint_repair_scope_uavs`（2..3）、
+  `max_joint_peer_drift_m`。
+
+### 本轮边界
+
+- 联合修复一次一搏：候选被拒即安全退出，不在组内自动重试。
+- peer 只接受 GOTO 转移边界的协调；SEARCH/TRACK 进行中的无人机不参与。
+- 突变阶段（Skill 启动失败）的 peer 补偿以“原后缀+版本递增”恢复；该路径
+  未在测试中强制触发（验证失败路径已覆盖）。
+- 未支持：REPORT、多别名混排、Graph 计划、>3 机小组、INSPECT 初始计划
+  （仅可信运行时修订后可见）。

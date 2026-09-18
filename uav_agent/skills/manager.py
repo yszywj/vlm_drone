@@ -492,6 +492,101 @@ class SkillManager:
             raise
         return self._task_status
 
+    def commit_coordinated_suffix(
+        self, plan: TaskPlan, *, expected_plan_version: int,
+        final_guard: Callable[[], None] | None = None,
+        allow_goto_detour_prefix: bool = False,
+    ) -> TaskStatus:
+        """Publish a coordinated suffix for a HEALTHY UAV soft-paused by the
+        trusted Fleet owner.
+
+        The protected-suffix rules are those of fault repair (immutable
+        prefix, retained current step identity, only authorized new GOTO
+        detours before it), keyed on the coordinated supervisory interruption
+        instead of a local repair event. Cancellation of the paused Skill is
+        real cancellation evidence, never fabricated success.
+        """
+        if self._local_repair_event is not None:
+            raise SkillManagerError(
+                "coordinated suffix conflicts with an active local repair event"
+            )
+        if (
+            self._task_status is not TaskStatus.RUNNING
+            or self._pending_task_result is not None
+            or self._program_executor is not None
+            or self._task_plan is None
+            or self._task_plan.plan_version != expected_plan_version
+        ):
+            raise SkillManagerError(
+                "coordinated repair boundary is stale or canceled"
+            )
+        interrupted = self._require_supervisory_interruption()
+        if (
+            self._plan_index != interrupted.plan_index
+            or self._active_planned_step_id != interrupted.step.step_id
+            or interrupted.step.step_id != self._task_plan.steps[self._plan_index].step_id
+        ):
+            raise SkillManagerError("coordinated repair execution boundary changed")
+        owned = self._validate_replacement_plan(plan, interrupted)
+        if not isinstance(allow_goto_detour_prefix, bool):
+            raise TypeError("allow_goto_detour_prefix must be a bool")
+        suffix = owned.steps[interrupted.plan_index:]
+        retained_index = next((index for index, step in enumerate(suffix)
+                               if step.step_id == interrupted.step.step_id), None)
+        retained = None if retained_index is None else suffix[retained_index]
+        if retained is None or retained.skill is not interrupted.step.skill:
+            raise SkillManagerError(
+                "coordinated repair must preserve current step identity and Skill"
+            )
+        if retained_index:
+            original_ids = {step.step_id for step in interrupted.plan.steps}
+            if (
+                not allow_goto_detour_prefix
+                or interrupted.step.skill not in {SkillName.GOTO, SkillName.SEARCH}
+                or any(step.skill is not SkillName.GOTO or step.step_id in original_ids
+                       for step in suffix[:retained_index])
+            ):
+                raise SkillManagerError(
+                    "coordinated repair must preserve current step identity; "
+                    "only authorized new GOTO detours may precede it"
+                )
+
+        def retire_hold() -> None:
+            if final_guard is not None:
+                final_guard()
+            if (
+                self._task_status is not TaskStatus.RUNNING
+                or self._task_plan is None
+                or self._task_plan.plan_version != expected_plan_version
+                or self._local_repair_event is not None
+                or self._interrupted_execution is not interrupted
+            ):
+                raise SkillManagerError(
+                    "coordinated repair boundary changed at publication"
+                )
+            self._active_skill().cancel()
+            self._reset_active_internal()
+
+        self._pending_replacement_plan = owned
+        try:
+            self._start_replacement_after_interruption(
+                old_status=SkillStatus.CANCELED,
+                result_code=SkillResultCode.CANCELED,
+                before_publication=retire_hold,
+            )
+        except Exception:
+            self._pending_replacement_plan = None
+            raise
+        return self._task_status
+
+    def resume_coordinated_interruption(self) -> TaskStatus:
+        """Undo a coordinated soft-pause whose suffix was never published."""
+        if self._local_repair_event is not None:
+            raise SkillManagerError(
+                "coordinated resume conflicts with an active local repair event"
+            )
+        return self.resume_interrupted_step()
+
     def fail_local_repair(self, *, expected_event_id: str, reason: str) -> bool:
         """Close only this live event. Late failures cannot cancel a new task."""
         event = self._local_repair_event

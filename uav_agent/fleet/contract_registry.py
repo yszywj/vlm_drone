@@ -6,8 +6,12 @@ remains the only trusted input; Qwen output can never assert completion,
 remaining amounts, restart policy or transferability. Unregistered goal
 types fail closed: no completion state is guessed.
 
-Adding a task type means adding/reusing evaluators and registering them
-here; the recovery controller and remaining-task pipeline stay unchanged:
+Extension scope: for a new task semantic whose execution capability already
+exists, adding/registering a Contract Evaluator here is sufficient. Adding a
+brand-new physical Skill still requires implementing the Skill, its input
+schema, its execution-result evidence and any planner/compiler support --
+but none of FleetRecoveryController, RemainingTaskContract or the
+spatial/dependency/joint recovery framework needs to change.
 
     Execution Evidence -> Contract Registry -> RemainingTaskContract
     -> Recovery/Repair

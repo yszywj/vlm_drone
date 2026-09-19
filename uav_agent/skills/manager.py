@@ -119,6 +119,38 @@ class _InterruptedExecution:
     timeout_fallback: HoverTimeoutFallback
 
 
+def _task_plan_digest(plan: TaskPlan) -> str:
+    from hashlib import sha256
+    import json as _json
+
+    return sha256(_json.dumps(plan.to_dict(), sort_keys=True,
+                              separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedSuffixPublication:
+    """Immutable result of the fallible PREPARE phase of a suffix publication.
+
+    Holds every binding the PUBLISH phase re-verifies (uav, version, step,
+    execution epoch, optional repair event, candidate digest) plus the fully
+    validated replacement plan, the trusted interruption snapshot and the
+    already-resolved retained-step Goal. PUBLISH never re-parses or
+    re-resolves anything fallible; it only re-checks bindings, runs the
+    owner's final guard, releases the active execution and swaps state.
+    """
+
+    kind: str  # LOCAL_REPAIR | COORDINATED
+    uav_id: str
+    expected_plan_version: int
+    expected_step_id: str
+    execution_epoch: int
+    event_id: str | None
+    plan_digest: str
+    owned: TaskPlan
+    interrupted: _InterruptedExecution
+    retained_goal: SkillGoal
+
+
 class _SupervisoryContinuation(str, Enum):
     RESUME = "RESUME"
     REPLACE = "REPLACE"
@@ -432,20 +464,81 @@ class SkillManager:
             raise SkillManagerError("local repair requires fresh stable HOVER evidence")
         return interrupted
 
-    def commit_local_repair(
-        self, plan: TaskPlan, *, expected_event_id: str, expected_plan_version: int,
-        final_guard: Callable[[], None] | None = None,
-        allow_goto_detour_prefix: bool = False,
-    ) -> TaskStatus:
-        """Publish a protected suffix synchronously, starting but never ticking it.
+    # ------------------------------------------------------------------
+    # Two-phase suffix publication: PREPARE (fallible, no mutation)
+    # -> FINAL GUARD -> ATOMIC PUBLISH (bindings only) -> RELEASE EXECUTION.
+    # ------------------------------------------------------------------
 
-        HOVER cancellation is real cancellation evidence, never fabricated
-        success. Publication can precede a replacement Skill start failure;
-        callers must adopt the published version even when LAND then starts.
+    def _snapshot_running_interruption(
+        self, *, fallback: HoverTimeoutFallback
+    ) -> _InterruptedExecution:
+        """Copy the trusted interruption boundary WITHOUT touching execution.
+
+        The same gates as interrupt_with_hover, minus the cancel/transition:
+        prepare must leave the running Skill, routes and versions untouched.
         """
-        interrupted = self._require_local_repair(
-            expected_event_id, expected_plan_version, require_hold=True
+        if self._task_status is not TaskStatus.RUNNING:
+            raise SkillManagerError("interruption snapshot requires a RUNNING task")
+        if self._interrupted_execution is not None:
+            raise SkillManagerError("a supervisory interruption is already active")
+        if self._local_repair_event is not None:
+            raise SkillManagerError("a local repair event already owns this boundary")
+        if self._active_name is None or self._active_name.value not in {
+            "GOTO",
+            "FOLLOW_ROUTE",
+            "SEARCH",
+            "INSPECT",
+            "TRACK",
+        }:
+            active = "NONE" if self._active_name is None else self._active_name.value
+            raise SkillManagerError(
+                f"Skill {active} cannot be interrupted for coordination"
+            )
+        if self._active_execution_kind is not ExecutionKind.PLANNED:
+            raise SkillManagerError(
+                "only a planned Skill can be coordinated"
+            )
+        if self.active_status is not SkillStatus.RUNNING:
+            raise SkillManagerError("only a RUNNING Skill can be coordinated")
+        if (
+            self._task_plan is None
+            or self._plan_index is None
+            or self._active_planned_step_id is None
+            or self._active_invocation is None
+        ):
+            raise SkillManagerError("task state is incomplete at the coordination boundary")
+        step = self._task_plan.steps[self._plan_index]
+        if (
+            step.step_id != self._active_planned_step_id
+            or step.skill is not self._active_name
+        ):
+            raise SkillManagerError("active Skill does not match the current plan step")
+        resolved_goal = deepcopy(self._active_invocation.goal)
+        if self._active_name is SkillName.TRACK:
+            if not isinstance(resolved_goal, TrackGoal):
+                raise SkillManagerError("active TRACK invocation has an invalid Goal")
+            trusted_target = self._active_target_id
+            if trusted_target is not None and resolved_goal.target_id != trusted_target:
+                raise SkillManagerError(
+                    "active TRACK target_id disagrees with trusted target state"
+                )
+        return _InterruptedExecution(
+            plan_index=self._plan_index,
+            step=TaskStep(step.step_id, step.skill, step.params, step.recovery),
+            resolved_goal=resolved_goal,
+            plan=_copy_task_plan(self._task_plan),
+            step_outputs=deepcopy(self._step_outputs),
+            active_target_id=self._active_target_id,
+            recovery_attempts=dict(self._recovery_attempts),
+            saved_track_goals=deepcopy(self._saved_track_goal_by_step),
+            timeout_fallback=fallback,
         )
+
+    def _prepare_replacement(
+        self, plan: TaskPlan, interrupted: _InterruptedExecution, *,
+        allow_goto_detour_prefix: bool,
+    ) -> tuple[TaskPlan, SkillGoal]:
+        """Every fallible replacement check, plus retained-Goal resolution."""
         owned = self._validate_replacement_plan(plan, interrupted)
         if not isinstance(allow_goto_detour_prefix, bool):
             raise TypeError("allow_goto_detour_prefix must be a bool")
@@ -454,7 +547,9 @@ class SkillManager:
                                if step.step_id == interrupted.step.step_id), None)
         retained = None if retained_index is None else suffix[retained_index]
         if retained is None or retained.skill is not interrupted.step.skill:
-            raise SkillManagerError("local repair must preserve current step identity and Skill")
+            raise SkillManagerError(
+                "replacement must preserve current step identity and Skill"
+            )
         if retained_index:
             original_ids = {step.step_id for step in interrupted.plan.steps}
             if (
@@ -464,47 +559,50 @@ class SkillManager:
                        for step in suffix[:retained_index])
             ):
                 raise SkillManagerError(
-                    "local repair must preserve current step identity; only authorized new GOTO detours may precede it"
+                    "replacement must preserve current step identity; "
+                    "only authorized new GOTO detours may precede it"
                 )
+        # Resolve the retained step Goal NOW: publication must not own any
+        # fallible parsing or resolution.
+        goal = self._goal_from_step(retained, plan=owned)
+        if retained.skill is SkillName.TRACK:
+            if not isinstance(goal, TrackGoal):
+                raise SkillManagerError("replacement TRACK compiled to invalid Goal")
+            if (interrupted.active_target_id is not None
+                    and goal.target_id != interrupted.active_target_id):
+                raise SkillManagerError(
+                    "replacement TRACK cannot change the active target identity"
+                )
+        return owned, deepcopy(goal)
 
-        def retire_hold() -> None:
-            # All goal resolution and owned-object preparation has finished.
-            # Check owner deadlines/dependencies at this last publication gate.
-            if final_guard is not None:
-                final_guard()
-            self._require_local_repair(
-                expected_event_id, expected_plan_version, require_hold=True
-            )
-            self._active_skill().cancel()
-            self._reset_active_internal()
-
-        self._pending_replacement_plan = owned
-        try:
-            self._start_replacement_after_interruption(
-                old_status=SkillStatus.CANCELED,
-                result_code=SkillResultCode.CANCELED,
-                before_publication=retire_hold,
-            )
-        except Exception:
-            event = self._local_repair_event
-            if event is not None and event.event_id == expected_event_id:
-                self._pending_replacement_plan = None
-            raise
-        return self._task_status
-
-    def commit_coordinated_suffix(
-        self, plan: TaskPlan, *, expected_plan_version: int,
-        final_guard: Callable[[], None] | None = None,
+    def prepare_local_repair_suffix(
+        self, plan: TaskPlan, *, expected_event_id: str, expected_plan_version: int,
         allow_goto_detour_prefix: bool = False,
-    ) -> TaskStatus:
-        """Publish a coordinated suffix for a HEALTHY UAV soft-paused by the
-        trusted Fleet owner.
+    ) -> PreparedSuffixPublication:
+        """PREPARE a fault-repair suffix: validate everything, mutate nothing."""
+        interrupted = self._require_local_repair(
+            expected_event_id, expected_plan_version, require_hold=True
+        )
+        owned, retained_goal = self._prepare_replacement(
+            plan, interrupted, allow_goto_detour_prefix=allow_goto_detour_prefix)
+        return PreparedSuffixPublication(
+            kind="LOCAL_REPAIR", uav_id=self._uav_id,
+            expected_plan_version=expected_plan_version,
+            expected_step_id=interrupted.step.step_id,
+            execution_epoch=self._execution_epoch,
+            event_id=expected_event_id,
+            plan_digest=_task_plan_digest(owned),
+            owned=owned, interrupted=interrupted, retained_goal=retained_goal)
 
-        The protected-suffix rules are those of fault repair (immutable
-        prefix, retained current step identity, only authorized new GOTO
-        detours before it), keyed on the coordinated supervisory interruption
-        instead of a local repair event. Cancellation of the paused Skill is
-        real cancellation evidence, never fabricated success.
+    def prepare_coordinated_suffix(
+        self, plan: TaskPlan, *, expected_plan_version: int,
+        allow_goto_detour_prefix: bool = True,
+    ) -> PreparedSuffixPublication:
+        """PREPARE a coordinated suffix for a HEALTHY UAV: validate only.
+
+        No hold is taken, no Skill is canceled, no version/route/record
+        changes: prepare is safe to run for every scope UAV before any
+        publication decision is made.
         """
         if self._local_repair_event is not None:
             raise SkillManagerError(
@@ -516,76 +614,127 @@ class SkillManager:
             or self._program_executor is not None
             or self._task_plan is None
             or self._task_plan.plan_version != expected_plan_version
+            or self._plan_index is None
         ):
             raise SkillManagerError(
                 "coordinated repair boundary is stale or canceled"
             )
-        interrupted = self._require_supervisory_interruption()
-        if (
-            self._plan_index != interrupted.plan_index
-            or self._active_planned_step_id != interrupted.step.step_id
-            or interrupted.step.step_id != self._task_plan.steps[self._plan_index].step_id
-        ):
-            raise SkillManagerError("coordinated repair execution boundary changed")
-        owned = self._validate_replacement_plan(plan, interrupted)
-        if not isinstance(allow_goto_detour_prefix, bool):
-            raise TypeError("allow_goto_detour_prefix must be a bool")
-        suffix = owned.steps[interrupted.plan_index:]
-        retained_index = next((index for index, step in enumerate(suffix)
-                               if step.step_id == interrupted.step.step_id), None)
-        retained = None if retained_index is None else suffix[retained_index]
-        if retained is None or retained.skill is not interrupted.step.skill:
-            raise SkillManagerError(
-                "coordinated repair must preserve current step identity and Skill"
-            )
-        if retained_index:
-            original_ids = {step.step_id for step in interrupted.plan.steps}
-            if (
-                not allow_goto_detour_prefix
-                or interrupted.step.skill not in {SkillName.GOTO, SkillName.SEARCH}
-                or any(step.skill is not SkillName.GOTO or step.step_id in original_ids
-                       for step in suffix[:retained_index])
-            ):
-                raise SkillManagerError(
-                    "coordinated repair must preserve current step identity; "
-                    "only authorized new GOTO detours may precede it"
-                )
+        interrupted = self._snapshot_running_interruption(
+            fallback=HoverTimeoutFallback.CANCEL_AND_LAND
+        )
+        owned, retained_goal = self._prepare_replacement(
+            plan, interrupted, allow_goto_detour_prefix=allow_goto_detour_prefix)
+        return PreparedSuffixPublication(
+            kind="COORDINATED", uav_id=self._uav_id,
+            expected_plan_version=expected_plan_version,
+            expected_step_id=interrupted.step.step_id,
+            execution_epoch=self._execution_epoch,
+            event_id=None,
+            plan_digest=_task_plan_digest(owned),
+            owned=owned, interrupted=interrupted, retained_goal=retained_goal)
 
-        def retire_hold() -> None:
+    def _verify_prepared_binding(self, prepared: PreparedSuffixPublication) -> None:
+        """Cheap binding re-check only; no parsing or resolution."""
+        if prepared.kind == "LOCAL_REPAIR":
+            self._require_local_repair(
+                prepared.event_id, prepared.expected_plan_version, require_hold=True)
+            return
+        if prepared.kind != "COORDINATED":
+            raise SkillManagerError("unknown prepared suffix kind")
+        if (
+            self._task_status is not TaskStatus.RUNNING
+            or self._pending_task_result is not None
+            or self._program_executor is not None
+            or self._task_plan is None
+            or self._plan_index is None
+            or self._task_plan.plan_version != prepared.expected_plan_version
+            or self._local_repair_event is not None
+            # Publish installs exactly the prepared interruption snapshot
+            # before its release gate; any other interruption is stale.
+            or self._interrupted_execution not in (None, prepared.interrupted)
+            or self._active_invocation is None
+            or self._active_name is None
+            or self._active_name.value not in {"GOTO", "FOLLOW_ROUTE", "SEARCH", "INSPECT", "TRACK"}
+            or self._active_execution_kind is not ExecutionKind.PLANNED
+            or self.active_status is not SkillStatus.RUNNING
+            or self._execution_epoch != prepared.execution_epoch
+            or self._active_planned_step_id != prepared.expected_step_id
+            or self._plan_index != prepared.interrupted.plan_index
+            or self._task_plan.steps[self._plan_index].step_id != prepared.expected_step_id
+        ):
+            raise SkillManagerError(
+                "prepared coordinated suffix binding is stale or canceled"
+            )
+
+    def publish_prepared_suffix(
+        self, prepared: PreparedSuffixPublication, *,
+        final_guard: Callable[[], None] | None = None,
+    ) -> TaskStatus:
+        """ATOMIC PUBLISH of a prepared suffix: bindings, guard, swap, release.
+
+        Consumes the immutable prepared object only. Cancellation of the
+        active Skill is real cancellation evidence, never fabricated success.
+        """
+        self._verify_prepared_binding(prepared)
+        interrupted = prepared.interrupted
+
+        def release_execution() -> None:
+            # Last publication gate: owner deadlines/dependencies, then the
+            # binding again, then release the running execution.
             if final_guard is not None:
                 final_guard()
-            if (
-                self._task_status is not TaskStatus.RUNNING
-                or self._task_plan is None
-                or self._task_plan.plan_version != expected_plan_version
-                or self._local_repair_event is not None
-                or self._interrupted_execution is not interrupted
-            ):
-                raise SkillManagerError(
-                    "coordinated repair boundary changed at publication"
-                )
+            self._verify_prepared_binding(prepared)
             self._active_skill().cancel()
             self._reset_active_internal()
 
-        self._pending_replacement_plan = owned
+        old_name = self._active_name
+        fresh_interruption = self._interrupted_execution is None
+        if fresh_interruption:
+            self._interrupted_execution = interrupted
+        self._pending_replacement_plan = prepared.owned
         try:
             self._start_replacement_after_interruption(
                 old_status=SkillStatus.CANCELED,
                 result_code=SkillResultCode.CANCELED,
-                before_publication=retire_hold,
+                before_publication=release_execution,
+                resolved_goal=prepared.retained_goal,
+                old_name=old_name,
             )
         except Exception:
-            self._pending_replacement_plan = None
+            if self._pending_replacement_plan is prepared.owned:
+                self._pending_replacement_plan = None
+            if fresh_interruption and self._interrupted_execution is interrupted:
+                self._interrupted_execution = None
             raise
         return self._task_status
 
-    def resume_coordinated_interruption(self) -> TaskStatus:
-        """Undo a coordinated soft-pause whose suffix was never published."""
-        if self._local_repair_event is not None:
-            raise SkillManagerError(
-                "coordinated resume conflicts with an active local repair event"
-            )
-        return self.resume_interrupted_step()
+    def commit_local_repair(
+        self, plan: TaskPlan, *, expected_event_id: str, expected_plan_version: int,
+        final_guard: Callable[[], None] | None = None,
+        allow_goto_detour_prefix: bool = False,
+    ) -> TaskStatus:
+        """Publish a protected fault-repair suffix synchronously.
+
+        Two-phase under the hood: prepare everything fallible, then publish.
+        Publication can precede a replacement Skill start failure; callers
+        must adopt the published version even when LAND then starts.
+        """
+        prepared = self.prepare_local_repair_suffix(
+            plan, expected_event_id=expected_event_id,
+            expected_plan_version=expected_plan_version,
+            allow_goto_detour_prefix=allow_goto_detour_prefix)
+        return self.publish_prepared_suffix(prepared, final_guard=final_guard)
+
+    def commit_coordinated_suffix(
+        self, plan: TaskPlan, *, expected_plan_version: int,
+        final_guard: Callable[[], None] | None = None,
+        allow_goto_detour_prefix: bool = True,
+    ) -> TaskStatus:
+        """Publish a coordinated suffix for a HEALTHY UAV (prepare + publish)."""
+        prepared = self.prepare_coordinated_suffix(
+            plan, expected_plan_version=expected_plan_version,
+            allow_goto_detour_prefix=allow_goto_detour_prefix)
+        return self.publish_prepared_suffix(prepared, final_guard=final_guard)
 
     def fail_local_repair(self, *, expected_event_id: str, reason: str) -> bool:
         """Close only this live event. Late failures cannot cancel a new task."""
@@ -2385,6 +2534,8 @@ class SkillManager:
         old_status: SkillStatus,
         result_code: SkillResultCode,
         before_publication: Callable[[], None] | None = None,
+        resolved_goal: SkillGoal | None = None,
+        old_name: SkillName | None = None,
     ) -> None:
         interrupted = self._require_supervisory_interruption()
         replacement = self._pending_replacement_plan
@@ -2444,7 +2595,12 @@ class SkillManager:
             if any(candidate.step_id == step_id for candidate in replacement.steps)
         }
         try:
-            goal = self._goal_from_step(step, plan=replacement)
+            if resolved_goal is not None:
+                # PREPARE already resolved the retained Goal; publication must
+                # not repeat fallible parsing or resolution.
+                goal = resolved_goal
+            else:
+                goal = self._goal_from_step(step, plan=replacement)
         except Exception as exc:
             # Validation above makes this an internal state/routing failure,
             # never a partially accepted revision that continues unchecked.
@@ -2499,7 +2655,7 @@ class SkillManager:
         old_step_id = interrupted.step.step_id
         self._discard_supervisory_state()
         self._start_transition(
-            SkillName.HOVER,
+            SkillName.HOVER if old_name is None else old_name,
             old_status,
             result_code,
             step.skill,

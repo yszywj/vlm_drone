@@ -84,7 +84,7 @@ cd /home/amax/ry/vlm_drones/uav_agent
 
 ## 当前仍未支持
 
-- COORDINATION_REQUIRED 只输出受影响集合与原因，不自动小组联合重规划。
+- 2026-09-17 时的边界；2026-09-18 起配置开启后已支持有界 2~3 UAV 联合修复（见下节），仍不做全 Fleet 自动重规划。
 - 无共享目标注册表接入：TRACK/INSPECT 的移交一律按 SAME_UAV_ONLY 拒绝
   （REQUIRES_SHARED_EVIDENCE 预留给未来的可信共享证据源）。
 - 重投影只重接"当前位置→既有世界折线"的接入段，不在代码内绕开新障碍；
@@ -104,8 +104,11 @@ cd /home/amax/ry/vlm_drones/uav_agent
   NAVIGATE/SEARCH/TRACK/INSPECT/WAIT/RETURN_HOME/LAND/RHAL 各一个 evaluator。
 - `GoalContractRegistry` + `DEFAULT_GOAL_CONTRACT_REGISTRY`：`assess_remaining_goals`
   与 `build_remaining_task_contract` 改为查表；未注册（如 REPORT）显式
-  `UNREGISTERED_GOAL_CONTRACT:<type>` fail-closed。新增任务只需注册 evaluator；
-  `FleetRecoveryController` 已无任何 goal_type 分支（测试做源码级断言）。
+  `UNREGISTERED_GOAL_CONTRACT:<type>` fail-closed。对于已有执行能力的新任务语义，
+  只需新增/注册 Contract Evaluator；若新增全新的物理 Skill，仍需实现 Skill、输入
+  schema、执行结果证据和必要编译支持，但无需修改 FleetRecoveryController、
+  RemainingTaskContract、空间/依赖/联合恢复主框架。`FleetRecoveryController`
+  已无任何 goal_type 分支（测试做源码级断言）。
 - 链路不变：Execution Evidence → Contract Registry → RemainingTaskContract
   → Recovery/Repair；TRACK 连续/有效时长与 handoff 约束语义逐字保留。
 
@@ -123,11 +126,16 @@ cd /home/amax/ry/vlm_drones/uav_agent
 - 验证：逐机 `validate_local_repair` 全流水线 + `_check_joint_live`
   （故障机全量 `_check_local_live`；peer 版本/步骤/锚点/依赖重验；组内组外
   统一空域与障碍检查 `ROUTE_CONFLICT`）。
-- 提交（all-or-none，仅软件计划状态）：全部检查先于任何变更；peer 先经
-  `interrupt_with_hover` → `commit_coordinated_suffix`（受保护后缀规则同故障
-  修复），故障机最后走原 `commit_local_repair`；任一失败 → 未发布 peer 立即
-  `resume_coordinated_interruption`，已发布 peer 以原后缀在下一版本补偿恢复，
-  全部元数据（路线/版本/记录）仅在两机均已发布后统一写入。
+- 提交（两阶段，仅软件计划状态）：`PREPARE → FINAL GUARD → ATOMIC PUBLISH →
+  RELEASE EXECUTION`。PREPARE 对 scope 内全部 UAV 完成所有可失败准备
+  （TaskPlan/compiled_mission/Skill 与 Goal 解析/前缀保护/版本/当前步骤/
+  契约/空间与依赖检查，含保留步骤 Goal 预解析），期间不修改任何计划、版本、
+  路线、assignment 记录或执行状态（peer 不再先进入 hover）。随后在
+  `runtime._recovery_commit_lock` 内统一重跑 final guard，通过后逐机
+  `publish_prepared_*` 只消费不可变 prepared 对象（绑定 uav/版本/步骤/
+  执行代次/候选摘要，发布时重验绑定），peer 先发布、故障机最后；元数据
+  （路线/进度/记录/编译）在全部落地后统一写入。异常兜底 rollback（原后缀
+  +版本递增并同步记录/编译）仅作为兜底保留，不是 all-or-none 的主要实现。
 - 配置：`joint_repair_enabled`（默认关）、`max_joint_repair_scope_uavs`（2..3）、
   `max_joint_peer_drift_m`。
 

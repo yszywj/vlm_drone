@@ -79,6 +79,24 @@ class AgentStatus(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedCoordinatedRepair:
+    """Immutable PREPARE result for one UAV's suffix publication.
+
+    Binds the publication to its trusted request: uav, expected plan version
+    and step, execution generation and the candidate digest. PUBLISH
+    re-verifies every binding before swapping any state.
+    """
+
+    manager_prepared: object
+    compiled_mission: CompiledMission
+    uav_id: str
+    expected_plan_version: int
+    expected_step_id: str
+    execution_generation: int
+    candidate_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class LocalRepairSnapshot:
     """Owned local execution view for the single Fleet repair coordinator."""
 
@@ -459,19 +477,16 @@ class MissionAgent:
             event_id, plan_version, require_hold=True
         )
 
-    def commit_local_repair(
-        self, task_plan: TaskPlan, *, expected_event_id: str,
-        expected_plan_version: int, compiled_mission: CompiledMission | None = None,
-        final_guard: Callable[[], None] | None = None,
-        allow_goto_detour_prefix: bool = False,
-    ) -> MissionAgentSnapshot:
-        """Preflight then synchronously adopt a protected Manager replacement.
+    # ------------------------------------------------------------------
+    # Two-phase suffix publication (agent side). PREPARE performs every
+    # fallible check and owns immutable objects; PUBLISH re-verifies the
+    # binding, runs the owner's final guard and adopts the publication.
+    # ------------------------------------------------------------------
 
-        ``final_guard`` may reject a stale Fleet dependency or expired real
-        deadline after preflight. A Skill start failure after publication still
-        updates Agent metadata; physical cancellation/start is not rolled back.
-        """
-        self._check_local_repair_boundary(expected_event_id, expected_plan_version)
+    def _prepare_suffix_compiled(
+        self, task_plan: TaskPlan, compiled_mission: CompiledMission | None, *,
+        expected_plan_version: int, note: str,
+    ) -> CompiledMission:
         original = self._compiled_mission
         assert original is not None
         if not isinstance(task_plan, TaskPlan):
@@ -480,26 +495,95 @@ class MissionAgent:
             compiled_mission = CompiledMission(
                 planner_output=original.planner_output,
                 task_plan=task_plan, source=original.source,
-                compiler_notes=(*original.compiler_notes, "trusted local suffix repair"),
+                compiler_notes=(*original.compiler_notes, note),
             )
         if not isinstance(compiled_mission, CompiledMission):
             raise TypeError("compiled_mission must be a CompiledMission")
         if compiled_mission.task_plan.to_dict() != task_plan.to_dict():
-            raise MissionAgentError("local repair compiled TaskPlan mismatch")
+            raise MissionAgentError("suffix compiled TaskPlan mismatch")
         if compiled_mission.target_spec != original.target_spec:
-            raise MissionAgentError("local repair cannot change the original TargetSpec")
+            raise MissionAgentError("suffix repair cannot change the original TargetSpec")
         owned = _copy_local_repair_compiled(compiled_mission)
         if (
             owned.task_plan.mission_id != self._mission_id
             or owned.task_plan.uav_id != self._uav_id
             or owned.task_plan.plan_version != expected_plan_version + 1
         ):
-            raise MissionAgentError("local repair routing/version mismatch")
+            raise MissionAgentError("suffix repair routing/version mismatch")
         decision = self._safety.preflight(owned)
         if not isinstance(decision, SafetyDecision) or decision.action is not SafetyAction.CONTINUE:
-            raise MissionAgentError("local repair safety preflight rejected TaskPlan")
+            raise MissionAgentError("suffix repair safety preflight rejected TaskPlan")
+        return owned
+
+    def prepare_local_repair_suffix(
+        self, task_plan: TaskPlan, *, expected_event_id: str,
+        expected_plan_version: int, compiled_mission: CompiledMission | None = None,
+        allow_goto_detour_prefix: bool = False,
+    ) -> "PreparedCoordinatedRepair":
+        """PREPARE a fault-repair suffix: all checks, zero mutation."""
         self._check_local_repair_boundary(expected_event_id, expected_plan_version)
+        owned = self._prepare_suffix_compiled(
+            task_plan, compiled_mission, expected_plan_version=expected_plan_version,
+            note="trusted local suffix repair")
+        self._check_local_repair_boundary(expected_event_id, expected_plan_version)
+        prepared = self._skill_manager.prepare_local_repair_suffix(
+            owned.task_plan, expected_event_id=expected_event_id,
+            expected_plan_version=expected_plan_version,
+            allow_goto_detour_prefix=allow_goto_detour_prefix)
+        return PreparedCoordinatedRepair(
+            manager_prepared=prepared, compiled_mission=owned,
+            uav_id=self._uav_id, expected_plan_version=expected_plan_version,
+            expected_step_id=prepared.expected_step_id,
+            execution_generation=prepared.execution_epoch,
+            candidate_digest=prepared.plan_digest)
+
+    def prepare_coordinated_suffix(
+        self, task_plan: TaskPlan, *, expected_plan_version: int,
+        compiled_mission: CompiledMission | None = None,
+    ) -> "PreparedCoordinatedRepair":
+        """PREPARE a coordinated suffix for a HEALTHY UAV: validate only.
+
+        No hold is taken and no execution state changes; the peer keeps
+        flying its current plan until an atomic publication is chosen.
+        """
+        if (self._status is not AgentStatus.RUNNING
+                or self._shutdown_outcome is not None
+                or self._plan_version != expected_plan_version):
+            raise MissionAgentError("coordinated repair Agent boundary is stale or canceled")
+        if self._skill_manager.local_repair_event is not None:
+            raise MissionAgentError(
+                "coordinated repair conflicts with an active fault repair"
+            )
+        owned = self._prepare_suffix_compiled(
+            task_plan, compiled_mission, expected_plan_version=expected_plan_version,
+            note="trusted coordinated suffix repair")
+        prepared = self._skill_manager.prepare_coordinated_suffix(
+            owned.task_plan, expected_plan_version=expected_plan_version)
+        return PreparedCoordinatedRepair(
+            manager_prepared=prepared, compiled_mission=owned,
+            uav_id=self._uav_id, expected_plan_version=expected_plan_version,
+            expected_step_id=prepared.expected_step_id,
+            execution_generation=prepared.execution_epoch,
+            candidate_digest=prepared.plan_digest)
+
+    def _verify_prepared_agent_binding(self, prepared: "PreparedCoordinatedRepair") -> None:
+        binding = prepared.manager_prepared
+        if (binding.uav_id != self._uav_id
+                or self._status is not AgentStatus.RUNNING
+                or self._shutdown_outcome is not None
+                or self._plan_version != prepared.expected_plan_version):
+            raise MissionAgentError("prepared suffix Agent binding is stale or canceled")
+
+    def publish_prepared_local_repair_suffix(
+        self, prepared: "PreparedCoordinatedRepair", *,
+        final_guard: Callable[[], None] | None = None,
+    ) -> MissionAgentSnapshot:
+        """PUBLISH a prepared fault-repair suffix (bindings + guard + adopt)."""
+        self._verify_prepared_agent_binding(prepared)
         event = self._skill_manager.local_repair_event
+        expected_event_id = prepared.manager_prepared.event_id
+        expected_plan_version = prepared.expected_plan_version
+        owned = prepared.compiled_mission
 
         def publication_guard() -> None:
             if final_guard is not None:
@@ -507,12 +591,8 @@ class MissionAgent:
             self._check_local_repair_boundary(expected_event_id, expected_plan_version)
 
         try:
-            self._skill_manager.commit_local_repair(
-                owned.task_plan, expected_event_id=expected_event_id,
-                expected_plan_version=expected_plan_version,
-                final_guard=publication_guard,
-                allow_goto_detour_prefix=allow_goto_detour_prefix,
-            )
+            self._skill_manager.publish_prepared_suffix(
+                prepared.manager_prepared, final_guard=publication_guard)
         finally:
             # This handoff cannot invoke safety/logging/model callbacks. A start
             # hook may have failed after the Manager published the new version.
@@ -522,101 +602,61 @@ class MissionAgent:
                 self._plan_version = owned.task_plan.plan_version
                 if event is not None and event.skill_name is SkillName.SEARCH:
                     self._local_repair_search_resume_step_id = event.step_id
-        # Target transitions are consumed by the next ordinary Agent tick, after
-        # the Fleet owner has synchronously adopted its corresponding metadata.
         return self.snapshot()
 
-    def begin_coordinated_repair_hold(self, *, max_wait_s: float) -> None:
-        """Trusted soft-pause for a HEALTHY UAV entering a bounded joint repair.
-
-        Called only by the Fleet recovery owner at its serial tick boundary;
-        never by model output. Physical hover is real execution, and a suffix
-        that is never published is undone by resume_coordinated_interruption.
-        """
-        if self._status is not AgentStatus.RUNNING or self._shutdown_outcome is not None:
-            raise MissionAgentError("coordinated repair requires a RUNNING agent")
-        if self._skill_manager.local_repair_event is not None:
-            raise MissionAgentError(
-                "coordinated repair conflicts with an active fault repair"
-            )
-        self._skill_manager.interrupt_with_hover(
-            "COORDINATED_REPAIR_PENDING",
-            max_wait_s=max_wait_s,
-        )
-
-    def resume_coordinated_interruption(self) -> None:
-        """Undo a coordinated hold whose suffix was never published."""
-        if self._status is not AgentStatus.RUNNING:
-            raise MissionAgentError("coordinated resume requires a RUNNING agent")
-        self._skill_manager.resume_coordinated_interruption()
-
-    def commit_coordinated_suffix(
-        self, task_plan: TaskPlan, *, expected_plan_version: int,
-        compiled_mission: CompiledMission | None = None,
+    def publish_prepared_coordinated_suffix(
+        self, prepared: "PreparedCoordinatedRepair", *,
         final_guard: Callable[[], None] | None = None,
     ) -> MissionAgentSnapshot:
-        """Preflight then synchronously adopt a coordinated joint-repair suffix.
-
-        Same protected-suffix contract as commit_local_repair, minus the fault
-        event: immutable prefix, retained current step, authorized GOTO
-        detours only. Software plan state advances by exactly one version.
-        """
-        if (
-            self._status is not AgentStatus.RUNNING
-            or self._shutdown_outcome is not None
-            or self._plan_version != expected_plan_version
-        ):
-            raise MissionAgentError("coordinated repair Agent boundary is stale or canceled")
-        original = self._compiled_mission
-        assert original is not None
-        if not isinstance(task_plan, TaskPlan):
-            raise TypeError("task_plan must be a TaskPlan")
-        if compiled_mission is None:
-            compiled_mission = CompiledMission(
-                planner_output=original.planner_output,
-                task_plan=task_plan, source=original.source,
-                compiler_notes=(*original.compiler_notes, "trusted coordinated suffix repair"),
-            )
-        if not isinstance(compiled_mission, CompiledMission):
-            raise TypeError("compiled_mission must be a CompiledMission")
-        if compiled_mission.task_plan.to_dict() != task_plan.to_dict():
-            raise MissionAgentError("coordinated repair compiled TaskPlan mismatch")
-        if compiled_mission.target_spec != original.target_spec:
-            raise MissionAgentError("coordinated repair cannot change the original TargetSpec")
-        owned = _copy_local_repair_compiled(compiled_mission)
-        if (
-            owned.task_plan.mission_id != self._mission_id
-            or owned.task_plan.uav_id != self._uav_id
-            or owned.task_plan.plan_version != expected_plan_version + 1
-        ):
-            raise MissionAgentError("coordinated repair routing/version mismatch")
-        decision = self._safety.preflight(owned)
-        if not isinstance(decision, SafetyDecision) or decision.action is not SafetyAction.CONTINUE:
-            raise MissionAgentError("coordinated repair safety preflight rejected TaskPlan")
+        """PUBLISH a prepared coordinated suffix (bindings + guard + adopt)."""
+        self._verify_prepared_agent_binding(prepared)
+        owned = prepared.compiled_mission
 
         def publication_guard() -> None:
             if final_guard is not None:
                 final_guard()
-            if (
-                self._status is not AgentStatus.RUNNING
-                or self._shutdown_outcome is not None
-                or self._plan_version != expected_plan_version
-            ):
-                raise MissionAgentError("coordinated repair Agent boundary is stale at publication")
+            self._verify_prepared_agent_binding(prepared)
 
         try:
-            self._skill_manager.commit_coordinated_suffix(
-                owned.task_plan,
-                expected_plan_version=expected_plan_version,
-                final_guard=publication_guard,
-                allow_goto_detour_prefix=True,
-            )
+            self._skill_manager.publish_prepared_suffix(
+                prepared.manager_prepared, final_guard=publication_guard)
         finally:
             published = self._skill_manager.task_plan
             if published is not None and published.to_dict() == owned.task_plan.to_dict():
                 self._compiled_mission = owned
                 self._plan_version = owned.task_plan.plan_version
         return self.snapshot()
+
+    def commit_local_repair(
+        self, task_plan: TaskPlan, *, expected_event_id: str,
+        expected_plan_version: int, compiled_mission: CompiledMission | None = None,
+        final_guard: Callable[[], None] | None = None,
+        allow_goto_detour_prefix: bool = False,
+    ) -> MissionAgentSnapshot:
+        """Preflight then synchronously adopt a protected Manager replacement.
+
+        Two-phase under the hood: prepare everything fallible, then publish.
+        ``final_guard`` may reject a stale Fleet dependency or expired real
+        deadline after preflight. A Skill start failure after publication still
+        updates Agent metadata; physical cancellation/start is not rolled back.
+        """
+        prepared = self.prepare_local_repair_suffix(
+            task_plan, expected_event_id=expected_event_id,
+            expected_plan_version=expected_plan_version,
+            compiled_mission=compiled_mission,
+            allow_goto_detour_prefix=allow_goto_detour_prefix)
+        return self.publish_prepared_local_repair_suffix(prepared, final_guard=final_guard)
+
+    def commit_coordinated_suffix(
+        self, task_plan: TaskPlan, *, expected_plan_version: int,
+        compiled_mission: CompiledMission | None = None,
+        final_guard: Callable[[], None] | None = None,
+    ) -> MissionAgentSnapshot:
+        """Prepare then publish a coordinated joint-repair suffix."""
+        prepared = self.prepare_coordinated_suffix(
+            task_plan, expected_plan_version=expected_plan_version,
+            compiled_mission=compiled_mission)
+        return self.publish_prepared_coordinated_suffix(prepared, final_guard=final_guard)
 
     def fail_local_repair(self, *, expected_event_id: str, reason: str) -> bool:
         if self._status is not AgentStatus.RUNNING or self._shutdown_outcome is not None:

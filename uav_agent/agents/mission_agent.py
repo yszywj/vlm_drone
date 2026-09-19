@@ -566,6 +566,11 @@ class MissionAgent:
             execution_generation=prepared.execution_epoch,
             candidate_digest=prepared.plan_digest)
 
+    def verify_prepared_binding(self, prepared: "PreparedCoordinatedRepair") -> None:
+        """Verify the Agent- and Manager-side bindings; mutate nothing."""
+        self._verify_prepared_agent_binding(prepared)
+        self._skill_manager.verify_prepared_binding(prepared.manager_prepared)
+
     def _verify_prepared_agent_binding(self, prepared: "PreparedCoordinatedRepair") -> None:
         binding = prepared.manager_prepared
         if (binding.uav_id != self._uav_id
@@ -574,57 +579,59 @@ class MissionAgent:
                 or self._plan_version != prepared.expected_plan_version):
             raise MissionAgentError("prepared suffix Agent binding is stale or canceled")
 
-    def publish_prepared_local_repair_suffix(
+    def apply_prepared_suffix_state(
         self, prepared: "PreparedCoordinatedRepair", *,
         final_guard: Callable[[], None] | None = None,
-    ) -> MissionAgentSnapshot:
-        """PUBLISH a prepared fault-repair suffix (bindings + guard + adopt)."""
-        self._verify_prepared_agent_binding(prepared)
-        event = self._skill_manager.local_repair_event
-        expected_event_id = prepared.manager_prepared.event_id
-        expected_plan_version = prepared.expected_plan_version
+    ) -> None:
+        """SOFTWARE COMMIT for one UAV: Manager TaskPlan plus Agent plan state.
+
+        No Skill is canceled or started here; the old execution keeps running
+        until release_prepared_execution. Used by Fleet joint repair to commit
+        the whole scope's software state before releasing any execution.
+        """
+        binding = prepared.manager_prepared
         owned = prepared.compiled_mission
 
         def publication_guard() -> None:
             if final_guard is not None:
                 final_guard()
-            self._check_local_repair_boundary(expected_event_id, expected_plan_version)
+            if binding.kind == "LOCAL_REPAIR":
+                self._check_local_repair_boundary(binding.event_id,
+                                                  prepared.expected_plan_version)
+            else:
+                self._verify_prepared_agent_binding(prepared)
 
-        try:
-            self._skill_manager.publish_prepared_suffix(
-                prepared.manager_prepared, final_guard=publication_guard)
-        finally:
-            # This handoff cannot invoke safety/logging/model callbacks. A start
-            # hook may have failed after the Manager published the new version.
-            published = self._skill_manager.task_plan
-            if published is not None and published.to_dict() == owned.task_plan.to_dict():
-                self._compiled_mission = owned
-                self._plan_version = owned.task_plan.plan_version
-                if event is not None and event.skill_name is SkillName.SEARCH:
-                    self._local_repair_search_resume_step_id = event.step_id
+        self.verify_prepared_binding(prepared)
+        self._skill_manager.apply_prepared_state(binding, final_guard=publication_guard)
+        self._compiled_mission = owned
+        self._plan_version = owned.task_plan.plan_version
+        if binding.kind == "LOCAL_REPAIR" and binding.event_id is not None:
+            # The repair event is consumed by the software commit; remember a
+            # SEARCH resume boundary exactly as the one-shot path did.
+            event_skill = getattr(prepared.manager_prepared.interrupted.step, "skill", None)
+            if event_skill is SkillName.SEARCH:
+                self._local_repair_search_resume_step_id = binding.expected_step_id
+
+    def release_prepared_execution(self, prepared: "PreparedCoordinatedRepair") -> None:
+        """EXECUTION RELEASE for one UAV after its software state committed."""
+        self._skill_manager.release_prepared_execution(prepared.manager_prepared)
+
+    def publish_prepared_local_repair_suffix(
+        self, prepared: "PreparedCoordinatedRepair", *,
+        final_guard: Callable[[], None] | None = None,
+    ) -> MissionAgentSnapshot:
+        """SOFTWARE COMMIT then EXECUTION RELEASE (single-UAV convenience)."""
+        self.apply_prepared_suffix_state(prepared, final_guard=final_guard)
+        self.release_prepared_execution(prepared)
         return self.snapshot()
 
     def publish_prepared_coordinated_suffix(
         self, prepared: "PreparedCoordinatedRepair", *,
         final_guard: Callable[[], None] | None = None,
     ) -> MissionAgentSnapshot:
-        """PUBLISH a prepared coordinated suffix (bindings + guard + adopt)."""
-        self._verify_prepared_agent_binding(prepared)
-        owned = prepared.compiled_mission
-
-        def publication_guard() -> None:
-            if final_guard is not None:
-                final_guard()
-            self._verify_prepared_agent_binding(prepared)
-
-        try:
-            self._skill_manager.publish_prepared_suffix(
-                prepared.manager_prepared, final_guard=publication_guard)
-        finally:
-            published = self._skill_manager.task_plan
-            if published is not None and published.to_dict() == owned.task_plan.to_dict():
-                self._compiled_mission = owned
-                self._plan_version = owned.task_plan.plan_version
+        """SOFTWARE COMMIT then EXECUTION RELEASE (single-UAV convenience)."""
+        self.apply_prepared_suffix_state(prepared, final_guard=final_guard)
+        self.release_prepared_execution(prepared)
         return self.snapshot()
 
     def commit_local_repair(

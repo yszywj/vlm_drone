@@ -126,16 +126,27 @@ cd /home/amax/ry/vlm_drones/uav_agent
 - 验证：逐机 `validate_local_repair` 全流水线 + `_check_joint_live`
   （故障机全量 `_check_local_live`；peer 版本/步骤/锚点/依赖重验；组内组外
   统一空域与障碍检查 `ROUTE_CONFLICT`）。
-- 提交（两阶段，仅软件计划状态）：`PREPARE → FINAL GUARD → ATOMIC PUBLISH →
-  RELEASE EXECUTION`。PREPARE 对 scope 内全部 UAV 完成所有可失败准备
-  （TaskPlan/compiled_mission/Skill 与 Goal 解析/前缀保护/版本/当前步骤/
-  契约/空间与依赖检查，含保留步骤 Goal 预解析），期间不修改任何计划、版本、
-  路线、assignment 记录或执行状态（peer 不再先进入 hover）。随后在
-  `runtime._recovery_commit_lock` 内统一重跑 final guard，通过后逐机
-  `publish_prepared_*` 只消费不可变 prepared 对象（绑定 uav/版本/步骤/
-  执行代次/候选摘要，发布时重验绑定），peer 先发布、故障机最后；元数据
-  （路线/进度/记录/编译）在全部落地后统一写入。异常兜底 rollback（原后缀
-  +版本递增并同步记录/编译）仅作为兜底保留，不是 all-or-none 的主要实现。
+- 提交（四阶段，软件状态与执行释放彻底分离）：`PREPARE → FINAL GUARD →
+  SOFTWARE COMMIT（全 scope 统一）→ EXECUTION RELEASE（逐机）`。
+  - PREPARE 对 scope 内全部 UAV 完成所有可失败准备（TaskPlan/compiled_mission/
+    Skill 与 Goal 解析/前缀保护/版本/当前步骤/契约/空间与依赖检查，含保留步骤
+    Goal 预解析），期间不修改任何计划、版本、路线、assignment 记录或执行状态。
+  - 提交锁内先对全 scope 重跑 final guard，再对全 scope 统一验证 prepared
+    绑定（uav/版本/步骤/执行代次/事件 + **重算当前 candidate 摘要**与 PREPARE
+    摘要比对，不一致即 `ROUTING_MISMATCH`）；任一失败则全 scope 零变更。
+  - SOFTWARE COMMIT：`apply_prepared_state` 只切换软件状态（Manager TaskPlan/
+    计划索引/账本、Agent 计划状态与版本、AssignmentRecord.local_plan_version/
+    路线/进度/编译），不取消/启动任何 Skill；正常路径下全 scope 一次性完成，
+    不存在"UAV2 已切换、UAV3 仍旧状态"的中间态。
+  - EXECUTION RELEASE：软件状态全部一致后才逐机 `release_prepared_execution`
+    （取消旧 Skill=真实取消证据，启动已发布计划的保留步骤）。Skill 启动失败走
+    既有可信 `skill_start_failed` 失败路径（安全降落），已发布软件版本不回滚，
+    其他 UAV 的已提交计划不撤销。
+  - 软件状态原子性 ≠ 物理动作可回滚：peer 旧 Skill 的取消/新 Skill 的启动是
+    物理执行，一旦发生不回滚。`_rollback_joint_peers`（原后缀+版本递增并同步
+    记录/编译）仅保留为"全 scope 绑定验证通过后、两次内存状态交换之间出现真
+    正意外异常"这一理论窗口的异常兜底，正常 prepare/guard/software commit
+    路径绝不调用，也不是 all-or-none 的实现机制。
 - 配置：`joint_repair_enabled`（默认关）、`max_joint_repair_scope_uavs`（2..3）、
   `max_joint_peer_drift_m`。
 

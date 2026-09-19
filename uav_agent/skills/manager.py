@@ -119,7 +119,7 @@ class _InterruptedExecution:
     timeout_fallback: HoverTimeoutFallback
 
 
-def _task_plan_digest(plan: TaskPlan) -> str:
+def task_plan_digest(plan: TaskPlan) -> str:
     from hashlib import sha256
     import json as _json
 
@@ -335,6 +335,7 @@ class SkillManager:
         self._interrupted_execution: _InterruptedExecution | None = None
         self._supervisory_continuation: _SupervisoryContinuation | None = None
         self._pending_replacement_plan: TaskPlan | None = None
+        self._prepared_release: PreparedSuffixPublication | None = None
         self._pending_program_patch: ProgramPatch | None = None
         self._pending_program_event_dispatch: ProgramEventDispatch | None = None
         self._pending_search_candidate_handoff: (
@@ -591,7 +592,7 @@ class SkillManager:
             expected_step_id=interrupted.step.step_id,
             execution_epoch=self._execution_epoch,
             event_id=expected_event_id,
-            plan_digest=_task_plan_digest(owned),
+            plan_digest=task_plan_digest(owned),
             owned=owned, interrupted=interrupted, retained_goal=retained_goal)
 
     def prepare_coordinated_suffix(
@@ -630,10 +631,10 @@ class SkillManager:
             expected_step_id=interrupted.step.step_id,
             execution_epoch=self._execution_epoch,
             event_id=None,
-            plan_digest=_task_plan_digest(owned),
+            plan_digest=task_plan_digest(owned),
             owned=owned, interrupted=interrupted, retained_goal=retained_goal)
 
-    def _verify_prepared_binding(self, prepared: PreparedSuffixPublication) -> None:
+    def verify_prepared_binding(self, prepared: PreparedSuffixPublication) -> None:
         """Cheap binding re-check only; no parsing or resolution."""
         if prepared.kind == "LOCAL_REPAIR":
             self._require_local_repair(
@@ -666,47 +667,105 @@ class SkillManager:
                 "prepared coordinated suffix binding is stale or canceled"
             )
 
+    def apply_prepared_state(
+        self, prepared: PreparedSuffixPublication, *,
+        final_guard: Callable[[], None] | None = None,
+    ) -> None:
+        """SOFTWARE COMMIT of a prepared suffix; no Skill is touched.
+
+        Swaps TaskPlan, plan index, step outputs, recovery bookkeeping and
+        plan version to the already-validated prepared values and consumes
+        the supervisory/repair state. The old Skill keeps running untouched
+        until release_prepared_execution cancels it, so a Fleet owner can
+        commit the whole repair scope's software state before releasing any
+        execution.
+        """
+        self.verify_prepared_binding(prepared)
+        if final_guard is not None:
+            final_guard()
+        self.verify_prepared_binding(prepared)
+        interrupted = prepared.interrupted
+        owned = prepared.owned
+        index = interrupted.plan_index
+        retained = owned.steps[index]
+        published_track_goals = {
+            step_id: deepcopy(goal)
+            for step_id, goal in interrupted.saved_track_goals.items()
+            if any(candidate.step_id == step_id for candidate in owned.steps)
+        }
+        if retained.skill is SkillName.TRACK and isinstance(prepared.retained_goal, TrackGoal):
+            published_track_goals[retained.step_id] = prepared.retained_goal
+        # Pure software swap; every fallible value was prepared up front.
+        self._task_plan = _copy_task_plan(owned)
+        self._plan_index = index
+        self._step_outputs = deepcopy(interrupted.step_outputs)
+        self._active_target_id = interrupted.active_target_id
+        self._recovery_attempts = {
+            candidate.step_id: interrupted.recovery_attempts.get(candidate.step_id, 0)
+            for candidate in owned.steps
+            if self._effective_recovery_policy(candidate) is not None
+        }
+        self._saved_track_goal_by_step = published_track_goals
+        self._discard_supervisory_state()
+        self._prepared_release = prepared
+
+    def release_prepared_execution(
+        self, prepared: PreparedSuffixPublication,
+    ) -> TaskStatus:
+        """EXECUTION RELEASE of an applied prepared suffix.
+
+        Cancels the still-running old Skill (real cancellation evidence),
+        then starts the prepared retained step of the already-published plan.
+        A Skill start failure is handled by the trusted skill_start_failed
+        path (safe landing); the published software plan is never rolled
+        back here.
+        """
+        if self._prepared_release is not prepared:
+            raise SkillManagerError(
+                "prepared suffix was not applied to this execution boundary"
+            )
+        if self._task_status is not TaskStatus.RUNNING or self._active_name is None:
+            raise SkillManagerError("no running execution to release")
+        retained = prepared.owned.steps[prepared.interrupted.plan_index]
+        old_name = self._active_name
+        old_step_id = prepared.expected_step_id
+        skill = self._active_skill()
+        skill.cancel()
+        canceled = skill.get_result()
+        self._reset_active_internal()
+        self._prepared_release = None
+        self._start_transition(
+            old_name,
+            SkillStatus.CANCELED,
+            None if canceled is None else canceled.code,
+            retained.skill,
+            prepared.retained_goal,
+            "prepared_suffix_released",
+            old_step_id=old_step_id,
+            new_step_id=retained.step_id,
+            recovery_attempt=(
+                self._recovery_attempts.get(retained.step_id)
+                if retained.skill is SkillName.TRACK
+                else None
+            ),
+            execution_kind=ExecutionKind.PLANNED,
+        )
+        return self._task_status
+
     def publish_prepared_suffix(
         self, prepared: PreparedSuffixPublication, *,
         final_guard: Callable[[], None] | None = None,
     ) -> TaskStatus:
-        """ATOMIC PUBLISH of a prepared suffix: bindings, guard, swap, release.
+        """SOFTWARE COMMIT then EXECUTION RELEASE of a prepared suffix.
 
-        Consumes the immutable prepared object only. Cancellation of the
-        active Skill is real cancellation evidence, never fabricated success.
+        Two-phase under the hood for single-UAV callers; Fleet joint repair
+        calls apply_prepared_state for the whole scope first and releases
+        execution only after every UAV's software state is consistent.
+        Cancellation of the old Skill is real cancellation evidence, never
+        fabricated success.
         """
-        self._verify_prepared_binding(prepared)
-        interrupted = prepared.interrupted
-
-        def release_execution() -> None:
-            # Last publication gate: owner deadlines/dependencies, then the
-            # binding again, then release the running execution.
-            if final_guard is not None:
-                final_guard()
-            self._verify_prepared_binding(prepared)
-            self._active_skill().cancel()
-            self._reset_active_internal()
-
-        old_name = self._active_name
-        fresh_interruption = self._interrupted_execution is None
-        if fresh_interruption:
-            self._interrupted_execution = interrupted
-        self._pending_replacement_plan = prepared.owned
-        try:
-            self._start_replacement_after_interruption(
-                old_status=SkillStatus.CANCELED,
-                result_code=SkillResultCode.CANCELED,
-                before_publication=release_execution,
-                resolved_goal=prepared.retained_goal,
-                old_name=old_name,
-            )
-        except Exception:
-            if self._pending_replacement_plan is prepared.owned:
-                self._pending_replacement_plan = None
-            if fresh_interruption and self._interrupted_execution is interrupted:
-                self._interrupted_execution = None
-            raise
-        return self._task_status
+        self.apply_prepared_state(prepared, final_guard=final_guard)
+        return self.release_prepared_execution(prepared)
 
     def commit_local_repair(
         self, plan: TaskPlan, *, expected_event_id: str, expected_plan_version: int,

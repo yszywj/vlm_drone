@@ -1350,12 +1350,12 @@ def test_publication_boundary_exception_keeps_all_layers_consistent(harness, mon
     episode = h.submit(0)
     h.complete(episode)
     assert episode.phase == "JOINT_QUEUED"
-    # The peer publishes first; the faulted UAV's publication then explodes
-    # at the boundary BEFORE its plan lands, forcing the fallback rollback.
+    # The peer's software commits first; the faulted UAV's SOFTWARE COMMIT
+    # then explodes, forcing the exceptional fallback rollback.
     faulted_agent = h.locals[0].agent
-    def broken_publish(prepared, *, final_guard=None):
-        raise RuntimeError("publication exploded")
-    monkeypatch.setattr(faulted_agent, "publish_prepared_local_repair_suffix", broken_publish)
+    def broken_apply(prepared, *, final_guard=None):
+        raise RuntimeError("software commit exploded")
+    monkeypatch.setattr(faulted_agent, "apply_prepared_suffix_state", broken_apply)
     drive_joint_submit(h, episode, completes=2)
     # Faulted UAV: nothing landed anywhere.
     assert faulted_agent.snapshot().plan_version == 1
@@ -1466,3 +1466,130 @@ def test_no_path_requires_rollback_for_normal_version_consistency(harness, monke
         assert joint_layer_versions(h2, 1) == (1, 1, 1)
     finally:
         pass
+
+
+# ---------------------------------------------------------------------------
+# SOFTWARE COMMIT / EXECUTION RELEASE split (whole-scope atomicity)
+# ---------------------------------------------------------------------------
+
+def test_stale_prepared_binding_before_software_commit_commits_nothing(harness, monkeypatch):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    before = {index: joint_layer_versions(h, index) for index in range(3)}
+    routes_before = dict(h.runtime._planned_routes)
+    episode = h.submit(0)
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+    rollback_calls = []
+    monkeypatch.setattr(h.controller, "_rollback_joint_peers",
+                        lambda *args, **kwargs: rollback_calls.append(args))
+    original_prepare = h.controller._prepare_joint_publications
+    def tamper_binding(episode_arg, candidates):
+        prepared = original_prepare(episode_arg, candidates)
+        # All UAVs prepared fine; one binding then goes stale before the
+        # software commit (e.g. version drift the guard cannot see).
+        object.__setattr__(prepared[episode_arg.source_uav_id], "expected_plan_version", 99)
+        return prepared
+    monkeypatch.setattr(h.controller, "_prepare_joint_publications", tamper_binding)
+    drive_joint_submit(h, episode, completes=2)
+    for index in range(3):
+        assert joint_layer_versions(h, index) == before[index] == (1, 1, 1)
+    assert h.runtime._planned_routes == routes_before
+    assert h.locals[1].manager._prepared_release is None
+    assert h.locals[1].manager._pending_replacement_plan is None
+    assert rollback_calls == []
+    assert h.exits and h.exits[0][1] in {"MissionAgentError", "SkillManagerError"}
+
+
+def test_candidate_replaced_after_prepare_is_rejected_by_digest(harness, monkeypatch):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    before = {index: joint_layer_versions(h, index) for index in range(3)}
+    episode = h.submit(0)
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+    rollback_calls = []
+    monkeypatch.setattr(h.controller, "_rollback_joint_peers",
+                        lambda *args, **kwargs: rollback_calls.append(args))
+    original_prepare = h.controller._prepare_joint_publications
+    def swap_candidate(episode_arg, candidates):
+        prepared = original_prepare(episode_arg, candidates)
+        # The candidate under uav_2 is swapped for a same-shaped twin with a
+        # different plan version after PREPARE: geometry stays clean and the
+        # recomputed digest must reject the whole commit.
+        from skills.plan import TaskPlan as _TaskPlan
+        from types import SimpleNamespace
+        base = candidates["uav_2"]
+        twin = _TaskPlan(base.task_plan.steps, base.task_plan.mission_id,
+                         base.task_plan.uav_id, base.task_plan.plan_version + 1)
+        candidates["uav_2"] = SimpleNamespace(task_plan=twin, world_route=base.world_route,
+                                              compiled_mission=base.compiled_mission)
+        return prepared
+    monkeypatch.setattr(h.controller, "_prepare_joint_publications", swap_candidate)
+    drive_joint_submit(h, episode, completes=2)
+    for index in range(3):
+        assert joint_layer_versions(h, index) == before[index] == (1, 1, 1)
+    assert rollback_calls == []
+    assert h.exits and h.exits[0][1] == "ROUTING_MISMATCH"
+
+
+def test_skill_start_failure_after_software_commit_keeps_published_plans(harness, monkeypatch):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    episode = h.submit(0)
+    h.complete(episode)
+    assert episode.phase == "JOINT_QUEUED"
+    peer = h.locals[1]
+    def broken_start(goal, context):
+        raise RuntimeError("start boom")
+    monkeypatch.setattr(peer.goto, "_on_start", broken_start)
+    rollback_calls = []
+    monkeypatch.setattr(h.controller, "_rollback_joint_peers",
+                        lambda *args, **kwargs: rollback_calls.append(args))
+    drive_joint_submit(h, episode, completes=2)
+    # Software commit stood for the whole scope; nothing rolled back.
+    assert joint_layer_versions(h, 0) == (2, 2, 2)
+    assert joint_layer_versions(h, 1) == (2, 2, 2)
+    assert h.runtime._planned_routes["uav_2"][1] == (40.0, 0.0, 10.0)
+    assert rollback_calls == []
+    assert h.exits == []
+    assert episode.assignment_id not in h.controller.episodes
+    # The peer's failed Skill start is trusted execution-failure evidence:
+    # Skill.start records INTERNAL_ERROR with the failure message, the next
+    # manager tick fails the task safely, and the published plan version
+    # stands (never rolled back).
+    from skills.types import SkillStatus as _SkillStatus
+    start_result = peer.goto.get_result()
+    assert start_result is not None and start_result.status is _SkillStatus.FAILED
+    assert "Skill start failed" in start_result.message
+    assert peer.agent.snapshot().plan_version == 2
+    assert peer.manager._prepared_release is None
+    assert peer.manager.task_plan.plan_version == 2
+    # The faulted UAV keeps its committed, running plan.
+    assert h.locals[0].manager._pending_task_result is None
+
+
+def test_failed_joint_leaves_no_prepared_or_pending_residual_state(harness, monkeypatch):
+    h = harness(count=3, config=joint_config())
+    healthy_peers(h, (1, 2))
+    occupy_corridor(h, "uav_2", (30.0, 0.0, 10.0))
+    episode = h.submit(0)
+    h.complete(episode)
+    original_prepare = h.controller._prepare_joint_publications
+    def prepare_then_guard_fails(episode_arg, candidates):
+        prepared = original_prepare(episode_arg, candidates)
+        def failing_guard(*args, **kwargs):
+            raise LocalRepairError("COORDINATION_REQUIRED", "final guard rejected")
+        monkeypatch.setattr(h.controller, "_check_joint_live", failing_guard)
+        return prepared
+    monkeypatch.setattr(h.controller, "_prepare_joint_publications", prepare_then_guard_fails)
+    drive_joint_submit(h, episode, completes=2)
+    assert h.exits and h.exits[0][1] == "COORDINATION_REQUIRED"
+    for item in h.locals:
+        assert item.manager._prepared_release is None
+        assert item.manager._pending_replacement_plan is None
+        assert item.manager._interrupted_execution is None
+        assert item.manager._local_repair_event is None or item is h.locals[0]

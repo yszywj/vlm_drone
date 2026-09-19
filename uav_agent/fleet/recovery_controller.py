@@ -936,52 +936,61 @@ class FleetRecoveryController:
                 compiled_mission=candidates[uav_id].compiled_mission)
         return prepared
 
-    def _publish_joint(self, episode, candidates, prepared, routes, committed):
-        """ATOMIC PUBLISH of every prepared suffix, then shared metadata.
+    def _verify_joint_candidate_binding(self, candidate, prepared):
+        """Bind the current LocalRepairCandidate to the prepared publication.
 
-        Publication consumes the immutable prepared objects only: bindings
-        are re-verified, the owner's final guard runs, the running execution
-        is released and the new plan state is swapped per UAV. Peers publish
-        first and the faulted UAV last; any pre-publication failure leaves
-        every UAV in its original state. The version+1 peer restore below is
-        only an exceptional fallback, never the all-or-none mechanism.
+        The candidate digest is recomputed from the live candidate TaskPlan;
+        any drift between what was prepared and what is about to be committed
+        is a ROUTING_MISMATCH, never a silent substitute.
+        """
+        from skills.manager import task_plan_digest
+        digest = task_plan_digest(candidate.task_plan)
+        if prepared.candidate_digest != digest or prepared.manager_prepared.plan_digest != digest:
+            raise LocalRepairError("ROUTING_MISMATCH",
+                                   "joint candidate changed after prepare",
+                                   affected_uav_ids=(prepared.uav_id,))
+
+    def _publish_joint(self, episode, candidates, prepared, routes, committed):
+        """FINAL GUARD -> SOFTWARE COMMIT (whole scope) -> EXECUTION RELEASE.
+
+        Inside the commit lock: the joint final guard runs once for the whole
+        scope, then every prepared binding (agent, manager and recomputed
+        candidate digest) is verified for every UAV BEFORE any state changes.
+        Only then is the scope's software state committed in one pass --
+        Manager TaskPlan, Agent plan state/versions, assignment records,
+        routes, progress and compilations -- and only after all of it is
+        consistent is each UAV's execution released. Software atomicity never
+        means physical actions are reversible.
         """
         faulted = episode.source_uav_id
         order = tuple(uav_id for uav_id in episode.joint_scope if uav_id != faulted) + (faulted,)
+
         def joint_guard():
             return self._check_joint_live(episode, candidates, committed)
-        published = []
+
+        # FINAL GUARD for the whole scope, then binding verification for the
+        # whole scope: any failure here leaves every UAV untouched.
+        joint_guard()
+        for uav_id in order:
+            self._verify_joint_candidate_binding(candidates[uav_id], prepared[uav_id])
+            self.runtime.agents[uav_id].verify_prepared_binding(prepared[uav_id])
+
+        # SOFTWARE COMMIT for the whole scope. Bindings for every UAV were
+        # verified immediately above; a failure here is an internal error and
+        # only the exceptional fallback below restores consistency.
+        applied = []
         try:
             for uav_id in order:
-                agent = self.runtime.agents[uav_id]
-                candidate = candidates[uav_id]
-                pre = prepared[uav_id]
-                if pre.uav_id != uav_id or pre.candidate_digest != pre.manager_prepared.plan_digest:
-                    raise LocalRepairError("ROUTING_MISMATCH", "prepared publication binding mismatch")
-                try:
-                    if uav_id == faulted:
-                        agent.publish_prepared_local_repair_suffix(pre, final_guard=joint_guard)
-                    else:
-                        agent.publish_prepared_coordinated_suffix(pre, final_guard=joint_guard)
-                except Exception:
-                    landed = self._publication_landed(agent, candidate)
-                    if not landed:
-                        # Nothing was mutated for this UAV; stop here with the
-                        # whole scope still in its original state.
-                        raise
-                    # Publication landed but a late Skill start failed: the
-                    # version is published and must be adopted, not rolled back.
-                    self._log("RECOVERY_JOINT_START_FAILURE_ADOPTED", episode, uav_id=uav_id,
-                              error_code=type(Exception).__name__)
-                published.append((uav_id, self._uav_plan_digest(agent)))
+                self.runtime.agents[uav_id].apply_prepared_suffix_state(prepared[uav_id])
+                applied.append(uav_id)
                 committed.add(uav_id)
-        except Exception:
-            self._rollback_joint_peers(episode, candidates, published)
+        except Exception as exc:
+            self._log("RECOVERY_JOINT_SOFTWARE_COMMIT_FAILED", episode,
+                      failed_uav_id=None if not applied else applied[-1],
+                      error_code=type(exc).__name__)
+            self._rollback_joint_peers(episode, candidates, applied)
             raise
         for uav_id in order:
-            agent = self.runtime.agents[uav_id]
-            if not self._publication_landed(agent, candidates[uav_id]):
-                continue
             row = self._record_for_uav(uav_id)
             self.runtime._planned_routes[uav_id] = routes[uav_id]
             self.runtime._route_progress[uav_id] = 0
@@ -990,29 +999,35 @@ class FleetRecoveryController:
                 local_plan_version=candidates[uav_id].task_plan.plan_version, last_error=None)
             self.compilations[uav_id] = candidates[uav_id].compiled_mission
 
-    def _publication_landed(self, agent, candidate):
-        plan = agent.local_repair_snapshot.task_plan
-        return plan is not None and plan.to_dict() == candidate.task_plan.to_dict()
+        # EXECUTION RELEASE only after every UAV's software state committed.
+        # A release/Skill-start failure is a trusted execution failure (the
+        # Manager's skill_start_failed path fails safe to LAND internally);
+        # the committed software plan is never rolled back for it.
+        for uav_id in order:
+            try:
+                self.runtime.agents[uav_id].release_prepared_execution(prepared[uav_id])
+            except Exception as exc:
+                self._log("RECOVERY_JOINT_RELEASE_FAILED", episode, uav_id=uav_id,
+                          error_code=type(exc).__name__)
 
-    def _uav_plan_digest(self, agent):
-        plan = agent.local_repair_snapshot.task_plan
-        return None if plan is None else plan.to_dict()
+    def _rollback_joint_peers(self, episode, candidates, applied):
+        """Exceptional fallback only; never the all-or-none mechanism.
 
-    def _rollback_joint_peers(self, episode, candidates, published):
-        """Exceptional fallback only: restore cross-layer consistency.
-
-        Normal all-or-none never reaches here (prepare + final guard front-run
-        every fallible step). If a UAV failed AFTER another published, the
-        published peer is restored to its original suffix at the next version
-        and its record/compilation are aligned, so Agent, SkillManager,
+        Unreachable on every normal path: PREPARE, the final guard and the
+        whole-scope binding verification front-run every fallible step, so a
+        SOFTWARE COMMIT failure means an internal invariant broke. The
+        residual window is a truly unexpected exception between two
+        in-memory state swaps (no physical action is rolled back); the
+        already-committed peers are restored to their original suffix at the
+        next version with records/compilations re-aligned so Agent, Manager,
         assignment record, route and compilation stay version-consistent.
         """
-        if not published:
+        if not applied:
             return
-        self._log("RECOVERY_JOINT_ROLLBACK", episode, uav_ids=[uav_id for uav_id, _ in published])
+        self._log("RECOVERY_JOINT_ROLLBACK", episode, uav_ids=list(applied))
         from skills.plan import TaskPlan
         from fleet.runtime import AssignmentStatus
-        for uav_id, _ in reversed(published):
+        for uav_id in reversed(applied):
             if uav_id == episode.source_uav_id:
                 continue
             agent = self.runtime.agents[uav_id]
